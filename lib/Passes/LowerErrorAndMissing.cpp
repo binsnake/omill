@@ -59,6 +59,9 @@ llvm::PreservedAnalyses LowerErrorAndMissingPass::run(
     llvm::IRBuilder<> Builder(CI);
     auto *BB = CI->getParent();
 
+    // Save old successors before we replace the terminator.
+    llvm::SmallVector<llvm::BasicBlock *, 4> old_succs(successors(BB));
+
     // arg0 = State&, arg1 = addr_t (PC at the error), arg2 = Memory*
     llvm::Value *pc = CI->getArgOperand(1);
 
@@ -80,6 +83,11 @@ llvm::PreservedAnalyses LowerErrorAndMissingPass::run(
         dead.replaceAllUsesWith(llvm::PoisonValue::get(dead.getType()));
       dead.eraseFromParent();
     }
+
+    // Update PHI nodes: unreachable has no successors, so all old successors
+    // lost this block as a predecessor.
+    for (auto *succ : old_succs)
+      succ->removePredecessor(BB);
   }
 
   return llvm::PreservedAnalyses::none();

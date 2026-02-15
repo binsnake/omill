@@ -75,6 +75,9 @@ llvm::PreservedAnalyses LowerJumpPass::run(llvm::Function &F,
     llvm::IRBuilder<> Builder(CI);
     auto *BB = CI->getParent();
 
+    // Save old successors before we replace the terminator.
+    llvm::SmallVector<llvm::BasicBlock *, 4> old_succs(successors(BB));
+
     // __remill_jump(State&, addr_t target_pc, Memory*)
     llvm::Value *state = CI->getArgOperand(0);
     llvm::Value *target_pc = CI->getArgOperand(1);
@@ -120,6 +123,13 @@ llvm::PreservedAnalyses LowerJumpPass::run(llvm::Function &F,
         dead.replaceAllUsesWith(llvm::PoisonValue::get(dead.getType()));
       dead.eraseFromParent();
     }
+
+    // Update PHI nodes in blocks that lost this predecessor.
+    llvm::SmallPtrSet<llvm::BasicBlock *, 4> new_succs(successors(BB).begin(),
+                                                        successors(BB).end());
+    for (auto *old_succ : old_succs)
+      if (!new_succs.count(old_succ))
+        old_succ->removePredecessor(BB);
   }
 
   return llvm::PreservedAnalyses::none();

@@ -36,6 +36,11 @@ add_executable(omill-unit-tests
   unit/ConstantMemoryFoldingTest.cpp
   unit/ImportHashDBTest.cpp
   unit/HashImportAnnotationTest.cpp
+  unit/FoldProgramCounterTest.cpp
+  unit/OutlineConstantStackDataTest.cpp
+  unit/LowerResolvedDispatchCallsTest.cpp
+  unit/ResolveIATCallsTest.cpp
+  unit/ResolveLazyImportsTest.cpp
 )
 
 target_link_libraries(omill-unit-tests

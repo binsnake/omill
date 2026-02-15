@@ -124,4 +124,213 @@ TEST_F(PromoteStateToSSATest, SROAPromotesToSSA) {
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
 }
 
+TEST_F(PromoteStateToSSATest, WideStoreOverlap) {
+  // Regression test: A 128-bit store at offset 16 spans both offset 16 and 24.
+  // After promotion, a load from offset 24 must see the upper half of the wide
+  // store, not the stale initial value.
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *i128_ty = llvm::Type::getInt128Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *fn_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *test_fn = llvm::Function::Create(
+      fn_ty, llvm::Function::ExternalLinkage, "test_func", *M);
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", test_fn);
+  llvm::IRBuilder<> B(entry);
+
+  auto *state = test_fn->getArg(0);
+  auto *mem = test_fn->getArg(2);
+
+  // Wide 128-bit store at State+16 (covers offsets 16..31, including offset 24).
+  auto *gep16 = B.CreateConstGEP1_64(B.getInt8Ty(), state, 16, "xmm_ptr");
+  auto *wide_val = llvm::ConstantInt::get(i128_ty, llvm::APInt(128, {0xDEADBEEFCAFEBABEULL, 0x1122334455667788ULL}));
+  B.CreateStore(wide_val, gep16);
+
+  // Load i64 from State+24 — must see upper half of the wide store.
+  auto *gep24 = B.CreateConstGEP1_64(B.getInt8Ty(), state, 24, "xmm_hi_ptr");
+  auto *hi_val = B.CreateLoad(i64_ty, gep24, "xmm_hi");
+  (void)hi_val;
+
+  B.CreateRet(mem);
+
+  llvm::FunctionPassManager FPM;
+  FPM.addPass(omill::PromoteStateToSSAPass());
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+  FPM.run(*test_fn, FAM);
+
+  // After promotion, there must be a load from within the wide alloca to feed
+  // the offset-24 alloca (the "wide.sub" decomposition).
+  bool found_wide_sub = false;
+  for (auto &BB : *test_fn)
+    for (auto &I : BB)
+      if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I))
+        if (LI->getName().starts_with("wide.sub"))
+          found_wide_sub = true;
+
+  EXPECT_TRUE(found_wide_sub);
+  EXPECT_FALSE(llvm::verifyFunction(*test_fn, &llvm::errs()));
+}
+
+TEST_F(PromoteStateToSSATest, FlushBeforeStateCall) {
+  // Regression test: calls that take State as arg must have flush/reload.
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *fn_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *test_fn = llvm::Function::Create(
+      fn_ty, llvm::Function::ExternalLinkage, "test_func", *M);
+
+  // Create an external function that takes State.
+  auto *callee_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *callee = llvm::Function::Create(
+      callee_ty, llvm::Function::ExternalLinkage, "__omill_dispatch_call", *M);
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", test_fn);
+  llvm::IRBuilder<> B(entry);
+
+  auto *state = test_fn->getArg(0);
+  auto *mem = test_fn->getArg(2);
+
+  // Store a value to State+16
+  auto *gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 16, "field_ptr");
+  B.CreateStore(B.getInt64(42), gep);
+
+  // Call that takes State as arg
+  auto *call = B.CreateCall(callee, {state, B.getInt64(0), mem});
+
+  // Load from State+16 after the call
+  auto *gep2 = B.CreateConstGEP1_64(B.getInt8Ty(), state, 16, "field_ptr2");
+  auto *post_val = B.CreateLoad(i64_ty, gep2, "post_val");
+  (void)post_val;
+
+  B.CreateRet(call);
+
+  llvm::FunctionPassManager FPM;
+  FPM.addPass(omill::PromoteStateToSSAPass());
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+  FPM.run(*test_fn, FAM);
+
+  // Count stores to State (GEP + store patterns) — there should be flush
+  // stores before the call AND write-back stores before the return.
+  unsigned state_stores = 0;
+  for (auto &BB : *test_fn) {
+    for (auto &I : BB) {
+      if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+        // Check if storing to a GEP from arg0 (State).
+        if (auto *gep_op = llvm::dyn_cast<llvm::GetElementPtrInst>(
+                SI->getPointerOperand())) {
+          if (gep_op->getPointerOperand() == state ||
+              (llvm::isa<llvm::BitCastInst>(gep_op->getPointerOperand()) &&
+               llvm::cast<llvm::BitCastInst>(gep_op->getPointerOperand())
+                       ->getOperand(0) == state))
+            state_stores++;
+        }
+      }
+    }
+  }
+
+  // We expect at least 2 stores to State: one flush before call, one
+  // write-back before return.
+  EXPECT_GE(state_stores, 2u);
+  EXPECT_FALSE(llvm::verifyFunction(*test_fn, &llvm::errs()));
+}
+
+TEST_F(PromoteStateToSSATest, MultipleFields) {
+  // Three independent fields at offsets 16, 24, and 32 each get their own
+  // alloca with independent values.
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *fn_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *test_fn = llvm::Function::Create(
+      fn_ty, llvm::Function::ExternalLinkage, "test_func", *M);
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", test_fn);
+  llvm::IRBuilder<> B(entry);
+
+  auto *state = test_fn->getArg(0);
+  auto *mem = test_fn->getArg(2);
+
+  // Store different values to three distinct offsets.
+  for (unsigned off : {16u, 24u, 32u}) {
+    auto *gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, off);
+    B.CreateStore(B.getInt64(off * 100), gep);
+  }
+
+  // Load them back.
+  for (unsigned off : {16u, 24u, 32u}) {
+    auto *gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, off);
+    auto *val = B.CreateLoad(i64_ty, gep);
+    (void)val;
+  }
+
+  B.CreateRet(mem);
+
+  llvm::FunctionPassManager FPM;
+  FPM.addPass(omill::PromoteStateToSSAPass());
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+  FPM.run(*test_fn, FAM);
+
+  // Should have at least 3 allocas (one per field).
+  unsigned alloca_count = 0;
+  for (auto &I : test_fn->getEntryBlock())
+    if (llvm::isa<llvm::AllocaInst>(&I))
+      alloca_count++;
+
+  EXPECT_GE(alloca_count, 3u);
+  EXPECT_FALSE(llvm::verifyFunction(*test_fn, &llvm::errs()));
+}
+
 }  // namespace

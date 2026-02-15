@@ -7,12 +7,18 @@ add_library(obf_test SHARED
   src/lazy_funcs.cpp
   src/combined_funcs.cpp
   src/mixed_funcs.cpp
+  src/cloakwork_str_funcs.cpp
+  src/cloakwork_import_funcs.cpp
+  src/cloakwork_combined_funcs.cpp
+  src/cmut_funcs.cpp
 )
 
 # Include paths for obfuscation headers.
 target_include_directories(obf_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/xorstr-master/include
   ${CMAKE_CURRENT_SOURCE_DIR}/lazy_importer-master/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/cloakwork
+  ${CMAKE_CURRENT_SOURCE_DIR}/cmut
 )
 
 # Per-file compile options: dllmain at -O0, everything else at -O2.
@@ -23,6 +29,20 @@ set_source_files_properties(
   src/combined_funcs.cpp
   src/mixed_funcs.cpp
   PROPERTIES COMPILE_OPTIONS "-O2"
+)
+
+# Cloakwork requires C++20 (constinit, consteval) and -O2 for optimization.
+set_source_files_properties(
+  src/cloakwork_str_funcs.cpp
+  src/cloakwork_import_funcs.cpp
+  src/cloakwork_combined_funcs.cpp
+  PROPERTIES COMPILE_OPTIONS "-O2;-std=c++20"
+)
+
+# cmut requires C++20 (<bit> for std::rotl/std::rotr) and -O2 for inlining.
+set_source_files_properties(
+  src/cmut_funcs.cpp
+  PROPERTIES COMPILE_OPTIONS "-O2;-std=c++20"
 )
 
 # Disable AVX for xorstr to keep SIMD at SSE2 level.

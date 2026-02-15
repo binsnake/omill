@@ -37,13 +37,18 @@ bool analyzeUses(llvm::Value *ptr, llvm::AllocaInst *AI,
         return false;
       if (!offset_known)
         return false;
-      if (!llvm::isa<llvm::ConstantInt>(SI->getValueOperand()))
+      auto *val = SI->getValueOperand();
+      if (!llvm::isa<llvm::ConstantInt>(val) &&
+          !llvm::isa<llvm::ConstantDataSequential>(val) &&
+          !llvm::isa<llvm::ConstantAggregateZero>(val))
         return false;
       if (SI->getParent() != &AI->getFunction()->getEntryBlock())
         return false;
       stores.push_back({SI, base_offset});
     } else if (llvm::isa<llvm::LoadInst>(U)) {
       // Loads are fine — they'll read from the global after promotion.
+    } else if (llvm::isa<llvm::PtrToIntInst>(U)) {
+      // ptrtoint is fine — will reference the global after promotion.
     } else if (auto *II = llvm::dyn_cast<llvm::IntrinsicInst>(U)) {
       auto id = II->getIntrinsicID();
       if (id == llvm::Intrinsic::lifetime_start ||
@@ -104,14 +109,25 @@ llvm::PreservedAnalyses OutlineConstantStackDataPass::run(
     // Build byte array from constant stores.
     std::vector<uint8_t> bytes(size, 0);
     for (auto &[SI, offset] : stores) {
-      auto *CI = llvm::cast<llvm::ConstantInt>(SI->getValueOperand());
-      unsigned store_size = DL.getTypeStoreSize(CI->getType());
-      llvm::APInt val = CI->getValue();
-      for (unsigned i = 0; i < store_size; ++i) {
-        int64_t idx = offset + i;
-        if (idx >= 0 && static_cast<uint64_t>(idx) < size)
-          bytes[idx] = val.extractBitsAsZExtValue(8, i * 8);
+      auto *val = SI->getValueOperand();
+      unsigned store_size = DL.getTypeStoreSize(val->getType());
+
+      if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(val)) {
+        llvm::APInt apval = CI->getValue();
+        for (unsigned i = 0; i < store_size; ++i) {
+          int64_t idx = offset + i;
+          if (idx >= 0 && static_cast<uint64_t>(idx) < size)
+            bytes[idx] = apval.extractBitsAsZExtValue(8, i * 8);
+        }
+      } else if (auto *CDS = llvm::dyn_cast<llvm::ConstantDataSequential>(val)) {
+        llvm::StringRef raw = CDS->getRawDataValues();
+        for (unsigned i = 0; i < raw.size() && i < store_size; ++i) {
+          int64_t idx = offset + i;
+          if (idx >= 0 && static_cast<uint64_t>(idx) < size)
+            bytes[idx] = static_cast<uint8_t>(raw[i]);
+        }
       }
+      // ConstantAggregateZero: all zeros, already default in bytes array.
     }
 
     // Create global constant.

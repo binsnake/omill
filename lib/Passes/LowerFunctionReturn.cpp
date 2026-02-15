@@ -34,6 +34,9 @@ llvm::PreservedAnalyses LowerFunctionReturnPass::run(
     llvm::IRBuilder<> Builder(CI);
     auto *BB = CI->getParent();
 
+    // Save old successors before we replace the terminator.
+    llvm::SmallVector<llvm::BasicBlock *, 4> old_succs(successors(BB));
+
     // __remill_function_return(State&, addr_t ret_pc, Memory*)
     // Create a ret that returns the Memory* argument to satisfy
     // the return type, or void if the function returns void.
@@ -55,6 +58,11 @@ llvm::PreservedAnalyses LowerFunctionReturnPass::run(
         dead.replaceAllUsesWith(llvm::PoisonValue::get(dead.getType()));
       dead.eraseFromParent();
     }
+
+    // Update PHI nodes: ret has no successors, so all old successors lost
+    // this block as a predecessor.
+    for (auto *succ : old_succs)
+      succ->removePredecessor(BB);
   }
 
   return llvm::PreservedAnalyses::none();

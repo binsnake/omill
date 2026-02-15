@@ -1,11 +1,14 @@
 #include "omill/Passes/RecoverStackFrame.h"
 
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Operator.h>
+
+#include <algorithm>
 
 namespace omill {
 
@@ -82,44 +85,98 @@ bool isDerivedFrom(llvm::Value *V, llvm::Value *base_val,
   return false;
 }
 
-/// Find loads from the State struct (first argument) whose values are used
-/// as memory base pointers with negative constant offsets (stack pointer).
+/// Resolve the byte offset of a GEP from the State pointer (arg0).
+/// Returns -1 if the pointer doesn't originate from State.
+int64_t resolveStateGEPOffset(llvm::Value *ptr, llvm::Value *state_ptr,
+                              const llvm::DataLayout &DL) {
+  llvm::Value *base = ptr;
+  int64_t total_offset = 0;
+  while (auto *GEP = llvm::dyn_cast<llvm::GEPOperator>(base)) {
+    llvm::APInt ap_offset(64, 0);
+    if (!GEP->accumulateConstantOffset(DL, ap_offset))
+      return -1;
+    total_offset += ap_offset.getSExtValue();
+    base = GEP->getPointerOperand();
+  }
+  return (base == state_ptr) ? total_offset : -1;
+}
+
+/// Check if a load has any constant-offset inttoptr user.
+bool hasIntToPtrUser(llvm::LoadInst *LI) {
+  for (auto *user : LI->users()) {
+    if (llvm::isa<llvm::IntToPtrInst>(user))
+      return true;
+    if (auto *binop = llvm::dyn_cast<llvm::BinaryOperator>(user)) {
+      int64_t offset = 0;
+      if (traceToBase(binop, LI, offset)) {
+        for (auto *bu : binop->users()) {
+          if (llvm::isa<llvm::IntToPtrInst>(bu))
+            return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/// Find loads from the State struct whose values are used as memory base
+/// pointers through inttoptr patterns.
+///
+/// Two-pass approach:
+///   1. Find State field offsets that have at least one load with a NEGATIVE
+///      constant offset through inttoptr (identifies the stack pointer field).
+///   2. Collect ALL loads from those State field offsets that have ANY
+///      inttoptr usage (captures both pre-SUB and post-SUB RSP values).
 llvm::SmallVector<llvm::LoadInst *, 4> findStackBaseLoads(
     llvm::Function &F) {
   llvm::SmallVector<llvm::LoadInst *, 4> result;
 
   if (F.arg_empty()) return result;
   llvm::Value *state_ptr = F.getArg(0);
+  auto &DL = F.getDataLayout();
 
+  // Pass 1: find State field offsets with negative-offset inttoptr patterns.
+  llvm::DenseSet<int64_t> stack_field_offsets;
   for (auto &BB : F) {
     for (auto &I : BB) {
       auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I);
       if (!LI || !LI->getType()->isIntegerTy(64)) continue;
 
-      auto *ptr_op = LI->getPointerOperand();
-      llvm::Value *base = ptr_op;
-      if (auto *GEP = llvm::dyn_cast<llvm::GEPOperator>(base))
-        base = GEP->getPointerOperand();
-      if (base != state_ptr) continue;
+      int64_t state_off = resolveStateGEPOffset(
+          LI->getPointerOperand(), state_ptr, DL);
+      if (state_off < 0) continue;
 
-      // Require at least one negative constant offset → inttoptr pattern.
-      bool has_negative_offset = false;
       for (auto *user : LI->users()) {
         if (auto *binop = llvm::dyn_cast<llvm::BinaryOperator>(user)) {
           int64_t offset = 0;
           if (traceToBase(binop, LI, offset) && offset < 0) {
-            for (auto *binop_user : binop->users()) {
-              if (llvm::isa<llvm::IntToPtrInst>(binop_user)) {
-                has_negative_offset = true;
+            for (auto *bu : binop->users()) {
+              if (llvm::isa<llvm::IntToPtrInst>(bu)) {
+                stack_field_offsets.insert(state_off);
                 break;
               }
             }
           }
         }
-        if (has_negative_offset) break;
+        if (stack_field_offsets.count(state_off)) break;
       }
+    }
+  }
 
-      if (has_negative_offset) {
+  if (stack_field_offsets.empty()) return result;
+
+  // Pass 2: collect ALL loads from those State field offsets that have
+  // inttoptr users (positive or negative offsets).
+  for (auto &BB : F) {
+    for (auto &I : BB) {
+      auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I);
+      if (!LI || !LI->getType()->isIntegerTy(64)) continue;
+
+      int64_t state_off = resolveStateGEPOffset(
+          LI->getPointerOperand(), state_ptr, DL);
+      if (state_off < 0 || !stack_field_offsets.count(state_off)) continue;
+
+      if (hasIntToPtrUser(LI)) {
         result.push_back(LI);
       }
     }
@@ -128,28 +185,58 @@ llvm::SmallVector<llvm::LoadInst *, 4> findStackBaseLoads(
   return result;
 }
 
-/// Scan constant-offset inttoptr patterns to determine frame bounds.
-void computeFrameBounds(llvm::LoadInst *base_load,
-                        int64_t &min_offset, int64_t &max_offset) {
+/// Collect constant inttoptr offsets from a base load.
+llvm::SmallVector<int64_t, 16> collectIntToPtrOffsets(
+    llvm::LoadInst *base_load) {
+  llvm::SmallVector<int64_t, 16> offsets;
   for (auto *user : base_load->users()) {
     if (llvm::isa<llvm::IntToPtrInst>(user)) {
-      if (0 < min_offset) min_offset = 0;
-      if (0 > max_offset) max_offset = 0;
+      offsets.push_back(0);
       continue;
     }
-
     if (auto *binop = llvm::dyn_cast<llvm::BinaryOperator>(user)) {
       int64_t offset = 0;
       if (traceToBase(binop, base_load, offset)) {
-        for (auto *binop_user : binop->users()) {
-          if (llvm::isa<llvm::IntToPtrInst>(binop_user)) {
-            if (offset < min_offset) min_offset = offset;
-            if (offset > max_offset) max_offset = offset;
-          }
+        bool has_itp = false;
+        for (auto *bu : binop->users()) {
+          if (llvm::isa<llvm::IntToPtrInst>(bu)) { has_itp = true; break; }
         }
+        if (has_itp) offsets.push_back(offset);
       }
     }
   }
+  return offsets;
+}
+
+/// A contiguous region of the stack frame.
+struct FrameRegion {
+  int64_t min_offset;
+  int64_t max_offset;
+};
+
+/// Group sorted offsets into contiguous regions.
+/// Offsets within `gap` bytes of each other are in the same region.
+llvm::SmallVector<FrameRegion, 4> clusterOffsets(
+    llvm::SmallVector<int64_t, 16> &offsets, int64_t gap = 16) {
+  llvm::SmallVector<FrameRegion, 4> regions;
+  if (offsets.empty()) return regions;
+
+  llvm::sort(offsets);
+  // Remove duplicates.
+  offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
+
+  int64_t cur_min = offsets[0];
+  int64_t cur_max = offsets[0];
+
+  for (size_t i = 1; i < offsets.size(); ++i) {
+    if (offsets[i] - cur_max > gap) {
+      regions.push_back({cur_min, cur_max});
+      cur_min = offsets[i];
+    }
+    cur_max = offsets[i];
+  }
+  regions.push_back({cur_min, cur_max});
+  return regions;
 }
 
 /// Collect all inttoptr instructions in the function whose operands are
@@ -182,54 +269,85 @@ llvm::PreservedAnalyses RecoverStackFramePass::run(
     return llvm::PreservedAnalyses::all();
   }
 
-  // Compute frame bounds from constant-offset patterns.
-  int64_t min_offset = 0;
-  int64_t max_offset = 0;
-  for (auto *base_load : base_loads) {
-    computeFrameBounds(base_load, min_offset, max_offset);
-  }
-
-  // Create a stack frame alloca.
-  int64_t frame_size = max_offset - min_offset + 8;
-  if (frame_size <= 0) frame_size = 8;
-
   llvm::IRBuilder<> EntryBuilder(&F.getEntryBlock().front());
   auto *i8_ty = EntryBuilder.getInt8Ty();
   auto *i64_ty = EntryBuilder.getInt64Ty();
-  auto *frame_ty = llvm::ArrayType::get(i8_ty, frame_size);
-  auto *frame_alloca = EntryBuilder.CreateAlloca(frame_ty, nullptr, "stack_frame");
-
   bool changed = false;
 
   for (auto *base_load : base_loads) {
-    // Collect ALL inttoptr instructions derived from this RSP load.
-    auto int_to_ptrs = collectDerivedIntToPtr(F, base_load);
+    // Collect all constant inttoptr offsets from this base load.
+    auto offsets = collectIntToPtrOffsets(base_load);
+    if (offsets.empty()) continue;
 
-    for (auto *itp : int_to_ptrs) {
-      llvm::Value *operand = itp->getOperand(0);
-      llvm::IRBuilder<> Builder(itp);
+    // Group offsets into contiguous regions (gap > 16 bytes = separate region).
+    auto regions = clusterOffsets(offsets, 16);
 
-      // Compute alloca index: (operand - rsp_load) - min_offset
-      // For constant offsets, InstCombine will fold sub(add(rsp,C), rsp) → C.
-      // For variable offsets, sub(add(add(rsp,C),V), rsp) → C+V, which
-      // then becomes (C+V) - min_offset = the correct alloca byte index.
-      llvm::Value *rsp_relative = Builder.CreateSub(operand, base_load,
-                                                     "rsp_rel");
-      llvm::Value *alloca_idx;
-      if (min_offset != 0) {
-        alloca_idx = Builder.CreateAdd(
-            rsp_relative,
-            llvm::ConstantInt::get(i64_ty, -min_offset), "frame_idx");
-      } else {
-        alloca_idx = rsp_relative;
+    // Create a separate alloca for each region.
+    for (auto &region : regions) {
+      int64_t min_off = region.min_offset;
+      int64_t max_off = region.max_offset;
+      int64_t frame_size = max_off - min_off + 8;
+      if (frame_size <= 0) frame_size = 8;
+
+      auto *frame_ty = llvm::ArrayType::get(i8_ty, frame_size);
+      auto *frame_alloca = EntryBuilder.CreateAlloca(frame_ty, nullptr,
+                                                      "stack_frame");
+
+      // Replace inttoptr instructions whose constant offset falls in this
+      // region.
+      auto int_to_ptrs = collectDerivedIntToPtr(F, base_load);
+
+      for (auto *itp : int_to_ptrs) {
+        llvm::Value *operand = itp->getOperand(0);
+        int64_t const_off = 0;
+        if (!traceToBase(operand, base_load, const_off)) continue;
+        if (const_off < min_off || const_off > max_off) continue;
+
+        llvm::IRBuilder<> Builder(itp);
+        auto *alloca_idx = llvm::ConstantInt::get(i64_ty,
+                                                    const_off - min_off);
+        auto *gep = Builder.CreateGEP(i8_ty, frame_alloca, alloca_idx,
+                                       "frame_ptr");
+        itp->replaceAllUsesWith(gep);
+        itp->eraseFromParent();
+        changed = true;
       }
 
-      auto *gep = Builder.CreateGEP(i8_ty, frame_alloca, alloca_idx,
-                                     "frame_ptr");
+      // Replace bare add(RSP, C) values whose offset falls in this region
+      // with ptrtoint(GEP).  This ties the buffer address to the alloca,
+      // preventing SROA from decomposing the xorstr buffer region.
+      {
+        llvm::SmallVector<llvm::BinaryOperator *, 8> bare_ops;
+        for (auto *user : base_load->users()) {
+          auto *binop = llvm::dyn_cast<llvm::BinaryOperator>(user);
+          if (!binop) continue;
+          int64_t offset = 0;
+          if (!traceToBase(binop, base_load, offset)) continue;
+          if (binop->use_empty()) continue;
+          if (offset < min_off || offset > max_off) continue;
+          // Skip if any user is an inttoptr (not yet replaced or in another
+          // region).
+          bool has_itp = false;
+          for (auto *bu : binop->users()) {
+            if (llvm::isa<llvm::IntToPtrInst>(bu)) { has_itp = true; break; }
+          }
+          if (has_itp) continue;
+          bare_ops.push_back(binop);
+        }
 
-      itp->replaceAllUsesWith(gep);
-      itp->eraseFromParent();
-      changed = true;
+        for (auto *binop : bare_ops) {
+          int64_t offset = 0;
+          traceToBase(binop, base_load, offset);
+          int64_t idx = offset - min_off;
+          llvm::IRBuilder<> Builder(binop->getNextNode());
+          auto *gep = Builder.CreateGEP(i8_ty, frame_alloca,
+              llvm::ConstantInt::get(i64_ty, idx), "frame_addr");
+          auto *pti = Builder.CreatePtrToInt(gep, i64_ty, "frame_int");
+          binop->replaceAllUsesWith(pti);
+          binop->eraseFromParent();
+          changed = true;
+        }
+      }
     }
   }
 

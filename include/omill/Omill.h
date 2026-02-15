@@ -44,7 +44,8 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts);
 void buildIntrinsicLoweringPipeline(llvm::FunctionPassManager &FPM);
 
 /// Build only the state optimization stage (Stage 3).
-void buildStateOptimizationPipeline(llvm::FunctionPassManager &FPM);
+void buildStateOptimizationPipeline(llvm::FunctionPassManager &FPM,
+                                    bool deobfuscate = false);
 
 /// Build only the control flow recovery stage (Stage 4).
 void buildControlFlowPipeline(llvm::FunctionPassManager &FPM);

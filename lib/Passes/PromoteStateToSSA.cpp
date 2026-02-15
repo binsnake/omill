@@ -192,6 +192,49 @@ llvm::PreservedAnalyses PromoteStateToSSAPass::run(
     }
   }
 
+  // Phase 3.5: Flush promoted fields to State before calls that take State
+  // as an argument, and reload after.  This ensures that later passes
+  // (e.g., LowerResolvedDispatchCalls) that create new loads from State
+  // see the promoted values instead of stale initial values.
+  for (auto &BB : F) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI) continue;
+      // Check if any argument is the State pointer.
+      bool takes_state = false;
+      for (auto &arg : CI->args()) {
+        if (arg.get() == state_ptr) { takes_state = true; break; }
+      }
+      if (!takes_state) continue;
+
+      // Flush: store promoted values back to State before the call.
+      {
+        llvm::IRBuilder<> Builder(CI);
+        for (auto &[offset, info] : fields) {
+          if (info.stores.empty()) continue;  // Never written — no need to flush
+          auto *alloca = field_allocas[offset];
+          auto *val = Builder.CreateLoad(info.type, alloca);
+          auto *gep = buildStateFieldGEP(Builder, state_ptr, offset,
+                                          info.type, DL);
+          Builder.CreateStore(val, gep);
+        }
+      }
+
+      // Reload: reload promoted fields from State after the call.
+      // The call may have modified State (e.g., return value in RAX).
+      {
+        llvm::IRBuilder<> Builder(CI->getNextNode());
+        for (auto &[offset, info] : fields) {
+          auto *alloca = field_allocas[offset];
+          auto *gep = buildStateFieldGEP(Builder, state_ptr, offset,
+                                          info.type, DL);
+          auto *reloaded = Builder.CreateLoad(info.type, gep);
+          Builder.CreateStore(reloaded, alloca);
+        }
+      }
+    }
+  }
+
   // Phase 4: Before each return-like terminator, store live-out fields
   // back to the State struct.
   for (auto &BB : F) {

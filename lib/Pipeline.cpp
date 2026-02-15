@@ -12,8 +12,6 @@
 #include <llvm/Transforms/IPO/AlwaysInliner.h>
 #include <llvm/Transforms/IPO/GlobalDCE.h>
 #include <llvm/Transforms/Scalar/ADCE.h>
-#include <llvm/Support/FileSystem.h>
-#include <llvm/Support/raw_ostream.h>
 #include <llvm/Transforms/Scalar/LoopDeletion.h>
 #include <llvm/Transforms/Scalar/LoopPassManager.h>
 
@@ -67,7 +65,8 @@ void buildIntrinsicLoweringPipeline(llvm::FunctionPassManager &FPM) {
   addCleanupPasses(FPM);
 }
 
-void buildStateOptimizationPipeline(llvm::FunctionPassManager &FPM) {
+void buildStateOptimizationPipeline(llvm::FunctionPassManager &FPM,
+                                    bool deobfuscate) {
   // Dead flag elimination first — biggest bang for the buck (~50% stores gone).
   FPM.addPass(DeadStateFlagEliminationPass());
   FPM.addPass(DeadStateStoreEliminationPass());
@@ -78,11 +77,26 @@ void buildStateOptimizationPipeline(llvm::FunctionPassManager &FPM) {
 
   // Let LLVM finish the job.
   FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
-  FPM.addPass(llvm::EarlyCSEPass());
-  FPM.addPass(llvm::InstCombinePass());
-  FPM.addPass(llvm::DCEPass());
-  FPM.addPass(llvm::SimplifyCFGPass());
-  FPM.addPass(llvm::GVNPass());
+
+  if (deobfuscate) {
+    // When deobfuscation is enabled, recover stack frames after SROA merges
+    // RSP into a single SSA chain.  Skip GVN here — it would destroy the
+    // inttoptr patterns and forward-eliminate xorstr stores.  Phase 5 runs
+    // GVN after ConstantMemoryFolding has folded the XOR operations and
+    // OutlineConstantStackData has promoted the alloca to a global constant.
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(RecoverStackFramePass());
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::EarlyCSEPass());
+    FPM.addPass(llvm::DCEPass());
+    FPM.addPass(llvm::SimplifyCFGPass());
+  } else {
+    FPM.addPass(llvm::EarlyCSEPass());
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::DCEPass());
+    FPM.addPass(llvm::SimplifyCFGPass());
+    FPM.addPass(llvm::GVNPass());
+  }
 }
 
 void buildControlFlowPipeline(llvm::FunctionPassManager &FPM) {
@@ -128,38 +142,18 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
   }
 }
 
-// Debug: dump function IR at pipeline stage
-struct DebugDumpPass : public llvm::PassInfoMixin<DebugDumpPass> {
-  std::string tag_;
-  DebugDumpPass(std::string tag) : tag_(std::move(tag)) {}
-  llvm::PreservedAnalyses run(llvm::Function &F,
-                              llvm::FunctionAnalysisManager &) {
-    if (F.getName().starts_with("sub_")) {
-      std::error_code ec;
-      std::string filename = "debug_" + tag_ + "_" + F.getName().str() + ".ll";
-      llvm::raw_fd_ostream os(filename, ec, llvm::sys::fs::OF_None);
-      if (!ec) F.print(os);
-    }
-    return llvm::PreservedAnalyses::all();
-  }
-};
-
 void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM) {
-  FPM.addPass(DebugDumpPass("00_pre_deobf"));
   // Recover stack frame: convert inttoptr(RSP+offset) to alloca GEPs.
   FPM.addPass(RecoverStackFramePass());
-  FPM.addPass(DebugDumpPass("01_post_stack"));
   FPM.addPass(llvm::InstCombinePass());
   FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
   FPM.addPass(llvm::InstCombinePass());
-  FPM.addPass(DebugDumpPass("02_post_sroa"));
 
   FPM.addPass(ConstantMemoryFoldingPass());
   // LLVM cleanup to fold constants exposed by memory folding.
   FPM.addPass(llvm::InstCombinePass());
   FPM.addPass(llvm::GVNPass());
   FPM.addPass(llvm::DCEPass());
-  FPM.addPass(DebugDumpPass("03_post_gvn"));
   // Promote stack allocas with all-constant stores to global constants.
   // After xorstr folding, decrypted strings are constant stores to allocas;
   // outlining them enables further simplification and cleaner output.
@@ -191,7 +185,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   // Phase 2: State Optimization
   if (opts.optimize_state) {
     llvm::FunctionPassManager FPM;
-    buildStateOptimizationPipeline(FPM);
+    buildStateOptimizationPipeline(FPM, opts.deobfuscate);
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
