@@ -69,6 +69,11 @@ target_link_libraries(omill
     ${OMILL_LLVM_LIBS}
 )
 
+if(OMILL_ENABLE_SIMPLIFIER)
+  target_link_libraries(omill PUBLIC eq_sat)
+  target_compile_definitions(omill PUBLIC OMILL_ENABLE_SIMPLIFIER=1)
+endif()
+
 target_compile_features(omill PUBLIC cxx_std_17)
 
 if(NOT MSVC)

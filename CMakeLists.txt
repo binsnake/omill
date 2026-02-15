@@ -63,6 +63,14 @@ else()
   message(STATUS "Remill disabled (set -DOMILL_ENABLE_REMILL=ON to enable e2e tests)")
 endif()
 
+# EqSat MBA simplifier (optional, Rust crate)
+if(OMILL_ENABLE_SIMPLIFIER)
+  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/EqSat.cmake")
+  message(STATUS "EqSat simplifier enabled (cargo build)")
+else()
+  message(STATUS "EqSat simplifier disabled (set -DOMILL_ENABLE_SIMPLIFIER=ON to enable)")
+endif()
+
 # omill library
 add_subdirectory(lib)
 

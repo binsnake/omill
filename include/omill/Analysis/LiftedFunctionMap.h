@@ -32,10 +32,11 @@ class LiftedFunctionMap {
   /// Number of lifted functions found.
   size_t size() const { return pc_to_func_.size(); }
 
-  /// LLVM analysis invalidation — map remains valid unless IR is modified.
-  bool invalidate(llvm::Module &, const llvm::PreservedAnalyses &PA,
+  /// LLVM analysis invalidation — the map is immutable after construction,
+  /// so it is never invalidated.
+  bool invalidate(llvm::Module &, const llvm::PreservedAnalyses &,
                   llvm::ModuleAnalysisManager::Invalidator &) {
-    return !PA.areAllPreserved();
+    return false;
   }
 
  private:

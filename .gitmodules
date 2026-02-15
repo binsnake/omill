@@ -1,3 +1,6 @@
 [submodule "third_party/remill"]
 	path = third_party/remill
 	url = https://github.com/binsnake/remill.git
+[submodule "third_party/Simplifier"]
+	path = third_party/Simplifier
+	url = https://github.com/mazeworks-security/Simplifier.git

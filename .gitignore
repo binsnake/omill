@@ -22,5 +22,6 @@ cmake-build-*/
 *.sln
 *.vcxproj*
 /build-remill
+/build-simplifier
 /.claude
 *.ll
