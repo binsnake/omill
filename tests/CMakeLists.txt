@@ -9,7 +9,19 @@ FetchContent_Declare(
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
+# Zydis disassembler (used by codegen unit tests and e2e tests)
+FetchContent_Declare(zydis
+  GIT_REPOSITORY https://github.com/zyantific/zydis.git
+  GIT_TAG v4.1.0
+)
+set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(zydis)
+
 include(GoogleTest)
+
+# Map LLVMObject for COFF parsing in codegen tests
+llvm_map_components_to_libnames(_llvm_object_lib Object)
 
 add_executable(omill-unit-tests
   unit/IntrinsicTableTest.cpp
@@ -44,13 +56,21 @@ add_executable(omill-unit-tests
   unit/ResolveDispatchTargetsTest.cpp
   unit/RecoverJumpTablesTest.cpp
   unit/EliminateDeadPathsTest.cpp
+  unit/HyperCallCodegenTest.cpp
 )
 
 target_link_libraries(omill-unit-tests
   PRIVATE
     omill
+    Zydis
     GTest::gtest_main
     ${OMILL_LLVM_LIBS}
+    ${_llvm_object_lib}
+)
+
+target_include_directories(omill-unit-tests
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/utils
 )
 
 if(NOT MSVC)
@@ -61,14 +81,6 @@ gtest_discover_tests(omill-unit-tests)
 
 # E2E tests (require remill + Zydis)
 if(OMILL_ENABLE_REMILL)
-  FetchContent_Declare(zydis
-    GIT_REPOSITORY https://github.com/zyantific/zydis.git
-    GIT_TAG v4.1.0
-  )
-  set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
-  set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-  FetchContent_MakeAvailable(zydis)
-
   add_executable(omill-e2e-tests
     e2e/LiftAndOptFixture.cpp
     e2e/MBAPatternTest.cpp
@@ -90,7 +102,7 @@ if(OMILL_ENABLE_REMILL)
       omill
       remill
       Zydis
-      LLVMObject
+      ${_llvm_object_lib}
       GTest::gtest_main
       ${OMILL_LLVM_LIBS}
   )
@@ -98,6 +110,7 @@ if(OMILL_ENABLE_REMILL)
   target_include_directories(omill-e2e-tests
     PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/e2e
+      ${CMAKE_CURRENT_SOURCE_DIR}/utils
   )
 
   # Ensure FetchContent'd gtest headers come before remill's installed deps
