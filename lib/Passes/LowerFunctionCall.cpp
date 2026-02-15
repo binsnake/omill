@@ -5,37 +5,19 @@
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
 
+#include "omill/Analysis/LiftedFunctionMap.h"
 #include "omill/Utils/IntrinsicTable.h"
 
 namespace omill {
-
-namespace {
-
-/// Try to find a lifted function for the given target PC.
-/// Remill names lifted functions as "sub_<hex_address>".
-llvm::Function *findLiftedFunction(llvm::Module &M, uint64_t target_pc) {
-  // Try common naming patterns
-  char buf[64];
-  snprintf(buf, sizeof(buf), "sub_%lx", target_pc);
-  if (auto *F = M.getFunction(buf)) return F;
-
-  snprintf(buf, sizeof(buf), "sub_%llx", (unsigned long long)target_pc);
-  if (auto *F = M.getFunction(buf)) return F;
-
-  // Try with uppercase
-  snprintf(buf, sizeof(buf), "sub_%lX", target_pc);
-  if (auto *F = M.getFunction(buf)) return F;
-
-  return nullptr;
-}
-
-}  // namespace
 
 llvm::PreservedAnalyses LowerFunctionCallPass::run(
     llvm::Function &F, llvm::FunctionAnalysisManager &AM) {
   IntrinsicTable table(*F.getParent());
   auto &M = *F.getParent();
   auto &Ctx = F.getContext();
+
+  auto &MAMProxy = AM.getResult<llvm::ModuleAnalysisManagerFunctionProxy>(F);
+  auto *lifted = MAMProxy.getCachedResult<LiftedFunctionAnalysis>(M);
 
   llvm::SmallVector<llvm::CallInst *, 8> call_intrinsics;
 
@@ -75,7 +57,9 @@ llvm::PreservedAnalyses LowerFunctionCallPass::run(
     // Case 1: constant target PC — emit direct call
     if (auto *const_pc = llvm::dyn_cast<llvm::ConstantInt>(target_pc)) {
       uint64_t pc_val = const_pc->getZExtValue();
-      if (auto *target_fn = findLiftedFunction(M, pc_val)) {
+      llvm::Function *target_fn =
+          lifted ? lifted->lookup(pc_val) : nullptr;
+      if (target_fn) {
         result = Builder.CreateCall(target_fn, {state, target_pc, mem});
       }
     }

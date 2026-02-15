@@ -1,5 +1,7 @@
 #include "omill/Passes/LowerJump.h"
 
+#include "omill/Analysis/LiftedFunctionMap.h"
+
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
@@ -26,10 +28,13 @@ class LowerJumpTest : public ::testing::Test {
     llvm::CGSCCAnalysisManager CGAM;
     llvm::ModuleAnalysisManager MAM;
     PB.registerModuleAnalyses(MAM);
+    MAM.registerPass([] { return omill::LiftedFunctionAnalysis(); });
     PB.registerCGSCCAnalyses(CGAM);
     PB.registerFunctionAnalyses(FAM);
     PB.registerLoopAnalyses(LAM);
     PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+    (void)MAM.getResult<omill::LiftedFunctionAnalysis>(*F->getParent());
 
     FPM.run(*F, FAM);
   }

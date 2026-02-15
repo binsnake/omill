@@ -7,6 +7,7 @@
 #include <llvm/IR/Module.h>
 
 #include "omill/Analysis/CallingConventionAnalysis.h"
+#include "omill/Utils/LiftedNames.h"
 #include "omill/Utils/StateFieldMap.h"
 
 namespace omill {
@@ -143,16 +144,7 @@ llvm::PreservedAnalyses RecoverFunctionSignaturesPass::run(
   // Lifted functions have the remill signature: (ptr, i64, ptr) -> ptr
   llvm::SmallVector<llvm::Function *, 16> functions;
   for (auto &F : M) {
-    if (F.isDeclaration()) continue;
-    if (F.getName().starts_with("__remill_")) continue;
-    if (F.getName().starts_with("__omill_")) continue;
-    if (F.getName().ends_with("_native")) continue;
-    if (F.arg_size() != 3) continue;
-    auto *FTy = F.getFunctionType();
-    if (!FTy->getReturnType()->isPointerTy()) continue;
-    if (!FTy->getParamType(0)->isPointerTy()) continue;
-    if (!FTy->getParamType(1)->isIntegerTy(64)) continue;
-    if (!FTy->getParamType(2)->isPointerTy()) continue;
+    if (!isLiftedFunction(F)) continue;
     functions.push_back(&F);
   }
 

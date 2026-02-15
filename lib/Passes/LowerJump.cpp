@@ -5,48 +5,20 @@
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
 
+#include "omill/Analysis/LiftedFunctionMap.h"
 #include "omill/Utils/IntrinsicTable.h"
+#include "omill/Utils/LiftedNames.h"
 
 namespace omill {
-
-namespace {
-
-/// Try to find a basic block within this function that corresponds to a
-/// given PC. Remill names blocks by their PC address.
-llvm::BasicBlock *findBlockForPC(llvm::Function &F, uint64_t pc) {
-  char buf[64];
-  snprintf(buf, sizeof(buf), "block_%llx", (unsigned long long)pc);
-  for (auto &BB : F) {
-    if (BB.getName() == buf) return &BB;
-  }
-
-  snprintf(buf, sizeof(buf), "block_%lx", (unsigned long)pc);
-  for (auto &BB : F) {
-    if (BB.getName() == buf) return &BB;
-  }
-
-  return nullptr;
-}
-
-/// Try to find a lifted function for an inter-function jump target.
-llvm::Function *findLiftedFunction(llvm::Module &M, uint64_t target_pc) {
-  char buf[64];
-  snprintf(buf, sizeof(buf), "sub_%llx", (unsigned long long)target_pc);
-  if (auto *F = M.getFunction(buf)) return F;
-
-  snprintf(buf, sizeof(buf), "sub_%lx", (unsigned long)target_pc);
-  if (auto *F = M.getFunction(buf)) return F;
-
-  return nullptr;
-}
-
-}  // namespace
 
 llvm::PreservedAnalyses LowerJumpPass::run(llvm::Function &F,
                                            llvm::FunctionAnalysisManager &AM) {
   IntrinsicTable table(*F.getParent());
   auto &M = *F.getParent();
   auto &Ctx = F.getContext();
+
+  auto &MAMProxy = AM.getResult<llvm::ModuleAnalysisManagerFunctionProxy>(F);
+  auto *lifted = MAMProxy.getCachedResult<LiftedFunctionAnalysis>(M);
 
   llvm::SmallVector<llvm::CallInst *, 8> jump_calls;
 
@@ -95,7 +67,8 @@ llvm::PreservedAnalyses LowerJumpPass::run(llvm::Function &F,
 
       // Case 2: Inter-function jump (tail call)
       if (!new_term) {
-        if (auto *target_fn = findLiftedFunction(M, pc_val)) {
+        auto *target_fn = lifted ? lifted->lookup(pc_val) : nullptr;
+        if (target_fn) {
           auto *tail_call =
               Builder.CreateCall(target_fn, {state, target_pc, mem});
           tail_call->setTailCallKind(llvm::CallInst::TCK_MustTail);

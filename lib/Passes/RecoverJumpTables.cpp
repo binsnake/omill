@@ -8,6 +8,8 @@
 #include <llvm/IR/PatternMatch.h>
 
 #include "omill/Analysis/BinaryMemoryMap.h"
+#include "omill/Analysis/LiftedFunctionMap.h"
+#include "omill/Utils/LiftedNames.h"
 
 namespace omill {
 
@@ -156,34 +158,6 @@ std::optional<uint64_t> findIndexBound(llvm::Value *idx,
   return std::nullopt;
 }
 
-llvm::BasicBlock *findBlockForPC(llvm::Function &F, uint64_t pc) {
-  char buf[64];
-  snprintf(buf, sizeof(buf), "block_%llx", (unsigned long long)pc);
-  for (auto &BB : F)
-    if (BB.getName() == buf)
-      return &BB;
-
-  snprintf(buf, sizeof(buf), "block_%lx", (unsigned long)pc);
-  for (auto &BB : F)
-    if (BB.getName() == buf)
-      return &BB;
-
-  return nullptr;
-}
-
-llvm::Function *findLiftedFunction(llvm::Module &M, uint64_t target_pc) {
-  char buf[64];
-  snprintf(buf, sizeof(buf), "sub_%llx", (unsigned long long)target_pc);
-  if (auto *F = M.getFunction(buf))
-    return F;
-
-  snprintf(buf, sizeof(buf), "sub_%lx", (unsigned long)target_pc);
-  if (auto *F = M.getFunction(buf))
-    return F;
-
-  return nullptr;
-}
-
 struct JumpTableCandidate {
   llvm::CallInst *dispatch_call;
   llvm::ReturnInst *ret;
@@ -216,10 +190,10 @@ llvm::PreservedAnalyses RecoverJumpTablesPass::run(
     llvm::Function &F, llvm::FunctionAnalysisManager &AM) {
   auto &MAMProxy = AM.getResult<llvm::ModuleAnalysisManagerFunctionProxy>(F);
   auto *map = MAMProxy.getCachedResult<BinaryMemoryAnalysis>(*F.getParent());
+  auto *lifted = MAMProxy.getCachedResult<LiftedFunctionAnalysis>(*F.getParent());
   if (!map || map->empty())
     return llvm::PreservedAnalyses::all();
 
-  auto &M = *F.getParent();
   auto &Ctx = F.getContext();
   auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
 
@@ -331,7 +305,8 @@ llvm::PreservedAnalyses RecoverJumpTablesPass::run(
       }
 
       // Try inter-function tail call.
-      if (auto *target_fn = findLiftedFunction(M, target_va)) {
+      auto *target_fn = lifted ? lifted->lookup(target_va) : nullptr;
+      if (target_fn) {
         // Create a trampoline block with musttail call.
         char name[64];
         snprintf(name, sizeof(name), "jt_case_%llu",

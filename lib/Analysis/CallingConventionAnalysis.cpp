@@ -5,6 +5,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Operator.h>
 
+#include "omill/Utils/LiftedNames.h"
 #include "omill/Utils/StateFieldMap.h"
 
 namespace omill {
@@ -205,17 +206,7 @@ CallingConventionInfo CallingConventionAnalysis::run(
   StateFieldMap field_map(M);
 
   for (auto &F : M) {
-    if (F.isDeclaration()) continue;
-    if (F.getName().starts_with("__remill_")) continue;
-    if (F.getName().starts_with("__omill_")) continue;
-
-    // Only analyze lifted functions: (ptr, i64, ptr) -> ptr
-    if (F.arg_size() != 3) continue;
-    auto *FTy = F.getFunctionType();
-    if (!FTy->getReturnType()->isPointerTy()) continue;
-    if (!FTy->getParamType(0)->isPointerTy()) continue;
-    if (!FTy->getParamType(1)->isIntegerTy(64)) continue;
-    if (!FTy->getParamType(2)->isPointerTy()) continue;
+    if (!isLiftedFunction(F)) continue;
 
     result.function_abis[&F] = analyzeFunction(F, DL, field_map);
   }

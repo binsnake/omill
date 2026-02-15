@@ -8,6 +8,8 @@
 #include <llvm/IR/Verifier.h>
 #include <llvm/Passes/PassBuilder.h>
 
+#include "omill/Analysis/LiftedFunctionMap.h"
+
 #include <gtest/gtest.h>
 
 namespace {
@@ -26,10 +28,14 @@ class LowerFunctionCallTest : public ::testing::Test {
     llvm::CGSCCAnalysisManager CGAM;
     llvm::ModuleAnalysisManager MAM;
     PB.registerModuleAnalyses(MAM);
+    MAM.registerPass([] { return omill::LiftedFunctionAnalysis(); });
     PB.registerCGSCCAnalyses(CGAM);
     PB.registerFunctionAnalyses(FAM);
     PB.registerLoopAnalyses(LAM);
     PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+    // Prime the analysis so getCachedResult works in the pass.
+    (void)MAM.getResult<omill::LiftedFunctionAnalysis>(*F->getParent());
 
     FPM.run(*F, FAM);
   }

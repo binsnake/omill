@@ -1,9 +1,11 @@
 add_library(omill STATIC
   # Utils
   Utils/IntrinsicTable.cpp
+  Utils/LiftedNames.cpp
   Utils/StateFieldMap.cpp
 
   # Analysis
+  Analysis/LiftedFunctionMap.cpp
   Analysis/RemillIntrinsicAnalysis.cpp
   Analysis/StateFieldAccessAnalysis.cpp
 

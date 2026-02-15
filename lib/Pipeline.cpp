@@ -15,6 +15,7 @@
 #include <llvm/Transforms/Scalar/LoopDeletion.h>
 #include <llvm/Transforms/Scalar/LoopPassManager.h>
 
+#include "omill/Analysis/LiftedFunctionMap.h"
 #include "omill/Analysis/RemillIntrinsicAnalysis.h"
 #include "omill/Passes/CFGRecovery.h"
 #include "omill/Passes/DeadStateFlagElimination.h"
@@ -194,6 +195,9 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
+  // Build the lifted function index before control flow passes need it.
+  MPM.addPass(llvm::RequireAnalysisPass<LiftedFunctionAnalysis, llvm::Module>());
+
   // Phase 3: Control Flow Recovery
   if (opts.lower_control_flow) {
     llvm::FunctionPassManager FPM;
@@ -256,6 +260,7 @@ void registerAnalyses(llvm::FunctionAnalysisManager &FAM) {
 void registerModuleAnalyses(llvm::ModuleAnalysisManager &MAM) {
   MAM.registerPass([&] { return CallingConventionAnalysis(); });
   MAM.registerPass([&] { return BinaryMemoryAnalysis(); });
+  MAM.registerPass([&] { return LiftedFunctionAnalysis(); });
 }
 
 }  // namespace omill

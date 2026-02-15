@@ -10,6 +10,7 @@
 #include <llvm/Passes/PassBuilder.h>
 
 #include "omill/Analysis/BinaryMemoryMap.h"
+#include "omill/Analysis/LiftedFunctionMap.h"
 
 #include <gtest/gtest.h>
 
@@ -46,6 +47,7 @@ class RecoverJumpTablesTest : public ::testing::Test {
 
     MAM.registerPass(
         [&]() { return omill::BinaryMemoryAnalysis(std::move(map)); });
+    MAM.registerPass([] { return omill::LiftedFunctionAnalysis(); });
 
     PB.registerModuleAnalyses(MAM);
     PB.registerCGSCCAnalyses(CGAM);
@@ -54,6 +56,7 @@ class RecoverJumpTablesTest : public ::testing::Test {
     PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
     (void)MAM.getResult<omill::BinaryMemoryAnalysis>(*M);
+    (void)MAM.getResult<omill::LiftedFunctionAnalysis>(*M);
 
     llvm::ModulePassManager MPM;
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(

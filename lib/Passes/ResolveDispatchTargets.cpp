@@ -8,38 +8,12 @@
 #include <llvm/IR/Operator.h>
 
 #include "omill/Analysis/BinaryMemoryMap.h"
+#include "omill/Analysis/LiftedFunctionMap.h"
+#include "omill/Utils/LiftedNames.h"
 
 namespace omill {
 
 namespace {
-
-llvm::BasicBlock *findBlockForPC(llvm::Function &F, uint64_t pc) {
-  char buf[64];
-  snprintf(buf, sizeof(buf), "block_%llx", (unsigned long long)pc);
-  for (auto &BB : F)
-    if (BB.getName() == buf)
-      return &BB;
-
-  snprintf(buf, sizeof(buf), "block_%lx", (unsigned long)pc);
-  for (auto &BB : F)
-    if (BB.getName() == buf)
-      return &BB;
-
-  return nullptr;
-}
-
-llvm::Function *findLiftedFunction(llvm::Module &M, uint64_t target_pc) {
-  char buf[64];
-  snprintf(buf, sizeof(buf), "sub_%llx", (unsigned long long)target_pc);
-  if (auto *F = M.getFunction(buf))
-    return F;
-
-  snprintf(buf, sizeof(buf), "sub_%lx", (unsigned long)target_pc);
-  if (auto *F = M.getFunction(buf))
-    return F;
-
-  return nullptr;
-}
 
 /// Check if a dispatch_call's target is already a ptrtoint(@func) — meaning
 /// it was already resolved by ResolveIATCalls or a prior iteration.
@@ -56,6 +30,7 @@ llvm::PreservedAnalyses ResolveDispatchTargetsPass::run(
     llvm::Function &F, llvm::FunctionAnalysisManager &AM) {
   auto &MAMProxy = AM.getResult<llvm::ModuleAnalysisManagerFunctionProxy>(F);
   auto *map = MAMProxy.getCachedResult<BinaryMemoryAnalysis>(*F.getParent());
+  auto *lifted = MAMProxy.getCachedResult<LiftedFunctionAnalysis>(*F.getParent());
 
   auto &M = *F.getParent();
   auto &Ctx = F.getContext();
@@ -112,7 +87,8 @@ llvm::PreservedAnalyses ResolveDispatchTargetsPass::run(
       }
 
       // Priority 2: Direct call to lifted function.
-      if (auto *target_fn = findLiftedFunction(M, target_pc)) {
+      auto *target_fn = lifted ? lifted->lookup(target_pc) : nullptr;
+      if (target_fn) {
         llvm::IRBuilder<> Builder(call);
         auto *direct_call = Builder.CreateCall(
             target_fn, {call->getArgOperand(0), ci, call->getArgOperand(2)});
@@ -190,7 +166,8 @@ llvm::PreservedAnalyses ResolveDispatchTargetsPass::run(
       }
 
       // Priority 2: Inter-function tail call.
-      if (auto *target_fn = findLiftedFunction(M, target_pc)) {
+      auto *target_fn = lifted ? lifted->lookup(target_pc) : nullptr;
+      if (target_fn) {
         llvm::IRBuilder<> Builder(call);
         auto *state = call->getArgOperand(0);
         auto *pc_val = call->getArgOperand(1);

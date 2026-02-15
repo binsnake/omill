@@ -1,8 +1,11 @@
 #include "omill/Passes/LowerHyperCalls.h"
 
+#include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/InlineAsm.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/Module.h>
 
 #include "omill/Utils/IntrinsicTable.h"
@@ -20,20 +23,132 @@ llvm::FunctionCallee getOrDeclareHelper(llvm::Module &M, llvm::StringRef name,
   return M.getOrInsertFunction(name, FT);
 }
 
-/// Lower __remill_sync_hyper_call(State&, Memory*, SyncHyperCall::Name)
-/// This dispatches to different handlers based on the hyper call name.
-/// For now, we replace with calls to external runtime stubs.
-void lowerSyncHyperCall(llvm::CallInst *CI) {
+// Remill SyncHyperCall IDs for x86-64.
+enum SyncHyperCallID : uint32_t {
+  kX86CPUID = 258,
+  kX86ReadTSC = 259,
+  kX86ReadTSCP = 260,
+};
+
+// State struct x86-64 GPR offsets (each Reg is 16 bytes with 8-byte padding).
+// GPR section starts at offset 2208; named register is at +8 within each Reg.
+enum StateGPROffset : uint64_t {
+  kRAX = 2216,
+  kRBX = 2232,
+  kRCX = 2248,
+  kRDX = 2264,
+};
+
+/// GEP into State at a byte offset and return a pointer typed for `ty`.
+llvm::Value *stateFieldPtr(llvm::IRBuilder<> &B, llvm::Value *state,
+                            uint64_t byte_offset, llvm::Type *ty) {
+  auto *i8_ty = llvm::Type::getInt8Ty(B.getContext());
+  auto *gep = B.CreateInBoundsGEP(i8_ty, state, B.getInt64(byte_offset));
+  return gep;
+}
+
+/// Emit inline CPUID: read EAX/ECX leaf from State, execute cpuid, write
+/// EAX/EBX/ECX/EDX results back to State.
+void emitCPUID(llvm::CallInst *CI) {
+  llvm::IRBuilder<> B(CI);
+  auto &Ctx = CI->getContext();
+  auto *i32_ty = llvm::Type::getInt32Ty(Ctx);
+  llvm::Value *state = CI->getArgOperand(0);
+  llvm::Value *mem = CI->getArgOperand(1);
+
+  // Read leaf (EAX) and subleaf (ECX) from State.
+  auto *eax_ptr = stateFieldPtr(B, state, kRAX, i32_ty);
+  auto *ecx_ptr = stateFieldPtr(B, state, kRCX, i32_ty);
+  auto *leaf = B.CreateLoad(i32_ty, eax_ptr, "cpuid.leaf");
+  auto *subleaf = B.CreateLoad(i32_ty, ecx_ptr, "cpuid.subleaf");
+
+  // Inline asm: cpuid
+  auto *asm_ty = llvm::FunctionType::get(
+      llvm::StructType::get(i32_ty, i32_ty, i32_ty, i32_ty),
+      {i32_ty, i32_ty}, false);
+  auto *ia = llvm::InlineAsm::get(
+      asm_ty, "cpuid",
+      "={eax},={ebx},={ecx},={edx},{eax},{ecx},~{dirflag},~{fpsr},~{flags}",
+      /*hasSideEffects=*/true);
+  auto *result = B.CreateCall(asm_ty, ia, {leaf, subleaf}, "cpuid");
+
+  // Extract and write results.
+  auto *out_eax = B.CreateExtractValue(result, 0);
+  auto *out_ebx = B.CreateExtractValue(result, 1);
+  auto *out_ecx = B.CreateExtractValue(result, 2);
+  auto *out_edx = B.CreateExtractValue(result, 3);
+
+  B.CreateStore(out_eax, stateFieldPtr(B, state, kRAX, i32_ty));
+  B.CreateStore(out_ebx, stateFieldPtr(B, state, kRBX, i32_ty));
+  B.CreateStore(out_ecx, stateFieldPtr(B, state, kRCX, i32_ty));
+  B.CreateStore(out_edx, stateFieldPtr(B, state, kRDX, i32_ty));
+
+  CI->replaceAllUsesWith(mem);
+  CI->eraseFromParent();
+}
+
+/// Emit inline RDTSC: readcyclecounter → split into EDX:EAX in State.
+void emitRDTSC(llvm::CallInst *CI) {
+  llvm::IRBuilder<> B(CI);
+  auto &Ctx = CI->getContext();
+  auto *i32_ty = llvm::Type::getInt32Ty(Ctx);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  llvm::Value *state = CI->getArgOperand(0);
+  llvm::Value *mem = CI->getArgOperand(1);
+
+  // llvm.readcyclecounter() → i64
+  auto *rdtsc_fn = llvm::Intrinsic::getOrInsertDeclaration(
+      CI->getModule(), llvm::Intrinsic::readcyclecounter);
+  auto *tsc = B.CreateCall(rdtsc_fn, {}, "rdtsc");
+
+  // Low 32 → EAX, high 32 → EDX
+  auto *lo = B.CreateTrunc(tsc, i32_ty, "rdtsc.lo");
+  auto *hi = B.CreateTrunc(B.CreateLShr(tsc, llvm::ConstantInt::get(i64_ty, 32)),
+                            i32_ty, "rdtsc.hi");
+
+  B.CreateStore(lo, stateFieldPtr(B, state, kRAX, i32_ty));
+  B.CreateStore(hi, stateFieldPtr(B, state, kRDX, i32_ty));
+
+  CI->replaceAllUsesWith(mem);
+  CI->eraseFromParent();
+}
+
+/// Emit inline RDTSCP: rdtscp asm → write EAX, EDX, ECX to State.
+void emitRDTSCP(llvm::CallInst *CI) {
+  llvm::IRBuilder<> B(CI);
+  auto &Ctx = CI->getContext();
+  auto *i32_ty = llvm::Type::getInt32Ty(Ctx);
+  llvm::Value *state = CI->getArgOperand(0);
+  llvm::Value *mem = CI->getArgOperand(1);
+
+  auto *asm_ty = llvm::FunctionType::get(
+      llvm::StructType::get(i32_ty, i32_ty, i32_ty), {}, false);
+  auto *ia = llvm::InlineAsm::get(
+      asm_ty, "rdtscp", "={eax},={edx},={ecx},~{dirflag},~{fpsr},~{flags}",
+      /*hasSideEffects=*/true);
+  auto *result = B.CreateCall(asm_ty, ia, {}, "rdtscp");
+
+  auto *out_eax = B.CreateExtractValue(result, 0);
+  auto *out_edx = B.CreateExtractValue(result, 1);
+  auto *out_ecx = B.CreateExtractValue(result, 2);
+
+  B.CreateStore(out_eax, stateFieldPtr(B, state, kRAX, i32_ty));
+  B.CreateStore(out_edx, stateFieldPtr(B, state, kRDX, i32_ty));
+  B.CreateStore(out_ecx, stateFieldPtr(B, state, kRCX, i32_ty));
+
+  CI->replaceAllUsesWith(mem);
+  CI->eraseFromParent();
+}
+
+/// Emit a generic fallback stub call for unknown sync hyper calls.
+void emitGenericSyncStub(llvm::CallInst *CI) {
   llvm::IRBuilder<> Builder(CI);
   auto &M = *CI->getModule();
 
-  // arg0 = State&, arg1 = Memory*, arg2 = SyncHyperCall::Name (i32)
   llvm::Value *state = CI->getArgOperand(0);
   llvm::Value *mem = CI->getArgOperand(1);
   llvm::Value *hyper_call_id = CI->getArgOperand(2);
 
-  // Create a generic external call: __omill_sync_hyper_call(State*, i32)
-  // The runtime can implement this to handle CPUID, RDTSC, etc.
   auto *state_ptr_ty = state->getType();
   auto *i32_ty = llvm::Type::getInt32Ty(CI->getContext());
   auto *void_ty = llvm::Type::getVoidTy(CI->getContext());
@@ -43,9 +158,27 @@ void lowerSyncHyperCall(llvm::CallInst *CI) {
 
   Builder.CreateCall(callee, {state, hyper_call_id});
 
-  // Replace Memory* return with input Memory*
   CI->replaceAllUsesWith(mem);
   CI->eraseFromParent();
+}
+
+/// Lower __remill_sync_hyper_call(State&, Memory*, SyncHyperCall::Name)
+/// Dispatches to typed inline lowering for known IDs, falls back to stub.
+void lowerSyncHyperCall(llvm::CallInst *CI) {
+  // arg0 = State&, arg1 = Memory*, arg2 = SyncHyperCall::Name (i32)
+  auto *id = CI->getArgOperand(2);
+  auto *ci = llvm::dyn_cast<llvm::ConstantInt>(id);
+  if (!ci) {
+    emitGenericSyncStub(CI);
+    return;
+  }
+
+  switch (ci->getZExtValue()) {
+    case kX86CPUID:   emitCPUID(CI); break;
+    case kX86ReadTSC: emitRDTSC(CI); break;
+    case kX86ReadTSCP: emitRDTSCP(CI); break;
+    default:          emitGenericSyncStub(CI); break;
+  }
 }
 
 /// Lower __remill_async_hyper_call(State&, addr_t, Memory*)

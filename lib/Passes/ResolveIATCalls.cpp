@@ -8,23 +8,11 @@
 #include <llvm/IR/Operator.h>
 
 #include "omill/Analysis/BinaryMemoryMap.h"
+#include "omill/Utils/LiftedNames.h"
 
 namespace omill {
 
 namespace {
-
-uint64_t extractEntryVA(llvm::StringRef name) {
-  if (!name.starts_with("sub_"))
-    return 0;
-  llvm::StringRef hex = name.drop_front(4);
-  auto dot = hex.find('.');
-  if (dot != llvm::StringRef::npos)
-    hex = hex.substr(0, dot);
-  uint64_t va = 0;
-  if (hex.getAsInteger(16, va))
-    return 0;
-  return va;
-}
 
 /// Check if a condition is known true/false at a basic block by walking
 /// up through single-predecessor chains.
