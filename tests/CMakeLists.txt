@@ -41,6 +41,7 @@ add_executable(omill-unit-tests
   unit/LowerResolvedDispatchCallsTest.cpp
   unit/ResolveIATCallsTest.cpp
   unit/ResolveLazyImportsTest.cpp
+  unit/ResolveDispatchTargetsTest.cpp
 )
 
 target_link_libraries(omill-unit-tests

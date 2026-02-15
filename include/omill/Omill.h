@@ -23,6 +23,13 @@ struct PipelineOptions {
   /// (Not yet implemented — future stage)
   bool deobfuscate = false;
 
+  /// Iteratively resolve indirect dispatch targets after optimization.
+  /// Runs between Phase 3.5 and Phase 4.
+  bool resolve_indirect_targets = false;
+
+  /// Maximum iterations for iterative target resolution.
+  unsigned max_resolution_iterations = 10;
+
   /// Run standard LLVM cleanup passes between stages.
   bool run_cleanup_passes = true;
 };

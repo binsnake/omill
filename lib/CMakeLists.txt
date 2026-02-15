@@ -43,6 +43,8 @@ add_library(omill STATIC
   Passes/LowerResolvedDispatchCalls.cpp
   Passes/FoldProgramCounter.cpp
   Passes/ResolveIATCalls.cpp
+  Passes/ResolveDispatchTargets.cpp
+  Passes/IterativeTargetResolution.cpp
   Passes/OutlineConstantStackData.cpp
 
   # Pipeline
