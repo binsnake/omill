@@ -11,6 +11,7 @@
 
 #include "omill/Analysis/BinaryMemoryMap.h"
 
+#include <cstring>
 #include <gtest/gtest.h>
 
 namespace {
@@ -205,6 +206,94 @@ TEST_F(ConstantMemoryFoldingTest, MultipleTypesFolded) {
     ASSERT_NE(ci, nullptr);
     EXPECT_EQ(ci->getZExtValue(), 0x88776655u);
   }
+}
+
+TEST_F(ConstantMemoryFoldingTest, FloatLoadFolded) {
+  auto M = createModule();
+  createLoadFunction(*M, "test_fn", llvm::Type::getFloatTy(Ctx), 0x1000);
+
+  // float 3.14f = 0x4048F5C3 in IEEE754
+  uint32_t float_bits = 0x4048F5C3u;
+  uint8_t data[4];
+  std::memcpy(data, &float_bits, 4);
+  omill::BinaryMemoryMap map;
+  map.addRegion(0x1000, data, 4);
+
+  runPass(*M, std::move(map));
+
+  auto *fn = M->getFunction("test_fn");
+  auto &entry = fn->getEntryBlock();
+  auto *ret = llvm::dyn_cast<llvm::ReturnInst>(entry.getTerminator());
+  ASSERT_NE(ret, nullptr);
+  auto *cfp = llvm::dyn_cast<llvm::ConstantFP>(ret->getReturnValue());
+  ASSERT_NE(cfp, nullptr);
+  float result = cfp->getValueAPF().convertToFloat();
+  EXPECT_NEAR(result, 3.14f, 1e-5f);
+}
+
+TEST_F(ConstantMemoryFoldingTest, DoubleLoadFolded) {
+  auto M = createModule();
+  createLoadFunction(*M, "test_fn", llvm::Type::getDoubleTy(Ctx), 0x1000);
+
+  // double 2.718281828 in IEEE754
+  double dval = 2.718281828;
+  uint8_t data[8];
+  std::memcpy(data, &dval, 8);
+  omill::BinaryMemoryMap map;
+  map.addRegion(0x1000, data, 8);
+
+  runPass(*M, std::move(map));
+
+  auto *fn = M->getFunction("test_fn");
+  auto &entry = fn->getEntryBlock();
+  auto *ret = llvm::dyn_cast<llvm::ReturnInst>(entry.getTerminator());
+  ASSERT_NE(ret, nullptr);
+  auto *cfp = llvm::dyn_cast<llvm::ConstantFP>(ret->getReturnValue());
+  ASSERT_NE(cfp, nullptr);
+  double result = cfp->getValueAPF().convertToDouble();
+  EXPECT_NEAR(result, 2.718281828, 1e-9);
+}
+
+TEST_F(ConstantMemoryFoldingTest, ChainedGEPResolved) {
+  auto M = createModule();
+  auto *i32_ty = llvm::Type::getInt32Ty(Ctx);
+  auto *fn_ty = llvm::FunctionType::get(i32_ty, {}, false);
+  auto *fn = llvm::Function::Create(fn_ty, llvm::Function::ExternalLinkage,
+                                    "test_fn", *M);
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", fn);
+  llvm::IRBuilder<> B(entry);
+
+  // gep(gep(inttoptr(0x1000), i32 2), i32 1) with i32 element type
+  // => offset = (2+1) * 4 = 12 bytes
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *addr_const = llvm::ConstantInt::get(i64_ty, 0x1000);
+  auto *base_ptr = llvm::ConstantExpr::getIntToPtr(addr_const, ptr_ty);
+  auto *gep1 =
+      llvm::ConstantExpr::getGetElementPtr(i32_ty, base_ptr,
+                                            llvm::ConstantInt::get(i32_ty, 2));
+  auto *gep2 = B.CreateGEP(i32_ty, gep1, llvm::ConstantInt::get(i32_ty, 1));
+  auto *load = B.CreateLoad(i32_ty, gep2);
+  B.CreateRet(load);
+
+  // Map 16 bytes at 0x1000. Value at offset 12 = 0xCAFEBABE.
+  uint8_t data[16] = {};
+  data[12] = 0xBE;
+  data[13] = 0xBA;
+  data[14] = 0xFE;
+  data[15] = 0xCA;
+
+  omill::BinaryMemoryMap map;
+  map.addRegion(0x1000, data, 16);
+
+  runPass(*M, std::move(map));
+
+  auto &blk = fn->getEntryBlock();
+  auto *ret = llvm::dyn_cast<llvm::ReturnInst>(blk.getTerminator());
+  ASSERT_NE(ret, nullptr);
+  auto *ci = llvm::dyn_cast<llvm::ConstantInt>(ret->getReturnValue());
+  ASSERT_NE(ci, nullptr);
+  EXPECT_EQ(ci->getZExtValue(), 0xCAFEBABEu);
 }
 
 }  // namespace

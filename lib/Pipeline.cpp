@@ -45,6 +45,7 @@
 #include "omill/Passes/ResolveIATCalls.h"
 #include "omill/Passes/ResolveDispatchTargets.h"
 #include "omill/Passes/IterativeTargetResolution.h"
+#include "omill/Passes/EliminateDeadPaths.h"
 
 namespace omill {
 
@@ -110,6 +111,8 @@ void buildControlFlowPipeline(llvm::FunctionPassManager &FPM) {
 
   FPM.addPass(llvm::SimplifyCFGPass());
   FPM.addPass(llvm::JumpThreadingPass());
+  FPM.addPass(EliminateDeadPathsPass());
+  FPM.addPass(llvm::SimplifyCFGPass());
 }
 
 void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {

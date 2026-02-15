@@ -232,4 +232,82 @@ TEST_F(ResolveIATCallsTest, SkipsAmbiguousSelect) {
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
 }
 
+TEST_F(ResolveIATCallsTest, SelectWithSameImportResolved) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *dispatch = createDispatchDecl(*M);
+
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *i1_ty = llvm::Type::getInt1Ty(Ctx);
+  auto *fn_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *F = llvm::Function::Create(fn_ty, llvm::Function::ExternalLinkage,
+                                    "sub_140001000", *M);
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  llvm::IRBuilder<> B(entry);
+
+  auto *state = F->getArg(0);
+  auto *mem = F->getArg(2);
+
+  // select(cond, 0x140002000, 0x140002000) → both arms same IAT entry.
+  auto *cond_alloca = B.CreateAlloca(i1_ty);
+  auto *cond = B.CreateLoad(i1_ty, cond_alloca, "cond");
+  auto *addr = B.CreateSelect(cond, B.getInt64(0x140002000),
+                               B.getInt64(0x140002000), "same_iat");
+  auto *iat_ptr = B.CreateIntToPtr(addr, ptr_ty);
+  auto *target = B.CreateLoad(i64_ty, iat_ptr, "iat_target");
+  B.CreateCall(dispatch, {state, target, mem});
+  B.CreateRet(mem);
+
+  omill::BinaryMemoryMap map;
+  map.addImport(0x140002000, "kernel32", "VirtualAlloc");
+
+  runPass(M.get(), std::move(map));
+
+  EXPECT_TRUE(hasResolvedTarget(F));
+  EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+}
+
+TEST_F(ResolveIATCallsTest, DLLStorageClassSet) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *dispatch = createDispatchDecl(*M);
+
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *fn_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *F = llvm::Function::Create(fn_ty, llvm::Function::ExternalLinkage,
+                                    "sub_140001000", *M);
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  llvm::IRBuilder<> B(entry);
+
+  auto *state = F->getArg(0);
+  auto *mem = F->getArg(2);
+
+  auto *iat_ptr = B.CreateIntToPtr(B.getInt64(0x140002000), ptr_ty);
+  auto *target = B.CreateLoad(i64_ty, iat_ptr, "iat_target");
+  B.CreateCall(dispatch, {state, target, mem});
+  B.CreateRet(mem);
+
+  omill::BinaryMemoryMap map;
+  map.addImport(0x140002000, "kernel32", "CreateFileW");
+
+  runPass(M.get(), std::move(map));
+
+  // Verify the created function has DLLImportStorageClass.
+  auto *import_fn = M->getFunction("CreateFileW");
+  ASSERT_NE(import_fn, nullptr);
+  EXPECT_EQ(import_fn->getDLLStorageClass(),
+            llvm::GlobalValue::DLLImportStorageClass);
+  EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+}
+
 }  // namespace

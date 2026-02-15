@@ -42,6 +42,8 @@ add_executable(omill-unit-tests
   unit/ResolveIATCallsTest.cpp
   unit/ResolveLazyImportsTest.cpp
   unit/ResolveDispatchTargetsTest.cpp
+  unit/RecoverJumpTablesTest.cpp
+  unit/EliminateDeadPathsTest.cpp
 )
 
 target_link_libraries(omill-unit-tests

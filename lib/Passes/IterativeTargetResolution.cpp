@@ -8,7 +8,9 @@
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
 
 #include "omill/Passes/ConstantMemoryFolding.h"
+#include "omill/Passes/EliminateDeadPaths.h"
 #include "omill/Passes/LowerResolvedDispatchCalls.h"
+#include "omill/Passes/RecoverJumpTables.h"
 #include "omill/Passes/ResolveDispatchTargets.h"
 
 namespace omill {
@@ -56,6 +58,7 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
       FPM.addPass(llvm::GVNPass());
       FPM.addPass(llvm::SimplifyCFGPass());
       FPM.addPass(ConstantMemoryFoldingPass());
+      FPM.addPass(EliminateDeadPathsPass());
       FPM.addPass(llvm::InstCombinePass());
       auto adaptor = llvm::createModuleToFunctionPassAdaptor(std::move(FPM));
       adaptor.run(M, MAM);
@@ -65,6 +68,7 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
     {
       llvm::FunctionPassManager FPM;
       FPM.addPass(ResolveDispatchTargetsPass());
+      FPM.addPass(RecoverJumpTablesPass());
       FPM.addPass(LowerResolvedDispatchCallsPass());
       auto adaptor = llvm::createModuleToFunctionPassAdaptor(std::move(FPM));
       adaptor.run(M, MAM);

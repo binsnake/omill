@@ -46,6 +46,8 @@ add_library(omill STATIC
   Passes/ResolveDispatchTargets.cpp
   Passes/IterativeTargetResolution.cpp
   Passes/OutlineConstantStackData.cpp
+  Passes/RecoverJumpTables.cpp
+  Passes/EliminateDeadPaths.cpp
 
   # Pipeline
   Pipeline.cpp

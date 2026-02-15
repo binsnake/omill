@@ -157,4 +157,64 @@ TEST_F(HashImportAnnotationTest, NoFalsePositiveOnArbitraryConstant) {
   }
 }
 
+TEST_F(HashImportAnnotationTest, MultipleHashComparisons) {
+  auto M = createModule();
+  auto *i32_ty = llvm::Type::getInt32Ty(Ctx);
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+
+  auto *fn_ty = llvm::FunctionType::get(void_ty, {i32_ty}, false);
+  auto *fn = llvm::Function::Create(fn_ty, llvm::Function::ExternalLinkage,
+                                    "test_fn", *M);
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", fn);
+  auto *loop_hdr = llvm::BasicBlock::Create(Ctx, "loop", fn);
+  auto *check2_bb = llvm::BasicBlock::Create(Ctx, "check2", fn);
+  auto *loop_body = llvm::BasicBlock::Create(Ctx, "body", fn);
+  auto *exit_bb = llvm::BasicBlock::Create(Ctx, "exit", fn);
+
+  llvm::IRBuilder<> B(entry);
+  B.CreateBr(loop_hdr);
+
+  // loop: phi, check hash 1 (VirtualAlloc)
+  B.SetInsertPoint(loop_hdr);
+  auto *phi = B.CreatePHI(i32_ty, 2, "hash");
+  phi->addIncoming(fn->getArg(0), entry);
+
+  uint32_t hash1 =
+      omill::ImportHashDB::computeHash("VirtualAlloc", 0x811c9dc5u);
+  auto *icmp1 = B.CreateICmpEQ(phi, llvm::ConstantInt::get(i32_ty, hash1));
+  B.CreateCondBr(icmp1, exit_bb, check2_bb);
+
+  // check2: check hash 2 (VirtualFree)
+  B.SetInsertPoint(check2_bb);
+  uint32_t hash2 =
+      omill::ImportHashDB::computeHash("VirtualFree", 0x811c9dc5u);
+  auto *icmp2 = B.CreateICmpEQ(phi, llvm::ConstantInt::get(i32_ty, hash2));
+  B.CreateCondBr(icmp2, exit_bb, loop_body);
+
+  // body: update phi, br loop
+  B.SetInsertPoint(loop_body);
+  auto *next = B.CreateAdd(phi, llvm::ConstantInt::get(i32_ty, 1));
+  phi->addIncoming(next, loop_body);
+  B.CreateBr(loop_hdr);
+
+  // exit: ret
+  B.SetInsertPoint(exit_bb);
+  B.CreateRetVoid();
+
+  runPass(*M);
+
+  // Both icmp instructions should have metadata.
+  unsigned metadata_count = 0;
+  for (auto &BB : *fn) {
+    for (auto &I : BB) {
+      if (auto *cmp = llvm::dyn_cast<llvm::ICmpInst>(&I)) {
+        if (cmp->getMetadata("omill.resolved_import"))
+          metadata_count++;
+      }
+    }
+  }
+  EXPECT_EQ(metadata_count, 2u);
+}
+
 }  // namespace

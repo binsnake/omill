@@ -289,4 +289,73 @@ TEST_F(OutlineConstantStackDataTest, AllowsGEPChain) {
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
 }
 
+TEST_F(OutlineConstantStackDataTest, RejectsSizeLimitExceeded) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i32_ty = llvm::Type::getInt32Ty(Ctx);
+  auto *fn_ty = llvm::FunctionType::get(i32_ty, false);
+  auto *F = llvm::Function::Create(fn_ty, llvm::Function::ExternalLinkage,
+                                    "test_func", *M);
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  llvm::IRBuilder<> B(entry);
+
+  // alloca > 4096 bytes (the pass limit).
+  auto *alloca = B.CreateAlloca(llvm::ArrayType::get(B.getInt8Ty(), 8192));
+  B.CreateStore(B.getInt32(42), alloca);
+
+  auto *val = B.CreateLoad(i32_ty, alloca);
+  B.CreateRet(val);
+
+  runPass(F);
+
+  // Should NOT be promoted — exceeds size limit.
+  EXPECT_EQ(countAllocas(F), 1u);
+  EXPECT_EQ(countGlobals(M.get(), ".const_stack"), 0u);
+  EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+}
+
+TEST_F(OutlineConstantStackDataTest, MultipleAllocasIndependent) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i32_ty = llvm::Type::getInt32Ty(Ctx);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *fn_ty = llvm::FunctionType::get(i64_ty, false);
+  auto *F = llvm::Function::Create(fn_ty, llvm::Function::ExternalLinkage,
+                                    "test_func", *M);
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  llvm::IRBuilder<> B(entry);
+
+  // Two independent allocas, both with constant stores.
+  auto *alloca1 = B.CreateAlloca(i32_ty);
+  B.CreateStore(B.getInt32(0x11111111), alloca1);
+
+  auto *alloca2 = B.CreateAlloca(i32_ty);
+  B.CreateStore(B.getInt32(0x22222222), alloca2);
+
+  auto *v1 = B.CreateLoad(i32_ty, alloca1);
+  auto *v2 = B.CreateLoad(i32_ty, alloca2);
+  auto *v1_ext = B.CreateZExt(v1, i64_ty);
+  auto *v2_ext = B.CreateZExt(v2, i64_ty);
+  auto *sum = B.CreateAdd(v1_ext, v2_ext);
+  B.CreateRet(sum);
+
+  EXPECT_EQ(countAllocas(F), 2u);
+  EXPECT_EQ(countGlobals(M.get(), ".const_stack"), 0u);
+
+  runPass(F);
+
+  // Both should be promoted.
+  EXPECT_EQ(countAllocas(F), 0u);
+  EXPECT_EQ(countGlobals(M.get(), ".const_stack"), 2u);
+  EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+}
+
 }  // namespace

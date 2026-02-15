@@ -217,4 +217,78 @@ TEST_F(LowerResolvedDispatchCallsTest, MultipleCalls) {
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
 }
 
+TEST_F(LowerResolvedDispatchCallsTest, StateFieldExtraction) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *dispatch = createDispatchDecl(*M);
+  auto *import_fn = createDLLImport(*M, "GetProcAddress");
+
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *fn_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *F = llvm::Function::Create(fn_ty, llvm::Function::ExternalLinkage,
+                                    "test_func", *M);
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  llvm::IRBuilder<> B(entry);
+
+  auto *state = F->getArg(0);
+  auto *mem = F->getArg(2);
+
+  auto *target = B.CreatePtrToInt(import_fn, i64_ty, "target");
+  auto *result = B.CreateCall(dispatch, {state, target, mem});
+  B.CreateRet(result);
+
+  runPass(F);
+
+  // Verify the lowered code loads RCX/RDX/R8/R9 from correct offsets
+  // and stores result to RAX offset.
+  static constexpr uint64_t kRCXOffset = 2248;
+  static constexpr uint64_t kRDXOffset = 2264;
+  static constexpr uint64_t kR8Offset = 2344;
+  static constexpr uint64_t kR9Offset = 2360;
+  static constexpr uint64_t kRAXOffset = 2216;
+
+  bool found_rcx = false, found_rdx = false, found_r8 = false, found_r9 = false;
+  bool found_rax_store = false;
+
+  for (auto &BB : *F) {
+    for (auto &I : BB) {
+      if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I)) {
+        // Check for GEP + load with correct offsets.
+        if (auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(
+                LI->getPointerOperand())) {
+          if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(GEP->getOperand(1))) {
+            uint64_t off = CI->getZExtValue();
+            if (off == kRCXOffset) found_rcx = true;
+            if (off == kRDXOffset) found_rdx = true;
+            if (off == kR8Offset) found_r8 = true;
+            if (off == kR9Offset) found_r9 = true;
+          }
+        }
+      }
+      if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+        if (auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(
+                SI->getPointerOperand())) {
+          if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(GEP->getOperand(1))) {
+            if (CI->getZExtValue() == kRAXOffset)
+              found_rax_store = true;
+          }
+        }
+      }
+    }
+  }
+
+  EXPECT_TRUE(found_rcx) << "RCX load not found at offset 2248";
+  EXPECT_TRUE(found_rdx) << "RDX load not found at offset 2264";
+  EXPECT_TRUE(found_r8) << "R8 load not found at offset 2344";
+  EXPECT_TRUE(found_r9) << "R9 load not found at offset 2360";
+  EXPECT_TRUE(found_rax_store) << "RAX store not found at offset 2216";
+  EXPECT_EQ(countCallsTo(F, "GetProcAddress"), 1u);
+  EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+}
+
 }  // namespace

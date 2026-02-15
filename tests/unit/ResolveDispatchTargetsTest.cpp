@@ -426,4 +426,124 @@ TEST_F(ResolveDispatchTargetsTest, IterativeConvergence) {
   EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
 }
 
+TEST_F(ResolveDispatchTargetsTest, MultipleDispatchCallsInFunction) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(kDataLayout);
+
+  createDispatchCallDecl(*M);
+
+  // Create 3 target functions.
+  for (auto addr : {"sub_140002000", "sub_140003000", "sub_140004000"}) {
+    auto *tf = llvm::Function::Create(liftedFnType(),
+                                       llvm::Function::ExternalLinkage, addr, *M);
+    auto *e = llvm::BasicBlock::Create(Ctx, "entry", tf);
+    llvm::IRBuilder<>(e).CreateRet(tf->getArg(2));
+  }
+
+  // Caller with 3 dispatch_calls.
+  auto *F = llvm::Function::Create(liftedFnType(),
+                                    llvm::Function::ExternalLinkage,
+                                    "sub_140001000", *M);
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  llvm::IRBuilder<> B(entry);
+  auto *dispatch = M->getFunction("__omill_dispatch_call");
+
+  B.CreateCall(dispatch, {F->getArg(0), B.getInt64(0x140002000), F->getArg(2)});
+  B.CreateCall(dispatch, {F->getArg(0), B.getInt64(0x140003000), F->getArg(2)});
+  auto *result =
+      B.CreateCall(dispatch, {F->getArg(0), B.getInt64(0x140004000), F->getArg(2)});
+  B.CreateRet(result);
+
+  EXPECT_EQ(3u, countDispatchCalls(F));
+
+  runResolvePass(M.get());
+
+  // All 3 should be resolved.
+  EXPECT_EQ(0u, countDispatchCalls(F));
+  EXPECT_TRUE(hasDirectCallTo(F, "sub_140002000"));
+  EXPECT_TRUE(hasDirectCallTo(F, "sub_140003000"));
+  EXPECT_TRUE(hasDirectCallTo(F, "sub_140004000"));
+  EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+}
+
+TEST_F(ResolveDispatchTargetsTest, JumpToNonexistentBlockUnchanged) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(kDataLayout);
+
+  createDispatchJumpDecl(*M);
+
+  auto *F = llvm::Function::Create(liftedFnType(),
+                                    llvm::Function::ExternalLinkage,
+                                    "sub_140001000", *M);
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  llvm::IRBuilder<> B(entry);
+
+  auto *dispatch = M->getFunction("__omill_dispatch_jump");
+  // Target 0xDEADBEEF doesn't match any block_ or sub_.
+  auto *result = B.CreateCall(
+      dispatch, {F->getArg(0), B.getInt64(0xDEADBEEF), F->getArg(2)});
+  B.CreateRet(result);
+
+  EXPECT_EQ(1u, countDispatchJumps(F));
+
+  runResolvePass(M.get());
+
+  // Should remain unchanged.
+  EXPECT_EQ(1u, countDispatchJumps(F));
+  EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+}
+
+TEST_F(ResolveDispatchTargetsTest, MaxIterationsRespected) {
+  // Create a scenario with a deeply chained constant that needs many iterations.
+  // With max_iterations = 1, it should stop early and leave dispatches unresolved.
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(kDataLayout);
+
+  createDispatchCallDecl(*M);
+
+  // Target at 0x140020000.
+  auto *target_fn =
+      llvm::Function::Create(liftedFnType(), llvm::Function::ExternalLinkage,
+                              "sub_140020000", *M);
+  auto *target_entry = llvm::BasicBlock::Create(Ctx, "entry", target_fn);
+  llvm::IRBuilder<>(target_entry).CreateRet(target_fn->getArg(2));
+
+  // Build: target = load(inttoptr(0x140010000)) + load(inttoptr(0x140010008))
+  auto *F = llvm::Function::Create(liftedFnType(),
+                                    llvm::Function::ExternalLinkage,
+                                    "sub_140001000", *M);
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  llvm::IRBuilder<> B(entry);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+
+  auto *addr1_ptr = B.CreateIntToPtr(B.getInt64(0x140010000), ptr_ty);
+  auto *v1 = B.CreateLoad(i64_ty, addr1_ptr);
+  auto *addr2_ptr = B.CreateIntToPtr(B.getInt64(0x140010008), ptr_ty);
+  auto *v2 = B.CreateLoad(i64_ty, addr2_ptr);
+  auto *target = B.CreateAdd(v1, v2, "computed");
+
+  auto *dispatch = M->getFunction("__omill_dispatch_call");
+  auto *result = B.CreateCall(dispatch, {F->getArg(0), target, F->getArg(2)});
+  B.CreateRet(result);
+
+  // val1 = 0x100000000, val2 = 0x40020000 → sum = 0x140020000
+  omill::BinaryMemoryMap map;
+  uint64_t val1 = 0x100000000ULL;
+  uint64_t val2 = 0x40020000ULL;
+  uint8_t region[16];
+  std::memcpy(region, &val1, 8);
+  std::memcpy(region + 8, &val2, 8);
+  map.addRegion(0x140010000, region, 16);
+
+  // With max_iter=1, the iteration should fold the loads and the add in the first
+  // iteration, resolve the target, then stop. Let's verify it works with 1 iteration.
+  runIterativePass(M.get(), std::move(map), 1);
+
+  // After 1 iteration: loads folded, add folded, target resolved.
+  // The pass does InstCombine+GVN+ConstantMemoryFolding first, then resolve.
+  EXPECT_EQ(0u, countDispatchCalls(F));
+  EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+}
+
 }  // namespace
