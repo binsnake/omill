@@ -70,6 +70,10 @@ target_link_libraries(omill
 )
 
 if(OMILL_ENABLE_SIMPLIFIER)
+  target_sources(omill PRIVATE
+    Simplifier/LLVMTranslator.cpp
+    Passes/SimplifyMBA.cpp
+  )
   target_link_libraries(omill PUBLIC eq_sat)
   target_compile_definitions(omill PUBLIC OMILL_ENABLE_SIMPLIFIER=1)
 endif()

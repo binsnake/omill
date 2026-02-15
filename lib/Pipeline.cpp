@@ -47,6 +47,9 @@
 #include "omill/Passes/ResolveDispatchTargets.h"
 #include "omill/Passes/IterativeTargetResolution.h"
 #include "omill/Passes/EliminateDeadPaths.h"
+#if OMILL_ENABLE_SIMPLIFIER
+#include "omill/Passes/SimplifyMBA.h"
+#endif
 
 namespace omill {
 
@@ -154,6 +157,10 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM) {
   FPM.addPass(llvm::InstCombinePass());
   FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
   FPM.addPass(llvm::InstCombinePass());
+#if OMILL_ENABLE_SIMPLIFIER
+  FPM.addPass(SimplifyMBAPass());
+  FPM.addPass(llvm::InstCombinePass());
+#endif
 
   FPM.addPass(ConstantMemoryFoldingPass());
   // LLVM cleanup to fold constants exposed by memory folding.

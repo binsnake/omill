@@ -77,7 +77,15 @@ if(NOT MSVC)
   target_compile_options(omill-unit-tests PRIVATE -fno-rtti)
 endif()
 
-gtest_discover_tests(omill-unit-tests)
+if(OMILL_ENABLE_SIMPLIFIER)
+  target_sources(omill-unit-tests PRIVATE unit/SimplifyMBATest.cpp)
+  eqsat_copy_dll(omill-unit-tests)
+  # Use PRE_TEST discovery so the exe isn't run at build time (requires
+  # Mba.FFI.dll which may not be available during the build step).
+  gtest_discover_tests(omill-unit-tests DISCOVERY_MODE PRE_TEST)
+else()
+  gtest_discover_tests(omill-unit-tests)
+endif()
 
 # E2E tests (require remill + Zydis)
 if(OMILL_ENABLE_REMILL)
