@@ -1195,8 +1195,9 @@ TEST_F(SimplifyMBATest, Pass_AndShrink) {
   EXPECT_LT(after, before);
 }
 
-// --- Full pass: XorReduce through the pass pipeline ---
-TEST_F(SimplifyMBATest, Pass_XorReduce) {
+// --- Full pass: XorReduce is pure-bitwise, so the MBA filter skips it ---
+// (InstCombine handles this pattern instead.)
+TEST_F(SimplifyMBATest, Pass_XorReduceSkippedByFilter) {
   auto M = createModule();
   auto *F = createBinaryFunc(*M, "test");
   auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
@@ -1219,12 +1220,13 @@ TEST_F(SimplifyMBATest, Pass_XorReduce) {
   ASSERT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
   unsigned after = countInstructions(*F);
 
-  // (~a&b)|(a&~b) = 6 ops + ret → a^b = 1 op + ret
-  EXPECT_LT(after, before);
+  // Pure-bitwise expression — the MBA filter skips it (no mixed arith+bitwise).
+  EXPECT_EQ(after, before);
 }
 
-// --- Full pass: ArithToNegation through the pass pipeline ---
-TEST_F(SimplifyMBATest, Pass_ArithToNegation) {
+// --- Full pass: ArithToNegation is pure-arithmetic, so the MBA filter skips it ---
+// (InstCombine handles this pattern instead.)
+TEST_F(SimplifyMBATest, Pass_ArithToNegationSkippedByFilter) {
   auto M = createModule();
   auto *F = createUnaryFunc(*M, "test");
   auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
@@ -1243,8 +1245,8 @@ TEST_F(SimplifyMBATest, Pass_ArithToNegation) {
   ASSERT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
   unsigned after = countInstructions(*F);
 
-  // -1 + (-1*a) = 2 ops + ret → ~a = 1 op + ret
-  EXPECT_LT(after, before);
+  // Pure-arithmetic expression — the MBA filter skips it (no mixed arith+bitwise).
+  EXPECT_EQ(after, before);
 }
 
 // --- i64 simplification: verify MBA rules work across bit widths ---
