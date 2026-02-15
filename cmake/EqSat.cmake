@@ -6,6 +6,9 @@
 # The Rust crate is built via `cargo build --release` in the EqSat directory.
 # The resulting DLL/lib is imported so C++ code can link against it.
 
+# Build Mba.FFI first — eq_sat.dll links to it at runtime via raw-dylib.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/MbaFFI.cmake")
+
 set(EQSAT_SOURCE_DIR "${CMAKE_SOURCE_DIR}/third_party/Simplifier/EqSat")
 set(EQSAT_CARGO_TARGET_DIR "${CMAKE_BINARY_DIR}/eqsat-target")
 
@@ -35,7 +38,7 @@ add_custom_command(
 
 # Custom target so other targets can depend on the build.
 add_custom_target(eqsat_build
-  DEPENDS "${EQSAT_DLL}" "${EQSAT_IMPLIB}"
+  DEPENDS "${EQSAT_DLL}" "${EQSAT_IMPLIB}" mba_ffi
 )
 
 # Imported shared library target.
@@ -53,8 +56,8 @@ else()
   )
 endif()
 
-# Copy the DLL next to executables so they can find it at runtime.
-# Call eqsat_copy_dll(<target>) to set up the copy.
+# Copy both DLLs (eq_sat + Mba.FFI) next to executables so they can find them
+# at runtime.  Call eqsat_copy_dll(<target>) to set up the copy.
 function(eqsat_copy_dll target)
   add_custom_command(TARGET ${target} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -63,4 +66,5 @@ function(eqsat_copy_dll target)
     COMMENT "Copying ${EQSAT_DLL_NAME} next to ${target}"
     VERBATIM
   )
+  mba_ffi_copy_dll(${target})
 endfunction()
