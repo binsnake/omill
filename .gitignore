@@ -25,3 +25,4 @@ cmake-build-*/
 /build-simplifier
 /.claude
 *.ll
+/build-z3
