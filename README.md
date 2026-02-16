@@ -114,14 +114,16 @@ The pipeline is organized into stages that progressively lower remill IR:
 | 3 | LowerErrorAndMissing, LowerFunctionReturn, LowerFunctionCall, LowerJump, CFGRecovery | Recover native control flow |
 | 3.5 | FoldProgramCounter, ResolveIATCalls, LowerResolvedDispatchCalls | Resolve static dispatch targets |
 | 3.6 | IterativeTargetResolution | Iteratively resolve indirect targets via optimization fixpoint |
-| 4 | CallingConventionAnalysis, RecoverStackFrame, RecoverFunctionSignatures, EliminateStateStruct | Recover ABI and remove State |
-| 5 | ConstantMemoryFolding, OutlineConstantStackData, HashImportAnnotation, ResolveLazyImports | Deobfuscation |
+| 3.7 | InterProceduralConstProp | Propagate constants across call boundaries |
+| 4 | CallingConventionAnalysis, RecoverStackFrame, RecoverStackFrameTypes, RecoverFunctionSignatures, RefineFunctionSignatures, EliminateStateStruct | Recover ABI and remove State |
+| 5 | ConstantMemoryFolding, RecoverGlobalTypes, OutlineConstantStackData, HashImportAnnotation, ResolveLazyImports | Deobfuscation |
 | 6 | LowerUndefinedIntrinsics | Final cleanup |
 
 ### Analyses
 
 - **RemillIntrinsicAnalysis** — identifies and classifies remill intrinsic calls
 - **StateFieldAccessAnalysis** — tracks which State struct fields are read/written
+- **CallGraphAnalysis** — builds inter-procedural call graph with SCC computation
 - **CallingConventionAnalysis** — determines calling conventions from register usage
 - **BinaryMemoryMap** — provides constant memory contents from the original binary for folding
 
@@ -161,6 +163,13 @@ ctest --test-dir build -R unit
 # Run e2e tests (requires remill build)
 ctest --test-dir build-remill -R e2e
 ```
+
+## Credits
+
+- [remill](https://github.com/lifting-bits/remill) — binary lifter by Trail of Bits
+- [LLVM](https://llvm.org/) — compiler infrastructure
+- [Zydis](https://github.com/zyantific/zydis) — x86/x86-64 disassembler
+- Inter-procedural analysis, type recovery, and string recovery passes co-authored with [Claude Code](https://claude.com/claude-code) (Anthropic)
 
 ## License
 
