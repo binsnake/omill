@@ -228,6 +228,86 @@ static bool trySimplifyBareLshr(Instruction *I) {
   return true;
 }
 
+/// Scalarize `extractelement` from `sext <N x i1>` (with or without bitcast).
+///
+/// Since `sext <N x i1> to <N x iK>` produces all-ones or all-zeros per lane,
+/// every sub-element (byte, i16, etc.) within a lane has the same uniform
+/// value.  We can always replace with a scalar sext:
+///
+///   extractelement <M x iJ> (bitcast? (sext <N x i1> to <N x iK>)), idx
+///   →  sext(extractelement <N x i1>, lane) to iJ
+///
+/// This enables InstCombine to fold downstream `and`, `lshr`, `zext` chains.
+static bool tryScalarizeExtractFromSext(Instruction *I) {
+  auto *EE = dyn_cast<ExtractElementInst>(I);
+  if (!EE)
+    return false;
+
+  auto *idx_ci = dyn_cast<ConstantInt>(EE->getIndexOperand());
+  if (!idx_ci)
+    return false;
+  unsigned idx = idx_ci->getZExtValue();
+
+  Value *vec = EE->getVectorOperand();
+  auto *vec_ty = dyn_cast<FixedVectorType>(vec->getType());
+  if (!vec_ty || !vec_ty->getElementType()->isIntegerTy())
+    return false;
+  unsigned elem_bits = vec_ty->getElementType()->getIntegerBitWidth();
+
+  // Peel optional bitcast.
+  Value *inner = vec;
+  if (auto *bc = dyn_cast<BitCastInst>(inner))
+    inner = bc->getOperand(0);
+
+  auto *sext = dyn_cast<SExtInst>(inner);
+  if (!sext)
+    return false;
+
+  auto *src_vec_ty = dyn_cast<FixedVectorType>(sext->getOperand(0)->getType());
+  if (!src_vec_ty || !src_vec_ty->getElementType()->isIntegerTy(1))
+    return false;
+
+  auto *dst_vec_ty = dyn_cast<FixedVectorType>(sext->getType());
+  if (!dst_vec_ty)
+    return false;
+
+  unsigned lane_bits = dst_vec_ty->getElementType()->getIntegerBitWidth();
+  unsigned num_lanes = src_vec_ty->getNumElements();
+
+  // If extracting directly from the sext (no bitcast), elem == lane size.
+  // Just scalarize: extractelement(sext(vec), idx) → sext(extractelement(vec, idx))
+  if (inner == vec) {
+    if (idx >= num_lanes)
+      return false;
+    IRBuilder<> Builder(I);
+    Value *flag = Builder.CreateExtractElement(sext->getOperand(0),
+                                               Builder.getInt64(idx));
+    Value *result = Builder.CreateSExt(flag, I->getType());
+    I->replaceAllUsesWith(result);
+    I->eraseFromParent();
+    return true;
+  }
+
+  // With bitcast: determine which lane the extracted element falls in.
+  // Each lane is lane_bits wide; each extracted element is elem_bits wide.
+  // The element at index `idx` spans bits [idx*elem_bits, (idx+1)*elem_bits).
+  // It must fall entirely within one lane.
+  unsigned bit_lo = idx * elem_bits;
+  unsigned bit_hi = bit_lo + elem_bits;
+  unsigned lane_lo = bit_lo / lane_bits;
+  unsigned lane_hi = (bit_hi - 1) / lane_bits;
+  if (lane_lo != lane_hi || lane_lo >= num_lanes)
+    return false;
+
+  IRBuilder<> Builder(I);
+  Value *flag = Builder.CreateExtractElement(sext->getOperand(0),
+                                             Builder.getInt64(lane_lo));
+  Value *result = Builder.CreateSExt(flag, I->getType());
+  I->replaceAllUsesWith(result);
+  I->eraseFromParent();
+  return true;
+}
+
 static bool runOnFunction(Function &F) {
   bool changed = false;
 
@@ -244,6 +324,12 @@ static bool runOnFunction(Function &F) {
 
       // Try bare lshr pattern (no trailing and).
       if (trySimplifyBareLshr(I)) {
+        changed = true;
+        continue;
+      }
+
+      // Scalarize extractelement from sext <N x i1> (unconditional).
+      if (tryScalarizeExtractFromSext(I)) {
         changed = true;
         continue;
       }
