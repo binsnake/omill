@@ -70,16 +70,18 @@ class LowerErrorAndMissingTest : public ::testing::Test {
   }
 };
 
-TEST_F(LowerErrorAndMissingTest, ErrorBecomesHandlerAndUnreachable) {
+TEST_F(LowerErrorAndMissingTest, ErrorBecomesHandlerAndRet) {
   auto M = createModuleWithIntrinsic("__remill_error");
   auto *F = M->getFunction("test_func");
   ASSERT_NE(F, nullptr);
 
   runPass(F);
 
-  // After: should have call to __omill_error_handler + unreachable
+  // After: should have call to __omill_error_handler + ret (not unreachable,
+  // to prevent LLVM from deducing the function is noreturn and eliminating
+  // live code in other branches).
   bool has_handler_call = false;
-  bool has_unreachable = false;
+  bool has_ret = false;
   for (auto &BB : *F) {
     for (auto &I : BB) {
       if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I)) {
@@ -87,12 +89,12 @@ TEST_F(LowerErrorAndMissingTest, ErrorBecomesHandlerAndUnreachable) {
             CI->getCalledFunction()->getName() == "__omill_error_handler")
           has_handler_call = true;
       }
-      if (llvm::isa<llvm::UnreachableInst>(&I))
-        has_unreachable = true;
+      if (llvm::isa<llvm::ReturnInst>(&I))
+        has_ret = true;
     }
   }
   EXPECT_TRUE(has_handler_call);
-  EXPECT_TRUE(has_unreachable);
+  EXPECT_TRUE(has_ret);
 
   // No more remill error calls
   bool has_remill = false;
@@ -112,9 +114,9 @@ TEST_F(LowerErrorAndMissingTest, MissingBlockHandled) {
 
   runPass(F);
 
-  // After: should have call to __omill_missing_block_handler + unreachable
+  // After: should have call to __omill_missing_block_handler + ret
   bool has_handler_call = false;
-  bool has_unreachable = false;
+  bool has_ret = false;
   for (auto &BB : *F) {
     for (auto &I : BB) {
       if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I)) {
@@ -123,12 +125,12 @@ TEST_F(LowerErrorAndMissingTest, MissingBlockHandled) {
                 "__omill_missing_block_handler")
           has_handler_call = true;
       }
-      if (llvm::isa<llvm::UnreachableInst>(&I))
-        has_unreachable = true;
+      if (llvm::isa<llvm::ReturnInst>(&I))
+        has_ret = true;
     }
   }
   EXPECT_TRUE(has_handler_call);
-  EXPECT_TRUE(has_unreachable);
+  EXPECT_TRUE(has_ret);
 }
 
 }  // namespace

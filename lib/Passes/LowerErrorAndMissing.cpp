@@ -47,13 +47,12 @@ llvm::PreservedAnalyses LowerErrorAndMissingPass::run(
   auto missing_handler =
       M.getOrInsertFunction("__omill_missing_block_handler", handler_ty);
 
-  // Mark handlers as noreturn
-  if (auto *F = llvm::dyn_cast<llvm::Function>(error_handler.getCallee())) {
-    F->addFnAttr(llvm::Attribute::NoReturn);
-  }
-  if (auto *F = llvm::dyn_cast<llvm::Function>(missing_handler.getCallee())) {
-    F->addFnAttr(llvm::Attribute::NoReturn);
-  }
+  // Do NOT mark handlers as noreturn.  If every path through a lifted function
+  // ends with an error/missing handler (common when the trace lifter stops at
+  // indirect jumps or unreachable code), marking the handlers noreturn lets
+  // LLVM deduce the *entire* function is noreturn, which causes it to
+  // aggressively eliminate all continuation code after intra-function calls
+  // as dead.  Keeping the handlers as normal calls preserves the code.
 
   for (auto &[CI, kind] : pending) {
     llvm::IRBuilder<> Builder(CI);
@@ -70,9 +69,14 @@ llvm::PreservedAnalyses LowerErrorAndMissingPass::run(
     } else {
       Builder.CreateCall(missing_handler, {pc});
     }
-    auto *new_term = Builder.CreateUnreachable();
 
-    // Replace Memory* return with poison (dead code after unreachable)
+    // Return poison — the handler never returns at runtime, but we must
+    // keep a 'ret' so that LLVM sees a valid return path and does not
+    // eliminate live code in other branches as dead.
+    llvm::Value *ret_val = llvm::PoisonValue::get(F.getReturnType());
+    auto *new_term = Builder.CreateRet(ret_val);
+
+    // Replace Memory* return with poison.
     CI->replaceAllUsesWith(llvm::PoisonValue::get(CI->getType()));
     CI->eraseFromParent();
 
@@ -84,7 +88,7 @@ llvm::PreservedAnalyses LowerErrorAndMissingPass::run(
       dead.eraseFromParent();
     }
 
-    // Update PHI nodes: unreachable has no successors, so all old successors
+    // Update PHI nodes: ret has no successors, so all old successors
     // lost this block as a predecessor.
     for (auto *succ : old_succs)
       succ->removePredecessor(BB);
