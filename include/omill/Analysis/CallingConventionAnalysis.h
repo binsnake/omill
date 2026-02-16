@@ -15,7 +15,6 @@ namespace omill {
 enum class DetectedCC {
   kUnknown,
   kWin64,          // RCX, RDX, R8, R9; RAX return; 32-byte shadow space
-  kVoid,           // No parameters, no return value
 };
 
 /// Describes a recovered function parameter.

@@ -151,8 +151,6 @@ llvm::PreservedAnalyses RecoverFunctionSignaturesPass::run(
   for (auto *F : functions) {
     auto *abi = cc_info.getABI(F);
     if (!abi) continue;
-    if (abi->cc == DetectedCC::kUnknown) continue;
-
     createNativeWrapper(F, *abi, field_map);
     changed = true;
   }

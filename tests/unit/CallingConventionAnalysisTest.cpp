@@ -153,22 +153,10 @@ TEST_F(CallingConventionAnalysisTest, DetectsWin64FourParams) {
   EXPECT_EQ(abi->params[3].reg_name, "R9");
 }
 
-TEST_F(CallingConventionAnalysisTest, DetectsVoidFunction) {
-  auto M = std::make_unique<llvm::Module>("test", Ctx);
-  M->setDataLayout(
-      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
-      "n8:16:32:64-S128");
-
-  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
-  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
-
-  auto *fn_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
-  auto *test_fn = llvm::Function::Create(
-      fn_ty, llvm::Function::ExternalLinkage, "sub_402000", *M);
-
-  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", test_fn);
-  llvm::IRBuilder<> B(entry);
-  B.CreateRet(test_fn->getArg(2));
+TEST_F(CallingConventionAnalysisTest, DefaultsToWin64WhenNoParamRegsDetected) {
+  // When no parameter registers are read in the entry block (e.g. obfuscated
+  // functions with SSE mutation), default to Win64 with all 4 params.
+  auto M = createModuleWithState({}, /*writes_rax=*/false);
 
   llvm::PassBuilder PB;
   llvm::LoopAnalysisManager LAM;
@@ -184,10 +172,15 @@ TEST_F(CallingConventionAnalysisTest, DetectsVoidFunction) {
 
   auto result = MAM.getResult<omill::CallingConventionAnalysis>(*M);
 
+  auto *test_fn = M->getFunction("sub_401000");
   auto *abi = result.getABI(test_fn);
   ASSERT_NE(abi, nullptr);
-  EXPECT_EQ(abi->cc, omill::DetectedCC::kVoid);
-  EXPECT_EQ(abi->numParams(), 0u);
+  EXPECT_EQ(abi->cc, omill::DetectedCC::kWin64);
+  EXPECT_EQ(abi->numParams(), 4u);
+  EXPECT_EQ(abi->params[0].reg_name, "RCX");
+  EXPECT_EQ(abi->params[1].reg_name, "RDX");
+  EXPECT_EQ(abi->params[2].reg_name, "R8");
+  EXPECT_EQ(abi->params[3].reg_name, "R9");
   EXPECT_FALSE(abi->ret.has_value());
 }
 

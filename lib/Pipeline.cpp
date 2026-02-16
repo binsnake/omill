@@ -57,6 +57,7 @@
 #include "omill/Passes/InterProceduralConstProp.h"
 #include "omill/Passes/IterativeTargetResolution.h"
 #include "omill/Passes/EliminateDeadPaths.h"
+#include "omill/Passes/RewriteLiftedCallsToNative.h"
 #if OMILL_ENABLE_Z3
 #include "omill/Passes/Z3DispatchSolver.h"
 #endif
@@ -147,6 +148,7 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
   // Signature recovery creates native wrappers; state elimination
   // internalizes the original lifted functions with alwaysinline.
   MPM.addPass(RecoverFunctionSignaturesPass());
+  MPM.addPass(RewriteLiftedCallsToNativePass());
   MPM.addPass(EliminateStateStructPass());
 
   // Inline the lifted functions into their native wrappers, then

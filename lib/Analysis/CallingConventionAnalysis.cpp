@@ -160,14 +160,20 @@ FunctionABI analyzeFunction(llvm::Function &F, const llvm::DataLayout &DL,
       abi.params.push_back(param);
     }
   } else {
-    // No parameter registers detected.
-    auto rax_field = field_map.fieldByName("RAX");
-    if (rax_field && live_out.count(rax_field->offset)) {
-      // Returns a value but takes no parameters.
-      abi.cc = DetectedCC::kWin64;
-    } else {
-      abi.cc = DetectedCC::kVoid;
-      return abi;
+    // No parameter registers detected in the entry block.  For obfuscated
+    // functions (SSE mutation entry), the liveness scan misses GPR reads.
+    // Default to Win64 with all 4 params — unused params become dead values
+    // after inlining and are trivially eliminated by DCE.
+    abi.cc = DetectedCC::kWin64;
+    for (unsigned i = 0; i < kWin64ParamCount; ++i) {
+      auto field = field_map.fieldByName(kWin64ParamRegs[i]);
+      if (!field) break;
+      RecoveredParam param;
+      param.reg_name = kWin64ParamRegs[i];
+      param.state_offset = field->offset;
+      param.size = field->size;
+      param.index = i;
+      abi.params.push_back(param);
     }
   }
 
