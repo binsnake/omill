@@ -20,6 +20,8 @@
 
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/CallingConventionAnalysis.h"
+#include "omill/Analysis/CallGraphAnalysis.h"
+#include "omill/Analysis/LiftedFunctionMap.h"
 #include "omill/Omill.h"
 
 #include <deque>
@@ -46,6 +48,26 @@ static cl::opt<bool> NoABI("no-abi",
 static cl::opt<bool> Deobfuscate("deobfuscate",
                                   cl::desc("Enable deobfuscation passes"),
                                   cl::init(false));
+
+static cl::opt<bool> ResolveTargets(
+    "resolve-targets",
+    cl::desc("Enable iterative indirect target resolution"),
+    cl::init(false));
+
+static cl::opt<unsigned> MaxIterations(
+    "max-iterations",
+    cl::desc("Max iterations for target resolution (default 10)"),
+    cl::init(10));
+
+static cl::opt<bool> RefineSignatures(
+    "refine-signatures",
+    cl::desc("Refine function signatures after ABI recovery"),
+    cl::init(false));
+
+static cl::opt<bool> IPCP(
+    "ipcp",
+    cl::desc("Enable interprocedural constant propagation"),
+    cl::init(false));
 
 namespace {
 
@@ -254,12 +276,16 @@ int main(int argc, char **argv) {
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
   omill::registerAnalyses(FAM);
-  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+  omill::registerModuleAnalyses(MAM);
 
   // Run the main pipeline (without ABI first)
   omill::PipelineOptions opts;
   opts.recover_abi = false;
   opts.deobfuscate = Deobfuscate;
+  opts.resolve_indirect_targets = ResolveTargets;
+  opts.max_resolution_iterations = MaxIterations;
+  opts.refine_signatures = RefineSignatures;
+  opts.interprocedural_const_prop = IPCP;
   {
     ModulePassManager MPM;
     omill::buildPipeline(MPM, opts);

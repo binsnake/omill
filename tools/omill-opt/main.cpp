@@ -13,6 +13,7 @@
 #include <llvm/Bitcode/BitcodeWriter.h>
 
 #include "omill/Omill.h"
+#include "omill/Analysis/CallingConventionAnalysis.h"
 #include "omill/Passes/LowerFlagIntrinsics.h"
 #include "omill/Passes/LowerMemoryIntrinsics.h"
 #include "omill/Passes/PassRegistry.h"
@@ -73,6 +74,36 @@ static cl::opt<bool> OnlyRemoveBarriers(
     cl::desc("Only run RemoveBarriers pass"),
     cl::init(false));
 
+static cl::opt<bool> Deobfuscate(
+    "deobfuscate",
+    cl::desc("Enable deobfuscation passes"),
+    cl::init(false));
+
+static cl::opt<bool> RecoverABI(
+    "recover-abi",
+    cl::desc("Enable ABI recovery passes"),
+    cl::init(false));
+
+static cl::opt<bool> ResolveTargets(
+    "resolve-targets",
+    cl::desc("Enable iterative indirect target resolution"),
+    cl::init(false));
+
+static cl::opt<unsigned> MaxIterations(
+    "max-iterations",
+    cl::desc("Max iterations for target resolution (default 10)"),
+    cl::init(10));
+
+static cl::opt<bool> RefineSignatures(
+    "refine-signatures",
+    cl::desc("Refine function signatures after ABI recovery"),
+    cl::init(false));
+
+static cl::opt<bool> IPCP(
+    "ipcp",
+    cl::desc("Enable interprocedural constant propagation"),
+    cl::init(false));
+
 int main(int argc, char **argv) {
   InitLLVM X(argc, argv);
   cl::ParseCommandLineOptions(argc, argv, "omill optimizer\n");
@@ -92,6 +123,12 @@ int main(int argc, char **argv) {
   opts.optimize_state = !NoOptimizeState;
   opts.lower_control_flow = !NoLowerControlFlow;
   opts.run_cleanup_passes = !NoCleanup;
+  opts.deobfuscate = Deobfuscate;
+  opts.recover_abi = RecoverABI;
+  opts.resolve_indirect_targets = ResolveTargets;
+  opts.max_resolution_iterations = MaxIterations;
+  opts.refine_signatures = RefineSignatures;
+  opts.interprocedural_const_prop = IPCP;
 
   // Set up pass infrastructure
   PassBuilder PB;
@@ -109,6 +146,7 @@ int main(int argc, char **argv) {
 
   // Register omill-specific analyses
   omill::registerAnalyses(FAM);
+  omill::registerModuleAnalyses(MAM);
 
   ModulePassManager MPM;
 
