@@ -73,6 +73,20 @@
 
 namespace omill {
 
+/// Tiny module pass that marks __omill_native_dispatch with alwaysinline
+/// so the subsequent AlwaysInlinerPass eliminates it.
+struct InlineNativeDispatchPass
+    : public llvm::PassInfoMixin<InlineNativeDispatchPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &) {
+    auto *F = M.getFunction("__omill_native_dispatch");
+    if (!F || F->isDeclaration())
+      return llvm::PreservedAnalyses::all();
+    F->addFnAttr(llvm::Attribute::AlwaysInline);
+    return llvm::PreservedAnalyses::all();
+  }
+};
+
 static void addCleanupPasses(llvm::FunctionPassManager &FPM) {
   FPM.addPass(llvm::InstCombinePass());
   FPM.addPass(llvm::DCEPass());
@@ -197,6 +211,21 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     // PC argument to a constant.  Replaces with direct calls to _native
     // functions, recovering the original jump target.
     FPM.addPass(ResolveNativeDispatchPass());
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::SimplifyCFGPass());
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+  }
+
+  // Inline __omill_native_dispatch into all callers while it's still a small
+  // switch.  Must happen BEFORE the cost-based inliner — otherwise the inliner
+  // pulls _native bodies into the dispatch, making it huge and recursive.
+  // After inlining the switch, SimplifyCFG folds constant-PC cases to direct
+  // calls.
+  MPM.addPass(InlineNativeDispatchPass());
+  MPM.addPass(llvm::AlwaysInlinerPass());
+  MPM.addPass(llvm::GlobalDCEPass());
+  {
+    llvm::FunctionPassManager FPM;
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(llvm::SimplifyCFGPass());
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
