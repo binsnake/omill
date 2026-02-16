@@ -34,7 +34,7 @@ TEST_F(MBAPatternTest, XorAndToAdd) {
   setCode(code, sizeof(code), 0x401000);
 
   // Verify disassembly works
-  auto disasm = omill::e2e::disassemble(code, sizeof(code), 0x401000);
+  auto disasm = omill::test::disassemble(code, sizeof(code), 0x401000);
   ASSERT_FALSE(disasm.empty());
   EXPECT_EQ(disasm.back().text, "ret");
 

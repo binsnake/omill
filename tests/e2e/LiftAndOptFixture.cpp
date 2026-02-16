@@ -8,7 +8,9 @@
 #include <remill/BC/IntrinsicTable.h>
 
 #include "omill/Analysis/BinaryMemoryMap.h"
+#include "omill/Analysis/CallGraphAnalysis.h"
 #include "omill/Analysis/CallingConventionAnalysis.h"
+#include "omill/Analysis/LiftedFunctionMap.h"
 
 #include <cstdlib>
 
@@ -91,6 +93,8 @@ void LiftAndOptFixture::optimizeWithMemoryMap(const PipelineOptions &opts,
   // Note: don't call registerModuleAnalyses() — we already registered
   // BinaryMemoryAnalysis with our custom map above. Register the rest manually.
   MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+  MAM.registerPass([&] { return omill::CallGraphAnalysis(); });
+  MAM.registerPass([&] { return omill::LiftedFunctionAnalysis(); });
 
   dumpIR("before");
 

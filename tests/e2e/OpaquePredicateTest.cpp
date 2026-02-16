@@ -37,7 +37,7 @@ TEST_F(OpaquePredicateTest, AlwaysEvenProduct) {
 
   setCode(code, sizeof(code), 0x401000);
 
-  auto disasm = omill::e2e::disassemble(code, sizeof(code), 0x401000);
+  auto disasm = omill::test::disassemble(code, sizeof(code), 0x401000);
   ASSERT_FALSE(disasm.empty());
 
   auto *M = lift();
