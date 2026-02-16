@@ -9,6 +9,7 @@
 #include "omill/Analysis/ExceptionInfo.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
 #include "omill/Utils/IntrinsicTable.h"
+#include "omill/Utils/LiftedNames.h"
 
 namespace omill {
 
@@ -160,17 +161,33 @@ llvm::PreservedAnalyses ResolveForcedExceptionsPass::run(
   if (!excinfo || excinfo->empty())
     return llvm::PreservedAnalyses::all();
 
+  // Look up the RUNTIME_FUNCTION for this function's entry VA.
+  // Using the function name (sub_<hex>) is more robust than using the
+  // error PC, because remill passes the *next* PC to __remill_error
+  // (past the faulting instruction), which can fall outside the
+  // RUNTIME_FUNCTION's [begin, end) range for short functions.
+  uint64_t func_va = extractEntryVA(F.getName());
+  if (func_va == 0)
+    return llvm::PreservedAnalyses::all();
+
+  auto *rt_entry = excinfo->lookup(func_va);
+  if (!rt_entry || rt_entry->handler_va == 0)
+    return llvm::PreservedAnalyses::all();
+
   auto *lifted =
       MAMProxy.getCachedResult<LiftedFunctionAnalysis>(M);
 
+  // Handler must be a lifted function.
+  auto *handler_fn = lifted ? lifted->lookup(rt_entry->handler_va) : nullptr;
+  if (!handler_fn)
+    return llvm::PreservedAnalyses::all();
+
   IntrinsicTable table(M);
 
-  // Collect __remill_error calls with constant PCs that have handlers.
+  // Collect all __remill_error calls in this function.
   struct Candidate {
     llvm::CallInst *CI;
-    uint64_t pc;
-    const RuntimeFunctionEntry *entry;
-    llvm::Function *handler_fn;
+    uint64_t pc;  // The error PC (next instruction after fault)
   };
   llvm::SmallVector<Candidate, 4> candidates;
 
@@ -182,23 +199,12 @@ llvm::PreservedAnalyses ResolveForcedExceptionsPass::run(
       if (table.classifyCall(CI) != IntrinsicKind::kError)
         continue;
 
-      // Extract constant PC (arg1).
+      // Extract constant PC (arg1) for use in EXCEPTION_RECORD.
       auto *pc_ci = llvm::dyn_cast<llvm::ConstantInt>(CI->getArgOperand(1));
       if (!pc_ci)
         continue;
-      uint64_t pc = pc_ci->getZExtValue();
 
-      // Look up RUNTIME_FUNCTION.
-      auto *entry = excinfo->lookup(pc);
-      if (!entry || entry->handler_va == 0)
-        continue;
-
-      // Handler must be a lifted function.
-      auto *handler_fn = lifted ? lifted->lookup(entry->handler_va) : nullptr;
-      if (!handler_fn)
-        continue;
-
-      candidates.push_back({CI, pc, entry, handler_fn});
+      candidates.push_back({CI, pc_ci->getZExtValue()});
     }
   }
 
@@ -217,7 +223,7 @@ llvm::PreservedAnalyses ResolveForcedExceptionsPass::run(
   auto dispatcher =
       M.getOrInsertFunction("__omill_dispatch_jump", lifted_fn_ty);
 
-  for (auto &[CI, pc, entry, handler_fn] : candidates) {
+  for (auto &[CI, pc] : candidates) {
     llvm::IRBuilder<> Builder(CI);
     auto *BB = CI->getParent();
 
@@ -292,7 +298,7 @@ llvm::PreservedAnalyses ResolveForcedExceptionsPass::run(
     // (e) Call the lifted handler.
     auto *handler_result = Builder.CreateCall(
         handler_fn,
-        {state, Builder.getInt64(entry->handler_va), mem});
+        {state, Builder.getInt64(rt_entry->handler_va), mem});
 
     // (f) Unmarshal CONTEXT -> State (handler may have modified any register).
     for (const auto &m : kGPRMappings) {
