@@ -196,7 +196,57 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM) {
   FPM.addPass(llvm::SimplifyCFGPass());
 }
 
+namespace {
+
+/// Strip bodies of remill intrinsic functions before AlwaysInlinerPass.
+///
+/// Remill's bitcode library defines intrinsic functions like
+/// __remill_sync_hyper_call with bodies containing switch statements whose
+/// default cases are unreachable.  Remill's semantic functions call these
+/// intrinsics with call-site `alwaysinline` attributes.  When LLVM's
+/// AlwaysInlinerPass inlines a semantic function, it also force-inlines the
+/// intrinsic body (honoring the call-site attribute), embedding the switch
+/// with its unreachable default.  If the hyper-call ID doesn't match any
+/// switch case, the entire function degenerates to unreachable, eliminating
+/// all continuation code.
+///
+/// Fix: delete intrinsic bodies before inlining so they become opaque
+/// declarations.  Our lowering passes (LowerHyperCalls, LowerMemoryIntrinsics,
+/// etc.) will replace the calls with proper implementations later.
+struct StripRemillIntrinsicBodiesPass
+    : llvm::PassInfoMixin<StripRemillIntrinsicBodiesPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                               llvm::ModuleAnalysisManager &) {
+    // Remill intrinsic prefixes to strip.
+    static constexpr llvm::StringLiteral prefixes[] = {
+        "__remill_sync_hyper_call",
+        "__remill_async_hyper_call",
+    };
+
+    bool changed = false;
+    for (auto &prefix : prefixes) {
+      if (auto *F = M.getFunction(prefix)) {
+        if (!F->isDeclaration()) {
+          F->deleteBody();
+          changed = true;
+        }
+      }
+    }
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+
+  static bool isRequired() { return true; }
+};
+
+}  // namespace
+
 void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
+  // Phase 0: Strip remill intrinsic bodies to prevent AlwaysInlinerPass from
+  // inlining them via call-site alwaysinline attributes.  Their bodies contain
+  // switch/unreachable patterns that poison the entire function's control flow.
+  MPM.addPass(StripRemillIntrinsicBodiesPass());
+
   // Phase 0: Inline remill's alwaysinline semantic functions so that
   // subsequent passes can see through them.
   MPM.addPass(llvm::AlwaysInlinerPass());
