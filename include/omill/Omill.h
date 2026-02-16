@@ -34,6 +34,10 @@ struct PipelineOptions {
   /// Maximum iterations for iterative target resolution.
   unsigned max_resolution_iterations = 10;
 
+  /// Refine _native function parameter types (ptr vs i64 vs double).
+  /// Opt-in; runs late in Phase 4 after ABI recovery.
+  bool refine_signatures = false;
+
   /// Run standard LLVM cleanup passes between stages.
   bool run_cleanup_passes = true;
 };

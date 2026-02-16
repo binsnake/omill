@@ -47,6 +47,7 @@ add_executable(omill-unit-tests
   unit/DeadStateFlagEliminationTest.cpp
   unit/MemoryPointerEliminationTest.cpp
   unit/RecoverFunctionSignaturesTest.cpp
+  unit/RefineFunctionSignaturesTest.cpp
   unit/EliminateStateStructTest.cpp
   unit/ConstantMemoryFoldingTest.cpp
   unit/ImportHashDBTest.cpp

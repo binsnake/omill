@@ -33,6 +33,7 @@
 #include "omill/Passes/MemoryPointerElimination.h"
 #include "omill/Passes/PromoteStateToSSA.h"
 #include "omill/Passes/RecoverFunctionSignatures.h"
+#include "omill/Passes/RefineFunctionSignatures.h"
 #include "omill/Passes/RecoverStackFrame.h"
 #include "omill/Passes/RecoverStackFrameTypes.h"
 #include "omill/Passes/EliminateStateStruct.h"
@@ -253,6 +254,11 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   // Phase 4: ABI Recovery
   if (opts.recover_abi) {
     buildABIRecoveryPipeline(MPM);
+
+    // Phase 4 (late): Refine _native function parameter types.
+    if (opts.refine_signatures) {
+      MPM.addPass(RefineFunctionSignaturesPass());
+    }
   }
 
   // Phase 5: Deobfuscation (after ABI recovery for max constant visibility)
