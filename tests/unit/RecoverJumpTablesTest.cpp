@@ -349,4 +349,197 @@ TEST_F(RecoverJumpTablesTest, MixedIntraInterTargets) {
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
 }
 
+TEST_F(RecoverJumpTablesTest, BoundsFromAndMask) {
+  // Index is bounded by AND mask: idx = and(raw, 7) → 8 entries.
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(kDataLayout);
+  createDispatchJumpDecl(*M);
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *dispatch = createDispatchJumpDecl(*M);  // already created, get it
+  dispatch = M->getFunction("__omill_dispatch_jump");
+
+  auto *F = llvm::Function::Create(liftedFnType(),
+                                    llvm::Function::ExternalLinkage,
+                                    "sub_140002000", *M);
+
+  // Create 8 target blocks.
+  llvm::SmallVector<llvm::BasicBlock *, 8> target_blocks;
+  for (unsigned i = 0; i < 8; ++i) {
+    char name[64];
+    snprintf(name, sizeof(name), "block_%llx",
+             (unsigned long long)(0x140002100 + i * 0x10));
+    auto *bb = llvm::BasicBlock::Create(Ctx, name, F);
+    llvm::IRBuilder<>(bb).CreateRet(F->getArg(2));
+    target_blocks.push_back(bb);
+  }
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  entry->moveBefore(&F->getEntryBlock());
+
+  llvm::IRBuilder<> B(entry);
+  auto *raw_ptr = B.CreateAlloca(i64_ty);
+  auto *raw = B.CreateLoad(i64_ty, raw_ptr, "raw");
+  // AND with mask 7 → range [0, 8)
+  auto *idx = B.CreateAnd(raw, llvm::ConstantInt::get(i64_ty, 7), "idx");
+  auto *scaled = B.CreateShl(idx, llvm::ConstantInt::get(i64_ty, 3));
+  auto *addr = B.CreateAdd(scaled, llvm::ConstantInt::get(i64_ty, 0x140030000));
+  auto *ptr = B.CreateIntToPtr(addr, ptr_ty);
+  auto *target = B.CreateLoad(i64_ty, ptr, "entry_val");
+  auto *result = B.CreateCall(dispatch, {F->getArg(0), target, F->getArg(2)});
+  B.CreateRet(result);
+
+  // Build memory: 8 entries * 8 bytes.
+  uint64_t table[8];
+  for (unsigned i = 0; i < 8; ++i)
+    table[i] = 0x140002100 + i * 0x10;
+
+  omill::BinaryMemoryMap map;
+  map.addRegion(0x140030000, reinterpret_cast<const uint8_t *>(table), 64);
+
+  runPass(M.get(), std::move(map));
+
+  EXPECT_TRUE(hasSwitchInst(F));
+  EXPECT_EQ(countSwitchCases(F), 8u);
+  EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+}
+
+TEST_F(RecoverJumpTablesTest, BoundsFromMultiPredecessor) {
+  // Index is bounded by icmp in a grandparent block (depth 2).
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(kDataLayout);
+  createDispatchJumpDecl(*M);
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *dispatch = M->getFunction("__omill_dispatch_jump");
+
+  auto *F = llvm::Function::Create(liftedFnType(),
+                                    llvm::Function::ExternalLinkage,
+                                    "sub_140003000", *M);
+
+  // Create 4 target blocks.
+  llvm::SmallVector<llvm::BasicBlock *, 4> target_blocks;
+  for (unsigned i = 0; i < 4; ++i) {
+    char name[64];
+    snprintf(name, sizeof(name), "block_%llx",
+             (unsigned long long)(0x140003100 + i * 0x10));
+    auto *bb = llvm::BasicBlock::Create(Ctx, name, F);
+    llvm::IRBuilder<>(bb).CreateRet(F->getArg(2));
+    target_blocks.push_back(bb);
+  }
+
+  auto *bounds_bb = llvm::BasicBlock::Create(Ctx, "bounds_check", F);
+  auto *middle_bb = llvm::BasicBlock::Create(Ctx, "middle", F);
+  auto *switch_bb = llvm::BasicBlock::Create(Ctx, "switch_bb", F);
+  auto *default_bb = llvm::BasicBlock::Create(Ctx, "default_bb", F);
+
+  // bounds_check: icmp ult %idx, 4 → middle / default
+  llvm::IRBuilder<> B(bounds_bb);
+  auto *idx_ptr = B.CreateAlloca(i64_ty);
+  auto *idx = B.CreateLoad(i64_ty, idx_ptr, "idx");
+  auto *cmp = B.CreateICmpULT(idx, llvm::ConstantInt::get(i64_ty, 4));
+  B.CreateCondBr(cmp, middle_bb, default_bb);
+
+  // middle: unconditional branch to switch_bb (simulates extra block)
+  B.SetInsertPoint(middle_bb);
+  B.CreateBr(switch_bb);
+
+  // switch_bb: table load + dispatch_jump
+  B.SetInsertPoint(switch_bb);
+  auto *scaled = B.CreateShl(idx, llvm::ConstantInt::get(i64_ty, 3));
+  auto *addr = B.CreateAdd(scaled, llvm::ConstantInt::get(i64_ty, 0x140040000));
+  auto *ptr = B.CreateIntToPtr(addr, ptr_ty);
+  auto *target = B.CreateLoad(i64_ty, ptr, "entry_val");
+  auto *result = B.CreateCall(dispatch, {F->getArg(0), target, F->getArg(2)});
+  B.CreateRet(result);
+
+  // default_bb
+  B.SetInsertPoint(default_bb);
+  auto *def_result = B.CreateCall(
+      dispatch, {F->getArg(0), llvm::ConstantInt::get(i64_ty, 0), F->getArg(2)});
+  B.CreateRet(def_result);
+
+  bounds_bb->moveBefore(&F->getEntryBlock());
+
+  uint64_t table[4];
+  for (unsigned i = 0; i < 4; ++i)
+    table[i] = 0x140003100 + i * 0x10;
+
+  omill::BinaryMemoryMap map;
+  map.addRegion(0x140040000, reinterpret_cast<const uint8_t *>(table), 32);
+
+  runPass(M.get(), std::move(map));
+
+  // The bounds check is two blocks up — enhanced computeIndexRange should find it.
+  EXPECT_TRUE(hasSwitchInst(F));
+  EXPECT_EQ(countSwitchCases(F), 4u);
+  EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+}
+
+TEST_F(RecoverJumpTablesTest, BoundsFromULE) {
+  // Index bounded by: icmp ule %idx, 3 (bound = 4).
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(kDataLayout);
+  createDispatchJumpDecl(*M);
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *dispatch = M->getFunction("__omill_dispatch_jump");
+
+  auto *F = llvm::Function::Create(liftedFnType(),
+                                    llvm::Function::ExternalLinkage,
+                                    "sub_140004000", *M);
+
+  llvm::SmallVector<llvm::BasicBlock *, 4> target_blocks;
+  for (unsigned i = 0; i < 4; ++i) {
+    char name[64];
+    snprintf(name, sizeof(name), "block_%llx",
+             (unsigned long long)(0x140004100 + i * 0x10));
+    auto *bb = llvm::BasicBlock::Create(Ctx, name, F);
+    llvm::IRBuilder<>(bb).CreateRet(F->getArg(2));
+    target_blocks.push_back(bb);
+  }
+
+  auto *bounds_bb = llvm::BasicBlock::Create(Ctx, "bounds_check", F);
+  auto *switch_bb = llvm::BasicBlock::Create(Ctx, "switch_bb", F);
+  auto *default_bb = llvm::BasicBlock::Create(Ctx, "default_bb", F);
+
+  // bounds_check: icmp ule %idx, 3
+  llvm::IRBuilder<> B(bounds_bb);
+  auto *idx_ptr = B.CreateAlloca(i64_ty);
+  auto *idx = B.CreateLoad(i64_ty, idx_ptr, "idx");
+  auto *cmp = B.CreateICmpULE(idx, llvm::ConstantInt::get(i64_ty, 3));
+  B.CreateCondBr(cmp, switch_bb, default_bb);
+
+  B.SetInsertPoint(switch_bb);
+  auto *scaled = B.CreateShl(idx, llvm::ConstantInt::get(i64_ty, 3));
+  auto *addr = B.CreateAdd(scaled, llvm::ConstantInt::get(i64_ty, 0x140050000));
+  auto *ptr = B.CreateIntToPtr(addr, ptr_ty);
+  auto *target = B.CreateLoad(i64_ty, ptr, "entry_val");
+  auto *result = B.CreateCall(dispatch, {F->getArg(0), target, F->getArg(2)});
+  B.CreateRet(result);
+
+  B.SetInsertPoint(default_bb);
+  auto *def_result = B.CreateCall(
+      dispatch, {F->getArg(0), llvm::ConstantInt::get(i64_ty, 0), F->getArg(2)});
+  B.CreateRet(def_result);
+
+  bounds_bb->moveBefore(&F->getEntryBlock());
+
+  uint64_t table[4];
+  for (unsigned i = 0; i < 4; ++i)
+    table[i] = 0x140004100 + i * 0x10;
+
+  omill::BinaryMemoryMap map;
+  map.addRegion(0x140050000, reinterpret_cast<const uint8_t *>(table), 32);
+
+  runPass(M.get(), std::move(map));
+
+  EXPECT_TRUE(hasSwitchInst(F));
+  EXPECT_EQ(countSwitchCases(F), 4u);
+  EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+}
+
 }  // namespace

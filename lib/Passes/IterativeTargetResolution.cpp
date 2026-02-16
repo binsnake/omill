@@ -6,12 +6,16 @@
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar/GVN.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
+#include <llvm/Transforms/Utils/FixIrreducible.h>
+#include <llvm/Transforms/Utils/LCSSA.h>
+#include <llvm/Transforms/Utils/LoopSimplify.h>
 
 #include "omill/Passes/ConstantMemoryFolding.h"
 #include "omill/Passes/EliminateDeadPaths.h"
 #include "omill/Passes/LowerResolvedDispatchCalls.h"
 #include "omill/Passes/RecoverJumpTables.h"
 #include "omill/Passes/ResolveDispatchTargets.h"
+#include "omill/Passes/SymbolicJumpTableSolver.h"
 
 namespace omill {
 
@@ -51,9 +55,12 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
   bool ever_changed = false;
 
   do {
-    // Step 1: Let LLVM expose new constants.
+    // Step 1: CFG canonicalization + LLVM optimizations.
     {
       llvm::FunctionPassManager FPM;
+      FPM.addPass(llvm::FixIrreduciblePass());
+      FPM.addPass(llvm::LoopSimplifyPass());
+      FPM.addPass(llvm::LCSSAPass());
       FPM.addPass(llvm::InstCombinePass());
       FPM.addPass(llvm::GVNPass());
       FPM.addPass(llvm::SimplifyCFGPass());
@@ -69,6 +76,7 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
       llvm::FunctionPassManager FPM;
       FPM.addPass(ResolveDispatchTargetsPass());
       FPM.addPass(RecoverJumpTablesPass());
+      FPM.addPass(SymbolicJumpTableSolverPass());
       FPM.addPass(LowerResolvedDispatchCallsPass());
       auto adaptor = llvm::createModuleToFunctionPassAdaptor(std::move(FPM));
       adaptor.run(M, MAM);

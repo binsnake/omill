@@ -55,6 +55,7 @@ add_executable(omill-unit-tests
   unit/ResolveLazyImportsTest.cpp
   unit/ResolveDispatchTargetsTest.cpp
   unit/RecoverJumpTablesTest.cpp
+  unit/SymbolicJumpTableSolverTest.cpp
   unit/EliminateDeadPathsTest.cpp
   unit/HyperCallCodegenTest.cpp
 )
