@@ -2,6 +2,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/BinaryFormat/COFF.h>
 #include <llvm/Object/COFF.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/CommandLine.h>
@@ -112,11 +113,16 @@ class BufferTraceManager : public remill::TraceManager {
   uint64_t base_addr_ = 0;
 };
 
+struct SectionInfo {
+  uint64_t va;
+  size_t size;
+  size_t storage_index;  // index into section_storage
+};
+
 struct PEInfo {
   std::deque<std::vector<uint8_t>> section_storage;
   omill::BinaryMemoryMap memory_map;
-  uint64_t text_base = 0;
-  uint64_t text_size = 0;
+  std::vector<SectionInfo> code_sections;
   uint64_t image_base = 0;
 };
 
@@ -162,24 +168,23 @@ bool loadPE(StringRef path, PEInfo &out) {
   }
 
   for (const auto &sec : coff.sections()) {
-    auto name_or_err = sec.getName();
-    if (!name_or_err) { consumeError(name_or_err.takeError()); continue; }
-    StringRef name = *name_or_err;
-
     auto contents_or_err = sec.getContents();
     if (!contents_or_err) { consumeError(contents_or_err.takeError()); continue; }
     StringRef contents = *contents_or_err;
 
     uint64_t va = sec.getAddress();
+    size_t idx = out.section_storage.size();
     out.section_storage.emplace_back(
         reinterpret_cast<const uint8_t *>(contents.data()),
         reinterpret_cast<const uint8_t *>(contents.data()) + contents.size());
     auto &stored = out.section_storage.back();
     out.memory_map.addRegion(va, stored.data(), stored.size());
 
-    if (name == ".text") {
-      out.text_base = va;
-      out.text_size = stored.size();
+    // Track all executable sections for the trace manager.
+    const auto *coff_sec = coff.getCOFFSection(sec);
+    if (coff_sec && (coff_sec->Characteristics &
+                     (COFF::IMAGE_SCN_CNT_CODE | COFF::IMAGE_SCN_MEM_EXECUTE))) {
+      out.code_sections.push_back({va, stored.size(), idx});
     }
   }
   return true;
@@ -210,8 +215,16 @@ int main(int argc, char **argv) {
   PEInfo pe;
   if (!loadPE(InputFilename, pe)) return 1;
   errs() << "Loaded PE: image_base=0x" << Twine::utohexstr(pe.image_base)
-         << " .text=0x" << Twine::utohexstr(pe.text_base)
-         << " (" << pe.text_size << " bytes)\n";
+         << " code_sections=" << pe.code_sections.size() << "\n";
+  for (const auto &cs : pe.code_sections) {
+    errs() << "  code: 0x" << Twine::utohexstr(cs.va)
+           << " (" << cs.size << " bytes)\n";
+  }
+
+  if (pe.code_sections.empty()) {
+    errs() << "No executable sections found in PE\n";
+    return 1;
+  }
 
   // Set up remill
   LLVMContext ctx;
@@ -227,16 +240,12 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // Read .text section
-  std::vector<uint8_t> text_copy(pe.text_size);
-  if (!pe.memory_map.read(pe.text_base, text_copy.data(),
-                           static_cast<unsigned>(pe.text_size))) {
-    errs() << "Failed to read .text section\n";
-    return 1;
-  }
-
+  // Load all executable sections into the trace manager.
   BufferTraceManager manager;
-  manager.setCode(text_copy.data(), text_copy.size(), pe.text_base);
+  for (const auto &cs : pe.code_sections) {
+    auto &stored = pe.section_storage[cs.storage_index];
+    manager.setCode(stored.data(), stored.size(), cs.va);
+  }
   manager.setBaseAddr(func_va);
 
   // Lift
