@@ -44,6 +44,7 @@ add_library(omill STATIC
   Passes/ConstantMemoryFolding.cpp
   Passes/HashImportAnnotation.cpp
   Passes/ResolveLazyImports.cpp
+  Passes/RecoverGlobalTypes.cpp
   Passes/LowerResolvedDispatchCalls.cpp
   Passes/FoldProgramCounter.cpp
   Passes/ResolveIATCalls.cpp

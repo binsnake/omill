@@ -45,6 +45,7 @@
 #include "omill/Passes/LowerResolvedDispatchCalls.h"
 #include "omill/Passes/FoldProgramCounter.h"
 #include "omill/Passes/OutlineConstantStackData.h"
+#include "omill/Passes/RecoverGlobalTypes.h"
 #include "omill/Passes/ResolveIATCalls.h"
 #include "omill/Passes/ResolveDispatchTargets.h"
 #include "omill/Passes/InterProceduralConstProp.h"
@@ -169,6 +170,8 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM) {
 #endif
 
   FPM.addPass(ConstantMemoryFoldingPass());
+  // Recover string constants from inttoptr(address) patterns.
+  FPM.addPass(RecoverGlobalTypesPass());
   // LLVM cleanup to fold constants exposed by memory folding.
   FPM.addPass(llvm::InstCombinePass());
   FPM.addPass(llvm::GVNPass());
