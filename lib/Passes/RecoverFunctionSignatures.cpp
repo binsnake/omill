@@ -151,6 +151,9 @@ llvm::PreservedAnalyses RecoverFunctionSignaturesPass::run(
   for (auto *F : functions) {
     auto *abi = cc_info.getABI(F);
     if (!abi) continue;
+    // Skip functions with non-standard register usage (e.g. XMM live-ins).
+    // These can't be correctly modeled with GPR-only native wrappers.
+    if (abi->has_non_standard_regs) continue;
     createNativeWrapper(F, *abi, field_map);
     changed = true;
   }

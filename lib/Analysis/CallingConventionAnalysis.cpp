@@ -187,6 +187,18 @@ FunctionABI analyzeFunction(llvm::Function &F, const llvm::DataLayout &DL,
     abi.ret = ret;
   }
 
+  // Detect non-standard register usage: XMM/vector live-ins.
+  // Any live-in that maps to a vector register in the StateFieldMap means
+  // the function depends on XMM/YMM/ZMM values that the GPR-only native
+  // wrapper can't provide.
+  for (auto off : live_in) {
+    auto field = field_map.fieldAtOffset(off);
+    if (field && field->category == StateFieldCategory::kVector) {
+      abi.has_non_standard_regs = true;
+      break;
+    }
+  }
+
   // Identify clobbered callee-saved registers.
   // In Win64, RBX, RBP, RDI, RSI, R12-R15 are nonvolatile.
   for (unsigned i = 0; i < kWin64CalleeSavedCount; ++i) {

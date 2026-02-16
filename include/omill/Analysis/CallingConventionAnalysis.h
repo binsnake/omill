@@ -49,6 +49,10 @@ struct FunctionABI {
   /// Win64 shadow space (home area) size in bytes. Always 32 for Win64.
   unsigned shadow_space_size = 0;
 
+  /// True if the function has non-standard register usage (e.g. XMM live-ins)
+  /// that can't be modeled by the detected calling convention.
+  bool has_non_standard_regs = false;
+
   bool isVoid() const { return !ret.has_value(); }
   unsigned numParams() const { return params.size(); }
 };

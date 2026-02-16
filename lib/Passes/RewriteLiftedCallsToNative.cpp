@@ -171,7 +171,9 @@ void collectCandidates(llvm::Function &F, const LiftedFunctionMap &lifted,
 }
 
 /// Create or get the native dispatch function that maps original PCs to
-/// _native wrapper calls.  Signature: i64(i64 pc, i64 rcx, i64 rdx, i64 r8, i64 r9).
+/// _native wrapper calls or lifted function calls (for functions with
+/// non-standard register usage).
+/// Signature: i64(ptr state, i64 pc, i64 rcx, i64 rdx, i64 r8, i64 r9).
 llvm::Function *getOrCreateNativeDispatch(
     llvm::Module &M, const LiftedFunctionMap &lifted,
     const CallingConventionInfo &cc_info) {
@@ -180,9 +182,10 @@ llvm::Function *getOrCreateNativeDispatch(
 
   auto &Ctx = M.getContext();
   auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::getUnqual(Ctx);
 
   auto *fn_ty = llvm::FunctionType::get(
-      i64_ty, {i64_ty, i64_ty, i64_ty, i64_ty, i64_ty}, false);
+      i64_ty, {ptr_ty, i64_ty, i64_ty, i64_ty, i64_ty, i64_ty}, false);
   auto *fn = llvm::Function::Create(
       fn_ty, llvm::Function::InternalLinkage, "__omill_native_dispatch", M);
   fn->addFnAttr(llvm::Attribute::NoUnwind);
@@ -196,7 +199,8 @@ llvm::Function *getOrCreateNativeDispatch(
   }
 
   llvm::IRBuilder<> Builder(entry_bb);
-  auto *pc_arg = fn->getArg(0);
+  auto *state_arg = fn->getArg(0);
+  auto *pc_arg = fn->getArg(1);
   auto *sw = Builder.CreateSwitch(pc_arg, default_bb);
 
   for (auto &F : M) {
@@ -204,10 +208,6 @@ llvm::Function *getOrCreateNativeDispatch(
 
     uint64_t va = extractEntryVA(F.getName());
     if (va == 0) continue;
-
-    std::string native_name = F.getName().str() + "_native";
-    auto *native_fn = M.getFunction(native_name);
-    if (!native_fn) continue;
 
     auto *abi = cc_info.getABI(&F);
     if (!abi) continue;
@@ -218,16 +218,37 @@ llvm::Function *getOrCreateNativeDispatch(
 
     llvm::IRBuilder<> CaseB(case_bb);
 
-    llvm::SmallVector<llvm::Value *, 4> args;
-    for (unsigned i = 0; i < abi->numParams(); ++i) {
-      args.push_back(fn->getArg(1 + i));
-    }
+    std::string native_name = F.getName().str() + "_native";
+    auto *native_fn = M.getFunction(native_name);
 
-    auto *result = CaseB.CreateCall(native_fn, args);
-    if (abi->ret.has_value()) {
-      CaseB.CreateRet(result);
+    if (native_fn && !abi->has_non_standard_regs) {
+      // Native target: pass GPR args from dispatch params.
+      llvm::SmallVector<llvm::Value *, 4> args;
+      for (unsigned i = 0; i < abi->numParams(); ++i) {
+        args.push_back(fn->getArg(2 + i));
+      }
+
+      auto *result = CaseB.CreateCall(native_fn, args);
+      if (abi->ret.has_value()) {
+        CaseB.CreateRet(result);
+      } else {
+        CaseB.CreateRet(CaseB.getInt64(0));
+      }
     } else {
-      CaseB.CreateRet(CaseB.getInt64(0));
+      // Lifted-only target (non-standard regs): call with State directly.
+      auto *lifted_ty = F.getFunctionType();
+      llvm::SmallVector<llvm::Value *, 3> args;
+      args.push_back(state_arg);
+      if (lifted_ty->getNumParams() > 1)
+        args.push_back(CaseB.getInt64(va));
+      if (lifted_ty->getNumParams() > 2)
+        args.push_back(llvm::PoisonValue::get(lifted_ty->getParamType(2)));
+
+      CaseB.CreateCall(&F, args);
+
+      // Load RAX from State for return value.
+      auto *rax = buildStateLoad(CaseB, state_arg, kRAXOffset, "rax");
+      CaseB.CreateRet(rax);
     }
   }
 
@@ -253,6 +274,14 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
 
     for (auto &cand : candidates) {
       if (cand.lifted_definition) {
+        // Functions with non-standard register usage (XMM live-ins):
+        // keep the lifted call so all State fields flow through correctly.
+        auto *abi = cc_info.getABI(cand.lifted_definition);
+        if (abi && abi->has_non_standard_regs) {
+          fixupForwardDeclarationCall(cand.call, cand.lifted_definition);
+          continue;
+        }
+
         // Static target: call the _native wrapper directly.
         std::string native_name =
             cand.lifted_definition->getName().str() + "_native";
@@ -261,7 +290,6 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
 
         if (native_fn == &F) continue;
 
-        auto *abi = cc_info.getABI(cand.lifted_definition);
         if (!abi) continue;
 
         llvm::IRBuilder<> Builder(cand.call);
@@ -300,7 +328,9 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
             buildStateLoad(Builder, cand.state_ptr, kR9Offset, "r9");
 
         auto *result = Builder.CreateCall(
-            dispatch_fn, {target_pc, rcx, rdx, r8, r9}, "dispatch.result");
+            dispatch_fn,
+            {cand.state_ptr, target_pc, rcx, rdx, r8, r9},
+            "dispatch.result");
 
         buildStateStore(Builder, cand.state_ptr, kRAXOffset, result);
       }
