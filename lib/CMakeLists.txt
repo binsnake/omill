@@ -54,6 +54,10 @@ add_library(omill STATIC
   Passes/IterativeTargetResolution.cpp
   Passes/OutlineConstantStackData.cpp
   Passes/CoalesceByteReassembly.cpp
+  Passes/DeadStateRoundtripElimination.cpp
+  Passes/CollapsePartialXMMWrites.cpp
+  Passes/EliminateRedundantByteStores.cpp
+  Passes/SimplifyVectorFlagComputation.cpp
   Passes/RecoverJumpTables.cpp
   Passes/SymbolicJumpTableSolver.cpp
   Passes/EliminateDeadPaths.cpp

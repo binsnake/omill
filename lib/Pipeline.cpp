@@ -46,6 +46,10 @@
 #include "omill/Passes/LowerResolvedDispatchCalls.h"
 #include "omill/Passes/FoldProgramCounter.h"
 #include "omill/Passes/CoalesceByteReassembly.h"
+#include "omill/Passes/CollapsePartialXMMWrites.h"
+#include "omill/Passes/DeadStateRoundtripElimination.h"
+#include "omill/Passes/EliminateRedundantByteStores.h"
+#include "omill/Passes/SimplifyVectorFlagComputation.h"
 #include "omill/Passes/OutlineConstantStackData.h"
 #include "omill/Passes/RecoverGlobalTypes.h"
 #include "omill/Passes/ResolveIATCalls.h"
@@ -169,7 +173,10 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM) {
   FPM.addPass(llvm::InstCombinePass());
   FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
   FPM.addPass(llvm::InstCombinePass());
+  FPM.addPass(CollapsePartialXMMWritesPass());
   FPM.addPass(CoalesceByteReassemblyPass());
+  FPM.addPass(SimplifyVectorFlagComputationPass());
+  FPM.addPass(EliminateRedundantByteStoresPass());
 #if OMILL_ENABLE_SIMPLIFIER
   FPM.addPass(SimplifyMBAPass());
   FPM.addPass(llvm::InstCombinePass());
@@ -181,7 +188,10 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM) {
   // LLVM cleanup to fold constants exposed by memory folding.
   FPM.addPass(llvm::InstCombinePass());
   FPM.addPass(llvm::GVNPass());
+  FPM.addPass(CollapsePartialXMMWritesPass());
   FPM.addPass(CoalesceByteReassemblyPass());
+  FPM.addPass(SimplifyVectorFlagComputationPass());
+  FPM.addPass(DeadStateRoundtripEliminationPass());
   FPM.addPass(llvm::DCEPass());
   // Promote stack allocas with all-constant stores to global constants.
   // After xorstr folding, decrypted strings are constant stores to allocas;
