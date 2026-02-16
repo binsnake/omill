@@ -187,7 +187,7 @@ llvm::PreservedAnalyses ResolveForcedExceptionsPass::run(
   // Collect all __remill_error calls in this function.
   struct Candidate {
     llvm::CallInst *CI;
-    uint64_t pc;  // The error PC (next instruction after fault)
+    llvm::Value *error_pc;  // The error PC (SSA value, may not be constant yet)
   };
   llvm::SmallVector<Candidate, 4> candidates;
 
@@ -199,12 +199,7 @@ llvm::PreservedAnalyses ResolveForcedExceptionsPass::run(
       if (table.classifyCall(CI) != IntrinsicKind::kError)
         continue;
 
-      // Extract constant PC (arg1) for use in EXCEPTION_RECORD.
-      auto *pc_ci = llvm::dyn_cast<llvm::ConstantInt>(CI->getArgOperand(1));
-      if (!pc_ci)
-        continue;
-
-      candidates.push_back({CI, pc_ci->getZExtValue()});
+      candidates.push_back({CI, CI->getArgOperand(1)});
     }
   }
 
@@ -223,7 +218,7 @@ llvm::PreservedAnalyses ResolveForcedExceptionsPass::run(
   auto dispatcher =
       M.getOrInsertFunction("__omill_dispatch_jump", lifted_fn_ty);
 
-  for (auto &[CI, pc] : candidates) {
+  for (auto &[CI, error_pc] : candidates) {
     llvm::IRBuilder<> Builder(CI);
     auto *BB = CI->getParent();
 
@@ -266,9 +261,9 @@ llvm::PreservedAnalyses ResolveForcedExceptionsPass::run(
       storeCtxXMM(Builder, ctx_alloca, n, val);
     }
 
-    // Set CONTEXT.Rip = pc of the faulting instruction.
-    storeCtxI64(Builder, ctx_alloca, kContextRipOffset,
-                Builder.getInt64(pc));
+    // Set CONTEXT.Rip = error PC (the faulting instruction's next-PC).
+    // This is an SSA value that becomes constant after FoldProgramCounter.
+    storeCtxI64(Builder, ctx_alloca, kContextRipOffset, error_pc);
 
     // (c) Fill EXCEPTION_RECORD.
     //     ExceptionCode = STATUS_ILLEGAL_INSTRUCTION (0xC000001D)
@@ -277,11 +272,10 @@ llvm::PreservedAnalyses ResolveForcedExceptionsPass::run(
     Builder.CreateStore(Builder.getInt32(kStatusIllegalInstruction),
                         exrec_code_ptr);
 
-    //     ExceptionAddress = pc (as pointer-sized int stored as i64)
+    //     ExceptionAddress = error PC
     auto *exrec_addr_ptr = gepByteOffset(Builder, exrec_alloca,
                                           kExRecAddressOffset);
-    // ExceptionAddress is a PVOID (8 bytes on x64), store as i64.
-    Builder.CreateStore(Builder.getInt64(pc), exrec_addr_ptr);
+    Builder.CreateStore(error_pc, exrec_addr_ptr);
 
     // (d) Store handler args into State (Win64 ABI).
     //     RCX = &EXCEPTION_RECORD
