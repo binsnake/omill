@@ -47,6 +47,7 @@ add_library(omill STATIC
   Passes/FoldProgramCounter.cpp
   Passes/ResolveIATCalls.cpp
   Passes/ResolveDispatchTargets.cpp
+  Passes/InterProceduralConstProp.cpp
   Passes/IterativeTargetResolution.cpp
   Passes/OutlineConstantStackData.cpp
   Passes/RecoverJumpTables.cpp

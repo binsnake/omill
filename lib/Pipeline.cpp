@@ -46,6 +46,7 @@
 #include "omill/Passes/OutlineConstantStackData.h"
 #include "omill/Passes/ResolveIATCalls.h"
 #include "omill/Passes/ResolveDispatchTargets.h"
+#include "omill/Passes/InterProceduralConstProp.h"
 #include "omill/Passes/IterativeTargetResolution.h"
 #include "omill/Passes/EliminateDeadPaths.h"
 #if OMILL_ENABLE_SIMPLIFIER
@@ -229,6 +230,17 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   if (opts.resolve_indirect_targets) {
     MPM.addPass(
         IterativeTargetResolutionPass(opts.max_resolution_iterations));
+  }
+
+  // Phase 3.7: Inter-procedural constant propagation.
+  if (opts.interprocedural_const_prop || opts.resolve_indirect_targets) {
+    MPM.addPass(llvm::RequireAnalysisPass<CallGraphAnalysis, llvm::Module>());
+    MPM.addPass(InterProceduralConstPropPass());
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(ResolveDispatchTargetsPass());
+    FPM.addPass(LowerResolvedDispatchCallsPass());
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
   // Phase 4: ABI Recovery

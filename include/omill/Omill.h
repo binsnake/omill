@@ -27,6 +27,10 @@ struct PipelineOptions {
   /// Runs between Phase 3.5 and Phase 4.
   bool resolve_indirect_targets = false;
 
+  /// Inter-procedural constant propagation across call boundaries.
+  /// Auto-enabled when resolve_indirect_targets is on.
+  bool interprocedural_const_prop = false;
+
   /// Maximum iterations for iterative target resolution.
   unsigned max_resolution_iterations = 10;
 
