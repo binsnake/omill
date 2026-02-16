@@ -145,6 +145,10 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
+  // Ensure LiftedFunctionAnalysis is cached — RewriteLiftedCallsToNative needs
+  // it to resolve forward-declaration calls (sub_X → sub_X.N definition).
+  MPM.addPass(llvm::RequireAnalysisPass<LiftedFunctionAnalysis, llvm::Module>());
+
   // Signature recovery creates native wrappers; state elimination
   // internalizes the original lifted functions with alwaysinline.
   MPM.addPass(RecoverFunctionSignaturesPass());
