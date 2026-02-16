@@ -37,7 +37,6 @@ void buildStateStore(llvm::IRBuilder<> &Builder, llvm::Value *state_ptr,
 }
 
 /// Check if a function has the remill lifted signature: (ptr, i64, ptr) -> ptr.
-/// Unlike isLiftedFunction(), this does NOT require the function to be defined.
 bool hasLiftedSignature(const llvm::Function &F) {
   if (F.arg_size() != 3) return false;
   auto *FTy = F.getFunctionType();
@@ -45,6 +44,34 @@ bool hasLiftedSignature(const llvm::Function &F) {
   if (!FTy->getParamType(0)->isPointerTy()) return false;
   if (!FTy->getParamType(1)->isIntegerTy(64)) return false;
   if (!FTy->getParamType(2)->isPointerTy()) return false;
+  return true;
+}
+
+/// Check if a lifted function is a "leaf" — it doesn't call other lifted
+/// functions or dispatch_call/dispatch_jump.  Leaf functions can be safely
+/// inlined directly (sharing the caller's State pointer) instead of going
+/// through a _native wrapper, which preserves flag/State field semantics.
+bool isLeafLifted(const llvm::Function &F, const LiftedFunctionMap &lifted) {
+  for (auto &BB : F) {
+    for (auto &I : BB) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!call) continue;
+      auto *callee = call->getCalledFunction();
+      if (!callee) continue;
+
+      // Calls to other lifted functions.
+      if (isLiftedFunction(*callee))
+        return false;
+      // Calls to lifted forward declarations.
+      if (callee->isDeclaration() && hasLiftedSignature(*callee) &&
+          callee->getName().starts_with("sub_"))
+        return false;
+      // Dispatch calls/jumps.
+      if (callee->getName() == "__omill_dispatch_call" ||
+          callee->getName() == "__omill_dispatch_jump")
+        return false;
+    }
+  }
   return true;
 }
 
@@ -70,8 +97,17 @@ llvm::Function *resolveToDefinition(llvm::Function *callee,
   return nullptr;
 }
 
-/// Collect all calls that target lifted functions, plus dynamic dispatch
-/// calls/jumps (lifted_definition == nullptr for dynamic targets).
+/// Rewrite a direct call to a forward declaration so it targets the actual
+/// definition instead.  This ensures AlwaysInlinerPass can inline it.
+void fixupForwardDeclarationCall(llvm::CallInst *call,
+                                  llvm::Function *definition) {
+  auto *callee = call->getCalledFunction();
+  if (callee == definition) return;  // Already targeting the definition.
+
+  // The declaration and definition have the same type (lifted signature).
+  call->setCalledFunction(definition->getFunctionType(), definition);
+}
+
 void collectCandidates(llvm::Function &F, const LiftedFunctionMap &lifted,
                        llvm::SmallVectorImpl<RewriteCandidate> &candidates) {
   for (auto &BB : F) {
@@ -86,6 +122,13 @@ void collectCandidates(llvm::Function &F, const LiftedFunctionMap &lifted,
       if (call->arg_size() >= 1 && callee->getName().starts_with("sub_")) {
         auto *def = resolveToDefinition(callee, lifted);
         if (def) {
+          // Leaf functions: don't rewrite — let AlwaysInlinerPass inline them
+          // directly, preserving flag/State field semantics.  Just fix the
+          // call target if it's a forward declaration.
+          if (isLeafLifted(*def, lifted)) {
+            fixupForwardDeclarationCall(call, def);
+            continue;
+          }
           candidates.push_back({call, def, call->getArgOperand(0)});
           continue;
         }
@@ -147,13 +190,11 @@ llvm::Function *getOrCreateNativeDispatch(
   auto *entry_bb = llvm::BasicBlock::Create(Ctx, "entry", fn);
   auto *default_bb = llvm::BasicBlock::Create(Ctx, "unknown", fn);
 
-  // Default case: return 0 (unknown target).
   {
     llvm::IRBuilder<> Builder(default_bb);
     Builder.CreateRet(Builder.getInt64(0));
   }
 
-  // Build switch over all known lifted function PCs.
   llvm::IRBuilder<> Builder(entry_bb);
   auto *pc_arg = fn->getArg(0);
   auto *sw = Builder.CreateSwitch(pc_arg, default_bb);
@@ -177,10 +218,9 @@ llvm::Function *getOrCreateNativeDispatch(
 
     llvm::IRBuilder<> CaseB(case_bb);
 
-    // Pass the right number of params.
     llvm::SmallVector<llvm::Value *, 4> args;
     for (unsigned i = 0; i < abi->numParams(); ++i) {
-      args.push_back(fn->getArg(1 + i));  // rcx=1, rdx=2, r8=3, r9=4
+      args.push_back(fn->getArg(1 + i));
     }
 
     auto *result = CaseB.CreateCall(native_fn, args);
@@ -202,7 +242,7 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
   auto &lifted = MAM.getResult<LiftedFunctionAnalysis>(M);
 
   bool changed = false;
-  llvm::Function *dispatch_fn = nullptr;  // Lazy-created.
+  llvm::Function *dispatch_fn = nullptr;
 
   for (auto &F : M) {
     if (F.isDeclaration()) continue;
