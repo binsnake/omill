@@ -5,6 +5,7 @@ add_library(omill STATIC
   Utils/StateFieldMap.cpp
 
   # Analysis
+  Analysis/CallGraphAnalysis.cpp
   Analysis/LiftedFunctionMap.cpp
   Analysis/RemillIntrinsicAnalysis.cpp
   Analysis/StateFieldAccessAnalysis.cpp

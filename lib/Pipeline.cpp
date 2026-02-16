@@ -15,6 +15,7 @@
 #include <llvm/Transforms/Scalar/LoopDeletion.h>
 #include <llvm/Transforms/Scalar/LoopPassManager.h>
 
+#include "omill/Analysis/CallGraphAnalysis.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
 #include "omill/Analysis/RemillIntrinsicAnalysis.h"
 #include "omill/Passes/CFGRecovery.h"
@@ -265,6 +266,7 @@ void registerAnalyses(llvm::FunctionAnalysisManager &FAM) {
 }
 
 void registerModuleAnalyses(llvm::ModuleAnalysisManager &MAM) {
+  MAM.registerPass([&] { return CallGraphAnalysis(); });
   MAM.registerPass([&] { return CallingConventionAnalysis(); });
   MAM.registerPass([&] { return BinaryMemoryAnalysis(); });
   MAM.registerPass([&] { return LiftedFunctionAnalysis(); });

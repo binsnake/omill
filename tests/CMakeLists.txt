@@ -24,6 +24,7 @@ include(GoogleTest)
 llvm_map_components_to_libnames(_llvm_object_lib Object)
 
 add_executable(omill-unit-tests
+  unit/CallGraphAnalysisTest.cpp
   unit/IntrinsicTableTest.cpp
   unit/LowerFlagIntrinsicsTest.cpp
   unit/LowerMemoryIntrinsicsTest.cpp
