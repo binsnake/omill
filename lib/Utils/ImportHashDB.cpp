@@ -2,7 +2,6 @@
 
 #include <llvm/ADT/StringSet.h>
 #include <llvm/Support/MemoryBuffer.h>
-#include <llvm/Support/raw_ostream.h>
 
 #include <fstream>
 
@@ -94,10 +93,14 @@ void ImportHashDB::buildLookupTables() {
 std::optional<ImportHashDB::ResolvedImport> ImportHashDB::tryResolve(
     uint32_t hash_value) const {
   for (const auto &lt : lookup_tables_) {
+    // DenseMap<uint32_t> reserves 0xFFFFFFFF (empty key) and 0xFFFFFFFE
+    // (tombstone key) as sentinels — find() on these values is UB.
+    // Skip them; no builtin export hashes to either sentinel value.
+    if (hash_value >= 0xFFFFFFFEu)
+      continue;
     auto it = lt.table.find(hash_value);
-    if (it != lt.table.end()) {
+    if (it != lt.table.end())
       return ResolvedImport{exports_[it->second], lt.algo, lt.seed};
-    }
   }
   return std::nullopt;
 }
