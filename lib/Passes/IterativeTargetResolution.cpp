@@ -16,6 +16,9 @@
 #include "omill/Passes/RecoverJumpTables.h"
 #include "omill/Passes/ResolveDispatchTargets.h"
 #include "omill/Passes/SymbolicJumpTableSolver.h"
+#if OMILL_ENABLE_SOUPER
+#include "omill/Passes/Z3DispatchSolver.h"
+#endif
 
 namespace omill {
 
@@ -77,6 +80,9 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
       FPM.addPass(ResolveDispatchTargetsPass());
       FPM.addPass(RecoverJumpTablesPass());
       FPM.addPass(SymbolicJumpTableSolverPass());
+#if OMILL_ENABLE_SOUPER
+      FPM.addPass(Z3DispatchSolverPass());
+#endif
       FPM.addPass(LowerResolvedDispatchCallsPass());
       auto adaptor = llvm::createModuleToFunctionPassAdaptor(std::move(FPM));
       adaptor.run(M, MAM);

@@ -83,6 +83,10 @@ if(NOT MSVC)
   target_compile_options(omill-unit-tests PRIVATE -fno-rtti)
 endif()
 
+if(OMILL_ENABLE_SOUPER)
+  target_sources(omill-unit-tests PRIVATE unit/Z3DispatchSolverTest.cpp)
+endif()
+
 if(OMILL_ENABLE_SIMPLIFIER)
   target_sources(omill-unit-tests PRIVATE unit/SimplifyMBATest.cpp)
   eqsat_copy_dll(omill-unit-tests)
