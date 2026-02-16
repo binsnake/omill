@@ -179,25 +179,61 @@ void collectCandidates(llvm::Function &F, const LiftedFunctionMap &lifted,
   }
 }
 
+/// Collect the sorted union of all XMM live-in offsets across all lifted
+/// functions that could be dispatch targets.
+void collectAllXMMOffsets(llvm::Module &M, const CallingConventionInfo &cc_info,
+                          llvm::SmallVectorImpl<unsigned> &xmm_offsets) {
+  llvm::DenseSet<unsigned> seen;
+  for (auto &F : M) {
+    if (!isLiftedFunction(F)) continue;
+    auto *abi = cc_info.getABI(&F);
+    if (!abi) continue;
+    for (auto off : abi->xmm_live_ins) {
+      if (seen.insert(off).second) {
+        xmm_offsets.push_back(off);
+      }
+    }
+  }
+  llvm::sort(xmm_offsets);
+}
+
 /// Create or get the native dispatch function that maps original PCs to
-/// _native wrapper calls or lifted function calls (for functions with
-/// non-standard register usage).
-/// Signature: i64(ptr state, i64 pc, i64 rcx, i64 rdx, i64 r8, i64 r9).
+/// _native wrapper calls.
+/// Signature: i64(i64 pc, i64 rcx, i64 rdx, i64 r8, i64 r9, <2 x i64>...).
+/// XMM values are passed as extra params (no State pointer — avoids escaping
+/// the State alloca which would prevent dead store elimination).
 llvm::Function *getOrCreateNativeDispatch(
     llvm::Module &M, const LiftedFunctionMap &lifted,
-    const CallingConventionInfo &cc_info) {
+    const CallingConventionInfo &cc_info,
+    const llvm::SmallVectorImpl<unsigned> &all_xmm_offsets) {
   auto *existing = M.getFunction("__omill_native_dispatch");
   if (existing) return existing;
 
   auto &Ctx = M.getContext();
   auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
-  auto *ptr_ty = llvm::PointerType::getUnqual(Ctx);
+  auto *vec_ty = llvm::FixedVectorType::get(i64_ty, 2);
 
-  auto *fn_ty = llvm::FunctionType::get(
-      i64_ty, {ptr_ty, i64_ty, i64_ty, i64_ty, i64_ty, i64_ty}, false);
+  // Build param types: pc, rcx, rdx, r8, r9, then XMM params.
+  llvm::SmallVector<llvm::Type *, 24> param_types;
+  param_types.push_back(i64_ty);  // pc
+  param_types.push_back(i64_ty);  // rcx
+  param_types.push_back(i64_ty);  // rdx
+  param_types.push_back(i64_ty);  // r8
+  param_types.push_back(i64_ty);  // r9
+  for (unsigned i = 0; i < all_xmm_offsets.size(); ++i) {
+    param_types.push_back(vec_ty);
+  }
+
+  auto *fn_ty = llvm::FunctionType::get(i64_ty, param_types, false);
   auto *fn = llvm::Function::Create(
       fn_ty, llvm::Function::InternalLinkage, "__omill_native_dispatch", M);
   fn->addFnAttr(llvm::Attribute::NoUnwind);
+
+  // Build offset-to-param-index map for XMM params.
+  llvm::DenseMap<unsigned, unsigned> xmm_param_idx;
+  for (unsigned i = 0; i < all_xmm_offsets.size(); ++i) {
+    xmm_param_idx[all_xmm_offsets[i]] = 5 + i;  // after pc,rcx,rdx,r8,r9
+  }
 
   auto *entry_bb = llvm::BasicBlock::Create(Ctx, "entry", fn);
   auto *default_bb = llvm::BasicBlock::Create(Ctx, "unknown", fn);
@@ -208,8 +244,7 @@ llvm::Function *getOrCreateNativeDispatch(
   }
 
   llvm::IRBuilder<> Builder(entry_bb);
-  auto *state_arg = fn->getArg(0);
-  auto *pc_arg = fn->getArg(1);
+  auto *pc_arg = fn->getArg(0);
   auto *sw = Builder.CreateSwitch(pc_arg, default_bb);
 
   for (auto &F : M) {
@@ -230,17 +265,17 @@ llvm::Function *getOrCreateNativeDispatch(
     std::string native_name = F.getName().str() + "_native";
     auto *native_fn = M.getFunction(native_name);
 
-    // Pass GPR args from dispatch params + XMM values from State.
+    // Pass GPR args from dispatch params.
     llvm::SmallVector<llvm::Value *, 8> args;
     for (unsigned i = 0; i < abi->numParams(); ++i) {
-      args.push_back(fn->getArg(2 + i));
+      args.push_back(fn->getArg(1 + i));  // skip pc, take rcx/rdx/r8/r9
     }
 
-    // Load XMM live-in values from State for this target.
+    // Pass XMM values from dispatch params (not from State).
     for (auto xmm_off : abi->xmm_live_ins) {
-      args.push_back(buildStateLoadVec(
-          CaseB, state_arg, xmm_off,
-          "xmm_" + llvm::Twine(xmm_off)));
+      auto it = xmm_param_idx.find(xmm_off);
+      assert(it != xmm_param_idx.end());
+      args.push_back(fn->getArg(it->second));
     }
 
     auto *result = CaseB.CreateCall(native_fn, args);
@@ -263,6 +298,7 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
 
   bool changed = false;
   llvm::Function *dispatch_fn = nullptr;
+  llvm::SmallVector<unsigned, 16> all_xmm_offsets;
 
   for (auto &F : M) {
     if (F.isDeclaration()) continue;
@@ -311,8 +347,12 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
         }
       } else {
         // Dynamic target: dispatch through the native dispatch function.
-        if (!dispatch_fn)
-          dispatch_fn = getOrCreateNativeDispatch(M, lifted, cc_info);
+        // Collect all XMM offsets on first use.
+        if (!dispatch_fn) {
+          collectAllXMMOffsets(M, cc_info, all_xmm_offsets);
+          dispatch_fn = getOrCreateNativeDispatch(M, lifted, cc_info,
+                                                   all_xmm_offsets);
+        }
 
         llvm::IRBuilder<> Builder(cand.call);
 
@@ -326,10 +366,21 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
         auto *r9 =
             buildStateLoad(Builder, cand.state_ptr, kR9Offset, "r9");
 
+        // Load XMM values from State for all possible dispatch targets.
+        llvm::SmallVector<llvm::Value *, 24> dispatch_args;
+        dispatch_args.push_back(target_pc);
+        dispatch_args.push_back(rcx);
+        dispatch_args.push_back(rdx);
+        dispatch_args.push_back(r8);
+        dispatch_args.push_back(r9);
+        for (auto xmm_off : all_xmm_offsets) {
+          dispatch_args.push_back(buildStateLoadVec(
+              Builder, cand.state_ptr, xmm_off,
+              "xmm_" + llvm::Twine(xmm_off)));
+        }
+
         auto *result = Builder.CreateCall(
-            dispatch_fn,
-            {cand.state_ptr, target_pc, rcx, rdx, r8, r9},
-            "dispatch.result");
+            dispatch_fn, dispatch_args, "dispatch.result");
 
         buildStateStore(Builder, cand.state_ptr, kRAXOffset, result);
       }
