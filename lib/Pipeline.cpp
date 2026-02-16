@@ -22,6 +22,8 @@
 #include "omill/Passes/DeadStateFlagElimination.h"
 #include "omill/Passes/DeadStateStoreElimination.h"
 #include "omill/Passes/LowerAtomicIntrinsics.h"
+#include "omill/Analysis/ExceptionInfo.h"
+#include "omill/Passes/ResolveForcedExceptions.h"
 #include "omill/Passes/LowerErrorAndMissing.h"
 #include "omill/Passes/LowerFlagIntrinsics.h"
 #include "omill/Passes/LowerFunctionCall.h"
@@ -123,6 +125,7 @@ void buildStateOptimizationPipeline(llvm::FunctionPassManager &FPM,
 }
 
 void buildControlFlowPipeline(llvm::FunctionPassManager &FPM) {
+  FPM.addPass(ResolveForcedExceptionsPass());
   FPM.addPass(LowerErrorAndMissingPass());
   FPM.addPass(LowerFunctionReturnPass());
   FPM.addPass(LowerFunctionCallPass());
@@ -297,6 +300,9 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   // Build the lifted function index before control flow passes need it.
   MPM.addPass(llvm::RequireAnalysisPass<LiftedFunctionAnalysis, llvm::Module>());
 
+  // Cache exception info before control flow passes need it.
+  MPM.addPass(llvm::RequireAnalysisPass<ExceptionInfoAnalysis, llvm::Module>());
+
   // Phase 3: Control Flow Recovery
   if (opts.lower_control_flow) {
     llvm::FunctionPassManager FPM;
@@ -373,6 +379,7 @@ void registerModuleAnalyses(llvm::ModuleAnalysisManager &MAM) {
   MAM.registerPass([&] { return CallingConventionAnalysis(); });
   MAM.registerPass([&] { return BinaryMemoryAnalysis(); });
   MAM.registerPass([&] { return LiftedFunctionAnalysis(); });
+  MAM.registerPass([&] { return ExceptionInfoAnalysis(); });
 }
 
 }  // namespace omill

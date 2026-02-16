@@ -9,6 +9,7 @@ add_library(omill STATIC
   Analysis/LiftedFunctionMap.cpp
   Analysis/RemillIntrinsicAnalysis.cpp
   Analysis/StateFieldAccessAnalysis.cpp
+  Analysis/ExceptionInfo.cpp
 
   # Passes - Stage 2: Intrinsic Lowering
   Passes/LowerFlagIntrinsics.cpp
@@ -28,6 +29,7 @@ add_library(omill STATIC
   Passes/LowerFunctionReturn.cpp
   Passes/LowerFunctionCall.cpp
   Passes/LowerJump.cpp
+  Passes/ResolveForcedExceptions.cpp
   Passes/LowerErrorAndMissing.cpp
   Passes/CFGRecovery.cpp
 

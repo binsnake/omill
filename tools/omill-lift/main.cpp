@@ -19,9 +19,12 @@
 #include <remill/BC/Util.h>
 #include <remill/OS/OS.h>
 
+#include <llvm/Support/Win64EH.h>
+
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/CallingConventionAnalysis.h"
 #include "omill/Analysis/CallGraphAnalysis.h"
+#include "omill/Analysis/ExceptionInfo.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
 #include "omill/Omill.h"
 
@@ -68,6 +71,11 @@ static cl::opt<bool> RefineSignatures(
 static cl::opt<bool> IPCP(
     "ipcp",
     cl::desc("Enable interprocedural constant propagation"),
+    cl::init(false));
+
+static cl::opt<bool> ResolveExceptions(
+    "resolve-exceptions",
+    cl::desc("Resolve forced exceptions (ud2/int3) via .pdata SEH handlers"),
     cl::init(false));
 
 namespace {
@@ -122,9 +130,73 @@ struct SectionInfo {
 struct PEInfo {
   std::deque<std::vector<uint8_t>> section_storage;
   omill::BinaryMemoryMap memory_map;
+  omill::ExceptionInfo exception_info;
   std::vector<SectionInfo> code_sections;
   uint64_t image_base = 0;
 };
+
+/// Parse .pdata (exception table) from a PE binary.
+/// Populates exception_info with RUNTIME_FUNCTION entries that have
+/// language-specific exception handlers.
+void parsePData(const object::COFFObjectFile &coff, uint64_t image_base,
+                omill::ExceptionInfo &exception_info) {
+  const object::data_directory *dd = coff.getDataDirectory(COFF::EXCEPTION_TABLE);
+  if (!dd || dd->RelativeVirtualAddress == 0 || dd->Size == 0)
+    return;
+
+  uintptr_t table_ptr = 0;
+  if (auto err = coff.getRvaPtr(dd->RelativeVirtualAddress, table_ptr)) {
+    consumeError(std::move(err));
+    return;
+  }
+
+  unsigned num_entries = dd->Size / sizeof(Win64EH::RuntimeFunction);
+  auto *entries = reinterpret_cast<const Win64EH::RuntimeFunction *>(table_ptr);
+
+  for (unsigned i = 0; i < num_entries; ++i) {
+    uint32_t begin_rva = entries[i].StartAddress;
+    uint32_t end_rva = entries[i].EndAddress;
+    uint32_t unwind_rva = entries[i].UnwindInfoOffset;
+
+    if (begin_rva == 0 && end_rva == 0)
+      continue;
+
+    // Follow unwind info chain to find the exception handler.
+    uint64_t handler_va = 0;
+    uint32_t current_unwind_rva = unwind_rva;
+
+    for (unsigned depth = 0; depth < 16; ++depth) {
+      uintptr_t unwind_ptr = 0;
+      if (auto err = coff.getRvaPtr(current_unwind_rva, unwind_ptr)) {
+        consumeError(std::move(err));
+        break;
+      }
+
+      auto *uwi =
+          reinterpret_cast<const Win64EH::UnwindInfo *>(unwind_ptr);
+      uint8_t flags = uwi->getFlags();
+
+      if (flags & Win64EH::UNW_ExceptionHandler) {
+        uint32_t handler_rva = uwi->getLanguageSpecificHandlerOffset();
+        handler_va = image_base + handler_rva;
+        break;
+      }
+
+      if (flags & Win64EH::UNW_ChainInfo) {
+        // Follow chain to next RUNTIME_FUNCTION.
+        auto *chained = uwi->getChainedFunctionEntry();
+        current_unwind_rva = chained->UnwindInfoOffset;
+        continue;
+      }
+
+      // No handler, no chain — done.
+      break;
+    }
+
+    exception_info.addEntry({image_base + begin_rva, image_base + end_rva,
+                             handler_va});
+  }
+}
 
 bool loadPE(StringRef path, PEInfo &out) {
   auto buf_or_err = MemoryBuffer::getFile(path);
@@ -187,6 +259,10 @@ bool loadPE(StringRef path, PEInfo &out) {
       out.code_sections.push_back({va, stored.size(), idx});
     }
   }
+
+  // Parse .pdata unconditionally (cheap); the flag controls usage.
+  parsePData(coff, out.image_base, out.exception_info);
+
   return true;
 }
 
@@ -248,11 +324,29 @@ int main(int argc, char **argv) {
   }
   manager.setBaseAddr(func_va);
 
+  if (ResolveExceptions && !pe.exception_info.empty()) {
+    errs() << "Parsed .pdata: " << pe.exception_info.getHandlerVAs().size()
+           << " unique handler(s)\n";
+  }
+
   // Lift
   remill::TraceLifter lifter(arch.get(), manager);
   if (!lifter.Lift(func_va)) {
     errs() << "TraceLifter::Lift() failed\n";
     return 1;
+  }
+
+  // Auto-lift exception handlers for the target function.
+  if (ResolveExceptions) {
+    auto *entry = pe.exception_info.lookup(func_va);
+    if (entry && entry->handler_va != 0) {
+      errs() << "Auto-lifting exception handler at 0x"
+             << Twine::utohexstr(entry->handler_va) << "\n";
+      if (!lifter.Lift(entry->handler_va)) {
+        errs() << "WARNING: failed to lift handler at 0x"
+               << Twine::utohexstr(entry->handler_va) << "\n";
+      }
+    }
   }
   errs() << "Lifting complete\n";
 
@@ -277,6 +371,13 @@ int main(int argc, char **argv) {
   MAM.registerPass([&] {
     return omill::BinaryMemoryAnalysis(pe.memory_map);
   });
+
+  // Register ExceptionInfoAnalysis with our parsed .pdata.
+  if (ResolveExceptions) {
+    MAM.registerPass([&] {
+      return omill::ExceptionInfoAnalysis(std::move(pe.exception_info));
+    });
+  }
 
   PB.registerModuleAnalyses(MAM);
   PB.registerCGSCCAnalyses(CGAM);
