@@ -57,6 +57,7 @@
 #include "omill/Passes/InterProceduralConstProp.h"
 #include "omill/Passes/IterativeTargetResolution.h"
 #include "omill/Passes/EliminateDeadPaths.h"
+#include "omill/Passes/FoldConstantVectorChains.h"
 #include "omill/Passes/RewriteLiftedCallsToNative.h"
 #if OMILL_ENABLE_Z3
 #include "omill/Passes/Z3DispatchSolver.h"
@@ -163,6 +164,13 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(llvm::GVNPass());
+    // Fold cascaded shufflevector chains to constants after GVN has
+    // propagated known values into vector blends.  SROA creates multi-level
+    // shufflevector chains that hide constant values; GVN resolves the
+    // non-constant operands, then this pass traces per-element constants
+    // through the remaining chains.
+    FPM.addPass(FoldConstantVectorChainsPass());
+    FPM.addPass(llvm::InstCombinePass());
     // Safety net: remove any remaining dead loops (e.g. PEB-walking loops
     // whose results are fully dead after State struct elimination).
     FPM.addPass(llvm::createFunctionToLoopPassAdaptor(llvm::LoopDeletionPass()));
@@ -194,6 +202,8 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM) {
   // LLVM cleanup to fold constants exposed by memory folding.
   FPM.addPass(llvm::InstCombinePass());
   FPM.addPass(llvm::GVNPass());
+  FPM.addPass(FoldConstantVectorChainsPass());
+  FPM.addPass(llvm::InstCombinePass());
   FPM.addPass(CollapsePartialXMMWritesPass());
   FPM.addPass(CoalesceByteReassemblyPass());
   FPM.addPass(SimplifyVectorFlagComputationPass());
