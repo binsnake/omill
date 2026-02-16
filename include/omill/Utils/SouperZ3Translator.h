@@ -9,6 +9,8 @@
 
 namespace omill {
 
+class BinaryMemoryMap;
+
 /// Translates LLVM IR def-use chains to Z3 bitvector expressions.
 ///
 /// Walks backward from a given llvm::Value through its defining instructions,
@@ -32,6 +34,17 @@ class LLVMZ3Translator {
   /// (loads, arguments, etc.).
   z3::expr getFreshVar(llvm::Value *val);
 
+  /// Set the binary memory map for memory-aware translation.
+  /// When set, loads from computable constant addresses will be resolved
+  /// to concrete values from binary memory instead of fresh variables.
+  void setBinaryMemory(const BinaryMemoryMap *map) { binary_mem_ = map; }
+
+  /// Collect all fresh Z3 variables created during translation (loads,
+  /// arguments, PHIs that couldn't be resolved).  Useful for identifying
+  /// the "root cause" variable in recursive solving.
+  void getUnresolvedVars(
+      llvm::SmallVectorImpl<std::pair<llvm::Value *, z3::expr>> &out) const;
+
   /// Clear the translation cache.
   void reset();
 
@@ -40,9 +53,17 @@ class LLVMZ3Translator {
   llvm::DenseMap<llvm::Value *, z3::expr *> cache_;
   std::vector<std::unique_ptr<z3::expr>> owned_exprs_;
   unsigned var_counter_ = 0;
+  const BinaryMemoryMap *binary_mem_ = nullptr;
+
+  /// Track which LLVM Values became fresh Z3 variables.
+  llvm::SmallVector<std::pair<llvm::Value *, z3::expr *>, 8> fresh_vars_;
 
   z3::expr cacheResult(llvm::Value *val, z3::expr result);
   unsigned getWidth(llvm::Value *val) const;
+
+  /// Try to translate a PHI node by enumerating constant incoming values.
+  /// Returns std::nullopt if any incoming value is non-constant.
+  std::optional<z3::expr> tryTranslatePHI(llvm::PHINode *phi);
 };
 
 }  // namespace omill

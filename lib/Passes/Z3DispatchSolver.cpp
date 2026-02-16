@@ -29,6 +29,34 @@ static constexpr unsigned kMaxSolutions = 256;
 /// Maximum CFG depth for path constraint collection.
 static constexpr unsigned kMaxPathDepth = 8;
 
+/// Maximum recursion depth for recursive variable resolution.
+static constexpr unsigned kMaxRecursionDepth = 4;
+
+/// Maximum solutions to enumerate when resolving an intermediate variable.
+static constexpr unsigned kMaxVarSolutions = 64;
+
+// ---------------------------------------------------------------------------
+// Z3 tactic pipeline (ported from Dna's Z3Driver)
+// ---------------------------------------------------------------------------
+
+/// Create an optimized Z3 solver using a tactic pipeline instead of the
+/// default solver.  This chains: simplify → propagate-values →
+/// elim-uncnstr → smt, which handles bitvector arithmetic much better
+/// than the plain solver.
+z3::solver makeTacticalSolver(z3::context &ctx) {
+  auto simplify = z3::tactic(ctx, "simplify");
+  auto propagate = z3::tactic(ctx, "propagate-values");
+  auto elim = z3::tactic(ctx, "elim-uncnstr");
+  auto smt = z3::tactic(ctx, "smt");
+
+  auto combined = simplify & propagate & elim & smt;
+  return combined.mk_solver();
+}
+
+// ---------------------------------------------------------------------------
+// Path constraint collection
+// ---------------------------------------------------------------------------
+
 /// Collect path constraints by walking backward from `target_bb` through
 /// the CFG.  For each conditional branch along the path, we add a constraint
 /// that the condition holds (or doesn't) depending on which edge leads
@@ -84,6 +112,183 @@ void collectPathConstraints(llvm::BasicBlock *target_bb,
   }
 }
 
+// ---------------------------------------------------------------------------
+// Solution enumeration
+// ---------------------------------------------------------------------------
+
+/// Enumerate solutions for `target_expr` under the given constraints.
+/// Returns the solutions found (may be empty).  Stops after kMaxSolutions.
+llvm::SmallVector<uint64_t, 32>
+enumerateSolutions(z3::context &ctx, z3::expr &target_expr,
+                   llvm::ArrayRef<z3::expr> constraints,
+                   unsigned max_solutions) {
+  auto solver = makeTacticalSolver(ctx);
+
+  for (auto &c : constraints)
+    solver.add(c);
+
+  // Address range bounds: non-zero, within 48-bit Windows user-mode space.
+  solver.add(target_expr != ctx.bv_val(0, target_expr.get_sort().bv_size()));
+  if (target_expr.get_sort().bv_size() == 64)
+    solver.add(z3::ult(target_expr, ctx.bv_val(0x800000000000ULL, 64)));
+
+  llvm::SmallVector<uint64_t, 32> solutions;
+  while (solver.check() == z3::sat && solutions.size() < max_solutions) {
+    auto model = solver.get_model();
+    z3::expr val = model.eval(target_expr, true);
+
+    uint64_t solution = 0;
+    if (val.is_numeral()) {
+      solution = val.get_numeral_uint64();
+    } else {
+      break;
+    }
+
+    solutions.push_back(solution);
+
+    // Block this solution.
+    solver.add(target_expr !=
+               ctx.bv_val(solution, target_expr.get_sort().bv_size()));
+  }
+
+  return solutions;
+}
+
+// ---------------------------------------------------------------------------
+// Recursive variable resolution (ported from Dna's SouperJumpTableSolver)
+// ---------------------------------------------------------------------------
+
+/// Try to resolve a load by solving its pointer address and reading from
+/// binary memory.  Returns the set of possible concrete values the load
+/// can produce.
+llvm::SmallVector<uint64_t, 16>
+resolveLoadFromMemory(llvm::LoadInst *load, const BinaryMemoryMap &map,
+                      z3::context &ctx, LLVMZ3Translator &translator,
+                      llvm::ArrayRef<z3::expr> path_constraints,
+                      unsigned depth) {
+  llvm::SmallVector<uint64_t, 16> values;
+  if (depth >= kMaxRecursionDepth)
+    return values;
+
+  auto *ptr = load->getPointerOperand();
+
+  // Strip inttoptr.
+  llvm::Value *addr_val = nullptr;
+  if (auto *itp = llvm::dyn_cast<llvm::IntToPtrInst>(ptr))
+    addr_val = itp->getOperand(0);
+  else if (auto *ce = llvm::dyn_cast<llvm::ConstantExpr>(ptr)) {
+    if (ce->getOpcode() == llvm::Instruction::IntToPtr)
+      addr_val = ce->getOperand(0);
+  }
+
+  if (!addr_val)
+    return values;
+
+  // If address is already a constant, just read directly.
+  if (auto *ci = llvm::dyn_cast<llvm::ConstantInt>(addr_val)) {
+    unsigned byte_size = load->getType()->getIntegerBitWidth() / 8;
+    if (auto mem_val = map.readInt(ci->getZExtValue(), byte_size))
+      values.push_back(*mem_val);
+    return values;
+  }
+
+  // Translate the address expression and solve for possible addresses.
+  z3::expr addr_expr = translator.translate(addr_val);
+  auto addresses = enumerateSolutions(ctx, addr_expr, path_constraints,
+                                       kMaxVarSolutions);
+
+  // Read the value at each solved address.
+  unsigned byte_size = load->getType()->getIntegerBitWidth() / 8;
+  for (uint64_t addr : addresses) {
+    if (auto mem_val = map.readInt(addr, byte_size))
+      values.push_back(*mem_val);
+  }
+
+  return values;
+}
+
+/// Build OR-of-equalities bounding constraint: (var == v0) || (var == v1) || ...
+z3::expr buildBoundingConstraint(z3::context &ctx, z3::expr &var,
+                                  llvm::ArrayRef<uint64_t> values) {
+  unsigned bits = var.get_sort().bv_size();
+  z3::expr constraint = ctx.bool_val(false);
+  for (uint64_t v : values)
+    constraint = constraint || (var == ctx.bv_val(v, bits));
+  return constraint;
+}
+
+/// Recursively solve a dispatch target.  If the initial solve is unbounded,
+/// identify the root variable, solve its possible values (potentially by
+/// reading binary memory), constrain it, and retry.
+llvm::SmallVector<uint64_t, 32>
+recursiveSolve(z3::context &ctx, z3::expr target_expr,
+               LLVMZ3Translator &translator,
+               llvm::SmallVectorImpl<z3::expr> &constraints,
+               const BinaryMemoryMap &map, unsigned depth) {
+  // First try: enumerate solutions directly.
+  auto solutions = enumerateSolutions(ctx, target_expr, constraints,
+                                       kMaxSolutions);
+
+  // If we got a bounded number of solutions, we're done.
+  if (!solutions.empty() && solutions.size() < kMaxSolutions)
+    return solutions;
+
+  // Too many or zero solutions — try recursive resolution.
+  if (depth >= kMaxRecursionDepth)
+    return {};
+
+  // Find the single unresolved variable causing unboundedness.
+  llvm::SmallVector<std::pair<llvm::Value *, z3::expr>, 8> vars;
+  translator.getUnresolvedVars(vars);
+
+  for (auto &[llvm_val, z3_var] : vars) {
+    llvm::SmallVector<uint64_t, 16> var_values;
+
+    // Case 1: The variable is a load — try to dereference through memory.
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(llvm_val)) {
+      var_values =
+          resolveLoadFromMemory(load, map, ctx, translator, constraints, depth);
+    }
+
+    // Case 2: The variable is a PHI — check if we can enumerate its values.
+    if (auto *phi = llvm::dyn_cast<llvm::PHINode>(llvm_val)) {
+      for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i) {
+        if (auto *ci =
+                llvm::dyn_cast<llvm::ConstantInt>(phi->getIncomingValue(i))) {
+          uint64_t v = ci->getZExtValue();
+          bool found = false;
+          for (auto u : var_values)
+            if (u == v) { found = true; break; }
+          if (!found)
+            var_values.push_back(v);
+        }
+      }
+    }
+
+    if (var_values.empty())
+      continue;
+
+    // Add bounding constraint and retry.
+    auto z3_var_copy = z3_var;
+    auto bound = buildBoundingConstraint(ctx, z3_var_copy, var_values);
+    constraints.push_back(bound);
+
+    auto bounded_solutions = enumerateSolutions(ctx, target_expr, constraints,
+                                                 kMaxSolutions);
+    if (!bounded_solutions.empty() && bounded_solutions.size() < kMaxSolutions)
+      return bounded_solutions;
+
+    // Remove the constraint we just added if it didn't help.
+    constraints.pop_back();
+  }
+
+  return {};
+}
+
+// ---------------------------------------------------------------------------
+// Main solver
+// ---------------------------------------------------------------------------
+
 /// Try to resolve a dispatch_jump target using Z3 constraint solving.
 /// Returns true if the dispatch was resolved (switch built).
 bool solveDispatch(llvm::CallInst *dispatch_call, llvm::ReturnInst *ret,
@@ -98,10 +303,11 @@ bool solveDispatch(llvm::CallInst *dispatch_call, llvm::ReturnInst *ret,
       !llvm::isa<llvm::Argument>(target_val))
     return false;
 
-  // Set up Z3 solver.
+  // Set up Z3 context with timeout.
   z3::context ctx;
   ctx.set("timeout", static_cast<int>(5000));  // 5 second timeout per dispatch.
   LLVMZ3Translator translator(ctx);
+  translator.setBinaryMemory(&map);
 
   z3::expr target_expr = translator.translate(target_val);
 
@@ -110,35 +316,9 @@ bool solveDispatch(llvm::CallInst *dispatch_call, llvm::ReturnInst *ret,
   collectPathConstraints(dispatch_call->getParent(), translator,
                          path_constraints, kMaxPathDepth);
 
-  z3::solver solver(ctx);
-
-  // Add path constraints.
-  for (auto &pc : path_constraints)
-    solver.add(pc);
-
-  // Add address range bound: target must be a reasonable code address.
-  // Non-zero, within 48-bit address space (Windows user-mode limit).
-  solver.add(target_expr != ctx.bv_val(0, 64));
-  solver.add(z3::ult(target_expr, ctx.bv_val(0x800000000000ULL, 64)));
-
-  // Enumerate solutions.
-  llvm::SmallVector<uint64_t, 32> solutions;
-  while (solver.check() == z3::sat && solutions.size() < kMaxSolutions) {
-    auto model = solver.get_model();
-    z3::expr val = model.eval(target_expr, true);
-
-    uint64_t solution = 0;
-    if (val.is_numeral()) {
-      solution = val.get_numeral_uint64();
-    } else {
-      break;
-    }
-
-    solutions.push_back(solution);
-
-    // Block this solution.
-    solver.add(target_expr != ctx.bv_val(solution, 64));
-  }
+  // Use recursive solving to handle nested jump tables.
+  auto solutions = recursiveSolve(ctx, target_expr, translator,
+                                   path_constraints, map, 0);
 
   if (solutions.empty())
     return false;

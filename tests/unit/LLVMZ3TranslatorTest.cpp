@@ -9,6 +9,8 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
 
+#include "omill/Analysis/BinaryMemoryMap.h"
+
 #include <z3++.h>
 
 #include <gtest/gtest.h>
@@ -390,7 +392,6 @@ TEST_F(LLVMZ3TranslatorTest, LoadBecomesVariable) {
   auto *entry = llvm::BasicBlock::Create(LCtx, "entry", F);
   llvm::IRBuilder<> B(entry);
   auto *i64_ty = llvm::Type::getInt64Ty(LCtx);
-  auto *ptr_ty = llvm::PointerType::get(LCtx, 0);
 
   auto *alloca = B.CreateAlloca(i64_ty);
   auto *load = B.CreateLoad(i64_ty, alloca, "mem_val");
@@ -485,6 +486,285 @@ TEST_F(LLVMZ3TranslatorTest, UnsatConstraints) {
   z3::solver solver(Z3Ctx);
   solver.add(result == Z3Ctx.bv_val(5, 64));
   EXPECT_EQ(solver.check(), z3::unsat);
+
+  delete F->getParent();
+}
+
+// ---------------------------------------------------------------------------
+// New tests for enhanced translator features
+// ---------------------------------------------------------------------------
+
+TEST_F(LLVMZ3TranslatorTest, TracksUnresolvedVars) {
+  omill::LLVMZ3Translator translator(Z3Ctx);
+
+  auto *F = createFunc();
+  auto *entry = llvm::BasicBlock::Create(LCtx, "entry", F);
+  llvm::IRBuilder<> B(entry);
+  auto *i64_ty = llvm::Type::getInt64Ty(LCtx);
+
+  auto *alloca = B.CreateAlloca(i64_ty);
+  auto *load = B.CreateLoad(i64_ty, alloca, "val");
+  auto *add = B.CreateAdd(load, llvm::ConstantInt::get(i64_ty, 100));
+  B.CreateRet(add);
+
+  translator.translate(add);
+
+  llvm::SmallVector<std::pair<llvm::Value *, z3::expr>, 8> vars;
+  translator.getUnresolvedVars(vars);
+
+  // The load should be tracked as an unresolved variable.
+  EXPECT_EQ(vars.size(), 1u);
+  EXPECT_EQ(vars[0].first, load);
+
+  delete F->getParent();
+}
+
+TEST_F(LLVMZ3TranslatorTest, MemoryAwareLoadResolvesConstantAddress) {
+  omill::LLVMZ3Translator translator(Z3Ctx);
+
+  // Set up binary memory with a known value.
+  omill::BinaryMemoryMap map;
+  uint8_t data[] = {0x00, 0x11, 0x00, 0x40, 0x01, 0x00, 0x00, 0x00};
+  map.addRegion(0x140020000, data, sizeof(data));
+  translator.setBinaryMemory(&map);
+
+  auto *F = createFunc();
+  auto *entry = llvm::BasicBlock::Create(LCtx, "entry", F);
+  llvm::IRBuilder<> B(entry);
+  auto *i32_ty = llvm::Type::getInt32Ty(LCtx);
+  auto *i64_ty = llvm::Type::getInt64Ty(LCtx);
+  auto *ptr_ty = llvm::PointerType::get(LCtx, 0);
+
+  // Load from constant address: inttoptr(0x140020000) -> i32
+  auto *addr = llvm::ConstantInt::get(i64_ty, 0x140020000);
+  auto *ptr = B.CreateIntToPtr(addr, ptr_ty);
+  auto *load = B.CreateLoad(i32_ty, ptr, "mem_read");
+  B.CreateRet(B.CreateZExt(load, i64_ty));
+
+  z3::expr result = translator.translate(load);
+
+  // Should resolve to the concrete value from memory: 0x40001100 (LE)
+  EXPECT_TRUE(result.is_numeral());
+  EXPECT_EQ(result.get_numeral_uint64(), 0x40001100u);
+
+  // No unresolved vars since the load was resolved.
+  llvm::SmallVector<std::pair<llvm::Value *, z3::expr>, 8> vars;
+  translator.getUnresolvedVars(vars);
+  EXPECT_EQ(vars.size(), 0u);
+
+  delete F->getParent();
+}
+
+TEST_F(LLVMZ3TranslatorTest, MemoryAwareLoadFallsBackForUnknownAddr) {
+  omill::LLVMZ3Translator translator(Z3Ctx);
+
+  // Binary memory with no mapping at the load address.
+  omill::BinaryMemoryMap map;
+  uint8_t data[] = {0xAA};
+  map.addRegion(0x140010000, data, 1);
+  translator.setBinaryMemory(&map);
+
+  auto *F = createFunc();
+  auto *entry = llvm::BasicBlock::Create(LCtx, "entry", F);
+  llvm::IRBuilder<> B(entry);
+  auto *i64_ty = llvm::Type::getInt64Ty(LCtx);
+  auto *ptr_ty = llvm::PointerType::get(LCtx, 0);
+
+  // Load from unmapped address.
+  auto *addr = llvm::ConstantInt::get(i64_ty, 0x140099000);
+  auto *ptr = B.CreateIntToPtr(addr, ptr_ty);
+  auto *load = B.CreateLoad(i64_ty, ptr, "unmapped");
+  B.CreateRet(load);
+
+  z3::expr result = translator.translate(load);
+
+  // Should fall back to a fresh variable.
+  EXPECT_FALSE(result.is_numeral());
+
+  llvm::SmallVector<std::pair<llvm::Value *, z3::expr>, 8> vars;
+  translator.getUnresolvedVars(vars);
+  EXPECT_EQ(vars.size(), 1u);
+
+  delete F->getParent();
+}
+
+TEST_F(LLVMZ3TranslatorTest, PHIWithAllConstants) {
+  omill::LLVMZ3Translator translator(Z3Ctx);
+
+  auto *F = createFunc();
+  auto *bb1 = llvm::BasicBlock::Create(LCtx, "bb1", F);
+  auto *bb2 = llvm::BasicBlock::Create(LCtx, "bb2", F);
+  auto *merge = llvm::BasicBlock::Create(LCtx, "merge", F);
+
+  auto *i64_ty = llvm::Type::getInt64Ty(LCtx);
+
+  // bb1 → merge with val 10
+  llvm::IRBuilder<>(bb1).CreateBr(merge);
+  // bb2 → merge with val 20
+  llvm::IRBuilder<>(bb2).CreateBr(merge);
+
+  // PHI in merge with two constant incoming values.
+  llvm::IRBuilder<> B(merge);
+  auto *phi = B.CreatePHI(i64_ty, 2, "const_phi");
+  phi->addIncoming(llvm::ConstantInt::get(i64_ty, 10), bb1);
+  phi->addIncoming(llvm::ConstantInt::get(i64_ty, 20), bb2);
+  B.CreateRet(phi);
+
+  z3::expr result = translator.translate(phi);
+
+  // The PHI with all-constant values should produce an expression that
+  // can only be 10 or 20.
+  z3::solver solver(Z3Ctx);
+  solver.add(result == Z3Ctx.bv_val(10, 64));
+  EXPECT_EQ(solver.check(), z3::sat);
+
+  z3::solver solver2(Z3Ctx);
+  solver2.add(result == Z3Ctx.bv_val(20, 64));
+  EXPECT_EQ(solver2.check(), z3::sat);
+
+  // 15 should not be a valid value.
+  z3::solver solver3(Z3Ctx);
+  solver3.add(result == Z3Ctx.bv_val(15, 64));
+  EXPECT_EQ(solver3.check(), z3::unsat);
+
+  // No unresolved vars since the PHI was resolved.
+  llvm::SmallVector<std::pair<llvm::Value *, z3::expr>, 8> vars;
+  translator.getUnresolvedVars(vars);
+  EXPECT_EQ(vars.size(), 0u);
+
+  delete F->getParent();
+}
+
+TEST_F(LLVMZ3TranslatorTest, PHIWithSingleConstant) {
+  omill::LLVMZ3Translator translator(Z3Ctx);
+
+  auto *F = createFunc();
+  auto *bb1 = llvm::BasicBlock::Create(LCtx, "bb1", F);
+  auto *bb2 = llvm::BasicBlock::Create(LCtx, "bb2", F);
+  auto *merge = llvm::BasicBlock::Create(LCtx, "merge", F);
+
+  auto *i64_ty = llvm::Type::getInt64Ty(LCtx);
+
+  llvm::IRBuilder<>(bb1).CreateBr(merge);
+  llvm::IRBuilder<>(bb2).CreateBr(merge);
+
+  // PHI with the same constant from both paths.
+  llvm::IRBuilder<> B(merge);
+  auto *phi = B.CreatePHI(i64_ty, 2);
+  phi->addIncoming(llvm::ConstantInt::get(i64_ty, 42), bb1);
+  phi->addIncoming(llvm::ConstantInt::get(i64_ty, 42), bb2);
+  B.CreateRet(phi);
+
+  z3::expr result = translator.translate(phi);
+
+  // Should be exactly 42.
+  EXPECT_TRUE(result.is_numeral());
+  EXPECT_EQ(result.get_numeral_uint64(), 42u);
+
+  delete F->getParent();
+}
+
+TEST_F(LLVMZ3TranslatorTest, PHIWithNonConstantFallsBack) {
+  omill::LLVMZ3Translator translator(Z3Ctx);
+
+  auto *F = createFunc();
+  auto *bb1 = llvm::BasicBlock::Create(LCtx, "bb1", F);
+  auto *bb2 = llvm::BasicBlock::Create(LCtx, "bb2", F);
+  auto *merge = llvm::BasicBlock::Create(LCtx, "merge", F);
+
+  auto *i64_ty = llvm::Type::getInt64Ty(LCtx);
+
+  llvm::IRBuilder<>(bb1).CreateBr(merge);
+  llvm::IRBuilder<>(bb2).CreateBr(merge);
+
+  // PHI with one constant and one non-constant.
+  llvm::IRBuilder<> B(merge);
+  auto *phi = B.CreatePHI(i64_ty, 2);
+  phi->addIncoming(llvm::ConstantInt::get(i64_ty, 10), bb1);
+  phi->addIncoming(F->getArg(0), bb2);
+  B.CreateRet(phi);
+
+  z3::expr result = translator.translate(phi);
+
+  // Should fall back to fresh variable (non-constant incoming).
+  EXPECT_FALSE(result.is_numeral());
+
+  llvm::SmallVector<std::pair<llvm::Value *, z3::expr>, 8> vars;
+  translator.getUnresolvedVars(vars);
+  EXPECT_EQ(vars.size(), 1u);
+
+  delete F->getParent();
+}
+
+TEST_F(LLVMZ3TranslatorTest, LShrAndAShr) {
+  omill::LLVMZ3Translator translator(Z3Ctx);
+
+  auto *F = createFunc();
+  auto *entry = llvm::BasicBlock::Create(LCtx, "entry", F);
+  llvm::IRBuilder<> B(entry);
+  auto *i64_ty = llvm::Type::getInt64Ty(LCtx);
+
+  // lshr(0x80, 2) = 0x20
+  auto *lshr_val = B.CreateLShr(llvm::ConstantInt::get(i64_ty, 0x80),
+                                  llvm::ConstantInt::get(i64_ty, 2));
+  // ashr(0xFFFFFFFFFFFFFF80, 2) = 0xFFFFFFFFFFFFFFE0
+  auto *ashr_val = B.CreateAShr(
+      llvm::ConstantInt::get(i64_ty, 0xFFFFFFFFFFFFFF80ULL),
+      llvm::ConstantInt::get(i64_ty, 2));
+  B.CreateRet(lshr_val);
+
+  z3::solver solver(Z3Ctx);
+  solver.add(translator.translate(lshr_val) == Z3Ctx.bv_val(0x20, 64));
+  solver.add(translator.translate(ashr_val) ==
+             Z3Ctx.bv_val(0xFFFFFFFFFFFFFFE0ULL, 64));
+  EXPECT_EQ(solver.check(), z3::sat);
+
+  delete F->getParent();
+}
+
+TEST_F(LLVMZ3TranslatorTest, UDivAndSDiv) {
+  omill::LLVMZ3Translator translator(Z3Ctx);
+
+  auto *F = createFunc();
+  auto *entry = llvm::BasicBlock::Create(LCtx, "entry", F);
+  llvm::IRBuilder<> B(entry);
+  auto *i64_ty = llvm::Type::getInt64Ty(LCtx);
+
+  // udiv(100, 10) = 10
+  auto *udiv = B.CreateUDiv(llvm::ConstantInt::get(i64_ty, 100),
+                             llvm::ConstantInt::get(i64_ty, 10));
+  B.CreateRet(udiv);
+
+  z3::solver solver(Z3Ctx);
+  solver.add(translator.translate(udiv) == Z3Ctx.bv_val(10, 64));
+  EXPECT_EQ(solver.check(), z3::sat);
+
+  delete F->getParent();
+}
+
+TEST_F(LLVMZ3TranslatorTest, IntToPtrAndPtrToInt) {
+  omill::LLVMZ3Translator translator(Z3Ctx);
+
+  auto *F = createFunc();
+  auto *entry = llvm::BasicBlock::Create(LCtx, "entry", F);
+  llvm::IRBuilder<> B(entry);
+  auto *i64_ty = llvm::Type::getInt64Ty(LCtx);
+  auto *ptr_ty = llvm::PointerType::get(LCtx, 0);
+
+  // inttoptr(arg0) then ptrtoint back should be identity.
+  auto *ptr = B.CreateIntToPtr(F->getArg(0), ptr_ty);
+  auto *back = B.CreatePtrToInt(ptr, i64_ty);
+  B.CreateRet(back);
+
+  z3::expr result = translator.translate(back);
+  z3::expr arg0 = translator.translate(F->getArg(0));
+
+  // result should equal arg0.
+  z3::solver solver(Z3Ctx);
+  solver.add(arg0 == Z3Ctx.bv_val(0x140001000ULL, 64));
+  EXPECT_EQ(solver.check(), z3::sat);
+  EXPECT_EQ(solver.get_model().eval(result, true).get_numeral_uint64(),
+            0x140001000ULL);
 
   delete F->getParent();
 }

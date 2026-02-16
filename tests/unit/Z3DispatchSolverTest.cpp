@@ -329,8 +329,6 @@ TEST_F(Z3DispatchSolverTest, ResolvesInterFunction) {
 
   // Only one target: 0x140002000 (sub_B).
   B.SetInsertPoint(switch_bb);
-  auto *target = llvm::ConstantInt::get(i64_ty, 0x140002000);
-  // But we need a non-constant target for the solver to kick in.
   // Use: target = idx * 0 + 0x140002000 (add(mul(idx, 0), const)).
   auto *computed_target = B.CreateAdd(
       B.CreateMul(idx, llvm::ConstantInt::get(i64_ty, 0)),
@@ -429,6 +427,211 @@ TEST_F(Z3DispatchSolverTest, VerifiesMultipleDispatches) {
     if (llvm::isa<llvm::SwitchInst>(BB.getTerminator()))
       ++switch_count;
   EXPECT_GE(switch_count, 2u);
+  EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+}
+
+// ---------------------------------------------------------------------------
+// New tests for enhanced Z3 solver features
+// ---------------------------------------------------------------------------
+
+TEST_F(Z3DispatchSolverTest, ResolvesWithMemoryDereference) {
+  // Simulate an RVA jump table:
+  //   target = sext(load(inttoptr(table_base + idx*4))) + image_base
+  // The load reads from binary memory, and the solver should resolve it.
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(kDataLayout);
+  createDispatchJumpDecl(*M);
+
+  auto *i32_ty = llvm::Type::getInt32Ty(Ctx);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *dispatch = M->getFunction("__omill_dispatch_jump");
+
+  auto *F = llvm::Function::Create(liftedFnType(),
+                                    llvm::Function::ExternalLinkage,
+                                    "sub_140001000", *M);
+
+  // Create 3 target blocks at known addresses.
+  uint64_t target_addrs[] = {0x140001100, 0x140001200, 0x140001300};
+  for (unsigned i = 0; i < 3; ++i) {
+    char name[64];
+    snprintf(name, sizeof(name), "block_%llx",
+             (unsigned long long)target_addrs[i]);
+    auto *bb = llvm::BasicBlock::Create(Ctx, name, F);
+    llvm::IRBuilder<>(bb).CreateRet(F->getArg(2));
+  }
+
+  // bounds_check: br (idx < 3), jt_bb, default_bb
+  auto *bounds_bb = llvm::BasicBlock::Create(Ctx, "bounds_check", F);
+  auto *jt_bb = llvm::BasicBlock::Create(Ctx, "jt_bb", F);
+  auto *default_bb = llvm::BasicBlock::Create(Ctx, "default_bb", F);
+
+  llvm::IRBuilder<> B(bounds_bb);
+  auto *idx_ptr = B.CreateAlloca(i64_ty);
+  auto *idx = B.CreateLoad(i64_ty, idx_ptr, "idx");
+  auto *cmp = B.CreateICmpULT(idx, llvm::ConstantInt::get(i64_ty, 3));
+  B.CreateCondBr(cmp, jt_bb, default_bb);
+
+  // jt_bb: target = sext(load(inttoptr(0x140020000 + idx*4))) + 0x140000000
+  B.SetInsertPoint(jt_bb);
+  auto *scaled = B.CreateShl(idx, llvm::ConstantInt::get(i64_ty, 2));
+  auto *table_addr =
+      B.CreateAdd(scaled, llvm::ConstantInt::get(i64_ty, 0x140020000));
+  auto *table_ptr = B.CreateIntToPtr(table_addr, ptr_ty);
+  auto *rva = B.CreateLoad(i32_ty, table_ptr, "rva");
+  auto *rva_wide = B.CreateSExt(rva, i64_ty);
+  auto *target =
+      B.CreateAdd(rva_wide, llvm::ConstantInt::get(i64_ty, 0x140000000));
+  auto *result =
+      B.CreateCall(dispatch, {F->getArg(0), target, F->getArg(2)});
+  B.CreateRet(result);
+
+  // default_bb
+  B.SetInsertPoint(default_bb);
+  auto *def_result = B.CreateCall(
+      dispatch,
+      {F->getArg(0), llvm::ConstantInt::get(i64_ty, 0), F->getArg(2)});
+  B.CreateRet(def_result);
+
+  bounds_bb->moveBefore(&F->getEntryBlock());
+
+  // Set up binary memory with RVA table entries.
+  // RVA[0] = 0x1100, RVA[1] = 0x1200, RVA[2] = 0x1300
+  // (target = RVA + 0x140000000)
+  omill::BinaryMemoryMap map;
+  uint8_t table_data[12];
+  // Entry 0: 0x00001100 (LE)
+  table_data[0] = 0x00; table_data[1] = 0x11;
+  table_data[2] = 0x00; table_data[3] = 0x00;
+  // Entry 1: 0x00001200 (LE)
+  table_data[4] = 0x00; table_data[5] = 0x12;
+  table_data[6] = 0x00; table_data[7] = 0x00;
+  // Entry 2: 0x00001300 (LE)
+  table_data[8] = 0x00; table_data[9] = 0x13;
+  table_data[10] = 0x00; table_data[11] = 0x00;
+
+  map.addRegion(0x140020000, table_data, sizeof(table_data));
+
+  runPass(M.get(), std::move(map));
+
+  // The solver should resolve all 3 targets via memory dereference.
+  EXPECT_TRUE(hasSwitchInst(F));
+  EXPECT_EQ(countSwitchCases(F), 3u);
+  EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+}
+
+TEST_F(Z3DispatchSolverTest, ResolvesNestedJumpTableViaRecursion) {
+  // Two-level dispatch: the target depends on a load from a table,
+  // but the table address itself depends on another computed value.
+  // target = sext(load(inttoptr(table_base + and(raw, 1)*4))) + image_base
+  // The AND mask bounds the index, so recursive resolution should
+  // find the load values and constrain them.
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(kDataLayout);
+  createDispatchJumpDecl(*M);
+
+  auto *i32_ty = llvm::Type::getInt32Ty(Ctx);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *dispatch = M->getFunction("__omill_dispatch_jump");
+
+  auto *F = llvm::Function::Create(liftedFnType(),
+                                    llvm::Function::ExternalLinkage,
+                                    "sub_140001000", *M);
+
+  // Create 2 target blocks.
+  uint64_t target_addrs[] = {0x140001100, 0x140001200};
+  for (unsigned i = 0; i < 2; ++i) {
+    char name[64];
+    snprintf(name, sizeof(name), "block_%llx",
+             (unsigned long long)target_addrs[i]);
+    auto *bb = llvm::BasicBlock::Create(Ctx, name, F);
+    llvm::IRBuilder<>(bb).CreateRet(F->getArg(2));
+  }
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  entry->moveBefore(&F->getEntryBlock());
+
+  llvm::IRBuilder<> B(entry);
+  auto *raw_ptr = B.CreateAlloca(i64_ty);
+  auto *raw = B.CreateLoad(i64_ty, raw_ptr, "raw");
+  auto *idx = B.CreateAnd(raw, llvm::ConstantInt::get(i64_ty, 1));
+  auto *scaled = B.CreateShl(idx, llvm::ConstantInt::get(i64_ty, 2));
+  auto *table_addr =
+      B.CreateAdd(scaled, llvm::ConstantInt::get(i64_ty, 0x140020000));
+  auto *table_ptr = B.CreateIntToPtr(table_addr, ptr_ty);
+  auto *rva = B.CreateLoad(i32_ty, table_ptr, "rva");
+  auto *rva_wide = B.CreateSExt(rva, i64_ty);
+  auto *target =
+      B.CreateAdd(rva_wide, llvm::ConstantInt::get(i64_ty, 0x140000000));
+  auto *result =
+      B.CreateCall(dispatch, {F->getArg(0), target, F->getArg(2)});
+  B.CreateRet(result);
+
+  // Binary memory with RVA table.
+  omill::BinaryMemoryMap map;
+  uint8_t table_data[8];
+  // Entry 0: 0x00001100 (LE)
+  table_data[0] = 0x00; table_data[1] = 0x11;
+  table_data[2] = 0x00; table_data[3] = 0x00;
+  // Entry 1: 0x00001200 (LE)
+  table_data[4] = 0x00; table_data[5] = 0x12;
+  table_data[6] = 0x00; table_data[7] = 0x00;
+
+  map.addRegion(0x140020000, table_data, sizeof(table_data));
+
+  runPass(M.get(), std::move(map));
+
+  // The solver should handle this via recursive resolution:
+  // 1. Initial solve finds rva is unbounded (fresh var)
+  // 2. Recursion identifies rva comes from a load with bounded address
+  // 3. Solves addresses (0x140020000, 0x140020004)
+  // 4. Reads memory → RVA values (0x1100, 0x1200)
+  // 5. Bounds rva to {0x1100, 0x1200}
+  // 6. Final solve: target = {0x140001100, 0x140001200}
+  EXPECT_TRUE(hasSwitchInst(F));
+  EXPECT_EQ(countSwitchCases(F), 2u);
+  EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+}
+
+TEST_F(Z3DispatchSolverTest, UsesOptimizedTactics) {
+  // The tactical solver should handle this pattern that might be slower
+  // with the plain solver: target = (x ^ x) + base (always = base).
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(kDataLayout);
+  createDispatchJumpDecl(*M);
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *dispatch = M->getFunction("__omill_dispatch_jump");
+
+  auto *F = llvm::Function::Create(liftedFnType(),
+                                    llvm::Function::ExternalLinkage,
+                                    "sub_140001000", *M);
+
+  // Target block.
+  auto *target_bb = llvm::BasicBlock::Create(Ctx, "block_140001100", F);
+  llvm::IRBuilder<>(target_bb).CreateRet(F->getArg(2));
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  entry->moveBefore(&F->getEntryBlock());
+
+  // target = (arg ^ arg) + 0x140001100  (always 0x140001100)
+  llvm::IRBuilder<> B(entry);
+  auto *xor_val = B.CreateXor(F->getArg(1), F->getArg(1));
+  auto *target =
+      B.CreateAdd(xor_val, llvm::ConstantInt::get(i64_ty, 0x140001100));
+  auto *result =
+      B.CreateCall(dispatch, {F->getArg(0), target, F->getArg(2)});
+  B.CreateRet(result);
+
+  omill::BinaryMemoryMap map;
+  uint8_t dummy = 0;
+  map.addRegion(0x140000000, &dummy, 1);
+  runPass(M.get(), std::move(map));
+
+  // The simplify tactic should recognize x^x == 0.
+  EXPECT_TRUE(hasSwitchInst(F));
+  EXPECT_EQ(countSwitchCases(F), 1u);
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
 }
 
