@@ -1,4 +1,4 @@
-#if OMILL_ENABLE_SOUPER
+#if OMILL_ENABLE_Z3
 
 #include "omill/Passes/Z3DispatchSolver.h"
 
@@ -8,11 +8,7 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
-#include <llvm/IR/PatternMatch.h>
 #include <llvm/Support/raw_ostream.h>
-
-#include <souper/Extractor/Candidates.h>
-#include <souper/Inst/Inst.h>
 
 #include <z3++.h>
 
@@ -27,13 +23,8 @@ namespace omill {
 
 namespace {
 
-using namespace llvm::PatternMatch;
-
 /// Maximum number of solutions to enumerate per dispatch target.
 static constexpr unsigned kMaxSolutions = 256;
-
-/// Maximum recursion depth for variable resolution.
-static constexpr unsigned kMaxRecursionDepth = 4;
 
 /// Maximum CFG depth for path constraint collection.
 static constexpr unsigned kMaxPathDepth = 8;
@@ -42,15 +33,10 @@ static constexpr unsigned kMaxPathDepth = 8;
 /// the CFG.  For each conditional branch along the path, we add a constraint
 /// that the condition holds (or doesn't) depending on which edge leads
 /// toward the dispatch block.
-///
-/// Returns Z3 boolean expressions representing the conjunction of all
-/// branch conditions on the path.
-void collectPathConstraints(
-    llvm::BasicBlock *target_bb, z3::context &ctx,
-    SouperZ3Translator &translator,
-    souper::ExprBuilderContext &expr_ctx,
-    souper::InstContext &inst_ctx,
-    llvm::SmallVectorImpl<z3::expr> &constraints, unsigned max_depth) {
+void collectPathConstraints(llvm::BasicBlock *target_bb,
+                            LLVMZ3Translator &translator,
+                            llvm::SmallVectorImpl<z3::expr> &constraints,
+                            unsigned max_depth) {
   llvm::SmallPtrSet<llvm::BasicBlock *, 16> visited;
   llvm::SmallVector<std::pair<llvm::BasicBlock *, unsigned>, 16> worklist;
   worklist.push_back({target_bb, 0});
@@ -76,23 +62,21 @@ void collectPathConstraints(
       }
 
       auto *cond = br->getCondition();
-      bool on_true = (br->getSuccessor(0) == bb);
-
-      // Try to find the condition in Souper's expression context.
-      auto cond_it = expr_ctx.InstMap.find(cond);
-      if (cond_it == expr_ctx.InstMap.end()) {
+      auto *icmp = llvm::dyn_cast<llvm::ICmpInst>(cond);
+      if (!icmp) {
         worklist.push_back({pred, depth + 1});
         continue;
       }
 
-      souper::Inst *cond_inst = cond_it->second;
-      z3::expr cond_z3 = translator.translate(cond_inst);
+      bool on_true = (br->getSuccessor(0) == bb);
 
-      // Condition is a 1-bit bitvector.  on_true => cond == 1.
+      // Translate the icmp to a Z3 boolean directly.
+      z3::expr cond_z3 = translator.translateICmp(icmp);
+
       if (on_true) {
-        constraints.push_back(cond_z3 == ctx.bv_val(1, 1));
+        constraints.push_back(cond_z3);
       } else {
-        constraints.push_back(cond_z3 == ctx.bv_val(0, 1));
+        constraints.push_back(!cond_z3);
       }
 
       worklist.push_back({pred, depth + 1});
@@ -104,35 +88,27 @@ void collectPathConstraints(
 /// Returns true if the dispatch was resolved (switch built).
 bool solveDispatch(llvm::CallInst *dispatch_call, llvm::ReturnInst *ret,
                    llvm::Function &F, const BinaryMemoryMap &map,
-                   const LiftedFunctionMap *lifted,
-                   souper::InstContext &inst_ctx,
-                   souper::ExprBuilderContext &expr_ctx,
-                   unsigned recursion_depth) {
-  if (recursion_depth > kMaxRecursionDepth)
-    return false;
-
+                   const LiftedFunctionMap *lifted) {
   auto *target_val = dispatch_call->getArgOperand(1);
   if (llvm::isa<llvm::ConstantInt>(target_val))
     return false;
 
-  // Look up the target in Souper's expression map.
-  auto target_it = expr_ctx.InstMap.find(target_val);
-  if (target_it == expr_ctx.InstMap.end())
+  // The target must be an instruction we can walk.
+  if (!llvm::isa<llvm::Instruction>(target_val) &&
+      !llvm::isa<llvm::Argument>(target_val))
     return false;
-
-  souper::Inst *target_inst = target_it->second;
 
   // Set up Z3 solver.
   z3::context ctx;
-  ctx.set("timeout", 5000u);  // 5 second timeout per dispatch.
-  SouperZ3Translator translator(ctx);
+  ctx.set("timeout", static_cast<int>(5000));  // 5 second timeout per dispatch.
+  LLVMZ3Translator translator(ctx);
 
-  z3::expr target_expr = translator.translate(target_inst);
+  z3::expr target_expr = translator.translate(target_val);
 
   // Collect path constraints.
   llvm::SmallVector<z3::expr, 8> path_constraints;
-  collectPathConstraints(dispatch_call->getParent(), ctx, translator,
-                         expr_ctx, inst_ctx, path_constraints, kMaxPathDepth);
+  collectPathConstraints(dispatch_call->getParent(), translator,
+                         path_constraints, kMaxPathDepth);
 
   z3::solver solver(ctx);
 
@@ -141,9 +117,7 @@ bool solveDispatch(llvm::CallInst *dispatch_call, llvm::ReturnInst *ret,
     solver.add(pc);
 
   // Add address range bound: target must be a reasonable code address.
-  // Use the binary memory map's regions to determine bounds.
-  // For now, use a conservative check: target must be non-zero and
-  // within 48-bit address space (Windows user-mode limit).
+  // Non-zero, within 48-bit address space (Windows user-mode limit).
   solver.add(target_expr != ctx.bv_val(0, 64));
   solver.add(z3::ult(target_expr, ctx.bv_val(0x800000000000ULL, 64)));
 
@@ -155,7 +129,6 @@ bool solveDispatch(llvm::CallInst *dispatch_call, llvm::ReturnInst *ret,
 
     uint64_t solution = 0;
     if (val.is_numeral()) {
-      // Z3 C++ API: get_numeral_uint64 for bitvectors.
       solution = val.get_numeral_uint64();
     } else {
       break;
@@ -220,11 +193,9 @@ bool solveDispatch(llvm::CallInst *dispatch_call, llvm::ReturnInst *ret,
   if (cases.empty())
     return false;
 
-  // Build switch.  We use a synthetic index that maps each solution to a
-  // case.  The switch discriminant is the target value itself.
+  // Build switch on the target value — each case matches a resolved address.
   llvm::BasicBlock *default_bb = nullptr;
   if (cases.size() < solutions.size()) {
-    // Not all solutions resolved — keep a default dispatch.
     default_bb = llvm::BasicBlock::Create(Ctx, "z3_default", &F);
     llvm::IRBuilder<> DBuilder(default_bb);
     auto *dispatch_fn = dispatch_call->getCalledFunction();
@@ -242,8 +213,7 @@ bool solveDispatch(llvm::CallInst *dispatch_call, llvm::ReturnInst *ret,
   // Save old successors for PHI cleanup.
   llvm::SmallVector<llvm::BasicBlock *, 4> old_succs(successors(BB));
 
-  // Build switch on the target value directly — each case matches
-  // a specific resolved address.
+  // Build switch.
   llvm::IRBuilder<> Builder(dispatch_call);
   auto *sw = Builder.CreateSwitch(dispatch_call->getArgOperand(1),
                                   default_bb, cases.size());
@@ -317,23 +287,11 @@ llvm::PreservedAnalyses Z3DispatchSolverPass::run(
   if (candidates.empty())
     return llvm::PreservedAnalyses::all();
 
-  // Build Souper expression context for the function.
-  souper::InstContext inst_ctx;
-  souper::ExprBuilderContext expr_ctx;
-  souper::ExprBuilderOptions opts;
-  opts.NamedArrays = false;
-
-  // Extract candidates from the function.
-  // This builds the InstMap that maps LLVM Values → Souper Inst DAGs.
-  auto candidate_set = souper::ExtractCandidates(F, inst_ctx, expr_ctx, opts);
-
   bool changed = false;
 
   for (auto &cand : candidates) {
-    if (solveDispatch(cand.dispatch_call, cand.ret, F, *map, lifted,
-                      inst_ctx, expr_ctx, /*recursion_depth=*/0)) {
+    if (solveDispatch(cand.dispatch_call, cand.ret, F, *map, lifted))
       changed = true;
-    }
   }
 
   return changed ? llvm::PreservedAnalyses::none()
@@ -342,4 +300,4 @@ llvm::PreservedAnalyses Z3DispatchSolverPass::run(
 
 }  // namespace omill
 
-#endif  // OMILL_ENABLE_SOUPER
+#endif  // OMILL_ENABLE_Z3

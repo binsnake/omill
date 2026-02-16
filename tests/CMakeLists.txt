@@ -83,8 +83,17 @@ if(NOT MSVC)
   target_compile_options(omill-unit-tests PRIVATE -fno-rtti)
 endif()
 
-if(OMILL_ENABLE_SOUPER)
-  target_sources(omill-unit-tests PRIVATE unit/Z3DispatchSolverTest.cpp)
+if(OMILL_ENABLE_Z3)
+  target_sources(omill-unit-tests PRIVATE
+    unit/LLVMZ3TranslatorTest.cpp
+    unit/Z3DispatchSolverTest.cpp
+  )
+  # Copy libz3.dll next to the test binary so it can be found at runtime.
+  add_custom_command(TARGET omill-unit-tests POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${z3_SOURCE_DIR}/bin/libz3.dll"
+      "$<TARGET_FILE_DIR:omill-unit-tests>/libz3.dll"
+  )
 endif()
 
 if(OMILL_ENABLE_SIMPLIFIER)

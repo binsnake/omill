@@ -1,13 +1,12 @@
 #pragma once
 
-#if OMILL_ENABLE_SOUPER
+#if OMILL_ENABLE_Z3
 
 #include <llvm/IR/PassManager.h>
 
 namespace omill {
 
-/// Constraint-based dispatch resolution using Souper expression extraction
-/// and Z3 SMT solving.
+/// Constraint-based dispatch resolution using Z3 SMT solving.
 ///
 /// This is the most expensive and most powerful dispatch resolver.  It handles
 /// cases where the jump index bound depends on path constraints (branch
@@ -17,11 +16,10 @@ namespace omill {
 ///
 /// Algorithm (ported from Dna's PreciseJmpTableSolver):
 ///   1. Find unresolved dispatch_jump calls with non-constant targets.
-///   2. Use Souper ExprBuilder to extract expression DAGs from LLVM IR.
+///   2. Walk the LLVM IR def-use chain to build Z3 bitvector expressions.
 ///   3. Walk backward through the CFG to collect path constraints.
-///   4. Translate everything to Z3 bitvectors and enumerate solutions.
+///   4. Enumerate valid solutions via Z3 SMT solving.
 ///   5. Build a switch from the valid solutions.
-///   6. If unboundable, recurse on the root-cause variable (depth limit 4).
 ///
 /// Runs after SymbolicJumpTableSolver in the iterative resolution loop.
 class Z3DispatchSolverPass
@@ -35,4 +33,4 @@ class Z3DispatchSolverPass
 
 }  // namespace omill
 
-#endif  // OMILL_ENABLE_SOUPER
+#endif  // OMILL_ENABLE_Z3

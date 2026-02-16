@@ -75,13 +75,13 @@ target_link_libraries(omill
     ${OMILL_LLVM_LIBS}
 )
 
-if(OMILL_ENABLE_SOUPER)
+if(OMILL_ENABLE_Z3)
   target_sources(omill PRIVATE
     Utils/SouperZ3Translator.cpp
     Passes/Z3DispatchSolver.cpp
   )
-  target_link_libraries(omill PUBLIC z3::libz3 souper)
-  target_compile_definitions(omill PUBLIC OMILL_ENABLE_SOUPER=1)
+  target_link_libraries(omill PUBLIC z3::libz3)
+  target_compile_definitions(omill PUBLIC OMILL_ENABLE_Z3=1)
 endif()
 
 if(OMILL_ENABLE_SIMPLIFIER)

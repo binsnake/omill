@@ -1,42 +1,50 @@
 #pragma once
 
-#if OMILL_ENABLE_SOUPER
+#if OMILL_ENABLE_Z3
 
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/IR/Instructions.h>
 
 #include <z3++.h>
 
-namespace souper {
-struct Inst;
-}
-
 namespace omill {
 
-/// Translates Souper Inst DAGs to Z3 bitvector expressions.
+/// Translates LLVM IR def-use chains to Z3 bitvector expressions.
 ///
-/// Souper extracts expression trees from LLVM IR.  This class maps each
-/// Souper node to a Z3 bitvector expression, preserving widths and semantics.
+/// Walks backward from a given llvm::Value through its defining instructions,
+/// translating each to the corresponding Z3 bitvector operation.  Values with
+/// no LLVM definition (function arguments, loads, PHI nodes) become fresh Z3
+/// variables that can be constrained externally (e.g. by path constraints).
+///
 /// DAG nodes are cached so shared subexpressions are translated only once.
-class SouperZ3Translator {
+class LLVMZ3Translator {
  public:
-  explicit SouperZ3Translator(z3::context &ctx);
+  explicit LLVMZ3Translator(z3::context &ctx);
 
-  /// Translate a Souper Inst DAG to a Z3 bitvector expression.
-  z3::expr translate(souper::Inst *inst);
+  /// Translate an LLVM value (following def-use chain) to a Z3 bitvector
+  /// expression.  The value must have an integer type.
+  z3::expr translate(llvm::Value *val);
 
-  /// Get or create a Z3 variable for a Souper Var node.
-  z3::expr getVar(souper::Inst *var);
+  /// Translate an icmp condition to a Z3 boolean expression.
+  z3::expr translateICmp(llvm::ICmpInst *icmp);
 
-  /// Clear the translation cache (for reuse across different DAGs).
+  /// Get or create a fresh Z3 variable for a value that can't be translated
+  /// (loads, arguments, etc.).
+  z3::expr getFreshVar(llvm::Value *val);
+
+  /// Clear the translation cache.
   void reset();
 
  private:
   z3::context &ctx_;
-  llvm::DenseMap<souper::Inst *, z3::expr *> cache_;
+  llvm::DenseMap<llvm::Value *, z3::expr *> cache_;
   std::vector<std::unique_ptr<z3::expr>> owned_exprs_;
   unsigned var_counter_ = 0;
+
+  z3::expr cacheResult(llvm::Value *val, z3::expr result);
+  unsigned getWidth(llvm::Value *val) const;
 };
 
 }  // namespace omill
 
-#endif  // OMILL_ENABLE_SOUPER
+#endif  // OMILL_ENABLE_Z3

@@ -52,7 +52,7 @@
 #include "omill/Passes/InterProceduralConstProp.h"
 #include "omill/Passes/IterativeTargetResolution.h"
 #include "omill/Passes/EliminateDeadPaths.h"
-#if OMILL_ENABLE_SOUPER
+#if OMILL_ENABLE_Z3
 #include "omill/Passes/Z3DispatchSolver.h"
 #endif
 #if OMILL_ENABLE_SIMPLIFIER

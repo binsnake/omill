@@ -1,360 +1,281 @@
-#if OMILL_ENABLE_SOUPER
+#if OMILL_ENABLE_Z3
 
 #include "omill/Utils/SouperZ3Translator.h"
 
-#include <souper/Inst/Inst.h>
-
-#include <llvm/Support/raw_ostream.h>
+#include <llvm/ADT/SmallString.h>
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/Instructions.h>
+#include <llvm/IR/Operator.h>
 
 #include <cassert>
 
 namespace omill {
 
-SouperZ3Translator::SouperZ3Translator(z3::context &ctx) : ctx_(ctx) {}
+LLVMZ3Translator::LLVMZ3Translator(z3::context &ctx) : ctx_(ctx) {}
 
-void SouperZ3Translator::reset() {
+void LLVMZ3Translator::reset() {
   cache_.clear();
   owned_exprs_.clear();
   var_counter_ = 0;
 }
 
-z3::expr SouperZ3Translator::getVar(souper::Inst *var) {
-  auto it = cache_.find(var);
+unsigned LLVMZ3Translator::getWidth(llvm::Value *val) const {
+  auto *ty = val->getType();
+  if (ty->isIntegerTy())
+    return ty->getIntegerBitWidth();
+  if (ty->isPointerTy())
+    return 64;  // x86-64
+  return 64;
+}
+
+z3::expr LLVMZ3Translator::cacheResult(llvm::Value *val, z3::expr result) {
+  auto expr = std::make_unique<z3::expr>(result);
+  auto *ptr = expr.get();
+  cache_[val] = ptr;
+  owned_exprs_.push_back(std::move(expr));
+  return *ptr;
+}
+
+z3::expr LLVMZ3Translator::getFreshVar(llvm::Value *val) {
+  auto it = cache_.find(val);
   if (it != cache_.end())
     return *it->second;
 
   std::string name;
-  if (!var->Name.empty()) {
-    name = var->Name;
+  if (val->hasName()) {
+    name = val->getName().str();
   } else {
     name = "v" + std::to_string(var_counter_++);
   }
 
-  auto expr = std::make_unique<z3::expr>(ctx_.bv_const(name.c_str(), var->Width));
-  auto *ptr = expr.get();
-  cache_[var] = ptr;
-  owned_exprs_.push_back(std::move(expr));
-  return *ptr;
+  unsigned width = getWidth(val);
+  return cacheResult(val, ctx_.bv_const(name.c_str(), width));
 }
 
-z3::expr SouperZ3Translator::translate(souper::Inst *inst) {
-  assert(inst && "null Inst");
+z3::expr LLVMZ3Translator::translateICmp(llvm::ICmpInst *icmp) {
+  auto lhs = translate(icmp->getOperand(0));
+  auto rhs = translate(icmp->getOperand(1));
 
-  // Check cache first (DAG dedup).
-  auto it = cache_.find(inst);
+  switch (icmp->getPredicate()) {
+    case llvm::ICmpInst::ICMP_EQ:
+      return lhs == rhs;
+    case llvm::ICmpInst::ICMP_NE:
+      return lhs != rhs;
+    case llvm::ICmpInst::ICMP_ULT:
+      return z3::ult(lhs, rhs);
+    case llvm::ICmpInst::ICMP_ULE:
+      return z3::ule(lhs, rhs);
+    case llvm::ICmpInst::ICMP_UGT:
+      return z3::ugt(lhs, rhs);
+    case llvm::ICmpInst::ICMP_UGE:
+      return z3::uge(lhs, rhs);
+    case llvm::ICmpInst::ICMP_SLT:
+      return lhs < rhs;
+    case llvm::ICmpInst::ICMP_SLE:
+      return lhs <= rhs;
+    case llvm::ICmpInst::ICMP_SGT:
+      return lhs > rhs;
+    case llvm::ICmpInst::ICMP_SGE:
+      return lhs >= rhs;
+    default:
+      return ctx_.bool_val(true);
+  }
+}
+
+z3::expr LLVMZ3Translator::translate(llvm::Value *val) {
+  assert(val && "null Value");
+
+  // Check cache.
+  auto it = cache_.find(val);
   if (it != cache_.end())
     return *it->second;
 
+  unsigned width = getWidth(val);
+
+  // Constants.
+  if (auto *ci = llvm::dyn_cast<llvm::ConstantInt>(val)) {
+    llvm::SmallString<80> str;
+    ci->getValue().toStringUnsigned(str);
+    return cacheResult(val, ctx_.bv_val(str.c_str(), width));
+  }
+
+  // Poison/undef → fresh variable.
+  if (llvm::isa<llvm::PoisonValue>(val) || llvm::isa<llvm::UndefValue>(val))
+    return getFreshVar(val);
+
+  // Instructions.
+  auto *inst = llvm::dyn_cast<llvm::Instruction>(val);
+  if (!inst)
+    return getFreshVar(val);
+
   z3::expr result(ctx_);
 
-  using K = souper::Inst::Kind;
-  switch (inst->K) {
-    case K::Const: {
-      // Convert APInt to Z3 bitvector constant.
-      llvm::SmallString<64> str;
-      inst->Val.toStringUnsigned(str);
-      result = ctx_.bv_val(str.c_str(), inst->Width);
-      break;
-    }
-
-    case K::UntypedConst: {
-      llvm::SmallString<64> str;
-      inst->Val.toStringUnsigned(str);
-      result = ctx_.bv_val(str.c_str(), inst->Width);
-      break;
-    }
-
-    case K::Var:
-    case K::Hole:
-    case K::ReservedConst:
-    case K::ReservedInst: {
-      return getVar(inst);
-    }
-
-    case K::Phi: {
-      // PHI nodes are treated as fresh unconstrained variables.
-      // Path constraints from branch conditions will bound them.
-      return getVar(inst);
-    }
-
+  switch (inst->getOpcode()) {
     // Binary arithmetic.
-    case K::Add:
-    case K::AddNSW:
-    case K::AddNUW:
-    case K::AddNW: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = lhs + rhs;
+    case llvm::Instruction::Add: {
+      result = translate(inst->getOperand(0)) + translate(inst->getOperand(1));
       break;
     }
-
-    case K::Sub:
-    case K::SubNSW:
-    case K::SubNUW:
-    case K::SubNW: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = lhs - rhs;
+    case llvm::Instruction::Sub: {
+      result = translate(inst->getOperand(0)) - translate(inst->getOperand(1));
       break;
     }
-
-    case K::Mul:
-    case K::MulNSW:
-    case K::MulNUW:
-    case K::MulNW: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = lhs * rhs;
+    case llvm::Instruction::Mul: {
+      result = translate(inst->getOperand(0)) * translate(inst->getOperand(1));
       break;
     }
-
-    case K::UDiv:
-    case K::UDivExact: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = z3::udiv(lhs, rhs);
+    case llvm::Instruction::UDiv: {
+      result = z3::udiv(translate(inst->getOperand(0)),
+                        translate(inst->getOperand(1)));
       break;
     }
-
-    case K::SDiv:
-    case K::SDivExact: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = lhs / rhs;  // Z3 default is signed division.
+    case llvm::Instruction::SDiv: {
+      result =
+          translate(inst->getOperand(0)) / translate(inst->getOperand(1));
       break;
     }
-
-    case K::URem: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = z3::urem(lhs, rhs);
+    case llvm::Instruction::URem: {
+      result = z3::urem(translate(inst->getOperand(0)),
+                        translate(inst->getOperand(1)));
       break;
     }
-
-    case K::SRem: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = z3::srem(lhs, rhs);
+    case llvm::Instruction::SRem: {
+      result = z3::srem(translate(inst->getOperand(0)),
+                        translate(inst->getOperand(1)));
       break;
     }
 
     // Bitwise.
-    case K::And: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = lhs & rhs;
+    case llvm::Instruction::And: {
+      result = translate(inst->getOperand(0)) & translate(inst->getOperand(1));
+      break;
+    }
+    case llvm::Instruction::Or: {
+      result = translate(inst->getOperand(0)) | translate(inst->getOperand(1));
+      break;
+    }
+    case llvm::Instruction::Xor: {
+      result = translate(inst->getOperand(0)) ^ translate(inst->getOperand(1));
       break;
     }
 
-    case K::Or: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = lhs | rhs;
+    // Shifts.
+    case llvm::Instruction::Shl: {
+      result = z3::shl(translate(inst->getOperand(0)),
+                       translate(inst->getOperand(1)));
       break;
     }
-
-    case K::Xor: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = lhs ^ rhs;
+    case llvm::Instruction::LShr: {
+      result = z3::lshr(translate(inst->getOperand(0)),
+                        translate(inst->getOperand(1)));
       break;
     }
-
-    case K::Shl:
-    case K::ShlNSW:
-    case K::ShlNUW:
-    case K::ShlNW: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = z3::shl(lhs, rhs);
-      break;
-    }
-
-    case K::LShr:
-    case K::LShrExact: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = z3::lshr(lhs, rhs);
-      break;
-    }
-
-    case K::AShr:
-    case K::AShrExact: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = z3::ashr(lhs, rhs);
+    case llvm::Instruction::AShr: {
+      result = z3::ashr(translate(inst->getOperand(0)),
+                        translate(inst->getOperand(1)));
       break;
     }
 
     // Conversions.
-    case K::ZExt: {
-      auto inner = translate(inst->Ops[0]);
-      unsigned src_width = inst->Ops[0]->Width;
-      unsigned ext = inst->Width - src_width;
-      result = z3::zext(inner, ext);
+    case llvm::Instruction::ZExt: {
+      auto inner = translate(inst->getOperand(0));
+      unsigned src_width = getWidth(inst->getOperand(0));
+      result = z3::zext(inner, width - src_width);
+      break;
+    }
+    case llvm::Instruction::SExt: {
+      auto inner = translate(inst->getOperand(0));
+      unsigned src_width = getWidth(inst->getOperand(0));
+      result = z3::sext(inner, width - src_width);
+      break;
+    }
+    case llvm::Instruction::Trunc: {
+      auto inner = translate(inst->getOperand(0));
+      result = inner.extract(width - 1, 0);
       break;
     }
 
-    case K::SExt: {
-      auto inner = translate(inst->Ops[0]);
-      unsigned src_width = inst->Ops[0]->Width;
-      unsigned ext = inst->Width - src_width;
-      result = z3::sext(inner, ext);
+    // Integer comparison → 1-bit bitvector.
+    case llvm::Instruction::ICmp: {
+      auto *icmp = llvm::cast<llvm::ICmpInst>(inst);
+      auto lhs = translate(icmp->getOperand(0));
+      auto rhs = translate(icmp->getOperand(1));
+      z3::expr cond(ctx_);
+
+      switch (icmp->getPredicate()) {
+        case llvm::ICmpInst::ICMP_EQ:
+          cond = (lhs == rhs);
+          break;
+        case llvm::ICmpInst::ICMP_NE:
+          cond = (lhs != rhs);
+          break;
+        case llvm::ICmpInst::ICMP_ULT:
+          cond = z3::ult(lhs, rhs);
+          break;
+        case llvm::ICmpInst::ICMP_ULE:
+          cond = z3::ule(lhs, rhs);
+          break;
+        case llvm::ICmpInst::ICMP_UGT:
+          cond = z3::ugt(lhs, rhs);
+          break;
+        case llvm::ICmpInst::ICMP_UGE:
+          cond = z3::uge(lhs, rhs);
+          break;
+        case llvm::ICmpInst::ICMP_SLT:
+          cond = (lhs < rhs);
+          break;
+        case llvm::ICmpInst::ICMP_SLE:
+          cond = (lhs <= rhs);
+          break;
+        case llvm::ICmpInst::ICMP_SGT:
+          cond = (lhs > rhs);
+          break;
+        case llvm::ICmpInst::ICMP_SGE:
+          cond = (lhs >= rhs);
+          break;
+        default:
+          cond = ctx_.bool_val(true);
+          break;
+      }
+      result = z3::ite(cond, ctx_.bv_val(1, 1), ctx_.bv_val(0, 1));
       break;
     }
 
-    case K::Trunc: {
-      auto inner = translate(inst->Ops[0]);
-      result = inner.extract(inst->Width - 1, 0);
-      break;
-    }
-
-    // Comparisons — produce 1-bit bitvector.
-    case K::Eq: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = z3::ite(lhs == rhs, ctx_.bv_val(1, 1), ctx_.bv_val(0, 1));
-      break;
-    }
-
-    case K::Ne: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = z3::ite(lhs != rhs, ctx_.bv_val(1, 1), ctx_.bv_val(0, 1));
-      break;
-    }
-
-    case K::Ult: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = z3::ite(z3::ult(lhs, rhs), ctx_.bv_val(1, 1), ctx_.bv_val(0, 1));
-      break;
-    }
-
-    case K::Slt: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = z3::ite(lhs < rhs, ctx_.bv_val(1, 1), ctx_.bv_val(0, 1));
-      break;
-    }
-
-    case K::Ule: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = z3::ite(z3::ule(lhs, rhs), ctx_.bv_val(1, 1), ctx_.bv_val(0, 1));
-      break;
-    }
-
-    case K::Sle: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = z3::ite(lhs <= rhs, ctx_.bv_val(1, 1), ctx_.bv_val(0, 1));
-      break;
-    }
-
-    // Select (ternary).
-    case K::Select: {
-      auto cond = translate(inst->Ops[0]);
-      auto tval = translate(inst->Ops[1]);
-      auto fval = translate(inst->Ops[2]);
+    // Select.
+    case llvm::Instruction::Select: {
+      auto *sel = llvm::cast<llvm::SelectInst>(inst);
+      auto cond = translate(sel->getCondition());
+      auto tval = translate(sel->getTrueValue());
+      auto fval = translate(sel->getFalseValue());
+      // Condition is i1 → 1-bit bv.
       result = z3::ite(cond == ctx_.bv_val(1, 1), tval, fval);
       break;
     }
 
-    // Bit manipulation — model conservatively as uninterpreted variables.
-    case K::CtPop:
-    case K::BSwap:
-    case K::Cttz:
-    case K::Ctlz:
-    case K::BitReverse:
-    case K::FShl:
-    case K::FShr:
-    case K::Freeze: {
-      return getVar(inst);
+    // IntToPtr / PtrToInt — pass through the integer operand.
+    case llvm::Instruction::IntToPtr: {
+      result = translate(inst->getOperand(0));
+      break;
     }
-
-    // Overflow intrinsics — extract the result (first element).
-    case K::SAddWithOverflow:
-    case K::SAddO:
-    case K::UAddWithOverflow:
-    case K::UAddO: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = lhs + rhs;
+    case llvm::Instruction::PtrToInt: {
+      result = translate(inst->getOperand(0));
       break;
     }
 
-    case K::SSubWithOverflow:
-    case K::SSubO:
-    case K::USubWithOverflow:
-    case K::USubO: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = lhs - rhs;
-      break;
-    }
-
-    case K::SMulWithOverflow:
-    case K::SMulO:
-    case K::UMulWithOverflow:
-    case K::UMulO: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = lhs * rhs;
-      break;
-    }
-
-    // Saturating arithmetic.
-    case K::SAddSat: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = lhs + rhs;  // Approximate — Z3 doesn't have native saturation.
-      break;
-    }
-
-    case K::UAddSat: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = lhs + rhs;
-      break;
-    }
-
-    case K::SSubSat: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = lhs - rhs;
-      break;
-    }
-
-    case K::USubSat: {
-      auto lhs = translate(inst->Ops[0]);
-      auto rhs = translate(inst->Ops[1]);
-      result = lhs - rhs;
-      break;
-    }
-
-    case K::ExtractValue: {
-      // ExtractValue from aggregate — translate the source and hope for
-      // the best.  Most commonly this extracts from overflow intrinsics.
-      result = translate(inst->Ops[0]);
-      break;
-    }
-
-    case K::None:
+    // PHI nodes → fresh variable (constrained by path).
+    case llvm::Instruction::PHI:
+    // Loads → fresh variable (value comes from memory).
+    case llvm::Instruction::Load:
+    // Calls → fresh variable.
+    case llvm::Instruction::Call:
     default: {
-      // Unknown — treat as fresh variable.
-      return getVar(inst);
+      return getFreshVar(val);
     }
   }
 
-  // Cache the result.
-  auto expr = std::make_unique<z3::expr>(result);
-  auto *ptr = expr.get();
-  cache_[inst] = ptr;
-  owned_exprs_.push_back(std::move(expr));
-  return *ptr;
+  return cacheResult(val, result);
 }
 
 }  // namespace omill
 
-#endif  // OMILL_ENABLE_SOUPER
+#endif  // OMILL_ENABLE_Z3
