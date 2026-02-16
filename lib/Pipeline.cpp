@@ -11,6 +11,8 @@
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
 #include <llvm/Transforms/IPO/AlwaysInliner.h>
 #include <llvm/Transforms/IPO/GlobalDCE.h>
+#include <llvm/Transforms/IPO/Inliner.h>
+#include <llvm/Transforms/IPO/SCCP.h>
 #include <llvm/Transforms/Scalar/ADCE.h>
 #include <llvm/Transforms/Scalar/LoopDeletion.h>
 #include <llvm/Transforms/Scalar/LoopPassManager.h>
@@ -196,6 +198,27 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     // functions, recovering the original jump target.
     FPM.addPass(ResolveNativeDispatchPass());
     FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::SimplifyCFGPass());
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+  }
+
+  // Inline _native functions into their callers to enable interprocedural
+  // constant folding.  Many callers pass zeroinitializer for XMM arguments;
+  // after inlining, the shufflevector/bitcast/xor chains fold to constants.
+  MPM.addPass(llvm::ModuleInlinerWrapperPass(llvm::getInlineParams(500)));
+  {
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::GVNPass());
+    FPM.addPass(FoldConstantVectorChainsPass());
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(CollapsePartialXMMWritesPass());
+    FPM.addPass(CoalesceByteReassemblyPass());
+    FPM.addPass(SimplifyVectorFlagComputationPass());
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::GVNPass());
+    FPM.addPass(llvm::ADCEPass());
     FPM.addPass(llvm::SimplifyCFGPass());
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
