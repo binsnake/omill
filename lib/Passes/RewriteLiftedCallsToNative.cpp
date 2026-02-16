@@ -98,6 +98,10 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
       auto *native_fn = M.getFunction(native_name);
       if (!native_fn) continue;
 
+      // Don't rewrite the call inside a wrapper to its own lifted function —
+      // that's the call that AlwaysInlinerPass will inline.
+      if (native_fn == &F) continue;
+
       // Get ABI for the target.
       auto *abi = cc_info.getABI(cand.lifted_target);
       if (!abi) continue;
