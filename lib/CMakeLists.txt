@@ -65,6 +65,7 @@ add_library(omill STATIC
   Passes/SymbolicJumpTableSolver.cpp
   Passes/EliminateDeadPaths.cpp
   Passes/FoldConstantVectorChains.cpp
+  Passes/ResolveNativeDispatch.cpp
 
   # Pipeline
   Pipeline.cpp

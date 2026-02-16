@@ -60,6 +60,7 @@
 #include "omill/Passes/IterativeTargetResolution.h"
 #include "omill/Passes/EliminateDeadPaths.h"
 #include "omill/Passes/FoldConstantVectorChains.h"
+#include "omill/Passes/ResolveNativeDispatch.h"
 #include "omill/Passes/RewriteLiftedCallsToNative.h"
 #if OMILL_ENABLE_Z3
 #include "omill/Passes/Z3DispatchSolver.h"
@@ -189,6 +190,12 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     // whose results are fully dead after State struct elimination).
     FPM.addPass(llvm::createFunctionToLoopPassAdaptor(llvm::LoopDeletionPass()));
     FPM.addPass(llvm::ADCEPass());
+    FPM.addPass(llvm::SimplifyCFGPass());
+    // Resolve __omill_native_dispatch calls where deobfuscation folded the
+    // PC argument to a constant.  Replaces with direct calls to _native
+    // functions, recovering the original jump target.
+    FPM.addPass(ResolveNativeDispatchPass());
+    FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(llvm::SimplifyCFGPass());
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }

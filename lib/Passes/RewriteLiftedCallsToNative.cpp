@@ -228,7 +228,6 @@ llvm::Function *getOrCreateNativeDispatch(
   auto *fn = llvm::Function::Create(
       fn_ty, llvm::Function::InternalLinkage, "__omill_native_dispatch", M);
   fn->addFnAttr(llvm::Attribute::NoUnwind);
-  fn->addFnAttr(llvm::Attribute::AlwaysInline);
 
   // Build offset-to-param-index map for XMM params.
   llvm::DenseMap<unsigned, unsigned> xmm_param_idx;
