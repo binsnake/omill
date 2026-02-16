@@ -166,6 +166,7 @@ ctest --test-dir build-remill -R e2e
 
 ## Credits
 
+- [Dna](https://github.com/Colton1skees/Dna) — inspiration for remill-based recompilation by Colton1skees
 - [remill](https://github.com/lifting-bits/remill) — binary lifter by Trail of Bits
 - [LLVM](https://llvm.org/) — compiler infrastructure
 - [Zydis](https://github.com/zyantific/zydis) — x86/x86-64 disassembler
