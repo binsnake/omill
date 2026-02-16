@@ -174,6 +174,17 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     // through the remaining chains.
     FPM.addPass(FoldConstantVectorChainsPass());
     FPM.addPass(llvm::InstCombinePass());
+    // After SROA decomposes the State alloca, vector operations from SSE
+    // obfuscation appear as shufflevector/extractelement/bitcast chains.
+    // Run the same vector simplification passes used in deobfuscation.
+    FPM.addPass(CollapsePartialXMMWritesPass());
+    FPM.addPass(CoalesceByteReassemblyPass());
+    FPM.addPass(SimplifyVectorFlagComputationPass());
+#if OMILL_ENABLE_SIMPLIFIER
+    FPM.addPass(SimplifyMBAPass());
+#endif
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::GVNPass());
     // Safety net: remove any remaining dead loops (e.g. PEB-walking loops
     // whose results are fully dead after State struct elimination).
     FPM.addPass(llvm::createFunctionToLoopPassAdaptor(llvm::LoopDeletionPass()));
