@@ -187,17 +187,42 @@ FunctionABI analyzeFunction(llvm::Function &F, const llvm::DataLayout &DL,
     abi.ret = ret;
   }
 
-  // Detect non-standard register usage: XMM/vector live-ins.
-  // Any live-in that maps to a vector register in the StateFieldMap means
-  // the function depends on XMM/YMM/ZMM values that the GPR-only native
-  // wrapper can't provide.
+  // Detect XMM/vector live-ins.  Collect the base offset of each vector
+  // register that is live-in so the native wrapper can accept them as extra
+  // <2 x i64> parameters.
+  llvm::DenseSet<unsigned> seen_vreg_bases;
   for (auto off : live_in) {
+    bool is_vec = false;
+    unsigned vreg_base = 0;
+
+    // Check StateFieldMap first.
     auto field = field_map.fieldAtOffset(off);
     if (field && field->category == StateFieldCategory::kVector) {
+      is_vec = true;
+      vreg_base = field->offset;
+    }
+
+    // Fallback: if the StateFieldMap didn't have an entry for this offset,
+    // check if it falls within the vec array region of the x86-64 State
+    // struct (offset 16..16+32*64=2064, lower 16 bytes of each 64-byte
+    // VectorReg slot).
+    if (!field && !is_vec && off >= 16 && off < 2064) {
+      unsigned vreg_idx = (off - 16) / 64;
+      unsigned base = 16 + vreg_idx * 64;
+      if (off < base + 16) {
+        is_vec = true;
+        vreg_base = base;
+      }
+    }
+
+    if (is_vec && seen_vreg_bases.insert(vreg_base).second) {
+      abi.xmm_live_ins.push_back(vreg_base);
       abi.has_non_standard_regs = true;
-      break;
     }
   }
+
+  // Sort XMM live-ins by offset for deterministic parameter ordering.
+  llvm::sort(abi.xmm_live_ins);
 
   // Identify clobbered callee-saved registers.
   // In Win64, RBX, RBP, RDI, RSI, R12-R15 are nonvolatile.

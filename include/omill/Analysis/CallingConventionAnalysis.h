@@ -53,8 +53,14 @@ struct FunctionABI {
   /// that can't be modeled by the detected calling convention.
   bool has_non_standard_regs = false;
 
+  /// XMM register live-ins (byte offsets into State) that need to be passed
+  /// as extra <2 x i64> parameters after the GPR params.
+  llvm::SmallVector<unsigned, 4> xmm_live_ins;
+
   bool isVoid() const { return !ret.has_value(); }
   unsigned numParams() const { return params.size(); }
+  unsigned numXMMParams() const { return xmm_live_ins.size(); }
+  unsigned totalNativeParams() const { return numParams() + numXMMParams(); }
 };
 
 /// Module-level analysis result mapping each lifted function to its ABI.

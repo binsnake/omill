@@ -260,6 +260,31 @@ void StateFieldMap::addX86_64RegisterNames() {
     addField(kGPRNames[i], offset, 8, StateFieldCategory::kGPR);
   }
 
+  // Add XMM/YMM register names from the vec array.
+  // X86State layout: { ArchState, [32 x VectorReg], ArithFlags, ... }
+  // The vec array is at element index 1 of X86State.
+  if (x86_ty->getNumElements() > 1) {
+    auto *vec_elem = x86_ty->getElementType(1);
+    if (auto *vec_arr = llvm::dyn_cast<llvm::ArrayType>(vec_elem)) {
+      unsigned vec_base = static_cast<unsigned>(x86_layout->getElementOffset(1));
+      unsigned vec_count = vec_arr->getNumElements();
+      auto *vreg_ty = vec_arr->getElementType();
+      unsigned vreg_size = static_cast<unsigned>(
+          data_layout_->getTypeAllocSize(vreg_ty));
+
+      for (unsigned i = 0; i < vec_count && i < 32; ++i) {
+        unsigned vreg_offset = vec_base + i * vreg_size;
+        // XMM = lower 16 bytes, YMM = lower 32 bytes of each VectorReg.
+        if (i < 16) {
+          addField("XMM" + std::to_string(i), vreg_offset, 16,
+                   StateFieldCategory::kVector);
+        }
+        addField("YMM" + std::to_string(i), vreg_offset, 32,
+                 StateFieldCategory::kVector);
+      }
+    }
+  }
+
   // Also add flags from ArithFlags struct.
   auto *aflags_ty = llvm::StructType::getTypeByName(
       state_type_->getContext(), "struct.ArithFlags");

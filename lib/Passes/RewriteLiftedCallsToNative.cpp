@@ -29,6 +29,15 @@ llvm::Value *buildStateLoad(llvm::IRBuilder<> &Builder, llvm::Value *state_ptr,
   return Builder.CreateLoad(Builder.getInt64Ty(), gep, name);
 }
 
+llvm::Value *buildStateLoadVec(llvm::IRBuilder<> &Builder,
+                                llvm::Value *state_ptr, uint64_t offset,
+                                const llvm::Twine &name) {
+  auto *vec_ty = llvm::FixedVectorType::get(Builder.getInt64Ty(), 2);
+  auto *gep = Builder.CreateGEP(Builder.getInt8Ty(), state_ptr,
+                                Builder.getInt64(offset));
+  return Builder.CreateLoad(vec_ty, gep, name);
+}
+
 void buildStateStore(llvm::IRBuilder<> &Builder, llvm::Value *state_ptr,
                      uint64_t offset, llvm::Value *val) {
   auto *gep = Builder.CreateGEP(Builder.getInt8Ty(), state_ptr,
@@ -221,34 +230,24 @@ llvm::Function *getOrCreateNativeDispatch(
     std::string native_name = F.getName().str() + "_native";
     auto *native_fn = M.getFunction(native_name);
 
-    if (native_fn && !abi->has_non_standard_regs) {
-      // Native target: pass GPR args from dispatch params.
-      llvm::SmallVector<llvm::Value *, 4> args;
-      for (unsigned i = 0; i < abi->numParams(); ++i) {
-        args.push_back(fn->getArg(2 + i));
-      }
+    // Pass GPR args from dispatch params + XMM values from State.
+    llvm::SmallVector<llvm::Value *, 8> args;
+    for (unsigned i = 0; i < abi->numParams(); ++i) {
+      args.push_back(fn->getArg(2 + i));
+    }
 
-      auto *result = CaseB.CreateCall(native_fn, args);
-      if (abi->ret.has_value()) {
-        CaseB.CreateRet(result);
-      } else {
-        CaseB.CreateRet(CaseB.getInt64(0));
-      }
+    // Load XMM live-in values from State for this target.
+    for (auto xmm_off : abi->xmm_live_ins) {
+      args.push_back(buildStateLoadVec(
+          CaseB, state_arg, xmm_off,
+          "xmm_" + llvm::Twine(xmm_off)));
+    }
+
+    auto *result = CaseB.CreateCall(native_fn, args);
+    if (abi->ret.has_value()) {
+      CaseB.CreateRet(result);
     } else {
-      // Lifted-only target (non-standard regs): call with State directly.
-      auto *lifted_ty = F.getFunctionType();
-      llvm::SmallVector<llvm::Value *, 3> args;
-      args.push_back(state_arg);
-      if (lifted_ty->getNumParams() > 1)
-        args.push_back(CaseB.getInt64(va));
-      if (lifted_ty->getNumParams() > 2)
-        args.push_back(llvm::PoisonValue::get(lifted_ty->getParamType(2)));
-
-      CaseB.CreateCall(&F, args);
-
-      // Load RAX from State for return value.
-      auto *rax = buildStateLoad(CaseB, state_arg, kRAXOffset, "rax");
-      CaseB.CreateRet(rax);
+      CaseB.CreateRet(CaseB.getInt64(0));
     }
   }
 
@@ -274,14 +273,6 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
 
     for (auto &cand : candidates) {
       if (cand.lifted_definition) {
-        // Functions with non-standard register usage (XMM live-ins):
-        // keep the lifted call so all State fields flow through correctly.
-        auto *abi = cc_info.getABI(cand.lifted_definition);
-        if (abi && abi->has_non_standard_regs) {
-          fixupForwardDeclarationCall(cand.call, cand.lifted_definition);
-          continue;
-        }
-
         // Static target: call the _native wrapper directly.
         std::string native_name =
             cand.lifted_definition->getName().str() + "_native";
@@ -290,15 +281,23 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
 
         if (native_fn == &F) continue;
 
+        auto *abi = cc_info.getABI(cand.lifted_definition);
         if (!abi) continue;
 
         llvm::IRBuilder<> Builder(cand.call);
 
-        llvm::SmallVector<llvm::Value *, 4> args;
+        llvm::SmallVector<llvm::Value *, 8> args;
         for (auto &param : abi->params) {
           args.push_back(buildStateLoad(
               Builder, cand.state_ptr, param.state_offset,
               llvm::StringRef(param.reg_name).lower()));
+        }
+
+        // Pass XMM live-in values from State as extra <2 x i64> args.
+        for (auto xmm_off : abi->xmm_live_ins) {
+          args.push_back(buildStateLoadVec(
+              Builder, cand.state_ptr, xmm_off,
+              "xmm_" + llvm::Twine(xmm_off)));
         }
 
         auto *result = Builder.CreateCall(native_fn, args,

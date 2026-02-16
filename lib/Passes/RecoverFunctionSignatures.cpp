@@ -31,6 +31,12 @@ llvm::FunctionType *buildNativeType(const FunctionABI &abi,
     param_types.push_back(llvm::Type::getInt64Ty(Ctx));
   }
 
+  // XMM live-ins are passed as <2 x i64> (128-bit) params after GPRs.
+  auto *xmm_ty = llvm::FixedVectorType::get(llvm::Type::getInt64Ty(Ctx), 2);
+  for (unsigned i = 0; i < abi.numXMMParams(); ++i) {
+    param_types.push_back(xmm_ty);
+  }
+
   return llvm::FunctionType::get(ret_ty, param_types, false);
 }
 
@@ -89,11 +95,19 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
                           llvm::MaybeAlign(16));
   }
 
-  // Store parameters into State fields.
+  // Store GPR parameters into State fields.
   for (unsigned i = 0; i < abi.numParams(); ++i) {
     auto *param = native_fn->getArg(i);
     auto *field_ptr = buildStateGEP(Builder, state_alloca,
                                      abi.params[i].state_offset);
+    Builder.CreateStore(param, field_ptr);
+  }
+
+  // Store XMM parameters into State vector register slots.
+  for (unsigned i = 0; i < abi.numXMMParams(); ++i) {
+    auto *param = native_fn->getArg(abi.numParams() + i);
+    auto *field_ptr = buildStateGEP(Builder, state_alloca,
+                                     abi.xmm_live_ins[i]);
     Builder.CreateStore(param, field_ptr);
   }
 
@@ -151,9 +165,6 @@ llvm::PreservedAnalyses RecoverFunctionSignaturesPass::run(
   for (auto *F : functions) {
     auto *abi = cc_info.getABI(F);
     if (!abi) continue;
-    // Skip functions with non-standard register usage (e.g. XMM live-ins).
-    // These can't be correctly modeled with GPR-only native wrappers.
-    if (abi->has_non_standard_regs) continue;
     createNativeWrapper(F, *abi, field_map);
     changed = true;
   }
