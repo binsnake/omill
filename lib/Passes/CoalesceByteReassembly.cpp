@@ -104,11 +104,18 @@ static bool collectContributions(Value *V,
   return false;
 }
 
-/// Check that contributions exactly cover [0, result_bytes) with matching
-/// source offsets from the same root vector and a consistent base offset.
+/// Check that contributions form a contiguous, aligned range of bytes from the
+/// same root vector.  Supports both full (8-byte) and partial (1/2/4-byte)
+/// reassembly.
+///
+/// \param contribs        The collected byte contributions.
+/// \param max_result_bytes The maximum number of result bytes (usually 8).
+/// \param out_root        [out] The root vector value.
+/// \param out_base_byte   [out] The starting source byte offset.
+/// \param out_num_bytes   [out] The actual number of contiguous bytes found.
 static bool validateContributions(
-    ArrayRef<ByteContribution> contribs, unsigned result_bytes,
-    Value *&out_root, unsigned &out_base_byte) {
+    ArrayRef<ByteContribution> contribs, unsigned max_result_bytes,
+    Value *&out_root, unsigned &out_base_byte, unsigned &out_num_bytes) {
   if (contribs.empty())
     return false;
 
@@ -127,8 +134,22 @@ static bool validateContributions(
   if (root_bits != 128)
     return false;
 
+  // Determine the actual byte range covered by contributions.
+  unsigned max_dst = 0;
+  for (auto &c : contribs) {
+    unsigned end = c.dst_byte_offset + c.num_bytes;
+    if (end > max_dst)
+      max_dst = end;
+  }
+
+  // Round up to next power of 2 for a valid element size (1, 2, 4, 8).
+  unsigned result_bytes = 1;
+  while (result_bytes < max_dst)
+    result_bytes *= 2;
+  if (result_bytes > max_result_bytes)
+    return false;
+
   // Build a byte map: for each destination byte, record the source byte.
-  // Initialize to sentinel.
   SmallVector<int, 16> byte_map(result_bytes, -1);
 
   for (auto &c : contribs) {
@@ -161,6 +182,7 @@ static bool validateContributions(
 
   out_root = root;
   out_base_byte = base;
+  out_num_bytes = result_bytes;
   return true;
 }
 
@@ -189,17 +211,30 @@ static bool runOnFunction(Function &F) {
 
       Value *root_vec = nullptr;
       unsigned base_byte = 0;
-      if (!validateContributions(contribs, 8, root_vec, base_byte))
+      unsigned num_bytes = 0;
+      if (!validateContributions(contribs, 8, root_vec, base_byte, num_bytes))
         continue;
 
-      // Build replacement: bitcast root to <2 x i64>, extractelement.
       IRBuilder<> Builder(BO);
-      auto *wide_ty = FixedVectorType::get(Builder.getInt64Ty(), 2);
+
+      // Build: bitcast root to <N x iM>, extractelement, zext to i64.
+      unsigned elem_bits = num_bytes * 8;
+      unsigned num_elems = 128 / elem_bits;
+      auto *elem_ty = IntegerType::get(F.getContext(), elem_bits);
+      auto *wide_ty = FixedVectorType::get(elem_ty, num_elems);
       Value *bc = Builder.CreateBitCast(root_vec, wide_ty);
-      unsigned lane = base_byte / 8;
+      unsigned lane = base_byte / num_bytes;
       Value *extract = Builder.CreateExtractElement(bc, lane);
 
-      BO->replaceAllUsesWith(extract);
+      // Zero-extend to i64 if the extraction is smaller than 8 bytes.
+      Value *result;
+      if (num_bytes < 8) {
+        result = Builder.CreateZExt(extract, BO->getType());
+      } else {
+        result = extract;
+      }
+
+      BO->replaceAllUsesWith(result);
       BO->eraseFromParent();
       changed = true;
     }
