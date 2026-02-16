@@ -36,6 +36,7 @@ add_executable(omill-unit-tests
   unit/CFGRecoveryTest.cpp
   unit/CallingConventionAnalysisTest.cpp
   unit/RecoverStackFrameTest.cpp
+  unit/RecoverStackFrameTypesTest.cpp
   unit/StateFieldMapTest.cpp
   unit/LowerAtomicIntrinsicsTest.cpp
   unit/LowerHyperCallsTest.cpp

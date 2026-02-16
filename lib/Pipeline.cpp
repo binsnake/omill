@@ -34,6 +34,7 @@
 #include "omill/Passes/PromoteStateToSSA.h"
 #include "omill/Passes/RecoverFunctionSignatures.h"
 #include "omill/Passes/RecoverStackFrame.h"
+#include "omill/Passes/RecoverStackFrameTypes.h"
 #include "omill/Passes/EliminateStateStruct.h"
 #include "omill/Passes/RemoveBarriers.h"
 #include "omill/Analysis/BinaryMemoryMap.h"
@@ -95,6 +96,7 @@ void buildStateOptimizationPipeline(llvm::FunctionPassManager &FPM,
     // OutlineConstantStackData has promoted the alloca to a global constant.
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(RecoverStackFramePass());
+    FPM.addPass(RecoverStackFrameTypesPass());
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(llvm::EarlyCSEPass());
     FPM.addPass(llvm::DCEPass());
@@ -126,6 +128,7 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
   {
     llvm::FunctionPassManager FPM;
     FPM.addPass(RecoverStackFramePass());
+    FPM.addPass(RecoverStackFrameTypesPass());
     FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
     FPM.addPass(llvm::InstCombinePass());
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
@@ -156,6 +159,7 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
 void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM) {
   // Recover stack frame: convert inttoptr(RSP+offset) to alloca GEPs.
   FPM.addPass(RecoverStackFramePass());
+  FPM.addPass(RecoverStackFrameTypesPass());
   FPM.addPass(llvm::InstCombinePass());
   FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
   FPM.addPass(llvm::InstCombinePass());

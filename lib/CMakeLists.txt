@@ -35,6 +35,7 @@ add_library(omill STATIC
   Analysis/CallingConventionAnalysis.cpp
   Passes/RecoverStackFrame.cpp
   Passes/RecoverFunctionSignatures.cpp
+  Passes/RecoverStackFrameTypes.cpp
   Passes/EliminateStateStruct.cpp
 
   # Analysis & Passes - Stage 6: Deobfuscation
