@@ -493,9 +493,8 @@ TEST_F(DeobfuscationTest, MixedSingleNativeFunction) {
 // Cloakwork obfuscation tests
 // =============================================================================
 
-/// DISABLED: CW_STR's TLS-guarded constinit pattern lifts ~2000 functions
-/// and triggers an access violation in the pipeline.
-TEST_F(DeobfuscationTest, DISABLED_CloakworkStrRecovery) {
+/// CW_STR's TLS-guarded constinit pattern lifts ~2000 functions.
+TEST_F(DeobfuscationTest, CloakworkStrRecovery) {
   ASSERT_TRUE(liftAndOptimize("cw_str_hello"));
   EXPECT_TRUE(verifyModule());
 

@@ -154,4 +154,58 @@ TEST(ImportHashDBTest, TryResolveFindsAcrossAlgorithms) {
   EXPECT_FALSE(result.has_value());
 }
 
+TEST(ImportHashDBTest, ResolveModuleNameFindsKernel32) {
+  omill::ImportHashDB db;
+  db.loadBuiltins();
+
+  // Compute the case-insensitive FNV1a32 hash of "kernel32.dll".
+  uint32_t hash = omill::ImportHashDB::computeHash(
+      "kernel32.dll", omill::HashAlgorithm::FNV1a32_Lowercase, 0x811c9dc5u);
+
+  auto result = db.resolveModuleName(hash);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(*result, "kernel32.dll");
+}
+
+TEST(ImportHashDBTest, ResolveModuleNameReturnsNulloptForUnknown) {
+  omill::ImportHashDB db;
+  db.loadBuiltins();
+
+  auto result = db.resolveModuleName(0xDEADDEADu);
+  EXPECT_FALSE(result.has_value());
+}
+
+TEST(ImportHashDBTest, ResolveInModuleFindsVirtualAlloc) {
+  omill::ImportHashDB db;
+  db.loadBuiltins();
+
+  uint32_t func_hash = omill::ImportHashDB::computeHash(
+      "VirtualAlloc", omill::HashAlgorithm::FNV1a32, 0x811c9dc5u);
+
+  auto result = db.resolveInModule("kernel32.dll", func_hash);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->module, "kernel32.dll");
+  EXPECT_EQ(result->function, "VirtualAlloc");
+}
+
+TEST(ImportHashDBTest, ResolveInModuleReturnsNulloptForWrongModule) {
+  omill::ImportHashDB db;
+  db.loadBuiltins();
+
+  uint32_t func_hash = omill::ImportHashDB::computeHash(
+      "VirtualAlloc", omill::HashAlgorithm::FNV1a32, 0x811c9dc5u);
+
+  // VirtualAlloc is in kernel32, not ntdll.
+  auto result = db.resolveInModule("ntdll.dll", func_hash);
+  EXPECT_FALSE(result.has_value());
+}
+
+TEST(ImportHashDBTest, ResolveInModuleReturnsNulloptForUnknownHash) {
+  omill::ImportHashDB db;
+  db.loadBuiltins();
+
+  auto result = db.resolveInModule("kernel32.dll", 0xDEADDEADu);
+  EXPECT_FALSE(result.has_value());
+}
+
 }  // namespace

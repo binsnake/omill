@@ -54,6 +54,15 @@ class ImportHashDB {
   std::optional<ExportEntry> resolve(uint32_t offset,
                                      uint32_t target_hash) const;
 
+  /// Given a hash, check if it matches a known DLL name (case-insensitive
+  /// FNV1a32 with seed 0x811c9dc5).
+  std::optional<std::string> resolveModuleName(uint32_t hash) const;
+
+  /// Given a known module and function hash, resolve the function name
+  /// (case-sensitive FNV1a32 with seed 0x811c9dc5).
+  std::optional<ExportEntry> resolveInModule(llvm::StringRef module,
+                                             uint32_t func_hash) const;
+
   /// Compute hash with a specific algorithm and seed.
   static uint32_t computeHash(llvm::StringRef name, HashAlgorithm algo,
                               uint32_t seed);

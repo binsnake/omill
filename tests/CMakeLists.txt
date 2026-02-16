@@ -63,6 +63,8 @@ add_executable(omill-unit-tests
   unit/SymbolicJumpTableSolverTest.cpp
   unit/EliminateDeadPathsTest.cpp
   unit/HyperCallCodegenTest.cpp
+  unit/IterativeTargetResolutionTest.cpp
+  unit/PassRegistryTest.cpp
 )
 
 target_link_libraries(omill-unit-tests

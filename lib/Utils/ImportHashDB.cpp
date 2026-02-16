@@ -1,5 +1,6 @@
 #include "omill/Utils/ImportHashDB.h"
 
+#include <llvm/ADT/StringSet.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/raw_ostream.h>
 
@@ -105,6 +106,34 @@ std::optional<ImportHashDB::ExportEntry> ImportHashDB::resolve(
     uint32_t offset, uint32_t target_hash) const {
   for (const auto &entry : exports_) {
     if (computeHash(entry.function, offset) == target_hash)
+      return entry;
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string> ImportHashDB::resolveModuleName(
+    uint32_t hash) const {
+  // Collect unique module names from exports.
+  llvm::StringSet<> seen;
+  for (const auto &entry : exports_) {
+    if (seen.insert(entry.module).second) {
+      uint32_t h = computeHash(entry.module, HashAlgorithm::FNV1a32_Lowercase,
+                                0x811c9dc5u);
+      if (h == hash)
+        return entry.module;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<ImportHashDB::ExportEntry> ImportHashDB::resolveInModule(
+    llvm::StringRef module, uint32_t func_hash) const {
+  for (const auto &entry : exports_) {
+    if (entry.module != module)
+      continue;
+    uint32_t h =
+        computeHash(entry.function, HashAlgorithm::FNV1a32, 0x811c9dc5u);
+    if (h == func_hash)
       return entry;
   }
   return std::nullopt;

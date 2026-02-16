@@ -289,10 +289,6 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   MPM.addPass(llvm::GlobalDCEPass());
 }
 
-void registerAnalyses(llvm::FunctionAnalysisManager &FAM) {
-  FAM.registerPass([&] { return RemillIntrinsicAnalysis(); });
-}
-
 void registerModuleAnalyses(llvm::ModuleAnalysisManager &MAM) {
   MAM.registerPass([&] { return CallGraphAnalysis(); });
   MAM.registerPass([&] { return CallingConventionAnalysis(); });

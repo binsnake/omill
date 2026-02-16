@@ -64,6 +64,41 @@ llvm::PreservedAnalyses HashImportAnnotationPass::run(
   bool changed = false;
   auto &Ctx = F.getContext();
 
+  /// Candidate icmp with its extracted hash value.
+  struct HashCandidate {
+    llvm::ICmpInst *icmp;
+    uint32_t hash_value;
+  };
+
+  /// Extract a 32-bit hash constant from an icmp eq instruction.
+  auto extractHashConstant =
+      [](llvm::ICmpInst *icmp) -> std::optional<uint32_t> {
+    for (unsigned i = 0; i < 2; ++i) {
+      auto *CI = llvm::dyn_cast<llvm::ConstantInt>(icmp->getOperand(i));
+      if (!CI)
+        continue;
+      uint64_t val = CI->getZExtValue();
+      if (CI->getBitWidth() <= 32) {
+        uint32_t h = static_cast<uint32_t>(val);
+        if (h >= 0x100)
+          return h;
+        continue;
+      }
+      uint32_t upper = static_cast<uint32_t>(val >> 32);
+      if (upper == 0 || upper == 0xFFFFFFFF) {
+        uint32_t h = static_cast<uint32_t>(val);
+        if (h >= 0x100)
+          return h;
+      }
+    }
+    return std::nullopt;
+  };
+
+  // All hash candidates seen in the function (for Strategy 3 pairing).
+  llvm::SmallVector<HashCandidate, 8> all_candidates;
+  // Unresolved candidates (subset of all_candidates).
+  llvm::SmallVector<HashCandidate, 8> unresolved_candidates;
+
   for (auto &BB : F) {
     auto *L = LI.getLoopFor(&BB);
     if (!L)
@@ -87,34 +122,15 @@ llvm::PreservedAnalyses HashImportAnnotationPass::run(
       if (!is_branch_cond)
         continue;
 
-      // Extract a 32-bit hash constant from either operand.
-      // Handles i32 constants and i64 constants (sign- or zero-extended).
-      uint32_t hash_value = 0;
-      bool found_constant = false;
-      for (unsigned i = 0; i < 2; ++i) {
-        auto *CI = llvm::dyn_cast<llvm::ConstantInt>(icmp->getOperand(i));
-        if (!CI)
-          continue;
-        uint64_t val = CI->getZExtValue();
-        if (CI->getBitWidth() <= 32) {
-          hash_value = static_cast<uint32_t>(val);
-          found_constant = true;
-          break;
-        }
-        // For i64: accept if upper 32 bits are zero or all-ones (sign-ext).
-        uint32_t upper = static_cast<uint32_t>(val >> 32);
-        if (upper == 0 || upper == 0xFFFFFFFF) {
-          hash_value = static_cast<uint32_t>(val);
-          found_constant = true;
-          break;
-        }
-      }
-      if (!found_constant || hash_value < 0x100)
+      auto hash_opt = extractHashConstant(icmp);
+      if (!hash_opt)
         continue;
+      uint32_t hash_value = *hash_opt;
+
+      // Track all candidates for Strategy 3 pairing.
+      all_candidates.push_back({icmp, hash_value});
 
       // Strategy 1: Dynamic seed extraction.
-      // Walk up the loop nest to find the outermost loop containing an
-      // FNV-1a multiply, then try each phi seed with the legacy resolve API.
       bool resolved = false;
       llvm::Loop *fnv_loop = nullptr;
       for (auto *loop = L; loop; loop = loop->getParentLoop()) {
@@ -147,7 +163,54 @@ llvm::PreservedAnalyses HashImportAnnotationPass::run(
           auto *md = llvm::MDNode::get(Ctx, {mod_str, fn_str});
           icmp->setMetadata("omill.resolved_import", md);
           changed = true;
+          resolved = true;
         }
+      }
+
+      // Track unresolved candidates for Strategy 3.
+      if (!resolved)
+        unresolved_candidates.push_back({icmp, hash_value});
+    }
+  }
+
+  // Strategy 3: Paired hash resolution for CW_IMPORT.
+  // Module hash (case-insensitive FNV1a32) + function hash (case-sensitive)
+  // appear as two separate FNV loops in the same function.
+  if (!unresolved_candidates.empty()) {
+    // Try each unresolved candidate as a potential module hash.
+    for (auto &cand : unresolved_candidates) {
+      if (cand.icmp->getMetadata("omill.resolved_import"))
+        continue;
+
+      auto mod_name = db.resolveModuleName(cand.hash_value);
+      if (!mod_name)
+        continue;
+
+      // Found a module match — scan ALL candidates (including those resolved
+      // by Strategy 1/2) for a matching function hash in this module.
+      for (auto &other : all_candidates) {
+        if (other.icmp == cand.icmp)
+          continue;
+
+        auto func_entry = db.resolveInModule(*mod_name, other.hash_value);
+        if (!func_entry)
+          continue;
+
+        // Annotate the function icmp if not already annotated.
+        auto *mod_str = llvm::MDString::get(Ctx, func_entry->module);
+        auto *fn_str = llvm::MDString::get(Ctx, func_entry->function);
+        auto *md = llvm::MDNode::get(Ctx, {mod_str, fn_str});
+        if (!other.icmp->getMetadata("omill.resolved_import")) {
+          other.icmp->setMetadata("omill.resolved_import", md);
+          changed = true;
+        }
+
+        // Annotate the module icmp with the module name.
+        auto *mod_only_md = llvm::MDNode::get(
+            Ctx, {mod_str, llvm::MDString::get(Ctx, "")});
+        cand.icmp->setMetadata("omill.resolved_import", mod_only_md);
+        changed = true;
+        break;  // One module matches one function.
       }
     }
   }
