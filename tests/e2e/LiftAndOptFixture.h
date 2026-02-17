@@ -131,6 +131,9 @@ class LiftAndOptFixture : public ::testing::Test {
   /// Returns the dump directory from OMILL_DUMP_IR, or empty if not set.
   static std::string getDumpDir();
 
+  /// Returns true if OMILL_TIME_PASSES env var is set.
+  static bool wantTimePasses();
+
   llvm::LLVMContext ctx_;
   std::unique_ptr<const remill::Arch> arch_;
   std::unique_ptr<llvm::Module> module_;

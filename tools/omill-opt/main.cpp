@@ -1,9 +1,11 @@
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
+#include <llvm/IR/PassTimingInfo.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/IRReader/IRReader.h>
 #include <llvm/Passes/PassBuilder.h>
+#include <llvm/Passes/StandardInstrumentations.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/InitLLVM.h>
 #include <llvm/Support/SourceMgr.h>
@@ -104,6 +106,11 @@ static cl::opt<bool> IPCP(
     cl::desc("Enable interprocedural constant propagation"),
     cl::init(false));
 
+static cl::opt<bool> TimePasses(
+    "time-passes",
+    cl::desc("Time each pass, printing elapsed time on exit"),
+    cl::init(false));
+
 int main(int argc, char **argv) {
   InitLLVM X(argc, argv);
   cl::ParseCommandLineOptions(argc, argv, "omill optimizer\n");
@@ -130,8 +137,13 @@ int main(int argc, char **argv) {
   opts.refine_signatures = RefineSignatures;
   opts.interprocedural_const_prop = IPCP;
 
+  // Set up pass timing instrumentation.
+  PassInstrumentationCallbacks PIC;
+  TimePassesHandler TimingHandler(TimePasses);
+  TimingHandler.registerCallbacks(PIC);
+
   // Set up pass infrastructure
-  PassBuilder PB;
+  PassBuilder PB(nullptr, PipelineTuningOptions(), std::nullopt, &PIC);
 
   LoopAnalysisManager LAM;
   FunctionAnalysisManager FAM;
@@ -172,6 +184,9 @@ int main(int argc, char **argv) {
 
   // Run the pipeline
   MPM.run(*M, MAM);
+
+  if (TimePasses)
+    TimingHandler.print();
 
   // Verify
   if (VerifyOutput) {

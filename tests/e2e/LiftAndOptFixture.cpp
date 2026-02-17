@@ -1,5 +1,7 @@
 #include "LiftAndOptFixture.h"
 
+#include <llvm/IR/PassInstrumentation.h>
+#include <llvm/IR/PassTimingInfo.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/FileSystem.h>
@@ -58,9 +60,16 @@ llvm::Module *LiftAndOptFixture::liftMultiple(llvm::ArrayRef<uint64_t> addrs) {
 void LiftAndOptFixture::optimize(const PipelineOptions &opts) {
   ASSERT_NE(module_, nullptr) << "Must call lift() before optimize()";
 
+  bool timing = wantTimePasses();
+  llvm::PassInstrumentationCallbacks PIC;
+  llvm::TimePassesHandler TimingHandler(timing);
+  if (timing)
+    TimingHandler.registerCallbacks(PIC);
+
   dumpIR("before");
 
-  llvm::PassBuilder PB;
+  llvm::PassBuilder PB(nullptr, llvm::PipelineTuningOptions(), std::nullopt,
+                        &PIC);
   llvm::LoopAnalysisManager LAM;
   llvm::FunctionAnalysisManager FAM;
   llvm::CGSCCAnalysisManager CGAM;
@@ -81,13 +90,22 @@ void LiftAndOptFixture::optimize(const PipelineOptions &opts) {
   MPM.run(*module_, MAM);
 
   dumpIR("after");
+  if (timing)
+    TimingHandler.print();
 }
 
 void LiftAndOptFixture::optimizeWithMemoryMap(const PipelineOptions &opts,
                                                BinaryMemoryMap memory_map) {
   ASSERT_NE(module_, nullptr) << "Must call lift() before optimizeWithMemoryMap()";
 
-  llvm::PassBuilder PB;
+  bool timing = wantTimePasses();
+  llvm::PassInstrumentationCallbacks PIC;
+  llvm::TimePassesHandler TimingHandler(timing);
+  if (timing)
+    TimingHandler.registerCallbacks(PIC);
+
+  llvm::PassBuilder PB(nullptr, llvm::PipelineTuningOptions(), std::nullopt,
+                        &PIC);
   llvm::LoopAnalysisManager LAM;
   llvm::FunctionAnalysisManager FAM;
   llvm::CGSCCAnalysisManager CGAM;
@@ -133,6 +151,9 @@ void LiftAndOptFixture::optimizeWithMemoryMap(const PipelineOptions &opts,
 
     dumpIR("after_abi");
   }
+
+  if (timing)
+    TimingHandler.print();
 }
 
 void LiftAndOptFixture::optimizeWithExceptions(
@@ -146,7 +167,14 @@ void LiftAndOptFixture::optimizeWithExceptions(
   std::deque<std::vector<uint8_t>> dc_storage;
   exc_info.buildSyntheticDCs(dc_storage, memory_map, exc_info.imageBase());
 
-  llvm::PassBuilder PB;
+  bool timing = wantTimePasses();
+  llvm::PassInstrumentationCallbacks PIC;
+  llvm::TimePassesHandler TimingHandler(timing);
+  if (timing)
+    TimingHandler.registerCallbacks(PIC);
+
+  llvm::PassBuilder PB(nullptr, llvm::PipelineTuningOptions(), std::nullopt,
+                        &PIC);
   llvm::LoopAnalysisManager LAM;
   llvm::FunctionAnalysisManager FAM;
   llvm::CGSCCAnalysisManager CGAM;
@@ -182,6 +210,13 @@ void LiftAndOptFixture::optimizeWithExceptions(
   }
 
   dumpIR("after");
+  if (timing)
+    TimingHandler.print();
+}
+
+bool LiftAndOptFixture::wantTimePasses() {
+  const char *env = std::getenv("OMILL_TIME_PASSES");
+  return env && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
 }
 
 std::string LiftAndOptFixture::getDumpDir() {
