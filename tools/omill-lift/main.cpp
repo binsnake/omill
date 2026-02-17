@@ -204,7 +204,7 @@ void parsePData(const object::COFFObjectFile &coff, uint64_t image_base,
     }
 
     exception_info.addEntry({image_base + begin_rva, image_base + end_rva,
-                             handler_va, handler_data_va, 0});
+                             handler_va, handler_data_va, 0, 0});
   }
 }
 

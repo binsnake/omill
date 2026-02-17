@@ -24,6 +24,7 @@ struct RuntimeFunctionEntry {
   uint64_t handler_va;        // Exception handler VA (0 if none)
   uint64_t handler_data_va;   // Language-specific handler data VA (0 if none)
   uint64_t dc_synthetic_va;   // Synthetic DISPATCHER_CONTEXT VA in BinaryMemoryMap
+  uint64_t ctx_synthetic_va;  // Synthetic CONTEXT VA (Rip = begin_va)
 };
 
 /// Provides structured exception handling metadata parsed from PE .pdata.

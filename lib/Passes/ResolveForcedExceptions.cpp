@@ -102,11 +102,12 @@ llvm::PreservedAnalyses ResolveForcedExceptionsPass::run(
     // Store handler args into State (Win64 SEH ABI):
     //   RCX = 0 (EXCEPTION_RECORD* — not needed for CFF)
     //   RDX = 0 (EstablisherFrame — not needed for CFF)
-    //   R8  = 0 (CONTEXT* — not needed for CFF)
+    //   R8  = synthetic CONTEXT VA (Rip = exception address)
     //   R9  = synthetic DC VA (DISPATCHER_CONTEXT* — has HandlerData)
     storeStateI64(Builder, state, kStateRCX, Builder.getInt64(0));
     storeStateI64(Builder, state, kStateRDX, Builder.getInt64(0));
-    storeStateI64(Builder, state, kStateR8, Builder.getInt64(0));
+    storeStateI64(Builder, state, kStateR8,
+                  Builder.getInt64(rt_entry->ctx_synthetic_va));
     storeStateI64(Builder, state, kStateR9,
                   Builder.getInt64(rt_entry->dc_synthetic_va));
 

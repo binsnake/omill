@@ -96,6 +96,7 @@ class ResolveForcedExceptionsTest : public ::testing::Test {
           /*handler_va=*/0x403000,
           /*handler_data_va=*/0,
           /*dc_synthetic_va=*/0x500000,
+          /*ctx_synthetic_va=*/0x600000,
       });
 
       MAM.registerPass(
