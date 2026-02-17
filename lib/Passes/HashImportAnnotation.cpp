@@ -52,11 +52,19 @@ static void collectSeeds(llvm::Loop *L,
     collectSeeds(sub, seeds);
 }
 
+static const ImportHashDB &getSharedDB() {
+  static const ImportHashDB db = [] {
+    ImportHashDB d;
+    d.loadBuiltins();
+    d.buildLookupTables();
+    return d;
+  }();
+  return db;
+}
+
 llvm::PreservedAnalyses HashImportAnnotationPass::run(
     llvm::Function &F, llvm::FunctionAnalysisManager &AM) {
-  ImportHashDB db;
-  db.loadBuiltins();
-  db.buildLookupTables();
+  const auto &db = getSharedDB();
 
   llvm::DominatorTree DT(F);
   llvm::LoopInfo LI(DT);

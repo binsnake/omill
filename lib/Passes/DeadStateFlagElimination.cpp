@@ -58,69 +58,34 @@ llvm::PreservedAnalyses DeadStateFlagEliminationPass::run(
   auto &DL = F.getParent()->getDataLayout();
   StateFieldMap field_map(*F.getParent());
 
-  // Collect all stores and loads to flag fields.
-  struct FlagAccess {
-    llvm::Instruction *inst;
-    unsigned offset;
-    bool is_store;
-  };
-
-  llvm::SmallVector<FlagAccess, 64> flag_accesses;
-
-  for (auto &BB : F) {
-    for (auto &I : BB) {
-      if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
-        int64_t off = resolveStateOffset(SI->getPointerOperand(), DL);
-        if (off >= 0 && isFlagOffset(static_cast<unsigned>(off), field_map)) {
-          flag_accesses.push_back(
-              {SI, static_cast<unsigned>(off), /*is_store=*/true});
-        }
-      }
-      if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I)) {
-        int64_t off = resolveStateOffset(LI->getPointerOperand(), DL);
-        if (off >= 0 && isFlagOffset(static_cast<unsigned>(off), field_map)) {
-          flag_accesses.push_back(
-              {LI, static_cast<unsigned>(off), /*is_store=*/false});
-        }
-      }
-    }
-  }
-
-  if (flag_accesses.empty()) {
-    return llvm::PreservedAnalyses::all();
-  }
-
-  // Per basic block: for each flag field, find stores that are followed by
-  // another store to the same field without an intervening load.
-  // This is a simple local (intra-block) dead store elimination.
-  // A more sophisticated version would use dominators for cross-block DSE.
-
+  // Single-pass: for each basic block, track last store per flag offset.
+  // When a store is superseded by another store to the same flag without
+  // an intervening load, mark the earlier store as dead.
   llvm::SmallVector<llvm::Instruction *, 16> dead_stores;
 
   for (auto &BB : F) {
-    // Track the last store to each flag field in this block.
     llvm::DenseMap<unsigned, llvm::StoreInst *> last_store;
 
     for (auto &I : BB) {
       if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I)) {
         int64_t off = resolveStateOffset(LI->getPointerOperand(), DL);
         if (off >= 0 && isFlagOffset(static_cast<unsigned>(off), field_map)) {
-          // This load reads the flag — the last store is NOT dead.
           last_store.erase(static_cast<unsigned>(off));
         }
+        continue;
       }
 
       if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
         int64_t off = resolveStateOffset(SI->getPointerOperand(), DL);
         if (off >= 0 && isFlagOffset(static_cast<unsigned>(off), field_map)) {
           unsigned u_off = static_cast<unsigned>(off);
-          // If there's already an unread store to this flag, it's dead.
           auto it = last_store.find(u_off);
           if (it != last_store.end()) {
             dead_stores.push_back(it->second);
           }
           last_store[u_off] = SI;
         }
+        continue;
       }
 
       // Calls may read flags through the State pointer — conservatively
@@ -129,9 +94,6 @@ llvm::PreservedAnalyses DeadStateFlagEliminationPass::run(
         last_store.clear();
       }
     }
-
-    // At block end: don't eliminate the last store because it may be
-    // live-out to successor blocks. A cross-block analysis would refine this.
   }
 
   if (dead_stores.empty()) {
