@@ -310,31 +310,38 @@ static bool tryScalarizeExtractFromSext(Instruction *I) {
 
 static bool runOnFunction(Function &F) {
   bool changed = false;
+  bool changed_this_iter;
 
-  for (auto &BB : F) {
-    for (auto it = BB.begin(); it != BB.end(); ) {
-      Instruction *I = &*it++;
+  do {
+    changed_this_iter = false;
 
-      // Try the and-mask pattern (handles both direct sext and
-      // bitcast+lshr+trunc chains).
-      if (trySimplifyAndMask(I)) {
-        changed = true;
-        continue;
-      }
+    for (auto &BB : F) {
+      for (auto it = BB.begin(); it != BB.end(); ) {
+        Instruction *I = &*it++;
 
-      // Try bare lshr pattern (no trailing and).
-      if (trySimplifyBareLshr(I)) {
-        changed = true;
-        continue;
-      }
+        // Try the and-mask pattern (handles both direct sext and
+        // bitcast+lshr+trunc chains).
+        if (trySimplifyAndMask(I)) {
+          changed_this_iter = true;
+          continue;
+        }
 
-      // Scalarize extractelement from sext <N x i1> (unconditional).
-      if (tryScalarizeExtractFromSext(I)) {
-        changed = true;
-        continue;
+        // Try bare lshr pattern (no trailing and).
+        if (trySimplifyBareLshr(I)) {
+          changed_this_iter = true;
+          continue;
+        }
+
+        // Scalarize extractelement from sext <N x i1> (unconditional).
+        if (tryScalarizeExtractFromSext(I)) {
+          changed_this_iter = true;
+          continue;
+        }
       }
     }
-  }
+
+    changed |= changed_this_iter;
+  } while (changed_this_iter);
 
   return changed;
 }

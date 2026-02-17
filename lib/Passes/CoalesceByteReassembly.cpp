@@ -106,16 +106,19 @@ static bool collectContributions(Value *V,
 
 /// Check that contributions form a contiguous, aligned range of bytes from the
 /// same root vector.  Supports both full (8-byte) and partial (1/2/4-byte)
-/// reassembly.
+/// reassembly, including high-byte patterns where min_dst > 0 (e.g., bytes
+/// 4-7 reassembled into the upper half of an i64).
 ///
 /// \param contribs        The collected byte contributions.
 /// \param max_result_bytes The maximum number of result bytes (usually 8).
 /// \param out_root        [out] The root vector value.
 /// \param out_base_byte   [out] The starting source byte offset.
-/// \param out_num_bytes   [out] The actual number of contiguous bytes found.
+/// \param out_num_bytes   [out] The extraction size in bytes (power of 2).
+/// \param out_min_dst     [out] The minimum destination byte offset.
 static bool validateContributions(
     ArrayRef<ByteContribution> contribs, unsigned max_result_bytes,
-    Value *&out_root, unsigned &out_base_byte, unsigned &out_num_bytes) {
+    Value *&out_root, unsigned &out_base_byte, unsigned &out_num_bytes,
+    unsigned &out_min_dst) {
   if (contribs.empty())
     return false;
 
@@ -135,54 +138,62 @@ static bool validateContributions(
     return false;
 
   // Determine the actual byte range covered by contributions.
+  unsigned min_dst = UINT_MAX;
   unsigned max_dst = 0;
   for (auto &c : contribs) {
+    if (c.dst_byte_offset < min_dst)
+      min_dst = c.dst_byte_offset;
     unsigned end = c.dst_byte_offset + c.num_bytes;
     if (end > max_dst)
       max_dst = end;
   }
 
-  // Round up to next power of 2 for a valid element size (1, 2, 4, 8).
-  unsigned result_bytes = 1;
-  while (result_bytes < max_dst)
-    result_bytes *= 2;
-  if (result_bytes > max_result_bytes)
+  // Compute the span of destination bytes actually covered.
+  unsigned span = max_dst - min_dst;
+
+  // Round up span to next power of 2 for a valid extraction element size.
+  unsigned extract_bytes = 1;
+  while (extract_bytes < span)
+    extract_bytes *= 2;
+  if (extract_bytes > max_result_bytes)
     return false;
 
-  // Build a byte map: for each destination byte, record the source byte.
-  SmallVector<int, 16> byte_map(result_bytes, -1);
+  // Build a byte map for the [min_dst, min_dst + extract_bytes) range.
+  SmallVector<int, 16> byte_map(extract_bytes, -1);
 
   for (auto &c : contribs) {
     for (unsigned i = 0; i < c.num_bytes; ++i) {
       unsigned dst = c.dst_byte_offset + i;
-      if (dst >= result_bytes)
+      if (dst < min_dst || dst >= min_dst + extract_bytes)
         return false;
-      if (byte_map[dst] != -1)
+      unsigned local = dst - min_dst;
+      if (byte_map[local] != -1)
         return false;  // Overlap.
-      byte_map[dst] = c.src_byte_offset + i;
+      byte_map[local] = c.src_byte_offset + i;
     }
   }
 
-  // All bytes must be covered.
-  for (unsigned i = 0; i < result_bytes; ++i) {
+  // All bytes in the extraction range must be covered.
+  for (unsigned i = 0; i < extract_bytes; ++i) {
     if (byte_map[i] == -1)
       return false;
   }
 
   // Bytes must be contiguous and in-order from the source.
   unsigned base = byte_map[0];
-  for (unsigned i = 1; i < result_bytes; ++i) {
+  for (unsigned i = 1; i < extract_bytes; ++i) {
     if (byte_map[i] != (int)(base + i))
       return false;
   }
 
-  // Base must be aligned to result_bytes for a clean extractelement.
-  if (base % result_bytes != 0)
+  // Base must be aligned to extract_bytes for a clean extractelement.
+  if (base % extract_bytes != 0)
     return false;
 
   out_root = root;
   out_base_byte = base;
-  out_num_bytes = result_bytes;
+  out_num_bytes = extract_bytes;
+  out_min_dst = min_dst;
   return true;
 }
 
@@ -212,7 +223,9 @@ static bool runOnFunction(Function &F) {
       Value *root_vec = nullptr;
       unsigned base_byte = 0;
       unsigned num_bytes = 0;
-      if (!validateContributions(contribs, 8, root_vec, base_byte, num_bytes))
+      unsigned min_dst = 0;
+      if (!validateContributions(contribs, 8, root_vec, base_byte, num_bytes,
+                                 min_dst))
         continue;
 
       IRBuilder<> Builder(BO);
@@ -232,6 +245,12 @@ static bool runOnFunction(Function &F) {
         result = Builder.CreateZExt(extract, BO->getType());
       } else {
         result = extract;
+      }
+
+      // If the contributions start at a non-zero destination byte, shift left
+      // to position the extracted value correctly in the i64.
+      if (min_dst > 0) {
+        result = Builder.CreateShl(result, min_dst * 8);
       }
 
       BO->replaceAllUsesWith(result);

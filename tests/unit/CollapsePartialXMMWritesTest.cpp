@@ -165,4 +165,74 @@ TEST_F(CollapsePartialXMMWritesTest, NonShuffleVectorNotTouched) {
   EXPECT_FALSE(llvm::verifyFunction(*test_fn, &llvm::errs()));
 }
 
+TEST_F(CollapsePartialXMMWritesTest, NestedShuffleResolved) {
+  // Two levels of shufflevector: extract should resolve through both.
+  // inner_sv = shufflevector(A, B, <0,17,2,19,...>)  — lanes 1,3 from B
+  // outer_sv = shufflevector(inner_sv, C, <16,1,18,3,...>) — lanes 0,2 from C
+  // extractelement(outer_sv, 1) → outer mask[1]=1 → inner_sv[1]
+  //   → inner mask[1]=17 → B[1]
+  // Should resolve directly to extractelement(B, 1).
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i8_ty = llvm::Type::getInt8Ty(Ctx);
+  auto *v16i8_ty = llvm::FixedVectorType::get(i8_ty, 16);
+
+  auto *fn_ty = llvm::FunctionType::get(
+      i8_ty, {v16i8_ty, v16i8_ty, v16i8_ty}, false);
+  auto *test_fn = llvm::Function::Create(
+      fn_ty, llvm::Function::ExternalLinkage, "test_func", *M);
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", test_fn);
+  llvm::IRBuilder<> B(entry);
+
+  auto *A = test_fn->getArg(0);
+  auto *vec_B = test_fn->getArg(1);
+  auto *C = test_fn->getArg(2);
+
+  // Inner shuffle: even lanes from A, odd lanes from B.
+  llvm::SmallVector<int, 16> inner_mask;
+  for (int i = 0; i < 16; ++i) {
+    if (i % 2 == 0)
+      inner_mask.push_back(i);       // A[i]
+    else
+      inner_mask.push_back(16 + i);  // B[i]
+  }
+  auto *inner_sv = B.CreateShuffleVector(A, vec_B, inner_mask, "inner");
+
+  // Outer shuffle: even lanes from C, odd lanes from inner_sv.
+  llvm::SmallVector<int, 16> outer_mask;
+  for (int i = 0; i < 16; ++i) {
+    if (i % 2 == 0)
+      outer_mask.push_back(16 + i);  // C[i]
+    else
+      outer_mask.push_back(i);       // inner_sv[i]
+  }
+  auto *outer_sv = B.CreateShuffleVector(inner_sv, C, outer_mask, "outer");
+
+  // Extract lane 1 from outer: outer_mask[1]=1 → inner_sv[1]
+  //   inner_mask[1]=17 → B[1]
+  auto *extracted = B.CreateExtractElement(outer_sv, B.getInt64(1), "byte");
+  B.CreateRet(extracted);
+
+  runPass(*test_fn);
+
+  // After: should extract directly from B at lane 1.
+  bool found_direct_extract = false;
+  for (auto &I : test_fn->getEntryBlock()) {
+    if (auto *EE = llvm::dyn_cast<llvm::ExtractElementInst>(&I)) {
+      if (EE->getVectorOperand() == vec_B) {
+        if (auto *ci = llvm::dyn_cast<llvm::ConstantInt>(EE->getIndexOperand()))
+          if (ci->getZExtValue() == 1)
+            found_direct_extract = true;
+      }
+    }
+  }
+  EXPECT_TRUE(found_direct_extract)
+      << "Should resolve through two levels of shufflevector to B[1]";
+  EXPECT_FALSE(llvm::verifyFunction(*test_fn, &llvm::errs()));
+}
+
 }  // namespace
