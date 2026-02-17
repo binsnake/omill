@@ -8,6 +8,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace omill {
 
@@ -28,11 +29,13 @@ namespace omill {
 ///   4. Assert output_before != output_after (negation of equivalence).
 ///   5. Check SAT: UNSAT = equivalent, SAT = counterexample.
 ///
-/// Limitations:
-///   - Bounded: loop-free IR only (or fixed unroll depth).
-///   - State array bounded to 3504 bytes.
-///   - Memory outside State (inttoptr) treated as uninterpreted functions.
-///   - Vectors encoded as concatenation of i64 elements.
+/// Supports:
+///   - Integer arithmetic, shifts, bitwise ops.
+///   - Vector instructions: extractelement, insertelement, shufflevector.
+///   - Bitcast between integer and vector types.
+///   - sext/zext/trunc including vector variants.
+///   - PHI nodes and conditional branches (loop-free CFG only).
+///   - Configurable State comparison range.
 class TranslationValidator {
  public:
   explicit TranslationValidator(z3::context &ctx);
@@ -51,6 +54,12 @@ class TranslationValidator {
   /// Returns whether the two are semantically equivalent.
   Result verify(llvm::Function &F);
 
+  /// Set the State byte offsets to compare. If empty, uses written offsets.
+  void setCompareOffsets(std::vector<unsigned> offsets);
+
+  /// Set max State offset to compare (default 3504).
+  void setMaxStateOffset(unsigned max_offset);
+
  private:
   z3::context &ctx_;
 
@@ -60,13 +69,17 @@ class TranslationValidator {
   /// Name of the cloned function in snapshot_module_.
   std::string snapshot_fn_name_;
 
+  /// User-specified offsets to compare. If empty, auto-detect.
+  std::vector<unsigned> compare_offsets_;
+
+  /// Max State offset for auto-detection.
+  unsigned max_state_offset_ = 3504;
+
+  /// Offsets written by the current function being encoded.
+  std::vector<unsigned> written_offsets_;
+
   /// Encode a function's State-to-State transformation as Z3 constraints.
   /// Returns the final State array expression after executing the function.
-  ///
-  /// \param F           The function to encode.
-  /// \param state_array The initial symbolic State array.
-  /// \param ret_val     [out] Z3 expression for the return value (if any).
-  /// \return The final State array after all stores.
   z3::expr encodeFunction(llvm::Function &F, z3::expr state_array,
                           z3::expr &ret_val);
 
@@ -79,6 +92,12 @@ class TranslationValidator {
   z3::expr translateValue(llvm::Value *V,
                           llvm::DenseMap<llvm::Value *, z3::expr *> &value_map,
                           z3::expr state_array);
+
+  /// Get the Z3 bitvector width for an LLVM type.
+  /// For integer types: the bit width.
+  /// For vector types: N * element_bits (flattened).
+  /// For pointer types: 64.
+  unsigned getBitWidth(llvm::Type *T);
 
   /// Owning storage for Z3 expressions.
   std::vector<std::unique_ptr<z3::expr>> owned_;

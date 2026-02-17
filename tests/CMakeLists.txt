@@ -99,6 +99,9 @@ if(OMILL_ENABLE_Z3)
     unit/LLVMZ3TranslatorTest.cpp
     unit/Z3DispatchSolverTest.cpp
     unit/TranslationValidationTest.cpp
+    unit/SemanticVerificationTest.cpp
+    unit/FuzzSemanticVerificationTest.cpp
+    unit/RandomIRVerifier.cpp
   )
   # Copy libz3.dll next to the test binary so it can be found at runtime.
   add_custom_command(TARGET omill-unit-tests POST_BUILD
