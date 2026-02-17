@@ -85,6 +85,7 @@ add_subdirectory(lib)
 # Tools
 if(OMILL_ENABLE_TOOLS)
   add_subdirectory(tools/omill-opt)
+  add_subdirectory(tools/ollvm-obf)
   if(OMILL_ENABLE_REMILL)
     add_subdirectory(tools/omill-lift)
   endif()

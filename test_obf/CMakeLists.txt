@@ -60,3 +60,57 @@ set_target_properties(obf_test PROPERTIES
   PREFIX ""
   OUTPUT_NAME "obf_test"
 )
+
+# --------------------------------------------------------------------------
+# OLLVM-obfuscated test DLL — C++ → bitcode → obfuscate → object → DLL.
+# --------------------------------------------------------------------------
+
+# Step 1: C++ → bitcode (at -O2 to get clean IR before obfuscation).
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs.bc
+  COMMAND ${CMAKE_CXX_COMPILER} -c -emit-llvm -O2
+    -target x86_64-pc-windows-msvc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/ollvm_funcs.cpp
+    -o ${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs.bc
+  DEPENDS src/ollvm_funcs.cpp
+  COMMENT "Compiling ollvm_funcs.cpp to bitcode"
+)
+
+# Step 2: obfuscate bitcode with ollvm-obf.
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs_obf.bc
+  COMMAND $<TARGET_FILE:ollvm-obf>
+    ${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs.bc
+    -o ${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs_obf.bc
+    --flatten --substitute --string-encrypt
+  DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs.bc ollvm-obf
+  COMMENT "Obfuscating ollvm_funcs.bc with CFF + MBA + string encryption"
+)
+
+# Step 3: obfuscated bitcode → object (O0 to prevent LLVM undoing obfuscation).
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs_obf.obj
+  COMMAND ${CMAKE_CXX_COMPILER} -c -O0
+    -target x86_64-pc-windows-msvc
+    ${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs_obf.bc
+    -o ${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs_obf.obj
+  DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs_obf.bc
+  COMMENT "Compiling obfuscated bitcode to object"
+)
+
+# Step 4: Link DLL from obfuscated object + dllmain.
+add_library(ollvm_test SHARED
+  src/dllmain.cpp
+  ${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs_obf.obj
+)
+set_source_files_properties(
+  ${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs_obf.obj
+  PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE
+)
+set_source_files_properties(src/dllmain.cpp
+  PROPERTIES COMPILE_OPTIONS "-O0"
+)
+target_compile_options(ollvm_test PRIVATE -UUNICODE -U_UNICODE)
+target_link_libraries(ollvm_test PRIVATE kernel32)
+set_target_properties(ollvm_test PROPERTIES PREFIX "" OUTPUT_NAME "ollvm_test")
+add_dependencies(ollvm_test ollvm-obf)

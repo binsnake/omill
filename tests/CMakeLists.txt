@@ -131,15 +131,17 @@ if(OMILL_ENABLE_REMILL)
     e2e/DeobfuscationTest.cpp
     e2e/HyperCallRoundTripTest.cpp
     e2e/ForcedExceptionTest.cpp
+    e2e/OLLVMTest.cpp
   )
 
-  # Pass the DLL path to the deobfuscation tests.
+  # Pass DLL paths to the deobfuscation tests.
   target_compile_definitions(omill-e2e-tests PRIVATE
     OBF_TEST_DLL_PATH="${CMAKE_BINARY_DIR}/test_obf/obf_test.dll"
+    OLLVM_TEST_DLL_PATH="${CMAKE_BINARY_DIR}/test_obf/ollvm_test.dll"
   )
 
-  # Ensure the DLL is built before the tests.
-  add_dependencies(omill-e2e-tests obf_test)
+  # Ensure DLLs are built before the tests.
+  add_dependencies(omill-e2e-tests obf_test ollvm_test)
 
   target_link_libraries(omill-e2e-tests
     PRIVATE
