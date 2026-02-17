@@ -249,6 +249,48 @@ bool loadPE(StringRef path, PEInfo &out) {
     }
   }
 
+  // Determine image size from PE optional header.
+  uint64_t image_size = 0;
+  if (auto *pe32p = coff.getPE32PlusHeader())
+    image_size = pe32p->SizeOfImage;
+  else if (auto *pe32 = coff.getPE32Header())
+    image_size = pe32->SizeOfImage;
+  out.memory_map.setImageBase(out.image_base);
+  out.memory_map.setImageSize(image_size);
+
+  // Check for suspicious preferred base (anti-analysis defense).
+  if (out.memory_map.isSuspiciousImageBase()) {
+    errs() << "WARNING: suspicious preferred image base 0x"
+           << Twine::utohexstr(out.image_base)
+           << " — ASLR will likely produce a non-zero delta.\n"
+           << "         Relocated constants in the binary may be unreliable.\n";
+  }
+
+  // Parse .reloc (base relocations) for relocation-aware constant folding.
+  for (const auto &reloc : coff.base_relocs()) {
+    uint8_t type = 0;
+    uint32_t rva = 0;
+    if (auto err = reloc.getType(type)) {
+      consumeError(std::move(err));
+      continue;
+    }
+    if (auto err = reloc.getRVA(rva)) {
+      consumeError(std::move(err));
+      continue;
+    }
+
+    uint8_t reloc_size = 0;
+    if (type == COFF::IMAGE_REL_BASED_DIR64)
+      reloc_size = 8;
+    else if (type == COFF::IMAGE_REL_BASED_HIGHLOW)
+      reloc_size = 4;
+    else
+      continue;  // Skip padding (ABSOLUTE) and exotic types.
+
+    out.memory_map.addRelocation(out.image_base + rva, reloc_size);
+  }
+  out.memory_map.finalizeRelocations();
+
   for (const auto &sec : coff.sections()) {
     auto contents_or_err = sec.getContents();
     if (!contents_or_err) { consumeError(contents_or_err.takeError()); continue; }

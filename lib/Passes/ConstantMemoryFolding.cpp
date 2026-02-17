@@ -4,6 +4,7 @@
 #include <llvm/IR/DataLayout.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/MDBuilder.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Operator.h>
 
@@ -79,58 +80,90 @@ llvm::PreservedAnalyses ConstantMemoryFoldingPass::run(
       if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I))
         loads.push_back(LI);
 
+  // Get or create the !omill.relocated metadata kind.
+  auto &Ctx = F.getContext();
+  unsigned reloc_md_kind = Ctx.getMDKindID("omill.relocated");
+  bool suspicious_base = map->isSuspiciousImageBase();
+
   for (auto *LI : loads) {
     auto addr = resolveConstantAddress(LI->getPointerOperand(), DL);
     if (!addr)
       continue;
 
     llvm::Type *ty = LI->getType();
+    unsigned bytes = 0;
 
-    // Handle integer types.
     if (ty->isIntegerTy()) {
       unsigned bits = ty->getIntegerBitWidth();
-      unsigned bytes = (bits + 7) / 8;
+      bytes = (bits + 7) / 8;
       if (bytes > 8)
         continue;
-      auto val = map->readInt(*addr, bytes);
-      if (!val)
-        continue;
-      // Truncate to the exact bit width.
-      auto *replacement = llvm::ConstantInt::get(ty, *val);
-      LI->replaceAllUsesWith(replacement);
-      LI->eraseFromParent();
-      changed = true;
+    } else if (ty->isFloatTy()) {
+      bytes = 4;
+    } else if (ty->isDoubleTy()) {
+      bytes = 8;
+    } else {
       continue;
     }
 
-    // Handle float types.
-    if (ty->isFloatTy()) {
-      auto val = map->readInt(*addr, 4);
-      if (!val)
+    auto val = map->readInt(*addr, bytes);
+    if (!val)
+      continue;
+
+    // Check relocation overlap and classify.
+    auto kind = map->classifyRelocatedValue(*addr, bytes, *val);
+
+    if (kind == RelocValueKind::Suspicious) {
+      // The value at a relocated address doesn't look like a valid VA.
+      // This could be a protector encoding constants via relocations.
+      // At preferred base (delta=0), the on-disk value is still correct.
+      // If the image base is suspicious, refuse to fold — the delta is
+      // likely non-zero and the on-disk value would be wrong.
+      if (suspicious_base)
         continue;
+    }
+
+    // Fold the value.
+    llvm::Value *replacement = nullptr;
+
+    if (ty->isIntegerTy()) {
+      replacement = llvm::ConstantInt::get(ty, *val);
+    } else if (ty->isFloatTy()) {
       uint32_t bits = static_cast<uint32_t>(*val);
       float fval;
       std::memcpy(&fval, &bits, 4);
-      auto *replacement =
-          llvm::ConstantFP::get(ty, static_cast<double>(fval));
-      LI->replaceAllUsesWith(replacement);
-      LI->eraseFromParent();
-      changed = true;
-      continue;
-    }
-
-    if (ty->isDoubleTy()) {
-      auto val = map->readInt(*addr, 8);
-      if (!val)
-        continue;
+      replacement = llvm::ConstantFP::get(ty, static_cast<double>(fval));
+    } else if (ty->isDoubleTy()) {
       double dval;
       std::memcpy(&dval, &*val, 8);
-      auto *replacement = llvm::ConstantFP::get(ty, dval);
-      LI->replaceAllUsesWith(replacement);
-      LI->eraseFromParent();
-      changed = true;
-      continue;
+      replacement = llvm::ConstantFP::get(ty, dval);
     }
+
+    if (!replacement)
+      continue;
+
+    // If the value is relocated, tag the original load's users with metadata
+    // before replacing. For integer types, we can directly tag the replacement
+    // instruction if there is one. For constants, we use metadata on the
+    // load's debug location as a breadcrumb.
+    if (kind != RelocValueKind::NotRelocated) {
+      // Create metadata: !omill.relocated !{kind_string, original_addr}
+      auto *kind_str = llvm::MDString::get(
+          Ctx, kind == RelocValueKind::NormalAddress ? "address" : "suspicious");
+      auto *addr_val = llvm::ConstantAsMetadata::get(
+          llvm::ConstantInt::get(llvm::Type::getInt64Ty(Ctx), *addr));
+      auto *md = llvm::MDNode::get(Ctx, {kind_str, addr_val});
+
+      // Attach to users that are instructions (they survive replacement).
+      for (auto *U : LI->users()) {
+        if (auto *UI = llvm::dyn_cast<llvm::Instruction>(U))
+          UI->setMetadata(reloc_md_kind, md);
+      }
+    }
+
+    LI->replaceAllUsesWith(replacement);
+    LI->eraseFromParent();
+    changed = true;
   }
 
   return changed ? llvm::PreservedAnalyses::none()
