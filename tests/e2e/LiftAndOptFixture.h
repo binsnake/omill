@@ -1,5 +1,6 @@
 #pragma once
 
+#include <llvm/ADT/ArrayRef.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
@@ -13,6 +14,7 @@
 #include <remill/OS/OS.h>
 
 #include "omill/Analysis/BinaryMemoryMap.h"
+#include "omill/Analysis/ExceptionInfo.h"
 #include "omill/Omill.h"
 
 #include <gtest/gtest.h>
@@ -34,6 +36,13 @@ class BufferTraceManager : public remill::TraceManager {
       code_[base + i] = data[i];
     }
     base_addr_ = base;
+  }
+
+  /// Append bytes without clearing existing code (for multi-function loading).
+  void addCode(const uint8_t *data, size_t size, uint64_t base) {
+    for (size_t i = 0; i < size; ++i) {
+      code_[base + i] = data[i];
+    }
   }
 
   void SetLiftedTraceDefinition(uint64_t addr,
@@ -86,12 +95,20 @@ class LiftAndOptFixture : public ::testing::Test {
   /// Returns the module containing lifted IR.
   llvm::Module *lift();
 
+  /// Lift code at the base address plus additional addresses (e.g. handler VAs).
+  llvm::Module *liftMultiple(llvm::ArrayRef<uint64_t> addrs);
+
   /// Run the omill pipeline on the module.
   void optimize(const PipelineOptions &opts = {});
 
   /// Run the pipeline with a pre-populated BinaryMemoryMap (for deobfuscation).
   void optimizeWithMemoryMap(const PipelineOptions &opts,
                              BinaryMemoryMap memory_map);
+
+  /// Run the pipeline with both a BinaryMemoryMap and ExceptionInfo.
+  void optimizeWithExceptions(const PipelineOptions &opts,
+                              ExceptionInfo exc_info,
+                              BinaryMemoryMap memory_map);
 
   /// Verify the module is well-formed.
   bool verifyModule();

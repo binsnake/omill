@@ -127,6 +127,7 @@ if(OMILL_ENABLE_REMILL)
     e2e/ControlFlowFlatteningTest.cpp
     e2e/DeobfuscationTest.cpp
     e2e/HyperCallRoundTripTest.cpp
+    e2e/ForcedExceptionTest.cpp
   )
 
   # Pass the DLL path to the deobfuscation tests.

@@ -10,6 +10,7 @@
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/CallGraphAnalysis.h"
 #include "omill/Analysis/CallingConventionAnalysis.h"
+#include "omill/Analysis/ExceptionInfo.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
 
 #include <cstdlib>
@@ -36,6 +37,20 @@ llvm::Module *LiftAndOptFixture::lift() {
   remill::TraceLifter lifter(arch_.get(), manager_);
   bool ok = lifter.Lift(manager_.baseAddr());
   EXPECT_TRUE(ok) << "TraceLifter::Lift() failed";
+
+  return module_.get();
+}
+
+llvm::Module *LiftAndOptFixture::liftMultiple(llvm::ArrayRef<uint64_t> addrs) {
+  module_ = remill::LoadArchSemantics(arch_.get());
+  EXPECT_NE(module_, nullptr) << "Failed to load arch semantics";
+  if (!module_) return nullptr;
+
+  remill::TraceLifter lifter(arch_.get(), manager_);
+  for (uint64_t addr : addrs) {
+    bool ok = lifter.Lift(addr);
+    EXPECT_TRUE(ok) << "TraceLifter::Lift() failed for 0x" << std::hex << addr;
+  }
 
   return module_.get();
 }
@@ -95,6 +110,7 @@ void LiftAndOptFixture::optimizeWithMemoryMap(const PipelineOptions &opts,
   MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
   MAM.registerPass([&] { return omill::CallGraphAnalysis(); });
   MAM.registerPass([&] { return omill::LiftedFunctionAnalysis(); });
+  MAM.registerPass([&] { return omill::ExceptionInfoAnalysis(); });
 
   dumpIR("before");
 
@@ -117,6 +133,55 @@ void LiftAndOptFixture::optimizeWithMemoryMap(const PipelineOptions &opts,
 
     dumpIR("after_abi");
   }
+}
+
+void LiftAndOptFixture::optimizeWithExceptions(
+    const PipelineOptions &opts, ExceptionInfo exc_info,
+    BinaryMemoryMap memory_map) {
+  ASSERT_NE(module_, nullptr)
+      << "Must call lift()/liftMultiple() before optimizeWithExceptions()";
+
+  // Build synthetic DCs in the memory map.
+  // Storage must outlive the pipeline run (deque is stable across push_back).
+  std::deque<std::vector<uint8_t>> dc_storage;
+  exc_info.buildSyntheticDCs(dc_storage, memory_map, exc_info.imageBase());
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+
+  // Register custom analyses BEFORE standard ones.
+  MAM.registerPass([&] {
+    return omill::BinaryMemoryAnalysis(std::move(memory_map));
+  });
+  MAM.registerPass([&] {
+    return omill::ExceptionInfoAnalysis(std::move(exc_info));
+  });
+
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+  omill::registerAnalyses(FAM);
+  // Register remaining module analyses (skip BinaryMemoryAnalysis and
+  // ExceptionInfoAnalysis since we already registered them above).
+  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+  MAM.registerPass([&] { return omill::CallGraphAnalysis(); });
+  MAM.registerPass([&] { return omill::LiftedFunctionAnalysis(); });
+
+  dumpIR("before");
+
+  {
+    llvm::ModulePassManager MPM;
+    omill::buildPipeline(MPM, opts);
+    MPM.run(*module_, MAM);
+  }
+
+  dumpIR("after");
 }
 
 std::string LiftAndOptFixture::getDumpDir() {
