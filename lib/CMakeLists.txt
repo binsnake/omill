@@ -88,6 +88,7 @@ target_link_libraries(omill
 if(OMILL_ENABLE_Z3)
   target_sources(omill PRIVATE
     Utils/SouperZ3Translator.cpp
+    Utils/TranslationValidator.cpp
     Passes/Z3DispatchSolver.cpp
   )
   target_link_libraries(omill PUBLIC z3::libz3)

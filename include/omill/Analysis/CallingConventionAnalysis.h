@@ -57,10 +57,18 @@ struct FunctionABI {
   /// as extra <2 x i64> parameters after the GPR params.
   llvm::SmallVector<unsigned, 4> xmm_live_ins;
 
+  /// Extra GPR live-ins that are NOT standard Win64 params (callee-saved regs
+  /// like RBX, RSI, R14 that the function reads before writing).  These are
+  /// passed as extra i64 parameters after XMM params.
+  llvm::SmallVector<unsigned, 8> extra_gpr_live_ins;
+
   bool isVoid() const { return !ret.has_value(); }
   unsigned numParams() const { return params.size(); }
   unsigned numXMMParams() const { return xmm_live_ins.size(); }
-  unsigned totalNativeParams() const { return numParams() + numXMMParams(); }
+  unsigned numExtraGPRParams() const { return extra_gpr_live_ins.size(); }
+  unsigned totalNativeParams() const {
+    return numParams() + numXMMParams() + numExtraGPRParams();
+  }
 };
 
 /// Module-level analysis result mapping each lifted function to its ABI.

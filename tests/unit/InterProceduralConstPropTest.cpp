@@ -220,4 +220,68 @@ TEST_F(InterProceduralConstPropTest, NonConstantStoreBlocks) {
   EXPECT_TRUE(has_load);
 }
 
+TEST_F(InterProceduralConstPropTest, AddressTakenFunctionSkipped) {
+  auto M = createModule();
+  auto *callee = createCallee(*M, "sub_402000", kRCX);
+  createCaller(*M, "sub_401000", callee, kRCX, 42);
+
+  // Take the address of the callee (ptrtoint) — this should prevent propagation.
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *addr_fn = llvm::Function::Create(
+      llvm::FunctionType::get(i64_ty, {}, false),
+      llvm::Function::ExternalLinkage, "get_addr", *M);
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", addr_fn);
+  llvm::IRBuilder<> B(entry);
+  auto *addr = B.CreatePtrToInt(callee, i64_ty);
+  B.CreateRet(addr);
+
+  runPass(*M);
+
+  // With address taken, the callee's load should remain (conservative).
+  bool has_load = false;
+  for (auto &I : callee->getEntryBlock()) {
+    if (llvm::isa<llvm::LoadInst>(&I))
+      has_load = true;
+  }
+  EXPECT_TRUE(has_load);
+}
+
+TEST_F(InterProceduralConstPropTest, MultipleCallersAgree) {
+  auto M = createModule();
+  auto *callee = createCallee(*M, "sub_403000", kRCX);
+  createCaller(*M, "sub_401000", callee, kRCX, 100);
+  createCaller(*M, "sub_402000", callee, kRCX, 100);
+
+  runPass(*M);
+
+  // Both callers store 100 → propagation should happen.
+  bool found_const = false;
+  for (auto &I : callee->getEntryBlock()) {
+    if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+      if (auto *C = llvm::dyn_cast<llvm::ConstantInt>(SI->getValueOperand())) {
+        if (C->getZExtValue() == 100)
+          found_const = true;
+      }
+    }
+  }
+  EXPECT_TRUE(found_const);
+}
+
+TEST_F(InterProceduralConstPropTest, MultipleCallersDisagree) {
+  auto M = createModule();
+  auto *callee = createCallee(*M, "sub_403000", kRCX);
+  createCaller(*M, "sub_401000", callee, kRCX, 42);
+  createCaller(*M, "sub_402000", callee, kRCX, 99);
+
+  runPass(*M);
+
+  // Different constants → no propagation, load should remain.
+  bool has_load = false;
+  for (auto &I : callee->getEntryBlock()) {
+    if (llvm::isa<llvm::LoadInst>(&I))
+      has_load = true;
+  }
+  EXPECT_TRUE(has_load);
+}
+
 }  // namespace

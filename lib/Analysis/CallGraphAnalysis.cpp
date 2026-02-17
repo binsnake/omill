@@ -127,16 +127,29 @@ LiftedCallGraph CallGraphAnalysis::run(llvm::Module &M,
         llvm::StringRef name = called->getName();
 
         // Direct call to a lifted function (sub_*)
-        if (isLiftedFunction(*called)) {
-          CallSite cs;
-          cs.inst = CI;
-          cs.caller = F;
-          cs.callee = called;
-          cs.target_pc = extractEntryVA(called->getName());
-          cs.is_tail_call = CI->isMustTailCall();
-          cs.is_dispatch = false;
-          node.callees.push_back(cs);
-          continue;
+        // isLiftedFunction rejects declarations, so also check by name
+        // and resolve via lifted function map.  This handles forward
+        // declarations (sub_140013efa → sub_140013efa.1).
+        {
+          llvm::Function *resolved = nullptr;
+          if (isLiftedFunction(*called)) {
+            resolved = called;
+          } else if (called->isDeclaration()) {
+            uint64_t va = extractEntryVA(called->getName());
+            if (va != 0)
+              resolved = lifted_map.lookup(va);
+          }
+          if (resolved) {
+            CallSite cs;
+            cs.inst = CI;
+            cs.caller = F;
+            cs.callee = resolved;
+            cs.target_pc = extractEntryVA(called->getName());
+            cs.is_tail_call = CI->isMustTailCall();
+            cs.is_dispatch = false;
+            node.callees.push_back(cs);
+            continue;
+          }
         }
 
         // __omill_dispatch_call or __omill_dispatch_jump

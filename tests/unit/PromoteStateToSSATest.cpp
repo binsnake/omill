@@ -333,4 +333,83 @@ TEST_F(PromoteStateToSSATest, MultipleFields) {
   EXPECT_FALSE(llvm::verifyFunction(*test_fn, &llvm::errs()));
 }
 
+TEST_F(PromoteStateToSSATest, MultiBlockPHI) {
+  // State field loaded in two predecessors → PHI in successor after SROA.
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *i1_ty = llvm::Type::getInt1Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *fn_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *test_fn = llvm::Function::Create(
+      fn_ty, llvm::Function::ExternalLinkage, "test_func", *M);
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", test_fn);
+  auto *then_bb = llvm::BasicBlock::Create(Ctx, "then", test_fn);
+  auto *else_bb = llvm::BasicBlock::Create(Ctx, "else", test_fn);
+  auto *merge_bb = llvm::BasicBlock::Create(Ctx, "merge", test_fn);
+
+  auto *state = test_fn->getArg(0);
+  auto *mem = test_fn->getArg(2);
+
+  // Entry: branch based on some condition.
+  llvm::IRBuilder<> EntryB(entry);
+  auto *cond_gep = EntryB.CreateConstGEP1_64(EntryB.getInt8Ty(), state, 0);
+  auto *cond_val = EntryB.CreateLoad(i64_ty, cond_gep, "cond_raw");
+  auto *cond = EntryB.CreateICmpNE(cond_val, EntryB.getInt64(0), "cond");
+  EntryB.CreateCondBr(cond, then_bb, else_bb);
+
+  // Then: store 42 to State+16.
+  llvm::IRBuilder<> ThenB(then_bb);
+  auto *gep_then = ThenB.CreateConstGEP1_64(ThenB.getInt8Ty(), state, 16);
+  ThenB.CreateStore(ThenB.getInt64(42), gep_then);
+  ThenB.CreateBr(merge_bb);
+
+  // Else: store 99 to State+16.
+  llvm::IRBuilder<> ElseB(else_bb);
+  auto *gep_else = ElseB.CreateConstGEP1_64(ElseB.getInt8Ty(), state, 16);
+  ElseB.CreateStore(ElseB.getInt64(99), gep_else);
+  ElseB.CreateBr(merge_bb);
+
+  // Merge: load from State+16 — should get PHI after SROA.
+  llvm::IRBuilder<> MergeB(merge_bb);
+  auto *gep_merge = MergeB.CreateConstGEP1_64(MergeB.getInt8Ty(), state, 16);
+  auto *merged_val = MergeB.CreateLoad(i64_ty, gep_merge, "merged");
+  (void)merged_val;
+  MergeB.CreateRet(mem);
+
+  llvm::FunctionPassManager FPM;
+  FPM.addPass(omill::PromoteStateToSSAPass());
+  FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+  FPM.run(*test_fn, FAM);
+
+  // After SROA: should have a PHI node in the merge block.
+  bool found_phi = false;
+  for (auto &BB : *test_fn) {
+    for (auto &I : BB) {
+      if (llvm::isa<llvm::PHINode>(&I))
+        found_phi = true;
+    }
+  }
+  EXPECT_TRUE(found_phi);
+  EXPECT_FALSE(llvm::verifyFunction(*test_fn, &llvm::errs()));
+}
+
 }  // namespace

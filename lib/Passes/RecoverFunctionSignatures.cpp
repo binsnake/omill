@@ -37,6 +37,11 @@ llvm::FunctionType *buildNativeType(const FunctionABI &abi,
     param_types.push_back(xmm_ty);
   }
 
+  // Extra GPR live-ins (callee-saved regs) as i64 params after XMMs.
+  for (unsigned i = 0; i < abi.numExtraGPRParams(); ++i) {
+    param_types.push_back(llvm::Type::getInt64Ty(Ctx));
+  }
+
   return llvm::FunctionType::get(ret_ty, param_types, false);
 }
 
@@ -108,6 +113,15 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
     auto *param = native_fn->getArg(abi.numParams() + i);
     auto *field_ptr = buildStateGEP(Builder, state_alloca,
                                      abi.xmm_live_ins[i]);
+    Builder.CreateStore(param, field_ptr);
+  }
+
+  // Store extra GPR parameters into State fields.
+  for (unsigned i = 0; i < abi.numExtraGPRParams(); ++i) {
+    unsigned arg_idx = abi.numParams() + abi.numXMMParams() + i;
+    auto *param = native_fn->getArg(arg_idx);
+    auto *field_ptr = buildStateGEP(Builder, state_alloca,
+                                     abi.extra_gpr_live_ins[i]);
     Builder.CreateStore(param, field_ptr);
   }
 

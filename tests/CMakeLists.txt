@@ -65,6 +65,15 @@ add_executable(omill-unit-tests
   unit/HyperCallCodegenTest.cpp
   unit/IterativeTargetResolutionTest.cpp
   unit/PassRegistryTest.cpp
+  unit/RewriteLiftedCallsToNativeTest.cpp
+  unit/ResolveForcedExceptionsTest.cpp
+  unit/SimplifyVectorFlagComputationTest.cpp
+  unit/CollapsePartialXMMWritesTest.cpp
+  unit/CoalesceByteReassemblyTest.cpp
+  unit/FoldConstantVectorChainsTest.cpp
+  unit/DeadStateRoundtripEliminationTest.cpp
+  unit/EliminateRedundantByteStoresTest.cpp
+  unit/ResolveNativeDispatchTest.cpp
 )
 
 target_link_libraries(omill-unit-tests
@@ -89,6 +98,7 @@ if(OMILL_ENABLE_Z3)
   target_sources(omill-unit-tests PRIVATE
     unit/LLVMZ3TranslatorTest.cpp
     unit/Z3DispatchSolverTest.cpp
+    unit/TranslationValidationTest.cpp
   )
   # Copy libz3.dll next to the test binary so it can be found at runtime.
   add_custom_command(TARGET omill-unit-tests POST_BUILD

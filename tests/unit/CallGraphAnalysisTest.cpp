@@ -269,4 +269,63 @@ TEST_F(CallGraphAnalysisTest, BottomUpOrderLeavesFirst) {
   EXPECT_LT(mid_pos, root_pos);
 }
 
+TEST_F(CallGraphAnalysisTest, ForwardDeclarationResolved) {
+  // Call to sub_401000 declaration → edge to sub_401000.1 definition.
+  auto M = createEmptyModule();
+
+  // Create the definition: sub_401000.1 (remill convention for definitions).
+  auto *definition = addLiftedFn(*M, "sub_401000.1");
+
+  // Create a declaration: sub_401000 (no body, same lifted signature).
+  auto *declaration = llvm::Function::Create(
+      liftedFnTy(), llvm::Function::ExternalLinkage, "sub_401000", *M);
+
+  // Create a caller that calls the declaration.
+  auto *caller_fn = llvm::Function::Create(
+      liftedFnTy(), llvm::Function::ExternalLinkage, "sub_402000", *M);
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", caller_fn);
+  llvm::IRBuilder<> B(entry);
+  auto *result = B.CreateCall(declaration,
+      {caller_fn->getArg(0), caller_fn->getArg(1), caller_fn->getArg(2)});
+  B.CreateRet(result);
+
+  auto graph = runAnalysis(*M);
+
+  auto *caller_node = graph.getNode(caller_fn);
+  ASSERT_NE(caller_node, nullptr);
+  // The call graph should resolve the declaration to the definition.
+  bool found_edge_to_def = false;
+  for (auto &edge : caller_node->callees) {
+    if (edge.callee == definition)
+      found_edge_to_def = true;
+  }
+  EXPECT_TRUE(found_edge_to_def);
+}
+
+TEST_F(CallGraphAnalysisTest, DeclarationWithNoDefinitionSkipped) {
+  // Call to unknown declaration → no resolved edge.
+  auto M = createEmptyModule();
+
+  // Declaration only — no definition in the module.
+  auto *declaration = llvm::Function::Create(
+      liftedFnTy(), llvm::Function::ExternalLinkage, "sub_999000", *M);
+
+  auto *caller_fn = addLiftedFn(*M, "sub_401000");
+  caller_fn->getEntryBlock().getTerminator()->eraseFromParent();
+  llvm::IRBuilder<> B(&caller_fn->getEntryBlock());
+  auto *result = B.CreateCall(declaration,
+      {caller_fn->getArg(0), caller_fn->getArg(1), caller_fn->getArg(2)});
+  B.CreateRet(result);
+
+  auto graph = runAnalysis(*M);
+
+  auto *caller_node = graph.getNode(caller_fn);
+  ASSERT_NE(caller_node, nullptr);
+  // No edge to the declaration (it has no definition to resolve to).
+  for (auto &edge : caller_node->callees) {
+    EXPECT_NE(edge.callee, declaration)
+        << "Should not have edge to unresolved declaration";
+  }
+}
+
 }  // namespace

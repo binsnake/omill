@@ -156,16 +156,9 @@ llvm::PreservedAnalyses InterProceduralConstPropPass::run(
     // Skip functions with no callers (entry points).
     if (node->callers.empty()) continue;
 
-    // Skip functions with unresolved callers.
-    bool has_unresolved_caller = false;
-    for (auto *caller_cs : node->callers) {
-      auto *caller_node = call_graph.getNode(caller_cs->caller);
-      if (!caller_node || caller_node->unresolved_count > 0) {
-        has_unresolved_caller = true;
-        break;
-      }
-    }
-    if (has_unresolved_caller) continue;
+    // Skip functions that might be called from unknown locations.
+    // If F's address is taken, indirect callers could pass different values.
+    if (F->hasAddressTaken()) continue;
 
     // For each parameter offset, check if all callers agree on a constant.
     for (unsigned offset : param_offsets) {

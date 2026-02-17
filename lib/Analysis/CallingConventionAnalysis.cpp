@@ -1,5 +1,6 @@
 #include "omill/Analysis/CallingConventionAnalysis.h"
 
+#include <llvm/ADT/DenseSet.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
@@ -224,6 +225,32 @@ FunctionABI analyzeFunction(llvm::Function &F, const llvm::DataLayout &DL,
   // Sort XMM live-ins by offset for deterministic parameter ordering.
   llvm::sort(abi.xmm_live_ins);
 
+  // Detect extra GPR live-ins (callee-saved regs read before written).
+  // These are GPR offsets in live_in that are NOT standard Win64 params.
+  {
+    llvm::DenseSet<unsigned> standard_param_offsets;
+    for (auto &p : abi.params)
+      standard_param_offsets.insert(p.state_offset);
+
+    for (auto off : live_in) {
+      // Skip already-covered standard params.
+      if (standard_param_offsets.count(off))
+        continue;
+      // Check if this is a GPR field.
+      auto field = field_map.fieldAtOffset(off);
+      if (field && field->category == StateFieldCategory::kGPR &&
+          field->size == 8) {
+        // Exclude RSP (stack pointer) and RIP (program counter) —
+        // these are handled specially, not as params.
+        if (field->name != "RSP" && field->name != "RIP") {
+          abi.extra_gpr_live_ins.push_back(off);
+          abi.has_non_standard_regs = true;
+        }
+      }
+    }
+    llvm::sort(abi.extra_gpr_live_ins);
+  }
+
   // Identify clobbered callee-saved registers.
   // In Win64, RBX, RBP, RDI, RSI, R12-R15 are nonvolatile.
   for (unsigned i = 0; i < kWin64CalleeSavedCount; ++i) {
@@ -242,6 +269,121 @@ FunctionABI analyzeFunction(llvm::Function &F, const llvm::DataLayout &DL,
 
 }  // namespace
 
+/// Propagate callee XMM live-ins to callers.
+///
+/// When a function passes its State pointer (arg 0) to a callee, the callee's
+/// XMM live-ins are effectively live-ins of the caller too — the caller must
+/// have those XMM values in State for the callee to read them.
+///
+/// This is critical for SEH resolution: the exception function
+/// (sub_140001a5a) passes State to the CFF resolver (sub_140013efa) which
+/// reads XMMs.  Without propagation, the exception function's native wrapper
+/// would have no XMM params and pass zeroinitializer to the resolver.
+static void propagateCalleeXMMLiveIns(
+    llvm::Module &M,
+    llvm::DenseMap<const llvm::Function *, FunctionABI> &abis) {
+
+  // Build VA → definition map for resolving forward declarations.
+  llvm::DenseMap<uint64_t, const llvm::Function *> va_to_def;
+  for (auto &[func, abi] : abis) {
+    uint64_t va = extractEntryVA(func->getName());
+    if (va != 0)
+      va_to_def[va] = func;
+  }
+
+  // Build a map from callee definition → callers for lifted functions.
+  // Only consider calls where the caller passes its own State (arg 0).
+  llvm::DenseMap<const llvm::Function *,
+                 llvm::SmallVector<const llvm::Function *, 4>>
+      callee_to_callers;
+
+  for (auto &F : M) {
+    if (!isLiftedFunction(F) || F.isDeclaration() || F.arg_size() == 0)
+      continue;
+    llvm::Argument *state_arg = F.getArg(0);
+
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+        if (!CI || CI->arg_size() == 0)
+          continue;
+        auto *callee = CI->getCalledFunction();
+        if (!callee)
+          continue;
+        // Check that the caller passes its own State as the first arg.
+        if (CI->getArgOperand(0) != state_arg)
+          continue;
+
+        // Resolve callee to its ABI-analyzed definition.
+        // isLiftedFunction() rejects declarations, so use extractEntryVA
+        // to match declarations (sub_140013efa) to definitions
+        // (sub_140013efa.1) by VA.
+        uint64_t callee_va = extractEntryVA(callee->getName());
+        if (callee_va == 0)
+          continue;
+        auto def_it = va_to_def.find(callee_va);
+        if (def_it == va_to_def.end())
+          continue;
+        callee_to_callers[def_it->second].push_back(&F);
+      }
+    }
+  }
+
+  // Propagate: for each callee with XMM or extra GPR live-ins, merge into
+  // callers.  Iterate to fixpoint (handles transitive chains A → B → C).
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (auto &[callee, callers] : callee_to_callers) {
+      auto callee_it = abis.find(callee);
+      if (callee_it == abis.end())
+        continue;
+      auto &callee_abi = callee_it->second;
+
+      for (auto *caller : callers) {
+        auto caller_it = abis.find(caller);
+        if (caller_it == abis.end())
+          continue;
+        auto &caller_abi = caller_it->second;
+
+        // Merge callee's XMM live-ins into caller's.
+        {
+          llvm::DenseSet<unsigned> existing(caller_abi.xmm_live_ins.begin(),
+                                            caller_abi.xmm_live_ins.end());
+          for (unsigned off : callee_abi.xmm_live_ins) {
+            if (existing.insert(off).second) {
+              caller_abi.xmm_live_ins.push_back(off);
+              caller_abi.has_non_standard_regs = true;
+              changed = true;
+            }
+          }
+          if (changed)
+            llvm::sort(caller_abi.xmm_live_ins);
+        }
+
+        // Merge callee's extra GPR live-ins into caller's.
+        {
+          llvm::DenseSet<unsigned> existing(
+              caller_abi.extra_gpr_live_ins.begin(),
+              caller_abi.extra_gpr_live_ins.end());
+          // Don't propagate offsets that are standard params for the caller.
+          for (auto &p : caller_abi.params)
+            existing.insert(p.state_offset);
+          for (unsigned off : callee_abi.extra_gpr_live_ins) {
+            if (existing.insert(off).second) {
+              caller_abi.extra_gpr_live_ins.push_back(off);
+              caller_abi.has_non_standard_regs = true;
+              changed = true;
+            }
+          }
+          if (changed)
+            llvm::sort(caller_abi.extra_gpr_live_ins);
+        }
+      }
+    }
+  }
+}
+
 CallingConventionInfo CallingConventionAnalysis::run(
     llvm::Module &M, llvm::ModuleAnalysisManager &MAM) {
   CallingConventionInfo result;
@@ -253,6 +395,9 @@ CallingConventionInfo CallingConventionAnalysis::run(
 
     result.function_abis[&F] = analyzeFunction(F, DL, field_map);
   }
+
+  // Propagate callee XMM live-ins to callers (transitive closure).
+  propagateCalleeXMMLiveIns(M, result.function_abis);
 
   return result;
 }

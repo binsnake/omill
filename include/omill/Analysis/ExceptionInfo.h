@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
+#include <deque>
 #include <vector>
 
 namespace llvm {
@@ -13,11 +15,15 @@ class Module;
 
 namespace omill {
 
+class BinaryMemoryMap;
+
 /// A single .pdata RUNTIME_FUNCTION entry parsed from a PE binary.
 struct RuntimeFunctionEntry {
-  uint64_t begin_va;    // Function start VA (ImageBase + BeginAddress RVA)
-  uint64_t end_va;      // Function end VA
-  uint64_t handler_va;  // Exception handler VA (0 if none)
+  uint64_t begin_va;          // Function start VA (ImageBase + BeginAddress RVA)
+  uint64_t end_va;            // Function end VA
+  uint64_t handler_va;        // Exception handler VA (0 if none)
+  uint64_t handler_data_va;   // Language-specific handler data VA (0 if none)
+  uint64_t dc_synthetic_va;   // Synthetic DISPATCHER_CONTEXT VA in BinaryMemoryMap
 };
 
 /// Provides structured exception handling metadata parsed from PE .pdata.
@@ -65,6 +71,16 @@ class ExceptionInfo {
 
   bool empty() const { return entries_.empty(); }
 
+  void setImageBase(uint64_t base) { image_base_ = base; }
+  uint64_t imageBase() const { return image_base_; }
+
+  /// Build synthetic DISPATCHER_CONTEXT regions in the BinaryMemoryMap.
+  /// Each entry with handler_data_va gets a synthetic DC at a unique address
+  /// so ConstantMemoryFolding can resolve [R9+0x38] → HandlerData.
+  /// Storage must outlive the BinaryMemoryMap.
+  void buildSyntheticDCs(std::deque<std::vector<uint8_t>> &storage,
+                          BinaryMemoryMap &mem_map, uint64_t image_base);
+
   /// LLVM analysis invalidation -- exception info is always valid.
   bool invalidate(llvm::Module &, const llvm::PreservedAnalyses &,
                   llvm::ModuleAnalysisManager::Invalidator &) {
@@ -86,6 +102,7 @@ class ExceptionInfo {
 
   llvm::SmallVector<RuntimeFunctionEntry, 64> entries_;
   bool sorted_ = false;
+  uint64_t image_base_ = 0;
 };
 
 /// Module-level analysis providing ExceptionInfo.

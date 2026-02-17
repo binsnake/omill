@@ -118,6 +118,7 @@ void fixupForwardDeclarationCall(llvm::CallInst *call,
 }
 
 void collectCandidates(llvm::Function &F, const LiftedFunctionMap &lifted,
+                       const llvm::DenseSet<const llvm::Function *> &non_leaf_set,
                        llvm::SmallVectorImpl<RewriteCandidate> &candidates) {
   for (auto &BB : F) {
     for (auto &I : BB) {
@@ -134,7 +135,7 @@ void collectCandidates(llvm::Function &F, const LiftedFunctionMap &lifted,
           // Leaf functions: don't rewrite — let AlwaysInlinerPass inline them
           // directly, preserving flag/State field semantics.  Just fix the
           // call target if it's a forward declaration.
-          if (isLeafLifted(*def, lifted)) {
+          if (!non_leaf_set.count(def)) {
             fixupForwardDeclarationCall(call, def);
             continue;
           }
@@ -197,15 +198,36 @@ void collectAllXMMOffsets(llvm::Module &M, const CallingConventionInfo &cc_info,
   llvm::sort(xmm_offsets);
 }
 
+/// Collect the sorted union of all extra GPR live-in offsets across all lifted
+/// functions that could be dispatch targets.
+void collectAllExtraGPROffsets(llvm::Module &M,
+                                const CallingConventionInfo &cc_info,
+                                llvm::SmallVectorImpl<unsigned> &gpr_offsets) {
+  llvm::DenseSet<unsigned> seen;
+  for (auto &F : M) {
+    if (!isLiftedFunction(F)) continue;
+    auto *abi = cc_info.getABI(&F);
+    if (!abi) continue;
+    for (auto off : abi->extra_gpr_live_ins) {
+      if (seen.insert(off).second) {
+        gpr_offsets.push_back(off);
+      }
+    }
+  }
+  llvm::sort(gpr_offsets);
+}
+
 /// Create or get the native dispatch function that maps original PCs to
 /// _native wrapper calls.
-/// Signature: i64(i64 pc, i64 rcx, i64 rdx, i64 r8, i64 r9, <2 x i64>...).
-/// XMM values are passed as extra params (no State pointer — avoids escaping
-/// the State alloca which would prevent dead store elimination).
+/// Signature: i64(i64 pc, i64 rcx, i64 rdx, i64 r8, i64 r9, <2 x i64>...,
+///                i64 extra_gpr...).
+/// XMM and extra GPR values are passed as extra params (no State pointer —
+/// avoids escaping the State alloca which would prevent dead store elimination).
 llvm::Function *getOrCreateNativeDispatch(
     llvm::Module &M, const LiftedFunctionMap &lifted,
     const CallingConventionInfo &cc_info,
-    const llvm::SmallVectorImpl<unsigned> &all_xmm_offsets) {
+    const llvm::SmallVectorImpl<unsigned> &all_xmm_offsets,
+    const llvm::SmallVectorImpl<unsigned> &all_extra_gpr_offsets) {
   auto *existing = M.getFunction("__omill_native_dispatch");
   if (existing) return existing;
 
@@ -213,7 +235,7 @@ llvm::Function *getOrCreateNativeDispatch(
   auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
   auto *vec_ty = llvm::FixedVectorType::get(i64_ty, 2);
 
-  // Build param types: pc, rcx, rdx, r8, r9, then XMM params.
+  // Build param types: pc, rcx, rdx, r8, r9, XMMs, extra GPRs.
   llvm::SmallVector<llvm::Type *, 24> param_types;
   param_types.push_back(i64_ty);  // pc
   param_types.push_back(i64_ty);  // rcx
@@ -223,6 +245,9 @@ llvm::Function *getOrCreateNativeDispatch(
   for (unsigned i = 0; i < all_xmm_offsets.size(); ++i) {
     param_types.push_back(vec_ty);
   }
+  for (unsigned i = 0; i < all_extra_gpr_offsets.size(); ++i) {
+    param_types.push_back(i64_ty);
+  }
 
   auto *fn_ty = llvm::FunctionType::get(i64_ty, param_types, false);
   auto *fn = llvm::Function::Create(
@@ -230,9 +255,17 @@ llvm::Function *getOrCreateNativeDispatch(
   fn->addFnAttr(llvm::Attribute::NoUnwind);
 
   // Build offset-to-param-index map for XMM params.
+  unsigned xmm_start = 5;  // after pc,rcx,rdx,r8,r9
   llvm::DenseMap<unsigned, unsigned> xmm_param_idx;
   for (unsigned i = 0; i < all_xmm_offsets.size(); ++i) {
-    xmm_param_idx[all_xmm_offsets[i]] = 5 + i;  // after pc,rcx,rdx,r8,r9
+    xmm_param_idx[all_xmm_offsets[i]] = xmm_start + i;
+  }
+
+  // Build offset-to-param-index map for extra GPR params.
+  unsigned gpr_start = xmm_start + all_xmm_offsets.size();
+  llvm::DenseMap<unsigned, unsigned> gpr_param_idx;
+  for (unsigned i = 0; i < all_extra_gpr_offsets.size(); ++i) {
+    gpr_param_idx[all_extra_gpr_offsets[i]] = gpr_start + i;
   }
 
   auto *entry_bb = llvm::BasicBlock::Create(Ctx, "entry", fn);
@@ -264,6 +297,12 @@ llvm::Function *getOrCreateNativeDispatch(
 
     std::string native_name = F.getName().str() + "_native";
     auto *native_fn = M.getFunction(native_name);
+    if (!native_fn) {
+      // No native wrapper — remove the empty case block.
+      sw->removeCase(sw->findCaseValue(Builder.getInt64(va)));
+      case_bb->eraseFromParent();
+      continue;
+    }
 
     // Pass GPR args from dispatch params.
     llvm::SmallVector<llvm::Value *, 8> args;
@@ -275,6 +314,13 @@ llvm::Function *getOrCreateNativeDispatch(
     for (auto xmm_off : abi->xmm_live_ins) {
       auto it = xmm_param_idx.find(xmm_off);
       assert(it != xmm_param_idx.end());
+      args.push_back(fn->getArg(it->second));
+    }
+
+    // Pass extra GPR values from dispatch params.
+    for (auto gpr_off : abi->extra_gpr_live_ins) {
+      auto it = gpr_param_idx.find(gpr_off);
+      assert(it != gpr_param_idx.end());
       args.push_back(fn->getArg(it->second));
     }
 
@@ -296,15 +342,26 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
   auto &cc_info = MAM.getResult<CallingConventionAnalysis>(M);
   auto &lifted = MAM.getResult<LiftedFunctionAnalysis>(M);
 
+  // Pre-compute leaf status for all lifted functions before any mutations.
+  // This prevents isLeafLifted from returning stale results after dispatch
+  // calls in earlier functions are erased during processing.
+  llvm::DenseSet<const llvm::Function *> non_leaf_set;
+  for (auto &F : M) {
+    if (!isLiftedFunction(F)) continue;
+    if (!isLeafLifted(F, lifted))
+      non_leaf_set.insert(&F);
+  }
+
   bool changed = false;
   llvm::Function *dispatch_fn = nullptr;
   llvm::SmallVector<unsigned, 16> all_xmm_offsets;
+  llvm::SmallVector<unsigned, 16> all_extra_gpr_offsets;
 
   for (auto &F : M) {
     if (F.isDeclaration()) continue;
 
     llvm::SmallVector<RewriteCandidate, 8> candidates;
-    collectCandidates(F, lifted, candidates);
+    collectCandidates(F, lifted, non_leaf_set, candidates);
     if (candidates.empty()) continue;
 
     for (auto &cand : candidates) {
@@ -336,6 +393,13 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
               "xmm_" + llvm::Twine(xmm_off)));
         }
 
+        // Pass extra GPR live-in values from State as extra i64 args.
+        for (auto gpr_off : abi->extra_gpr_live_ins) {
+          args.push_back(buildStateLoad(
+              Builder, cand.state_ptr, gpr_off,
+              "extra_gpr_" + llvm::Twine(gpr_off)));
+        }
+
         auto *result = Builder.CreateCall(native_fn, args,
                                           abi->ret.has_value()
                                               ? native_fn->getName() + ".result"
@@ -350,8 +414,10 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
         // Collect all XMM offsets on first use.
         if (!dispatch_fn) {
           collectAllXMMOffsets(M, cc_info, all_xmm_offsets);
+          collectAllExtraGPROffsets(M, cc_info, all_extra_gpr_offsets);
           dispatch_fn = getOrCreateNativeDispatch(M, lifted, cc_info,
-                                                   all_xmm_offsets);
+                                                   all_xmm_offsets,
+                                                   all_extra_gpr_offsets);
         }
 
         llvm::IRBuilder<> Builder(cand.call);
@@ -377,6 +443,11 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
           dispatch_args.push_back(buildStateLoadVec(
               Builder, cand.state_ptr, xmm_off,
               "xmm_" + llvm::Twine(xmm_off)));
+        }
+        for (auto gpr_off : all_extra_gpr_offsets) {
+          dispatch_args.push_back(buildStateLoad(
+              Builder, cand.state_ptr, gpr_off,
+              "extra_gpr_" + llvm::Twine(gpr_off)));
         }
 
         auto *result = Builder.CreateCall(

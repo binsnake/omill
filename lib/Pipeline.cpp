@@ -142,7 +142,6 @@ void buildStateOptimizationPipeline(llvm::FunctionPassManager &FPM,
 }
 
 void buildControlFlowPipeline(llvm::FunctionPassManager &FPM) {
-  FPM.addPass(ResolveForcedExceptionsPass());
   FPM.addPass(LowerErrorAndMissingPass());
   FPM.addPass(LowerFunctionReturnPass());
   FPM.addPass(LowerFunctionCallPass());
@@ -176,24 +175,38 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
   MPM.addPass(RewriteLiftedCallsToNativePass());
   MPM.addPass(EliminateStateStructPass());
 
-  // Inline the lifted functions into their native wrappers, then
-  // SROA decomposes the State alloca into individual fields.
+  // Inline the lifted functions into their native wrappers.
+  // IMPORTANT: defer ALL per-function optimization until after
+  // interprocedural inlining.  SEH handlers and CFF resolvers read
+  // from parameter-based pointers (DISPATCHER_CONTEXT*, etc.) that
+  // can only fold once inlined into the caller where the allocas live.
+  // Any optimization here (even InstCombine+SimplifyCFG) would kill
+  // the handler/resolver bodies prematurely.
   MPM.addPass(llvm::AlwaysInlinerPass());
+
+  // SROA only: decompose State alloca to expose SSA values for dispatch
+  // resolution.  No InstCombine, GVN, or SimplifyCFG yet.
+  {
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+  }
+
+  // Inline __omill_native_dispatch into all callers while it's still a small
+  // switch.  Must happen BEFORE the cost-based inliner — otherwise the inliner
+  // pulls _native bodies into the dispatch, making it huge and recursive.
+  MPM.addPass(InlineNativeDispatchPass());
+  MPM.addPass(llvm::AlwaysInlinerPass());
+  MPM.addPass(llvm::GlobalDCEPass());
+
+  // Full optimization after inlining native wrappers.
   {
     llvm::FunctionPassManager FPM;
     FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(llvm::GVNPass());
-    // Fold cascaded shufflevector chains to constants after GVN has
-    // propagated known values into vector blends.  SROA creates multi-level
-    // shufflevector chains that hide constant values; GVN resolves the
-    // non-constant operands, then this pass traces per-element constants
-    // through the remaining chains.
     FPM.addPass(FoldConstantVectorChainsPass());
     FPM.addPass(llvm::InstCombinePass());
-    // After SROA decomposes the State alloca, vector operations from SSE
-    // obfuscation appear as shufflevector/extractelement/bitcast chains.
-    // Run the same vector simplification passes used in deobfuscation.
     FPM.addPass(CollapsePartialXMMWritesPass());
     FPM.addPass(CoalesceByteReassemblyPass());
     FPM.addPass(SimplifyVectorFlagComputationPass());
@@ -202,52 +215,11 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
 #endif
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(llvm::GVNPass());
-    // Safety net: remove any remaining dead loops (e.g. PEB-walking loops
-    // whose results are fully dead after State struct elimination).
     FPM.addPass(llvm::createFunctionToLoopPassAdaptor(llvm::LoopDeletionPass()));
     FPM.addPass(llvm::ADCEPass());
     FPM.addPass(llvm::SimplifyCFGPass());
-    // Resolve __omill_native_dispatch calls where deobfuscation folded the
-    // PC argument to a constant.  Replaces with direct calls to _native
-    // functions, recovering the original jump target.
     FPM.addPass(ResolveNativeDispatchPass());
     FPM.addPass(llvm::InstCombinePass());
-    FPM.addPass(llvm::SimplifyCFGPass());
-    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
-  }
-
-  // Inline __omill_native_dispatch into all callers while it's still a small
-  // switch.  Must happen BEFORE the cost-based inliner — otherwise the inliner
-  // pulls _native bodies into the dispatch, making it huge and recursive.
-  // After inlining the switch, SimplifyCFG folds constant-PC cases to direct
-  // calls.
-  MPM.addPass(InlineNativeDispatchPass());
-  MPM.addPass(llvm::AlwaysInlinerPass());
-  MPM.addPass(llvm::GlobalDCEPass());
-  {
-    llvm::FunctionPassManager FPM;
-    FPM.addPass(llvm::InstCombinePass());
-    FPM.addPass(llvm::SimplifyCFGPass());
-    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
-  }
-
-  // Inline _native functions into their callers to enable interprocedural
-  // constant folding.  Many callers pass zeroinitializer for XMM arguments;
-  // after inlining, the shufflevector/bitcast/xor chains fold to constants.
-  MPM.addPass(llvm::ModuleInlinerWrapperPass(llvm::getInlineParams(500)));
-  {
-    llvm::FunctionPassManager FPM;
-    FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
-    FPM.addPass(llvm::InstCombinePass());
-    FPM.addPass(llvm::GVNPass());
-    FPM.addPass(FoldConstantVectorChainsPass());
-    FPM.addPass(llvm::InstCombinePass());
-    FPM.addPass(CollapsePartialXMMWritesPass());
-    FPM.addPass(CoalesceByteReassemblyPass());
-    FPM.addPass(SimplifyVectorFlagComputationPass());
-    FPM.addPass(llvm::InstCombinePass());
-    FPM.addPass(llvm::GVNPass());
-    FPM.addPass(llvm::ADCEPass());
     FPM.addPass(llvm::SimplifyCFGPass());
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
@@ -373,7 +345,29 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   // Cache exception info before control flow passes need it.
   MPM.addPass(llvm::RequireAnalysisPass<ExceptionInfoAnalysis, llvm::Module>());
 
-  // Phase 3: Control Flow Recovery
+  // Phase 3a: Resolve forced exceptions (UD2/INT3 → handler call).
+  // Must run before the remaining control flow passes so the handler's body
+  // can be inlined and then processed by LowerFunctionCall/LowerJump.
+  if (opts.lower_control_flow) {
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(ResolveForcedExceptionsPass());
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+
+    // Inline exception handlers into their callers.  This is critical:
+    // CFF handlers are trampolines that call resolvers.  Without inlining,
+    // ABI recovery creates a native wrapper for the handler that drops XMM
+    // values (the handler doesn't use XMMs directly), so the resolver's SSE
+    // computation gets all-zero XMM inputs and folds to ret 0.
+    // Inlining merges the handler body into the caller (which HAS XMM values),
+    // preserving the full State across the call chain.
+    MPM.addPass(llvm::AlwaysInlinerPass());
+    // Remove inlined handler functions so they don't appear as callers in
+    // the call graph, which would prevent InterProceduralConstProp from
+    // propagating R9 (synthetic DC address) to the resolver.
+    MPM.addPass(llvm::GlobalDCEPass());
+  }
+
+  // Phase 3b: Remaining control flow recovery.
   if (opts.lower_control_flow) {
     llvm::FunctionPassManager FPM;
     buildControlFlowPipeline(FPM);
@@ -399,10 +393,16 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   }
 
   // Phase 3.7: Inter-procedural constant propagation.
+  // After InterProceduralConstProp propagates R9 (DISPATCHER_CONTEXT* from
+  // SEH resolution) to handler/resolver functions, ConstantMemoryFolding
+  // resolves [R9+0x38] → HandlerData from the synthetic binary region.
   if (opts.interprocedural_const_prop || opts.resolve_indirect_targets) {
     MPM.addPass(llvm::RequireAnalysisPass<CallGraphAnalysis, llvm::Module>());
     MPM.addPass(InterProceduralConstPropPass());
     llvm::FunctionPassManager FPM;
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(ConstantMemoryFoldingPass());
+    FPM.addPass(llvm::GVNPass());
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(ResolveDispatchTargetsPass());
     FPM.addPass(LowerResolvedDispatchCallsPass());

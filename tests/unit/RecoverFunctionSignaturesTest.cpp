@@ -108,4 +108,67 @@ TEST_F(RecoverFunctionSignaturesTest, CreatesNativeWrapper) {
   EXPECT_FALSE(native_fn->isDeclaration());
 }
 
+TEST_F(RecoverFunctionSignaturesTest, VoidReturnWrapper) {
+  // Function that doesn't write RAX → void return type.
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *state_ty = llvm::StructType::create(Ctx, "struct.State");
+  auto *arr_ty = llvm::ArrayType::get(llvm::Type::getInt8Ty(Ctx), 3504);
+  state_ty->setBody({arr_ty});
+
+  auto *bb_fn_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *bb_fn = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "__remill_basic_block", *M);
+  auto *bb_entry = llvm::BasicBlock::Create(Ctx, "entry", bb_fn);
+  llvm::IRBuilder<> BBB(bb_entry);
+  auto *bb_state = bb_fn->getArg(0);
+  BBB.CreateConstGEP1_64(BBB.getInt8Ty(), bb_state, 0, "RAX");
+  BBB.CreateConstGEP1_64(BBB.getInt8Ty(), bb_state, 16, "RCX");
+  BBB.CreateConstGEP1_64(BBB.getInt8Ty(), bb_state, 24, "RDX");
+  BBB.CreateConstGEP1_64(BBB.getInt8Ty(), bb_state, 64, "R8");
+  BBB.CreateConstGEP1_64(BBB.getInt8Ty(), bb_state, 72, "R9");
+  BBB.CreateRet(bb_fn->getArg(2));
+
+  // Lifted function that reads RCX but does NOT write RAX.
+  auto *fn_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *test_fn = llvm::Function::Create(
+      fn_ty, llvm::Function::ExternalLinkage, "sub_401000", *M);
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", test_fn);
+  llvm::IRBuilder<> B(entry);
+  auto *rcx_gep = B.CreateConstGEP1_64(B.getInt8Ty(), test_fn->getArg(0), 16);
+  B.CreateLoad(i64_ty, rcx_gep, "rcx_val");
+  B.CreateRet(test_fn->getArg(2));
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+
+  llvm::ModulePassManager MPM;
+  MPM.addPass(omill::RecoverFunctionSignaturesPass());
+  MPM.run(*M, MAM);
+
+  auto *native_fn = M->getFunction("sub_401000_native");
+  ASSERT_NE(native_fn, nullptr);
+
+  // Void return: native wrapper returns void.
+  EXPECT_TRUE(native_fn->getReturnType()->isVoidTy());
+  EXPECT_EQ(native_fn->getFunctionType()->getNumParams(), 1u);
+}
+
 }  // namespace

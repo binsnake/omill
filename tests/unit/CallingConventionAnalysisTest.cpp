@@ -52,7 +52,12 @@ class CallingConventionAnalysisTest : public ::testing::Test {
         {"RIP", 128},
     };
     for (auto &reg : all_regs) {
-      BBB.CreateConstGEP1_64(BBB.getInt8Ty(), bb_state, reg.offset, reg.name);
+      // Use i64 element type so StateFieldMap sees size=8 for GPR fields.
+      // StateFieldMap uses getTypeAllocSize(GEP->getResultElementType()).
+      // GEP(i64, ptr, idx) has result element type i64 → size=8.
+      auto *gep = BBB.CreateGEP(BBB.getInt64Ty(), bb_state,
+                                BBB.getInt64(reg.offset / 8));
+      gep->setName(reg.name);
     }
     BBB.CreateRet(bb_fn->getArg(2));
 
@@ -182,6 +187,161 @@ TEST_F(CallingConventionAnalysisTest, DefaultsToWin64WhenNoParamRegsDetected) {
   EXPECT_EQ(abi->params[2].reg_name, "R8");
   EXPECT_EQ(abi->params[3].reg_name, "R9");
   EXPECT_FALSE(abi->ret.has_value());
+}
+
+TEST_F(CallingConventionAnalysisTest, XMMLiveInsDetected) {
+  // A function that reads from XMM0 (vector offset) before writing.
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *state_ty = llvm::StructType::create(Ctx, "struct.State");
+  auto *arr_ty = llvm::ArrayType::get(llvm::Type::getInt8Ty(Ctx), 3504);
+  state_ty->setBody({arr_ty});
+
+  // __remill_basic_block with GPR + XMM GEPs.
+  auto *bb_fn_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *bb_fn = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "__remill_basic_block", *M);
+  auto *bb_entry = llvm::BasicBlock::Create(Ctx, "entry", bb_fn);
+  llvm::IRBuilder<> BBB(bb_entry);
+  auto *bb_state = bb_fn->getArg(0);
+
+  // GPR registers.
+  BBB.CreateConstGEP1_64(BBB.getInt8Ty(), bb_state, 0, "RAX");
+  BBB.CreateConstGEP1_64(BBB.getInt8Ty(), bb_state, 16, "RCX");
+  BBB.CreateConstGEP1_64(BBB.getInt8Ty(), bb_state, 24, "RDX");
+  BBB.CreateConstGEP1_64(BBB.getInt8Ty(), bb_state, 64, "R8");
+  BBB.CreateConstGEP1_64(BBB.getInt8Ty(), bb_state, 72, "R9");
+  BBB.CreateConstGEP1_64(BBB.getInt8Ty(), bb_state, 48, "RSP");
+  BBB.CreateConstGEP1_64(BBB.getInt8Ty(), bb_state, 128, "RIP");
+  // XMM register at offset 200.
+  BBB.CreateConstGEP1_64(BBB.getInt8Ty(), bb_state, 200, "XMM0");
+  BBB.CreateRet(bb_fn->getArg(2));
+
+  // Lifted function that reads RCX and XMM0.
+  auto *fn_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *test_fn = llvm::Function::Create(
+      fn_ty, llvm::Function::ExternalLinkage, "sub_401000", *M);
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", test_fn);
+  llvm::IRBuilder<> B(entry);
+  auto *state = test_fn->getArg(0);
+
+  // Read RCX.
+  auto *rcx_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 16);
+  B.CreateLoad(i64_ty, rcx_gep, "rcx_val");
+  // Read XMM0.
+  auto *xmm_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 200);
+  B.CreateLoad(i64_ty, xmm_gep, "xmm0_val");
+  // Write RAX.
+  auto *rax_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 0);
+  B.CreateStore(B.getInt64(42), rax_gep);
+
+  B.CreateRet(test_fn->getArg(2));
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+
+  auto result = MAM.getResult<omill::CallingConventionAnalysis>(*M);
+  auto *abi = result.getABI(test_fn);
+  ASSERT_NE(abi, nullptr);
+  EXPECT_FALSE(abi->xmm_live_ins.empty());
+  EXPECT_EQ(abi->xmm_live_ins[0], 200u);
+  EXPECT_TRUE(abi->has_non_standard_regs);
+}
+
+TEST_F(CallingConventionAnalysisTest, ExtraGPRLiveInsDetected) {
+  // A function that reads RBX (callee-saved) before writing.
+  auto M = createModuleWithState({
+      {"RCX", 16},
+      {"RBX", 8},  // callee-saved, not a standard param
+  });
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+
+  auto result = MAM.getResult<omill::CallingConventionAnalysis>(*M);
+  auto *abi = result.getABI(M->getFunction("sub_401000"));
+  ASSERT_NE(abi, nullptr);
+  // RBX at offset 8 should be in extra_gpr_live_ins.
+  bool found_rbx = false;
+  for (auto off : abi->extra_gpr_live_ins) {
+    if (off == 8) found_rbx = true;
+  }
+  EXPECT_TRUE(found_rbx);
+}
+
+TEST_F(CallingConventionAnalysisTest, RSPExcludedFromExtraGPR) {
+  // RSP read before write should NOT be added to extra_gpr_live_ins.
+  auto M = createModuleWithState({
+      {"RCX", 16},
+      {"RSP", 48},
+  });
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+
+  auto result = MAM.getResult<omill::CallingConventionAnalysis>(*M);
+  auto *abi = result.getABI(M->getFunction("sub_401000"));
+  ASSERT_NE(abi, nullptr);
+  // RSP should NOT appear in extra_gpr_live_ins.
+  for (auto off : abi->extra_gpr_live_ins) {
+    EXPECT_NE(off, 48u) << "RSP should be excluded from extra_gpr_live_ins";
+  }
+}
+
+TEST_F(CallingConventionAnalysisTest, VoidReturnWrapper) {
+  // Function that doesn't write RAX → no return value.
+  auto M = createModuleWithState({{"RCX", 16}}, /*writes_rax=*/false);
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+
+  auto result = MAM.getResult<omill::CallingConventionAnalysis>(*M);
+  auto *abi = result.getABI(M->getFunction("sub_401000"));
+  ASSERT_NE(abi, nullptr);
+  EXPECT_FALSE(abi->ret.has_value());
+  EXPECT_TRUE(abi->isVoid());
 }
 
 }  // namespace

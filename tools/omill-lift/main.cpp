@@ -132,6 +132,7 @@ struct PEInfo {
   omill::BinaryMemoryMap memory_map;
   omill::ExceptionInfo exception_info;
   std::vector<SectionInfo> code_sections;
+  std::deque<std::vector<uint8_t>> synthetic_dc_storage;
   uint64_t image_base = 0;
 };
 
@@ -163,6 +164,7 @@ void parsePData(const object::COFFObjectFile &coff, uint64_t image_base,
 
     // Follow unwind info chain to find the exception handler.
     uint64_t handler_va = 0;
+    uint64_t handler_data_va = 0;
     uint32_t current_unwind_rva = unwind_rva;
 
     for (unsigned depth = 0; depth < 16; ++depth) {
@@ -179,6 +181,14 @@ void parsePData(const object::COFFObjectFile &coff, uint64_t image_base,
       if (flags & Win64EH::UNW_ExceptionHandler) {
         uint32_t handler_rva = uwi->getLanguageSpecificHandlerOffset();
         handler_va = image_base + handler_rva;
+
+        // HandlerData follows the handler RVA in the language-specific data.
+        auto *lsd = reinterpret_cast<const support::ulittle32_t *>(
+            uwi->getLanguageSpecificData());
+        // lsd[0] = handler RVA, lsd[1] = handler data RVA
+        uint32_t data_rva = lsd[1];
+        if (data_rva != 0)
+          handler_data_va = image_base + data_rva;
         break;
       }
 
@@ -194,7 +204,7 @@ void parsePData(const object::COFFObjectFile &coff, uint64_t image_base,
     }
 
     exception_info.addEntry({image_base + begin_rva, image_base + end_rva,
-                             handler_va});
+                             handler_va, handler_data_va, 0});
   }
 }
 
@@ -262,6 +272,13 @@ bool loadPE(StringRef path, PEInfo &out) {
 
   // Parse .pdata unconditionally (cheap); the flag controls usage.
   parsePData(coff, out.image_base, out.exception_info);
+  out.exception_info.setImageBase(out.image_base);
+
+  // Create synthetic DISPATCHER_CONTEXT regions in BinaryMemoryMap.
+  // Each exception entry with HandlerData gets a synthetic DC at a unique
+  // address so ConstantMemoryFolding can resolve [R9+0x38] → HandlerData.
+  out.exception_info.buildSyntheticDCs(out.synthetic_dc_storage, out.memory_map,
+                                        out.image_base);
 
   return true;
 }
