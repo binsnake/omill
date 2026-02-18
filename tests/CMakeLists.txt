@@ -120,6 +120,68 @@ else()
   gtest_discover_tests(omill-unit-tests)
 endif()
 
+# --------------------------------------------------------------------------
+# OLLVM JIT tests — compile C++ → bitcode → obfuscate → JIT → verify.
+# Requires ollvm-obf tool (OMILL_ENABLE_TOOLS) but NOT remill.
+# --------------------------------------------------------------------------
+if(OMILL_ENABLE_TOOLS)
+  set(_ollvm_src "${CMAKE_CURRENT_SOURCE_DIR}/../test_obf/src/ollvm_funcs.cpp")
+  set(_ollvm_clean_bc "${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs_clean.bc")
+  set(_ollvm_obf_bc "${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs_obf.bc")
+
+  # Step 1: C++ → clean bitcode at -O2.
+  add_custom_command(
+    OUTPUT ${_ollvm_clean_bc}
+    COMMAND ${CMAKE_CXX_COMPILER} -c -emit-llvm -O2
+      -target x86_64-pc-windows-msvc
+      ${_ollvm_src}
+      -o ${_ollvm_clean_bc}
+    DEPENDS ${_ollvm_src}
+    COMMENT "Compiling ollvm_funcs.cpp to clean bitcode"
+  )
+
+  # Step 2: obfuscate with ollvm-obf.
+  add_custom_command(
+    OUTPUT ${_ollvm_obf_bc}
+    COMMAND $<TARGET_FILE:ollvm-obf>
+      ${_ollvm_clean_bc}
+      -o ${_ollvm_obf_bc}
+      --flatten --substitute --string-encrypt --const-unfold --vectorize
+    DEPENDS ${_ollvm_clean_bc} ollvm-obf
+    COMMENT "Obfuscating ollvm_funcs.bc with CFF + MBA + string encryption + const unfold + vectorize"
+  )
+
+  # Custom target so the test binary depends on the .bc files.
+  add_custom_target(ollvm_jit_bitcode
+    DEPENDS ${_ollvm_clean_bc} ${_ollvm_obf_bc}
+  )
+
+  add_executable(omill-ollvm-jit-tests
+    unit/OLLVMJITTest.cpp
+  )
+
+  add_dependencies(omill-ollvm-jit-tests ollvm_jit_bitcode)
+
+  target_compile_definitions(omill-ollvm-jit-tests PRIVATE
+    OLLVM_CLEAN_BC_PATH="${_ollvm_clean_bc}"
+    OLLVM_OBF_BC_PATH="${_ollvm_obf_bc}"
+  )
+
+  target_link_libraries(omill-ollvm-jit-tests
+    PRIVATE
+      GTest::gtest_main
+      ${OMILL_LLVM_LIBS}
+  )
+
+  if(NOT MSVC)
+    target_compile_options(omill-ollvm-jit-tests PRIVATE -fno-rtti)
+  endif()
+
+  gtest_discover_tests(omill-ollvm-jit-tests
+    PROPERTIES TIMEOUT 30
+  )
+endif()
+
 # E2E tests (require remill + Zydis)
 if(OMILL_ENABLE_REMILL)
   add_executable(omill-e2e-tests
@@ -170,5 +232,7 @@ if(OMILL_ENABLE_REMILL)
     target_compile_options(omill-e2e-tests PRIVATE -fno-rtti)
   endif()
 
-  gtest_discover_tests(omill-e2e-tests)
+  gtest_discover_tests(omill-e2e-tests
+    PROPERTIES TIMEOUT 30
+  )
 endif()
