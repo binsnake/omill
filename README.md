@@ -13,6 +13,16 @@ omill transforms remill's semantics-preserving lifted IR — which operates on a
 5. **Recovers ABI** — calling convention analysis, stack frame recovery, function signature recovery, State struct elimination
 6. **Deobfuscation** (optional) — constant memory folding, stack data outlining, import hash resolution, lazy import resolution, dead path elimination
 
+## Limitations
+
+- **Platform Support:** Currently only supports **Windows x64 (PE)** files using the Win64 ABI.
+- **Project Scope:** `omill` is optimized for deobfuscating complicated functions with relatively simple control flow.
+- **Not Recommended For:**
+  - Full binary lifting or recompilation (focuses on specific functions and their reachable targets).
+  - Virtualized code (VM-based obfuscation like VMProtect or Themida).
+  - Packed or compressed files (binaries must be unpacked or in a state where code is statically accessible).
+- **Status:** Deobfuscation capabilities are improving weekly, with expanding support for more complex obfuscation methods.
+
 ## Requirements
 
 - **LLVM 21** (tested with prebuilt install at `C:/Program Files/LLVM21`)
@@ -113,6 +123,21 @@ ollvm-obf input.bc -o output.bc --flatten --substitute --string-encrypt --const-
 ```
 
 Supported transforms: control flow flattening, instruction substitution, string encryption, constant unfolding, and i32 vectorization (SSE2).
+
+### omill-lift CLI (requires remill)
+
+`omill-lift` lifts functions starting from a specific virtual address (VA) in a Windows x64 PE file to LLVM IR, then runs the omill pipeline:
+
+```bash
+omill-lift input.exe --va 0x140001000 -o lifted.ll --deobfuscate --resolve-targets
+```
+
+Available options:
+- `--va <hex>`: Start address for lifting (required).
+- `--deobfuscate`: Enable deobfuscation passes (MBA simplification, dead path elimination, etc.).
+- `--resolve-targets`: Enable iterative indirect branch resolution via Z3/SCEV.
+- `--refine-signatures`: Enable parameter type refinement after ABI recovery.
+- `--no-abi`: Skip ABI recovery (keep `State` struct and remill intrinsics).
 
 ## Architecture
 
