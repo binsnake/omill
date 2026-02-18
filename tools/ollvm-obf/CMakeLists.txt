@@ -3,6 +3,8 @@ add_executable(ollvm-obf
   Flattening.cpp
   Substitution.cpp
   StringEncryption.cpp
+  ConstantUnfolding.cpp
+  Vectorize.cpp
 )
 
 target_link_libraries(ollvm-obf PRIVATE ${OMILL_LLVM_LIBS})

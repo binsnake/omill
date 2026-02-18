@@ -82,9 +82,9 @@ add_custom_command(
   COMMAND $<TARGET_FILE:ollvm-obf>
     ${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs.bc
     -o ${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs_obf.bc
-    --flatten --substitute --string-encrypt
+    --flatten --substitute --string-encrypt --const-unfold --vectorize
   DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs.bc ollvm-obf
-  COMMENT "Obfuscating ollvm_funcs.bc with CFF + MBA + string encryption"
+  COMMENT "Obfuscating ollvm_funcs.bc with CFF + MBA + string encryption + const unfold + vectorize"
 )
 
 # Step 3: obfuscated bitcode → object (O0 to prevent LLVM undoing obfuscation).

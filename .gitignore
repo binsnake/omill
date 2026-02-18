@@ -26,3 +26,6 @@ cmake-build-*/
 /.claude
 *.ll
 /build-z3
+/.cache
+*.log
+*.ps1

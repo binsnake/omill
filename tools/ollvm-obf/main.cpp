@@ -10,9 +10,11 @@
 #include <llvm/Support/ToolOutputFile.h>
 #include <llvm/Support/raw_ostream.h>
 
+#include "ConstantUnfolding.h"
 #include "Flattening.h"
 #include "StringEncryption.h"
 #include "Substitution.h"
+#include "Vectorize.h"
 
 using namespace llvm;
 
@@ -36,6 +38,14 @@ static cl::opt<bool> DoStringEncrypt("string-encrypt",
                                       cl::desc("Apply XOR-based string encryption"),
                                       cl::init(false));
 
+static cl::opt<bool> DoConstUnfold("const-unfold",
+                                    cl::desc("Replace constants with equivalent expressions"),
+                                    cl::init(false));
+
+static cl::opt<bool> DoVectorize("vectorize",
+                                  cl::desc("Replace i32 scalar ops with SSE vector ops"),
+                                  cl::init(false));
+
 int main(int argc, char **argv) {
   InitLLVM X(argc, argv);
   cl::ParseCommandLineOptions(argc, argv, "OLLVM-style obfuscation tool\n");
@@ -50,7 +60,9 @@ int main(int argc, char **argv) {
   }
 
   // Apply passes in order: string encryption first (before CFF moves blocks
-  // around), then substitution, then flattening.
+  // around), then substitution, then flattening, then constant unfolding and
+  // vectorize (after CFF so the restructured CFG doesn't break domination of
+  // the inserted instructions).
   if (DoStringEncrypt) {
     ollvm::encryptStringsModule(*M);
   }
@@ -61,6 +73,14 @@ int main(int argc, char **argv) {
 
   if (DoFlatten) {
     ollvm::flattenModule(*M);
+  }
+
+  if (DoConstUnfold) {
+    ollvm::unfoldConstantsModule(*M);
+  }
+
+  if (DoVectorize) {
+    ollvm::vectorizeModule(*M);
   }
 
   // Verify.

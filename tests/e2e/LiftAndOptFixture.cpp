@@ -135,9 +135,28 @@ void LiftAndOptFixture::optimizeWithMemoryMap(const PipelineOptions &opts,
   // Run the main pipeline (without ABI recovery, even if requested).
   PipelineOptions main_opts = opts;
   main_opts.recover_abi = false;
+
+  // Phase 0+1+2: intrinsic lowering + state optimization only.
+  // lower_control_flow=false skips phases 3a/3b.
   {
+    PipelineOptions state_opts = main_opts;
+    state_opts.lower_control_flow = false;
+    state_opts.resolve_indirect_targets = false;
+    state_opts.interprocedural_const_prop = false;
     llvm::ModulePassManager MPM;
-    omill::buildPipeline(MPM, main_opts);
+    omill::buildPipeline(MPM, state_opts);
+    MPM.run(*module_, MAM);
+  }
+
+  dumpIR("after_state");
+
+  // Phase 3+: control flow recovery (skip already-run phases 1/2).
+  {
+    PipelineOptions cf_opts = main_opts;
+    cf_opts.lower_intrinsics = false;
+    cf_opts.optimize_state = false;
+    llvm::ModulePassManager MPM;
+    omill::buildPipeline(MPM, cf_opts);
     MPM.run(*module_, MAM);
   }
 
@@ -221,12 +240,16 @@ bool LiftAndOptFixture::wantTimePasses() {
 
 std::string LiftAndOptFixture::getDumpDir() {
   const char *env = std::getenv("OMILL_DUMP_IR");
-  // Default to dumping in the current directory.
-  if (!env || env[0] == '\0' || (env[0] == '1' && env[1] == '\0'))
-    return ".";
+  // Not set or empty → no dumping.
+  if (!env || env[0] == '\0')
+    return {};
   // "0" disables dumping.
   if (env[0] == '0' && env[1] == '\0')
     return {};
+  // "1" means dump to current directory.
+  if (env[0] == '1' && env[1] == '\0')
+    return ".";
+  // Otherwise use the value as a directory path.
   return env;
 }
 

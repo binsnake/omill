@@ -4,6 +4,7 @@
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/Intrinsics.h>
 
 #include <random>
 #include <vector>
@@ -82,6 +83,71 @@ static void demotePhiNodes(llvm::Function &F) {
   }
 }
 
+/// Demote all instructions with cross-block uses to alloca/store/load.
+/// After CFF, no switch case dominates another, so any value defined in one
+/// block and used in another causes a domination failure.
+static void demoteCrossBlockValues(llvm::Function &F) {
+  llvm::BasicBlock &entry = F.getEntryBlock();
+  llvm::IRBuilder<> alloca_builder(&entry, entry.begin());
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (auto &BB : F) {
+      for (auto it = BB.begin(); it != BB.end(); ++it) {
+        auto *I = &*it;
+        // Skip allocas, terminators, and void-typed instructions.
+        if (llvm::isa<llvm::AllocaInst>(I) || I->isTerminator() ||
+            I->getType()->isVoidTy())
+          continue;
+
+        // Check if any use is in a different block.
+        bool has_cross_block_use = false;
+        for (auto *user : I->users()) {
+          if (auto *user_inst = llvm::dyn_cast<llvm::Instruction>(user)) {
+            if (user_inst->getParent() != &BB) {
+              has_cross_block_use = true;
+              break;
+            }
+          }
+        }
+        if (!has_cross_block_use)
+          continue;
+
+        // Demote to alloca.
+        auto *alloca = alloca_builder.CreateAlloca(
+            I->getType(), nullptr, I->getName() + ".demote");
+
+        // Store after the instruction.
+        llvm::IRBuilder<> store_builder(I->getNextNode());
+        store_builder.CreateStore(I, alloca);
+
+        // Replace cross-block uses with loads.
+        std::vector<llvm::Use *> cross_uses;
+        for (auto &U : I->uses()) {
+          if (auto *user_inst = llvm::dyn_cast<llvm::Instruction>(U.getUser())) {
+            if (user_inst->getParent() != &BB)
+              cross_uses.push_back(&U);
+          }
+        }
+
+        for (auto *U : cross_uses) {
+          auto *user_inst = llvm::cast<llvm::Instruction>(U->getUser());
+          llvm::IRBuilder<> load_builder(user_inst);
+          auto *load = load_builder.CreateLoad(I->getType(), alloca,
+                                               I->getName() + ".reload");
+          U->set(load);
+        }
+
+        changed = true;
+        break;  // restart scan since we modified uses
+      }
+      if (changed)
+        break;
+    }
+  }
+}
+
 static void flattenFunction(llvm::Function &F, std::mt19937 &rng) {
   if (F.isDeclaration() || F.size() <= 1)
     return;
@@ -92,8 +158,11 @@ static void flattenFunction(llvm::Function &F, std::mt19937 &rng) {
   if (F.size() <= 1)
     return;
 
-  // Step 2: Demote PHI nodes to allocas (CFF breaks PHI predecessor info).
+  // Step 2: Demote PHI nodes to allocas (CFF breaks PHI predecessor info),
+  // then demote all cross-block SSA values (CFF switch cases don't dominate
+  // each other).
   demotePhiNodes(F);
+  demoteCrossBlockValues(F);
 
   // Collect all basic blocks except entry.
   llvm::BasicBlock &entry = F.getEntryBlock();
@@ -173,6 +242,16 @@ static void flattenFunction(llvm::Function &F, std::mt19937 &rng) {
   auto *default_bb =
       llvm::BasicBlock::Create(ctx, "cff_default", &F);
   llvm::IRBuilder<> def_builder(default_bb);
+  // Store a defined value back to switch_var so that after mem2reg the
+  // dispatcher's phi-node has a non-undef contribution from this predecessor.
+  // Without this, LLVM's SCCP treats the phi as potentially-undef and may
+  // prove all case blocks unreachable, collapsing the function to this loop.
+  def_builder.CreateStore(llvm::ConstantInt::get(i32_ty, initial_case),
+                          switch_var);
+  // Prevent loop-deletion passes from removing this as a side-effect-free loop.
+  def_builder.CreateCall(
+      llvm::Intrinsic::getOrInsertDeclaration(F.getParent(),
+                                              llvm::Intrinsic::sideeffect));
   def_builder.CreateBr(dispatcher);
 
   auto *sw =
