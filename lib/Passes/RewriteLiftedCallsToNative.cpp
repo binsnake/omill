@@ -180,161 +180,6 @@ void collectCandidates(llvm::Function &F, const LiftedFunctionMap &lifted,
   }
 }
 
-/// Collect the sorted union of all XMM live-in offsets across all lifted
-/// functions that could be dispatch targets.
-void collectAllXMMOffsets(llvm::Module &M, const CallingConventionInfo &cc_info,
-                          llvm::SmallVectorImpl<unsigned> &xmm_offsets) {
-  llvm::DenseSet<unsigned> seen;
-  for (auto &F : M) {
-    if (!isLiftedFunction(F)) continue;
-    auto *abi = cc_info.getABI(&F);
-    if (!abi) continue;
-    for (auto off : abi->xmm_live_ins) {
-      if (seen.insert(off).second) {
-        xmm_offsets.push_back(off);
-      }
-    }
-  }
-  llvm::sort(xmm_offsets);
-}
-
-/// Collect the sorted union of all extra GPR live-in offsets across all lifted
-/// functions that could be dispatch targets.
-void collectAllExtraGPROffsets(llvm::Module &M,
-                                const CallingConventionInfo &cc_info,
-                                llvm::SmallVectorImpl<unsigned> &gpr_offsets) {
-  llvm::DenseSet<unsigned> seen;
-  for (auto &F : M) {
-    if (!isLiftedFunction(F)) continue;
-    auto *abi = cc_info.getABI(&F);
-    if (!abi) continue;
-    for (auto off : abi->extra_gpr_live_ins) {
-      if (seen.insert(off).second) {
-        gpr_offsets.push_back(off);
-      }
-    }
-  }
-  llvm::sort(gpr_offsets);
-}
-
-/// Create or get the native dispatch function that maps original PCs to
-/// _native wrapper calls.
-/// Signature: i64(i64 pc, i64 rcx, i64 rdx, i64 r8, i64 r9, <2 x i64>...,
-///                i64 extra_gpr...).
-/// XMM and extra GPR values are passed as extra params (no State pointer —
-/// avoids escaping the State alloca which would prevent dead store elimination).
-llvm::Function *getOrCreateNativeDispatch(
-    llvm::Module &M, const LiftedFunctionMap &lifted,
-    const CallingConventionInfo &cc_info,
-    const llvm::SmallVectorImpl<unsigned> &all_xmm_offsets,
-    const llvm::SmallVectorImpl<unsigned> &all_extra_gpr_offsets) {
-  auto *existing = M.getFunction("__omill_native_dispatch");
-  if (existing) return existing;
-
-  auto &Ctx = M.getContext();
-  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
-  auto *vec_ty = llvm::FixedVectorType::get(i64_ty, 2);
-
-  // Build param types: pc, rcx, rdx, r8, r9, XMMs, extra GPRs.
-  llvm::SmallVector<llvm::Type *, 24> param_types;
-  param_types.push_back(i64_ty);  // pc
-  param_types.push_back(i64_ty);  // rcx
-  param_types.push_back(i64_ty);  // rdx
-  param_types.push_back(i64_ty);  // r8
-  param_types.push_back(i64_ty);  // r9
-  for (unsigned i = 0; i < all_xmm_offsets.size(); ++i) {
-    param_types.push_back(vec_ty);
-  }
-  for (unsigned i = 0; i < all_extra_gpr_offsets.size(); ++i) {
-    param_types.push_back(i64_ty);
-  }
-
-  auto *fn_ty = llvm::FunctionType::get(i64_ty, param_types, false);
-  auto *fn = llvm::Function::Create(
-      fn_ty, llvm::Function::InternalLinkage, "__omill_native_dispatch", M);
-  fn->addFnAttr(llvm::Attribute::NoUnwind);
-
-  // Build offset-to-param-index map for XMM params.
-  unsigned xmm_start = 5;  // after pc,rcx,rdx,r8,r9
-  llvm::DenseMap<unsigned, unsigned> xmm_param_idx;
-  for (unsigned i = 0; i < all_xmm_offsets.size(); ++i) {
-    xmm_param_idx[all_xmm_offsets[i]] = xmm_start + i;
-  }
-
-  // Build offset-to-param-index map for extra GPR params.
-  unsigned gpr_start = xmm_start + all_xmm_offsets.size();
-  llvm::DenseMap<unsigned, unsigned> gpr_param_idx;
-  for (unsigned i = 0; i < all_extra_gpr_offsets.size(); ++i) {
-    gpr_param_idx[all_extra_gpr_offsets[i]] = gpr_start + i;
-  }
-
-  auto *entry_bb = llvm::BasicBlock::Create(Ctx, "entry", fn);
-  auto *default_bb = llvm::BasicBlock::Create(Ctx, "unknown", fn);
-
-  {
-    llvm::IRBuilder<> Builder(default_bb);
-    Builder.CreateRet(Builder.getInt64(0));
-  }
-
-  llvm::IRBuilder<> Builder(entry_bb);
-  auto *pc_arg = fn->getArg(0);
-  auto *sw = Builder.CreateSwitch(pc_arg, default_bb);
-
-  for (auto &F : M) {
-    if (!isLiftedFunction(F)) continue;
-
-    uint64_t va = extractEntryVA(F.getName());
-    if (va == 0) continue;
-
-    auto *abi = cc_info.getABI(&F);
-    if (!abi) continue;
-
-    auto *case_bb = llvm::BasicBlock::Create(Ctx,
-        "call_" + llvm::Twine::utohexstr(va), fn);
-    sw->addCase(Builder.getInt64(va), case_bb);
-
-    llvm::IRBuilder<> CaseB(case_bb);
-
-    std::string native_name = F.getName().str() + "_native";
-    auto *native_fn = M.getFunction(native_name);
-    if (!native_fn) {
-      // No native wrapper — remove the empty case block.
-      sw->removeCase(sw->findCaseValue(Builder.getInt64(va)));
-      case_bb->eraseFromParent();
-      continue;
-    }
-
-    // Pass GPR args from dispatch params.
-    llvm::SmallVector<llvm::Value *, 8> args;
-    for (unsigned i = 0; i < abi->numParams(); ++i) {
-      args.push_back(fn->getArg(1 + i));  // skip pc, take rcx/rdx/r8/r9
-    }
-
-    // Pass XMM values from dispatch params (not from State).
-    for (auto xmm_off : abi->xmm_live_ins) {
-      auto it = xmm_param_idx.find(xmm_off);
-      assert(it != xmm_param_idx.end());
-      args.push_back(fn->getArg(it->second));
-    }
-
-    // Pass extra GPR values from dispatch params.
-    for (auto gpr_off : abi->extra_gpr_live_ins) {
-      auto it = gpr_param_idx.find(gpr_off);
-      assert(it != gpr_param_idx.end());
-      args.push_back(fn->getArg(it->second));
-    }
-
-    auto *result = CaseB.CreateCall(native_fn, args);
-    if (abi->ret.has_value()) {
-      CaseB.CreateRet(result);
-    } else {
-      CaseB.CreateRet(CaseB.getInt64(0));
-    }
-  }
-
-  return fn;
-}
-
 }  // namespace
 
 llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
@@ -353,9 +198,6 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
   }
 
   bool changed = false;
-  llvm::Function *dispatch_fn = nullptr;
-  llvm::SmallVector<unsigned, 16> all_xmm_offsets;
-  llvm::SmallVector<unsigned, 16> all_extra_gpr_offsets;
 
   for (auto &F : M) {
     if (F.isDeclaration()) continue;
@@ -410,19 +252,14 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
                           result);
         }
       } else {
-        // Dynamic target: dispatch through the native dispatch function.
-        // Collect all XMM offsets on first use.
-        if (!dispatch_fn) {
-          collectAllXMMOffsets(M, cc_info, all_xmm_offsets);
-          collectAllExtraGPROffsets(M, cc_info, all_extra_gpr_offsets);
-          dispatch_fn = getOrCreateNativeDispatch(M, lifted, cc_info,
-                                                   all_xmm_offsets,
-                                                   all_extra_gpr_offsets);
-        }
-
+        // Dynamic target: emit an indirect call through the computed PC.
         llvm::IRBuilder<> Builder(cand.call);
+        auto *i64_ty = Builder.getInt64Ty();
+        auto *ptr_ty = llvm::PointerType::get(Builder.getContext(), 0);
 
         auto *target_pc = cand.call->getArgOperand(1);
+        auto *fn_ptr = Builder.CreateIntToPtr(target_pc, ptr_ty, "fn.ptr");
+
         auto *rcx =
             buildStateLoad(Builder, cand.state_ptr, kRCXOffset, "rcx");
         auto *rdx =
@@ -432,26 +269,19 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
         auto *r9 =
             buildStateLoad(Builder, cand.state_ptr, kR9Offset, "r9");
 
-        // Load XMM values from State for all possible dispatch targets.
-        llvm::SmallVector<llvm::Value *, 24> dispatch_args;
-        dispatch_args.push_back(target_pc);
-        dispatch_args.push_back(rcx);
-        dispatch_args.push_back(rdx);
-        dispatch_args.push_back(r8);
-        dispatch_args.push_back(r9);
-        for (auto xmm_off : all_xmm_offsets) {
-          dispatch_args.push_back(buildStateLoadVec(
-              Builder, cand.state_ptr, xmm_off,
-              "xmm_" + llvm::Twine(xmm_off)));
-        }
-        for (auto gpr_off : all_extra_gpr_offsets) {
-          dispatch_args.push_back(buildStateLoad(
-              Builder, cand.state_ptr, gpr_off,
-              "extra_gpr_" + llvm::Twine(gpr_off)));
-        }
+        auto *fn_ty = llvm::FunctionType::get(
+            i64_ty, {i64_ty, i64_ty, i64_ty, i64_ty}, false);
 
-        auto *result = Builder.CreateCall(
-            dispatch_fn, dispatch_args, "dispatch.result");
+        bool is_jump =
+            cand.call->getCalledFunction()->getName() == "__omill_dispatch_jump";
+
+        auto *result = Builder.CreateCall(fn_ty, fn_ptr,
+                                          {rcx, rdx, r8, r9},
+                                          "indirect.result");
+        if (is_jump) {
+          llvm::cast<llvm::CallInst>(result)->setTailCallKind(
+              llvm::CallInst::TCK_MustTail);
+        }
 
         buildStateStore(Builder, cand.state_ptr, kRAXOffset, result);
       }

@@ -188,9 +188,23 @@ FunctionABI analyzeFunction(llvm::Function &F, const llvm::DataLayout &DL,
     abi.ret = ret;
   }
 
-  // Detect XMM/vector live-ins.  Collect the base offset of each vector
-  // register that is live-in so the native wrapper can accept them as extra
-  // <2 x i64> parameters.
+  // Detect XMM/vector live-ins.  In Win64 ABI, only XMM0-XMM3 can be
+  // parameters (positions 0-3), and each position uses EITHER a GPR or an
+  // XMM register, never both.  XMM4+ are scratch/callee-saved, never params.
+  //
+  // Only consider XMM params for positions within the detected param count.
+  // If scoreWin64Params detected N consecutive GPR params, the function has
+  // N parameter slots.  XMM at positions >= N would imply additional params
+  // that the GPR analysis didn't find — in our PE decompilation context,
+  // these are obfuscation artifacts (vectorized integer ops), not real float
+  // parameters.
+  llvm::DenseSet<unsigned> filled_param_positions;
+  for (auto &p : abi.params) {
+    filled_param_positions.insert(p.index);
+  }
+
+  static constexpr unsigned kMaxXMMParams = 4;
+
   llvm::DenseSet<unsigned> seen_vreg_bases;
   for (auto off : live_in) {
     bool is_vec = false;
@@ -203,10 +217,7 @@ FunctionABI analyzeFunction(llvm::Function &F, const llvm::DataLayout &DL,
       vreg_base = field->offset;
     }
 
-    // Fallback: if the StateFieldMap didn't have an entry for this offset,
-    // check if it falls within the vec array region of the x86-64 State
-    // struct (offset 16..16+32*64=2064, lower 16 bytes of each 64-byte
-    // VectorReg slot).
+    // Fallback: check if offset falls within the vec array region.
     if (!field && !is_vec && off >= 16 && off < 2064) {
       unsigned vreg_idx = (off - 16) / 64;
       unsigned base = 16 + vreg_idx * 64;
@@ -216,36 +227,70 @@ FunctionABI analyzeFunction(llvm::Function &F, const llvm::DataLayout &DL,
       }
     }
 
-    if (is_vec && seen_vreg_bases.insert(vreg_base).second) {
-      abi.xmm_live_ins.push_back(vreg_base);
-      abi.has_non_standard_regs = true;
-    }
+    if (!is_vec)
+      continue;
+    if (!seen_vreg_bases.insert(vreg_base).second)
+      continue;
+
+    // Only XMM0-3 can be Win64 parameters.  Skip XMM4+.
+    unsigned xmm_idx = (vreg_base - 16) / 64;
+    if (xmm_idx >= kMaxXMMParams)
+      continue;
+
+    // Only consider XMM at positions within the detected GPR param count.
+    // Positions beyond the GPR count are not real params — they're artifacts.
+    if (xmm_idx >= win64_score)
+      continue;
+
+    // If the corresponding GPR param position is already filled,
+    // this XMM is scratch, not a parameter.
+    if (filled_param_positions.count(xmm_idx))
+      continue;
+
+    abi.xmm_live_ins.push_back(vreg_base);
+    abi.has_non_standard_regs = true;
   }
 
   // Sort XMM live-ins by offset for deterministic parameter ordering.
   llvm::sort(abi.xmm_live_ins);
 
-  // Detect extra GPR live-ins (callee-saved regs read before written).
-  // These are GPR offsets in live_in that are NOT standard Win64 params.
+  // Detect extra GPR live-ins: only volatile (caller-saved) GPRs beyond the
+  // standard parameter registers.  Callee-saved registers (RBX, RBP, RDI,
+  // RSI, R12-R15) are preserved by convention — they are NOT input params
+  // even if the function reads them (it reads them to save/restore).
+  // Also exclude RSP and RIP which are handled specially.
   {
     llvm::DenseSet<unsigned> standard_param_offsets;
     for (auto &p : abi.params)
       standard_param_offsets.insert(p.state_offset);
 
+    // Build set of offsets to exclude: standard params + callee-saved +
+    // RSP/RIP + volatile scratch (RAX=return, R10/R11=scratch).
+    // In Win64, only RCX/RDX/R8/R9 can be params, and those are already
+    // handled as standard params.  All other GPRs are either callee-saved,
+    // return value, stack pointer, program counter, or scratch.
+    llvm::DenseSet<unsigned> excluded_offsets = standard_param_offsets;
+    for (unsigned i = 0; i < kWin64CalleeSavedCount; ++i) {
+      auto field = field_map.fieldByName(kWin64CalleeSaved[i]);
+      if (field)
+        excluded_offsets.insert(field->offset);
+    }
+    static constexpr const char *kExcludedGPRs[] = {
+        "RSP", "RIP", "RAX", "R10", "R11",
+    };
+    for (auto name : kExcludedGPRs) {
+      auto field = field_map.fieldByName(name);
+      if (field) excluded_offsets.insert(field->offset);
+    }
+
     for (auto off : live_in) {
-      // Skip already-covered standard params.
-      if (standard_param_offsets.count(off))
+      if (excluded_offsets.count(off))
         continue;
-      // Check if this is a GPR field.
       auto field = field_map.fieldAtOffset(off);
       if (field && field->category == StateFieldCategory::kGPR &&
           field->size == 8) {
-        // Exclude RSP (stack pointer) and RIP (program counter) —
-        // these are handled specially, not as params.
-        if (field->name != "RSP" && field->name != "RIP") {
-          abi.extra_gpr_live_ins.push_back(off);
-          abi.has_non_standard_regs = true;
-        }
+        abi.extra_gpr_live_ins.push_back(off);
+        abi.has_non_standard_regs = true;
       }
     }
     llvm::sort(abi.extra_gpr_live_ins);

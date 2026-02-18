@@ -150,7 +150,7 @@ TEST_F(RewriteLiftedCallsToNativeTest, StaticCallRewritten) {
   EXPECT_TRUE(calls_native) << "Call targets in caller: " << call_targets;
 }
 
-TEST_F(RewriteLiftedCallsToNativeTest, DynamicDispatchCreated) {
+TEST_F(RewriteLiftedCallsToNativeTest, DynamicDispatchEmitsIndirectCall) {
   auto M = createBaseModule();
   auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
 
@@ -192,19 +192,19 @@ TEST_F(RewriteLiftedCallsToNativeTest, DynamicDispatchCreated) {
 
   runPass(*M);
 
-  // After: should have created __omill_native_dispatch.
+  // After: should NOT have __omill_native_dispatch; instead the caller
+  // should contain an indirect call (CallInst with null getCalledFunction()).
   auto *native_dispatch = M->getFunction("__omill_native_dispatch");
-  EXPECT_NE(native_dispatch, nullptr);
+  EXPECT_EQ(native_dispatch, nullptr);
 
-  // Caller should call native_dispatch now.
-  bool calls_native_dispatch = false;
+  bool has_indirect_call = false;
   for (auto &BB : *caller)
     for (auto &I : BB)
       if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
-        if (CI->getCalledFunction() == native_dispatch)
-          calls_native_dispatch = true;
+        if (!CI->getCalledFunction())
+          has_indirect_call = true;
 
-  EXPECT_TRUE(calls_native_dispatch);
+  EXPECT_TRUE(has_indirect_call);
 }
 
 TEST_F(RewriteLiftedCallsToNativeTest, LeafFunctionNotRewritten) {

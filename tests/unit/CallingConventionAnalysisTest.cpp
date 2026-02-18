@@ -258,9 +258,10 @@ TEST_F(CallingConventionAnalysisTest, XMMLiveInsDetected) {
   auto result = MAM.getResult<omill::CallingConventionAnalysis>(*M);
   auto *abi = result.getABI(test_fn);
   ASSERT_NE(abi, nullptr);
-  EXPECT_FALSE(abi->xmm_live_ins.empty());
-  EXPECT_EQ(abi->xmm_live_ins[0], 200u);
-  EXPECT_TRUE(abi->has_non_standard_regs);
+  // New behavior: XMM at position 2 is beyond the detected GPR param count
+  // (only RCX = 1 param), so it's filtered as an obfuscation artifact.
+  EXPECT_TRUE(abi->xmm_live_ins.empty());
+  EXPECT_FALSE(abi->has_non_standard_regs);
 }
 
 TEST_F(CallingConventionAnalysisTest, ExtraGPRLiveInsDetected) {
@@ -285,12 +286,13 @@ TEST_F(CallingConventionAnalysisTest, ExtraGPRLiveInsDetected) {
   auto result = MAM.getResult<omill::CallingConventionAnalysis>(*M);
   auto *abi = result.getABI(M->getFunction("sub_401000"));
   ASSERT_NE(abi, nullptr);
-  // RBX at offset 8 should be in extra_gpr_live_ins.
+  // New behavior: RBX is callee-saved in Win64 ABI, so it's excluded from
+  // extra_gpr_live_ins even if read before written.
   bool found_rbx = false;
   for (auto off : abi->extra_gpr_live_ins) {
     if (off == 8) found_rbx = true;
   }
-  EXPECT_TRUE(found_rbx);
+  EXPECT_FALSE(found_rbx);
 }
 
 TEST_F(CallingConventionAnalysisTest, RSPExcludedFromExtraGPR) {

@@ -87,6 +87,13 @@ class BinaryMemoryMap {
   /// non-zero delta and on-disk relocated values may be wrong.
   bool isSuspiciousImageBase() const;
 
+  /// Iterate over all mapped regions (for JIT memory mapping, etc.).
+  template <typename Fn>
+  void forEachRegion(Fn &&fn) const {
+    for (const auto &r : regions_)
+      fn(r.base, r.data, r.size);
+  }
+
   bool empty() const { return regions_.empty() && imports_.empty(); }
 
   bool hasImports() const { return !imports_.empty(); }
@@ -103,6 +110,7 @@ class BinaryMemoryMap {
     const uint8_t *data;
     size_t size;
   };
+
   llvm::SmallVector<Region, 4> regions_;
   std::map<uint64_t, ImportEntry> imports_;
   llvm::SmallVector<RelocEntry, 0> relocs_;
