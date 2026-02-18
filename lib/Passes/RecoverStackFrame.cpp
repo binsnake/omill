@@ -413,116 +413,46 @@ llvm::PreservedAnalyses RecoverStackFramePass::run(
 
     bool is_phi_base = llvm::isa<llvm::PHINode>(base);
 
-    if (has_dynamic_uses && is_phi_base) {
-      // ---------------------------------------------------------------
-      // Phi base with dynamic inttoptr uses: single alloca + RAUW phi.
-      // ---------------------------------------------------------------
-      llvm::sort(offsets);
-      offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
-      int64_t min_off = offsets.front();
-      int64_t max_off = offsets.back();
+    // Dynamic phi-based stack pointers are common in loops. Replacing the
+    // phi globally (RAUW with ptrtoint(alloca)) is unsound because that phi
+    // may also feed non-address arithmetic/control values. Conservatively
+    // recover only constant-offset inttoptr users and leave dynamic uses
+    // untouched.
+    (void)has_dynamic_uses;
+    (void)is_phi_base;
+    auto regions = clusterOffsets(offsets, 16);
+
+    for (auto &region : regions) {
+      int64_t min_off = region.min_offset;
+      int64_t max_off = region.max_offset;
       int64_t frame_size = max_off - min_off + 8;
       if (frame_size <= 0) frame_size = 8;
 
       auto *frame_ty = llvm::ArrayType::get(i8_ty, frame_size);
       auto *frame_alloca = EntryBuilder.CreateAlloca(frame_ty, nullptr,
                                                       "stack_frame");
-      frame_alloca->setAlignment(llvm::Align(16));
 
-      // Replace constant-offset inttoptr instructions with GEP.
       auto int_to_ptrs = collectDerivedIntToPtr(F, base);
+
       for (auto *itp : int_to_ptrs) {
+        llvm::Value *operand = itp->getOperand(0);
         int64_t const_off = 0;
-        if (!traceToBase(itp->getOperand(0), base, const_off)) continue;
-        if (const_off < min_off || const_off > max_off + 7) continue;
+        if (!traceToBase(operand, base, const_off)) continue;
+        if (const_off < min_off || const_off > max_off) continue;
 
         llvm::IRBuilder<> Builder(itp);
-        auto *gep = Builder.CreateGEP(i8_ty, frame_alloca,
-            llvm::ConstantInt::get(i64_ty, const_off - min_off), "frame_ptr");
+        auto *alloca_idx = llvm::ConstantInt::get(i64_ty,
+                                                    const_off - min_off);
+        auto *gep = Builder.CreateGEP(i8_ty, frame_alloca, alloca_idx,
+                                       "frame_ptr");
         itp->replaceAllUsesWith(gep);
         itp->eraseFromParent();
         changed = true;
       }
 
-      // RAUW the phi with ptrtoint(alloca_base_gep) so that remaining
-      // dynamic-offset inttoptr uses produce valid alloca pointers.
-      // base + offset  ==>  ptrtoint(alloca) + (-min_off) + offset
-      //                 ==>  inttoptr produces alloca + (offset - min_off)
-      auto *gep_base = EntryBuilder.CreateGEP(i8_ty, frame_alloca,
-          llvm::ConstantInt::get(i64_ty, -min_off), "frame_base");
-      auto *base_int = EntryBuilder.CreatePtrToInt(gep_base, i64_ty,
-                                                     "frame_base_int");
-      base->replaceAllUsesWith(base_int);
-      if (auto *phi = llvm::dyn_cast<llvm::PHINode>(base)) {
-        phi->eraseFromParent();
-      }
-      changed = true;
-    } else {
-      // ---------------------------------------------------------------
-      // Load base or phi without dynamic uses: per-region allocas.
-      // ---------------------------------------------------------------
-      auto regions = clusterOffsets(offsets, 16);
-
-      for (auto &region : regions) {
-        int64_t min_off = region.min_offset;
-        int64_t max_off = region.max_offset;
-        int64_t frame_size = max_off - min_off + 8;
-        if (frame_size <= 0) frame_size = 8;
-
-        auto *frame_ty = llvm::ArrayType::get(i8_ty, frame_size);
-        auto *frame_alloca = EntryBuilder.CreateAlloca(frame_ty, nullptr,
-                                                        "stack_frame");
-
-        auto int_to_ptrs = collectDerivedIntToPtr(F, base);
-
-        for (auto *itp : int_to_ptrs) {
-          llvm::Value *operand = itp->getOperand(0);
-          int64_t const_off = 0;
-          if (!traceToBase(operand, base, const_off)) continue;
-          if (const_off < min_off || const_off > max_off) continue;
-
-          llvm::IRBuilder<> Builder(itp);
-          auto *alloca_idx = llvm::ConstantInt::get(i64_ty,
-                                                      const_off - min_off);
-          auto *gep = Builder.CreateGEP(i8_ty, frame_alloca, alloca_idx,
-                                         "frame_ptr");
-          itp->replaceAllUsesWith(gep);
-          itp->eraseFromParent();
-          changed = true;
-        }
-
-        // Replace bare add(base, C) values with ptrtoint(GEP).
-        {
-          llvm::SmallVector<llvm::BinaryOperator *, 8> bare_ops;
-          for (auto *user : base->users()) {
-            auto *binop = llvm::dyn_cast<llvm::BinaryOperator>(user);
-            if (!binop) continue;
-            int64_t offset = 0;
-            if (!traceToBase(binop, base, offset)) continue;
-            if (binop->use_empty()) continue;
-            if (offset < min_off || offset > max_off) continue;
-            bool has_itp = false;
-            for (auto *bu : binop->users()) {
-              if (llvm::isa<llvm::IntToPtrInst>(bu)) { has_itp = true; break; }
-            }
-            if (has_itp) continue;
-            bare_ops.push_back(binop);
-          }
-
-          for (auto *binop : bare_ops) {
-            int64_t offset = 0;
-            traceToBase(binop, base, offset);
-            int64_t idx = offset - min_off;
-            llvm::IRBuilder<> Builder(binop->getNextNode());
-            auto *gep = Builder.CreateGEP(i8_ty, frame_alloca,
-                llvm::ConstantInt::get(i64_ty, idx), "frame_addr");
-            auto *pti = Builder.CreatePtrToInt(gep, i64_ty, "frame_int");
-            binop->replaceAllUsesWith(pti);
-            binop->eraseFromParent();
-            changed = true;
-          }
-        }
-      }
+      // Keep non-inttoptr arithmetic untouched. Rewriting those to
+      // ptrtoint(GEP) can over-constrain stack-pointer value flow and
+      // introduce incorrect constant folding in lifted control flow.
     }
   }
 

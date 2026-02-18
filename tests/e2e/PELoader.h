@@ -46,6 +46,7 @@ inline bool loadPE(llvm::StringRef path, PEInfo &out) {
   auto &coff = **obj_or_err;
 
   out.image_base = coff.getImageBase();
+  out.memory_map.setImageBase(out.image_base);
 
   // Map each section — copy data into section_storage for lifetime safety.
   for (const auto &sec : coff.sections()) {

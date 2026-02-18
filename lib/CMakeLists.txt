@@ -13,6 +13,7 @@ add_library(omill STATIC
 
   # Passes - Stage 2: Intrinsic Lowering
   Passes/LowerRemillIntrinsics.cpp
+  Passes/InlineJumpTargets.cpp
 
   # Passes - Stage 3: State Optimization
   Passes/OptimizeState.cpp

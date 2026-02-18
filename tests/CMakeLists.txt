@@ -125,6 +125,29 @@ endif()
 # Requires ollvm-obf tool (OMILL_ENABLE_TOOLS) but NOT remill.
 # --------------------------------------------------------------------------
 if(OMILL_ENABLE_TOOLS)
+  option(OMILL_OLLVM_OBF_FLATTEN "Enable OLLVM CFF flattening for test samples" ON)
+  option(OMILL_OLLVM_OBF_SUBSTITUTE "Enable OLLVM MBA substitution for test samples" ON)
+  option(OMILL_OLLVM_OBF_STRING_ENCRYPT "Enable OLLVM string encryption for test samples" ON)
+  option(OMILL_OLLVM_OBF_CONST_UNFOLD "Enable OLLVM const unfold for test samples" ON)
+  option(OMILL_OLLVM_OBF_VECTORIZE "Enable OLLVM scalar-to-vector transform for test samples" ON)
+
+  set(_ollvm_obf_flags "")
+  if(OMILL_OLLVM_OBF_FLATTEN)
+    list(APPEND _ollvm_obf_flags --flatten)
+  endif()
+  if(OMILL_OLLVM_OBF_SUBSTITUTE)
+    list(APPEND _ollvm_obf_flags --substitute)
+  endif()
+  if(OMILL_OLLVM_OBF_STRING_ENCRYPT)
+    list(APPEND _ollvm_obf_flags --string-encrypt)
+  endif()
+  if(OMILL_OLLVM_OBF_CONST_UNFOLD)
+    list(APPEND _ollvm_obf_flags --const-unfold)
+  endif()
+  if(OMILL_OLLVM_OBF_VECTORIZE)
+    list(APPEND _ollvm_obf_flags --vectorize)
+  endif()
+
   set(_ollvm_src "${CMAKE_CURRENT_SOURCE_DIR}/../test_obf/src/ollvm_funcs.cpp")
   set(_ollvm_clean_bc "${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs_clean.bc")
   set(_ollvm_obf_bc "${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs_obf.bc")
@@ -146,9 +169,9 @@ if(OMILL_ENABLE_TOOLS)
     COMMAND $<TARGET_FILE:ollvm-obf>
       ${_ollvm_clean_bc}
       -o ${_ollvm_obf_bc}
-      --flatten --substitute --string-encrypt --const-unfold --vectorize
+      ${_ollvm_obf_flags}
     DEPENDS ${_ollvm_clean_bc} ollvm-obf
-    COMMENT "Obfuscating ollvm_funcs.bc with CFF + MBA + string encryption + const unfold + vectorize"
+    COMMENT "Obfuscating ollvm_funcs.bc with selected OLLVM transforms: ${_ollvm_obf_flags}"
   )
 
   # Custom target so the test binary depends on the .bc files.

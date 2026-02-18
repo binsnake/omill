@@ -57,6 +57,7 @@ enum EqSatOpcode {
 // ---------------------------------------------------------------------------
 
 EqSatContext *CreateContext(void);
+void DestroyContext(EqSatContext *ctx);
 void ContextClear(EqSatContext *ctx, EqSatAstIdx a);
 
 // ---------------------------------------------------------------------------

@@ -256,7 +256,7 @@ TEST_F(RecoverStackFrameTest, MultipleNegativeOffsets) {
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
 }
 
-TEST_F(RecoverStackFrameTest, BareRSPOffsetReplaced) {
+TEST_F(RecoverStackFrameTest, BareRSPOffsetNotReplaced) {
   // add(RSP, -16) with non-inttoptr users (store to State) → replaced with
   // ptrtoint(GEP).
   auto M = createTestModule();
@@ -311,15 +311,22 @@ TEST_F(RecoverStackFrameTest, BareRSPOffsetReplaced) {
 
   FPM.run(*F, FAM);
 
-  // The bare add should have been replaced with ptrtoint(GEP).
+  // The bare add should remain; there should be no synthesized ptrtoint(GEP).
   bool found_ptrtoint = false;
+  bool found_bare_add = false;
   for (auto &BB2 : *F)
-    for (auto &I : BB2)
+    for (auto &I : BB2) {
       if (auto *PTI = llvm::dyn_cast<llvm::PtrToIntInst>(&I))
         if (llvm::isa<llvm::GetElementPtrInst>(PTI->getOperand(0)))
           found_ptrtoint = true;
+      if (auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(&I))
+        if (BO->getOpcode() == llvm::Instruction::Add &&
+            BO->getName() == "bare_addr")
+          found_bare_add = true;
+    }
 
-  EXPECT_TRUE(found_ptrtoint);
+  EXPECT_FALSE(found_ptrtoint);
+  EXPECT_TRUE(found_bare_add);
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
 }
 

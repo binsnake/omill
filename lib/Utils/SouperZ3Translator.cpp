@@ -85,6 +85,10 @@ std::optional<z3::expr> LLVMZ3Translator::tryTranslatePHI(
   // where phi_sel is a fresh variable selecting among incoming values.
   unsigned width = getWidth(phi);
 
+  // Wide integers (i128 from XMM, etc.) can't be represented as uint64_t.
+  if (width > 64)
+    return std::nullopt;
+
   // Deduplicate constants.
   llvm::SmallVector<uint64_t, 8> unique_vals;
   for (auto *ci : constants) {

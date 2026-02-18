@@ -11,9 +11,7 @@ namespace omill {
 LLVMTranslator::LLVMTranslator() : ctx_(CreateContext()) {}
 
 LLVMTranslator::~LLVMTranslator() {
-  // EqSat context is cleaned up by ContextClear on individual nodes;
-  // the context itself is leaked (no DestroyContext in the C API).
-  // This is acceptable for a tool that runs once per compilation.
+  DestroyContext(ctx_);
 }
 
 void LLVMTranslator::reset() {
@@ -56,6 +54,10 @@ EqSatAstIdx LLVMTranslator::translate(llvm::Value *V, unsigned max_depth) {
 
   // Non-integer types are opaque.
   if (!V->getType()->isIntegerTy())
+    return makeSymbol(V);
+
+  // Wide integers (i128 from XMM, etc.) exceed EqSat's uint64_t constant range.
+  if (V->getType()->getIntegerBitWidth() > 64)
     return makeSymbol(V);
 
   // Depth limit → opaque.

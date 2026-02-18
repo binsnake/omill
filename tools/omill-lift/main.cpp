@@ -21,6 +21,7 @@
 
 #include <llvm/Support/Win64EH.h>
 
+#include "omill/Support/MemoryLimit.h"
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/CallingConventionAnalysis.h"
 #include "omill/Analysis/CallGraphAnalysis.h"
@@ -328,6 +329,7 @@ bool loadPE(StringRef path, PEInfo &out) {
 }  // namespace
 
 int main(int argc, char **argv) {
+  omill::setProcessMemoryLimit(32ULL * 1024 * 1024 * 1024);  // 32 GB
   InitLLVM X(argc, argv);
   cl::ParseCommandLineOptions(argc, argv,
       "omill-lift: Lift a function from a PE binary and optimize\n");

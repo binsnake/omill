@@ -12,6 +12,10 @@ struct PipelineOptions {
   /// Stage 3: Promote State struct fields to SSA, dead store elimination.
   bool optimize_state = true;
 
+  /// Debug/staging knob: stop pipeline immediately after state optimization.
+  /// Used by tests that run the pipeline in multiple explicit phases.
+  bool stop_after_state_optimization = false;
+
   /// Stage 4: Lower control flow intrinsics (call/ret/jump).
   bool lower_control_flow = true;
 

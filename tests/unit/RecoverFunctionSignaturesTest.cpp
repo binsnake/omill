@@ -106,6 +106,27 @@ TEST_F(RecoverFunctionSignaturesTest, CreatesNativeWrapper) {
 
   // Verify the native wrapper has a body (not just a declaration)
   EXPECT_FALSE(native_fn->isDeclaration());
+
+  // Verify wrapper calls the lifted entry with correct PC and null memory.
+  llvm::CallInst *lifted_call = nullptr;
+  for (auto &BB : *native_fn) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI) continue;
+      if (CI->getCalledFunction() == test_fn) {
+        lifted_call = CI;
+        break;
+      }
+    }
+    if (lifted_call) break;
+  }
+  ASSERT_NE(lifted_call, nullptr);
+  auto *pc_arg = llvm::dyn_cast<llvm::ConstantInt>(lifted_call->getArgOperand(1));
+  ASSERT_NE(pc_arg, nullptr);
+  EXPECT_EQ(pc_arg->getZExtValue(), 0x401000u);
+  auto *mem_arg = llvm::dyn_cast<llvm::Constant>(lifted_call->getArgOperand(2));
+  ASSERT_NE(mem_arg, nullptr);
+  EXPECT_TRUE(mem_arg->isNullValue());
 }
 
 TEST_F(RecoverFunctionSignaturesTest, VoidReturnWrapper) {

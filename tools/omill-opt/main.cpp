@@ -15,6 +15,7 @@
 #include <llvm/Bitcode/BitcodeWriter.h>
 
 #include "omill/Omill.h"
+#include "omill/Support/MemoryLimit.h"
 #include "omill/Analysis/CallingConventionAnalysis.h"
 #include "omill/Passes/LowerRemillIntrinsics.h"
 #include "omill/Passes/PassRegistry.h"
@@ -110,6 +111,7 @@ static cl::opt<bool> TimePasses(
     cl::init(false));
 
 int main(int argc, char **argv) {
+  omill::setProcessMemoryLimit(32ULL * 1024 * 1024 * 1024);  // 32 GB
   InitLLVM X(argc, argv);
   cl::ParseCommandLineOptions(argc, argv, "omill optimizer\n");
 

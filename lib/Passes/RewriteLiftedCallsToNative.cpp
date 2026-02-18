@@ -45,16 +45,7 @@ void buildStateStore(llvm::IRBuilder<> &Builder, llvm::Value *state_ptr,
   Builder.CreateStore(val, gep);
 }
 
-/// Check if a function has the remill lifted signature: (ptr, i64, ptr) -> ptr.
-bool hasLiftedSignature(const llvm::Function &F) {
-  if (F.arg_size() != 3) return false;
-  auto *FTy = F.getFunctionType();
-  if (!FTy->getReturnType()->isPointerTy()) return false;
-  if (!FTy->getParamType(0)->isPointerTy()) return false;
-  if (!FTy->getParamType(1)->isIntegerTy(64)) return false;
-  if (!FTy->getParamType(2)->isPointerTy()) return false;
-  return true;
-}
+// hasLiftedSignature is now in omill/Utils/LiftedNames.h
 
 /// Check if a lifted function is a "leaf" — it doesn't call other lifted
 /// functions or dispatch_call/dispatch_jump.  Leaf functions can be safely
@@ -88,6 +79,7 @@ struct RewriteCandidate {
   llvm::CallInst *call;
   llvm::Function *lifted_definition;  // nullptr for dynamic dispatch
   llvm::Value *state_ptr;
+  bool is_dispatch_jump;
 };
 
 /// Resolve a callee to the defined lifted function.
@@ -139,7 +131,7 @@ void collectCandidates(llvm::Function &F, const LiftedFunctionMap &lifted,
             fixupForwardDeclarationCall(call, def);
             continue;
           }
-          candidates.push_back({call, def, call->getArgOperand(0)});
+          candidates.push_back({call, def, call->getArgOperand(0), false});
           continue;
         }
       }
@@ -150,6 +142,7 @@ void collectCandidates(llvm::Function &F, const LiftedFunctionMap &lifted,
           callee->getName() == "__omill_dispatch_jump";
       if (!is_dispatch || call->arg_size() < 3)
         continue;
+      bool is_dispatch_jump = callee->getName() == "__omill_dispatch_jump";
 
       auto *target_arg = call->getArgOperand(1);
 
@@ -159,23 +152,34 @@ void collectCandidates(llvm::Function &F, const LiftedFunctionMap &lifted,
                 llvm::dyn_cast<llvm::Function>(ptoi->getPointerOperand())) {
           auto *def = resolveToDefinition(target_fn, lifted);
           if (def) {
-            candidates.push_back({call, def, call->getArgOperand(0)});
+            candidates.push_back(
+                {call, def, call->getArgOperand(0), is_dispatch_jump});
+            continue;
+          }
+        }
+      }
+      // B2: ConstantInt(pc) -> look up by PC value.
+      if (auto *ci = llvm::dyn_cast<llvm::ConstantInt>(target_arg)) {
+        const auto &pc_ap = ci->getValue();
+        // Some obfuscated paths synthesize oversized integer widths.
+        // Only treat values that fit in 64-bit VA space as direct targets.
+        if (pc_ap.getActiveBits() <= 64) {
+          auto *def = lifted.lookup(pc_ap.getZExtValue());
+          if (def) {
+            candidates.push_back(
+                {call, def, call->getArgOperand(0), is_dispatch_jump});
             continue;
           }
         }
       }
 
-      // B2: ConstantInt(pc) — look up by PC value.
-      if (auto *ci = llvm::dyn_cast<llvm::ConstantInt>(target_arg)) {
-        auto *def = lifted.lookup(ci->getZExtValue());
-        if (def) {
-          candidates.push_back({call, def, call->getArgOperand(0)});
-          continue;
-        }
-      }
-
       // B3: Dynamic target — still rewrite to prevent State escape.
-      candidates.push_back({call, nullptr, call->getArgOperand(0)});
+      // Keep unresolved jump dispatches as calls to __omill_dispatch_jump.
+      // Rewriting them to inttoptr(target_pc) can call raw binary VAs.
+      if (is_dispatch_jump)
+        continue;
+
+      candidates.push_back({call, nullptr, call->getArgOperand(0), false});
     }
   }
 }
@@ -272,16 +276,13 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
         auto *fn_ty = llvm::FunctionType::get(
             i64_ty, {i64_ty, i64_ty, i64_ty, i64_ty}, false);
 
-        bool is_jump =
-            cand.call->getCalledFunction()->getName() == "__omill_dispatch_jump";
-
         auto *result = Builder.CreateCall(fn_ty, fn_ptr,
                                           {rcx, rdx, r8, r9},
                                           "indirect.result");
-        if (is_jump) {
-          llvm::cast<llvm::CallInst>(result)->setTailCallKind(
-              llvm::CallInst::TCK_MustTail);
-        }
+        // This call is not structurally in tail position in many lifted
+        // functions, so using musttail here can produce invalid IR.
+        llvm::cast<llvm::CallInst>(result)->setTailCallKind(
+            llvm::CallInst::TCK_Tail);
 
         buildStateStore(Builder, cand.state_ptr, kRAXOffset, result);
       }

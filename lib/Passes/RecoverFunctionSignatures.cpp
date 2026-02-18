@@ -100,6 +100,24 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
                           llvm::MaybeAlign(16));
   }
 
+  // Seed a synthetic native stack so lifted prologues don't run with RSP=0.
+  // Keeping RSP as a dynamic pointer avoids constant-folding stack math into
+  // degenerate infinite loops in flattened dispatchers.
+  constexpr uint64_t kSyntheticStackSize = 1ull << 16;  // 64 KiB
+  auto *stack_ty = llvm::ArrayType::get(Builder.getInt8Ty(), kSyntheticStackSize);
+  auto *stack_alloca = Builder.CreateAlloca(stack_ty, nullptr, "native_stack");
+  auto *stack_top = Builder.CreateConstGEP1_64(
+      Builder.getInt8Ty(), stack_alloca, kSyntheticStackSize - 0x20);
+  auto *stack_top_i64 = Builder.CreatePtrToInt(stack_top, Builder.getInt64Ty());
+  if (auto rsp = field_map.fieldByName("RSP"); rsp.has_value()) {
+    auto *rsp_ptr = buildStateGEP(Builder, state_alloca, rsp->offset);
+    Builder.CreateStore(stack_top_i64, rsp_ptr);
+  }
+  if (auto rbp = field_map.fieldByName("RBP"); rbp.has_value()) {
+    auto *rbp_ptr = buildStateGEP(Builder, state_alloca, rbp->offset);
+    Builder.CreateStore(stack_top_i64, rbp_ptr);
+  }
+
   // Store GPR parameters into State fields.
   for (unsigned i = 0; i < abi.numParams(); ++i) {
     auto *param = native_fn->getArg(i);
@@ -129,19 +147,20 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
   // Lifted functions have signature: (State*, i64, Memory*) -> Memory*
   auto *lifted_ty = lifted_fn->getFunctionType();
   llvm::SmallVector<llvm::Value *, 3> call_args;
-
-  // Arg 0: State pointer
+  // Arg 0: State pointer.
   call_args.push_back(state_alloca);
 
-  // Arg 1: PC (pass 0 — not meaningful in the wrapper)
+  // Arg 1: Entry PC from the lifted symbol name (e.g. sub_401000).
+  // Passing 0 here can trap unresolved dispatchers in synthetic loops.
   if (lifted_ty->getNumParams() > 1) {
-    call_args.push_back(Builder.getInt64(0));
+    uint64_t entry_va = extractEntryVA(lifted_fn->getName());
+    call_args.push_back(Builder.getInt64(entry_va));
   }
 
-  // Arg 2: Memory pointer (pass null/poison — already lowered)
+  // Arg 2: Memory pointer. Use null (not poison) to avoid injecting UB.
   if (lifted_ty->getNumParams() > 2) {
     call_args.push_back(
-        llvm::PoisonValue::get(lifted_ty->getParamType(2)));
+        llvm::Constant::getNullValue(lifted_ty->getParamType(2)));
   }
 
   Builder.CreateCall(lifted_fn, call_args);

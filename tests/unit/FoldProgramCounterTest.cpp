@@ -148,4 +148,58 @@ TEST_F(FoldProgramCounterTest, InvalidHexSkipped) {
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
 }
 
+TEST_F(FoldProgramCounterTest, DoesNotFoldControlFlowSensitivePCUse) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *fn_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *F = llvm::Function::Create(
+      fn_ty, llvm::Function::ExternalLinkage, "sub_140001000", *M);
+  auto dispatch = M->getOrInsertFunction("__omill_dispatch_jump", fn_ty);
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  llvm::IRBuilder<> B(entry);
+
+  auto *pc = F->getArg(1);
+  auto *pc_plus = B.CreateAdd(pc, B.getInt64(0x20), "pc_plus");
+  auto *p = B.CreateIntToPtr(pc_plus, ptr_ty);
+  (void)B.CreateLoad(B.getInt8Ty(), p);
+  (void)B.CreateCall(dispatch, {F->getArg(0), pc, F->getArg(2)});
+  B.CreateRet(F->getArg(2));
+
+  runPass(F);
+
+  bool found_folded_add = false;
+  bool dispatch_arg_kept_dynamic = false;
+
+  for (auto &BB : *F) {
+    for (auto &I : BB) {
+      if (auto *add = llvm::dyn_cast<llvm::BinaryOperator>(&I)) {
+        if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(add->getOperand(0))) {
+          EXPECT_EQ(CI->getZExtValue(), 0x140001000ULL);
+          found_folded_add = true;
+        }
+      }
+
+      if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I)) {
+        if (CI->getCalledFunction() &&
+            CI->getCalledFunction()->getName() == "__omill_dispatch_jump") {
+          dispatch_arg_kept_dynamic = (CI->getArgOperand(1) == F->getArg(1));
+        }
+      }
+    }
+  }
+
+  EXPECT_TRUE(found_folded_add);
+  EXPECT_TRUE(dispatch_arg_kept_dynamic);
+  EXPECT_FALSE(F->getArg(1)->use_empty());
+  EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+}
+
 }  // namespace

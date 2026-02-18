@@ -4,6 +4,8 @@
 // SymbolicJumpTableSolver.  Not installed.
 
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/ADT/SmallPtrSet.h>
+#include <llvm/ADT/DenseMap.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
@@ -28,6 +30,206 @@ struct LinearAddress {
   unsigned stride;
 };
 
+inline std::optional<uint64_t> foldConstAtEntryPC(
+    llvm::Value *V, const llvm::Function &F,
+    llvm::DenseMap<llvm::Value *, std::optional<uint64_t>> &memo,
+    llvm::SmallPtrSet<llvm::Value *, 32> &in_progress,
+    unsigned depth = 0) {
+  if (!V || depth > 24)
+    return std::nullopt;
+
+  if (auto it = memo.find(V); it != memo.end())
+    return it->second;
+
+  if (in_progress.contains(V))
+    return std::nullopt;
+  in_progress.insert(V);
+
+  auto finish = [&](std::optional<uint64_t> val) -> std::optional<uint64_t> {
+    in_progress.erase(V);
+    memo[V] = val;
+    return val;
+  };
+
+  // Treat the lifted function's program_counter parameter as entry VA.
+  if (F.arg_size() >= 2 && V == F.getArg(1))
+    return finish(extractEntryVA(F.getName()));
+
+  if (auto *ci = llvm::dyn_cast<llvm::ConstantInt>(V)) {
+    if (ci->getValue().getActiveBits() <= 64)
+      return finish(ci->getZExtValue());
+    return finish(std::nullopt);
+  }
+
+  if (auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(V)) {
+    auto lhs = foldConstAtEntryPC(BO->getOperand(0), F, memo, in_progress,
+                                  depth + 1);
+    auto rhs = foldConstAtEntryPC(BO->getOperand(1), F, memo, in_progress,
+                                  depth + 1);
+    if (lhs && rhs) {
+      if (BO->getOpcode() == llvm::Instruction::Add)
+        return finish(*lhs + *rhs);
+      if (BO->getOpcode() == llvm::Instruction::Sub)
+        return finish(*lhs - *rhs);
+    }
+    return finish(std::nullopt);
+  }
+
+  if (auto *PN = llvm::dyn_cast<llvm::PHINode>(V)) {
+    std::optional<uint64_t> merged;
+    for (unsigned i = 0; i < PN->getNumIncomingValues(); ++i) {
+      auto val = foldConstAtEntryPC(PN->getIncomingValue(i), F, memo,
+                                    in_progress, depth + 1);
+      if (!val)
+        continue;
+      if (!merged)
+        merged = *val;
+      else if (*merged != *val)
+        return finish(std::nullopt);
+    }
+    return finish(merged);
+  }
+
+  if (auto *SI = llvm::dyn_cast<llvm::SelectInst>(V)) {
+    auto tv = foldConstAtEntryPC(SI->getTrueValue(), F, memo, in_progress,
+                                 depth + 1);
+    auto fv = foldConstAtEntryPC(SI->getFalseValue(), F, memo, in_progress,
+                                 depth + 1);
+    if (tv && fv && *tv == *fv)
+      return finish(*tv);
+    // Optimistic: if only one arm folds, use it.  This is sound for jump
+    // table resolution because the result is validated against the binary
+    // memory map — an incorrect base produces unreadable addresses and the
+    // candidate is discarded harmlessly.
+    if (tv && !fv)
+      return finish(*tv);
+    if (fv && !tv)
+      return finish(*fv);
+    return finish(std::nullopt);
+  }
+
+  if (auto *CI = llvm::dyn_cast<llvm::CastInst>(V))
+    return finish(foldConstAtEntryPC(CI->getOperand(0), F, memo, in_progress,
+                                     depth + 1));
+
+  if (auto *FI = llvm::dyn_cast<llvm::FreezeInst>(V))
+    return finish(foldConstAtEntryPC(FI->getOperand(0), F, memo, in_progress,
+                                     depth + 1));
+
+  // Load from State GEP: walk backwards to find the nearest dominating store
+  // to the same pointer and fold through the stored value.  This handles the
+  // pattern where PromoteStateToSSA flushed a register (e.g. R10D) to State
+  // and a later block reloads it, but GVN failed to forward due to aliasing.
+  if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(V)) {
+    auto *ptr = LI->getPointerOperand();
+    // Only handle loads from State GEPs (arg0 + const offset).
+    auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(ptr);
+    if (gep && gep->getPointerOperand() == F.getArg(0) &&
+        gep->hasAllConstantIndices()) {
+      // Compute the byte offset of this GEP.
+      llvm::APInt load_offset(64, 0);
+      if (!gep->accumulateConstantOffset(
+              F.getDataLayout(), load_offset))
+        return finish(std::nullopt);
+      uint64_t target_offset = load_offset.getZExtValue();
+
+      // Match stores by offset, not pointer identity, because inlining
+      // may produce distinct GEP instructions at the same offset.
+      auto matchesOffset = [&](llvm::Value *store_ptr) -> bool {
+        if (store_ptr == ptr) return true;
+        auto *sg = llvm::dyn_cast<llvm::GetElementPtrInst>(store_ptr);
+        if (!sg || sg->getPointerOperand() != F.getArg(0) ||
+            !sg->hasAllConstantIndices())
+          return false;
+        llvm::APInt so(64, 0);
+        if (!sg->accumulateConstantOffset(
+                F.getDataLayout(), so))
+          return false;
+        return so.getZExtValue() == target_offset;
+      };
+
+      // Walk backwards in same block to find store to same State offset.
+      auto *BB = LI->getParent();
+      llvm::StoreInst *found_store = nullptr;
+      for (auto it = llvm::BasicBlock::reverse_iterator(
+               LI->getIterator());
+           it != BB->rend(); ++it) {
+        if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&*it)) {
+          if (matchesOffset(SI->getPointerOperand())) {
+            found_store = SI;
+            break;
+          }
+        }
+        if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&*it))
+          if (!CI->doesNotAccessMemory())
+            break;
+      }
+      // Walk up the single-predecessor chain to find the store.
+      if (!found_store) {
+        llvm::SmallPtrSet<llvm::BasicBlock *, 8> visited;
+        visited.insert(BB);
+        auto *cur = BB;
+        for (unsigned chain = 0; chain < 8 && !found_store; ++chain) {
+          auto *pred = cur->getSinglePredecessor();
+          if (!pred || visited.count(pred))
+            break;
+          visited.insert(pred);
+          for (auto &I : llvm::reverse(*pred)) {
+            if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+              if (matchesOffset(SI->getPointerOperand())) {
+                found_store = SI;
+                break;
+              }
+            }
+            if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
+              if (!CI->doesNotAccessMemory())
+                goto done_walk;
+          }
+          cur = pred;
+        }
+        done_walk:;
+      }
+      if (found_store) {
+        return finish(foldConstAtEntryPC(found_store->getValueOperand(), F,
+                                         memo, in_progress, depth + 1));
+      }
+    }
+  }
+
+  if (auto *CE = llvm::dyn_cast<llvm::ConstantExpr>(V)) {
+    if (CE->getOpcode() == llvm::Instruction::IntToPtr ||
+        CE->getOpcode() == llvm::Instruction::PtrToInt ||
+        CE->getOpcode() == llvm::Instruction::BitCast ||
+        CE->getOpcode() == llvm::Instruction::Trunc ||
+        CE->getOpcode() == llvm::Instruction::ZExt ||
+        CE->getOpcode() == llvm::Instruction::SExt) {
+      return finish(foldConstAtEntryPC(CE->getOperand(0), F, memo,
+                                       in_progress, depth + 1));
+    }
+    if (CE->getOpcode() == llvm::Instruction::Add ||
+        CE->getOpcode() == llvm::Instruction::Sub) {
+      auto lhs = foldConstAtEntryPC(CE->getOperand(0), F, memo, in_progress,
+                                    depth + 1);
+      auto rhs = foldConstAtEntryPC(CE->getOperand(1), F, memo, in_progress,
+                                    depth + 1);
+      if (lhs && rhs) {
+        if (CE->getOpcode() == llvm::Instruction::Add)
+          return finish(*lhs + *rhs);
+        return finish(*lhs - *rhs);
+      }
+    }
+  }
+
+  return finish(std::nullopt);
+}
+
+inline std::optional<uint64_t> foldConstAtEntryPC(llvm::Value *V,
+                                                  const llvm::Function &F) {
+  llvm::DenseMap<llvm::Value *, std::optional<uint64_t>> memo;
+  llvm::SmallPtrSet<llvm::Value *, 32> in_progress;
+  return foldConstAtEntryPC(V, F, memo, in_progress);
+}
+
 // ---------------------------------------------------------------------------
 // Address decomposition
 // ---------------------------------------------------------------------------
@@ -36,7 +238,8 @@ struct LinearAddress {
 /// Handles: inttoptr(add(shl/mul/zext/sext/gep, const_base))
 ///          inttoptr(add(add(..., const), const_base))
 ///          inttoptr(or(shl(idx, N), base)) when low bits of base are zero
-inline std::optional<LinearAddress> decomposeTableAddress(llvm::Value *ptr) {
+inline std::optional<LinearAddress> decomposeTableAddress(
+    llvm::Value *ptr, const llvm::Function *F = nullptr) {
   // Strip inttoptr.
   llvm::Value *addr = nullptr;
   if (auto *ITP = llvm::dyn_cast<llvm::IntToPtrInst>(ptr))
@@ -70,6 +273,28 @@ inline std::optional<LinearAddress> decomposeTableAddress(llvm::Value *ptr) {
           }
         }
       }
+      if (auto *base_itp = llvm::dyn_cast<llvm::IntToPtrInst>(base_ptr)) {
+        if (F) {
+          if (auto base_val = foldConstAtEntryPC(base_itp->getOperand(0), *F)) {
+            // Check if idx_val has a stride.
+            llvm::Value *idx;
+            llvm::ConstantInt *shift_ci;
+            if (match(idx_val, m_Shl(m_Value(idx), m_ConstantInt(shift_ci)))) {
+              unsigned shift = shift_ci->getZExtValue();
+              if (shift >= 1 && shift <= 3)
+                return LinearAddress{idx, *base_val, 1u << shift};
+            }
+            llvm::ConstantInt *stride_ci;
+            if (match(idx_val, m_Mul(m_Value(idx), m_ConstantInt(stride_ci)))) {
+              uint64_t stride = stride_ci->getZExtValue();
+              if (stride >= 1 && stride <= 8)
+                return LinearAddress{idx, *base_val,
+                                     static_cast<unsigned>(stride)};
+            }
+            return LinearAddress{idx_val, *base_val, 1};
+          }
+        }
+      }
     }
     return std::nullopt;
   } else {
@@ -87,6 +312,16 @@ inline std::optional<LinearAddress> decomposeTableAddress(llvm::Value *ptr) {
     if (auto *ci = llvm::dyn_cast<llvm::ConstantInt>(rhs)) {
       accum_base += ci->getZExtValue();
       addr = lhs;
+    } else if (F) {
+      if (auto folded = foldConstAtEntryPC(rhs, *F)) {
+        accum_base += *folded;
+        addr = lhs;
+      } else if (auto folded_lhs = foldConstAtEntryPC(lhs, *F)) {
+        accum_base += *folded_lhs;
+        addr = rhs;
+      } else {
+        break;
+      }
     } else if (auto *ci = llvm::dyn_cast<llvm::ConstantInt>(lhs)) {
       accum_base += ci->getZExtValue();
       addr = rhs;
@@ -124,6 +359,36 @@ inline std::optional<LinearAddress> decomposeTableAddress(llvm::Value *ptr) {
         uint64_t stride = stride_ci->getZExtValue();
         if (stride >= 1 && stride <= 8)
           return LinearAddress{idx, accum_base, static_cast<unsigned>(stride)};
+      }
+    }
+    // add(non_const_base, shl/mul(idx, stride)) — after GVN forwards a
+    // State register store, the base register value appears as an SSA
+    // expression (e.g. R10D = NEXT_PC + offset).  Try to fold it.
+    if (F) {
+      auto tryScaledAdd = [&](llvm::Value *extra,
+                              llvm::Value *rest) -> std::optional<LinearAddress> {
+        auto folded = foldConstAtEntryPC(extra, *F);
+        if (!folded)
+          return std::nullopt;
+        uint64_t total_base = accum_base + *folded;
+        if (match(rest, m_Shl(m_Value(idx), m_ConstantInt(shift_ci)))) {
+          unsigned shift = shift_ci->getZExtValue();
+          if (shift >= 1 && shift <= 3)
+            return LinearAddress{idx, total_base, 1u << shift};
+        }
+        if (match(rest, m_Mul(m_Value(idx), m_ConstantInt(stride_ci)))) {
+          uint64_t stride = stride_ci->getZExtValue();
+          if (stride >= 1 && stride <= 8)
+            return LinearAddress{idx, total_base, static_cast<unsigned>(stride)};
+        }
+        return std::nullopt;
+      };
+      llvm::Value *add_lhs, *add_rhs;
+      if (match(scaled, m_Add(m_Value(add_lhs), m_Value(add_rhs)))) {
+        if (auto r = tryScaledAdd(add_lhs, add_rhs))
+          return *r;
+        if (auto r = tryScaledAdd(add_rhs, add_lhs))
+          return *r;
       }
     }
     return std::nullopt;
@@ -363,7 +628,7 @@ inline std::optional<uint64_t> computeIndexRange(llvm::Value *idx,
 /// Strip RVA→VA conversion: target = add(zext/sext(load_val), image_base).
 /// Returns {image_base, inner_value}.
 inline std::pair<uint64_t, llvm::Value *>
-unwrapRVAConversion(llvm::Value *target) {
+unwrapRVAConversion(llvm::Value *target, const llvm::Function *F = nullptr) {
   llvm::Value *loaded;
   llvm::ConstantInt *addend;
 
@@ -371,6 +636,17 @@ unwrapRVAConversion(llvm::Value *target) {
     return {addend->getZExtValue(), loaded};
   if (match(target, m_Add(m_ConstantInt(addend), m_Value(loaded))))
     return {addend->getZExtValue(), loaded};
+
+  // Some lifted traces keep image-base arithmetic as
+  // add(load_or_zext, program_counter + const). Fold that term.
+  llvm::Value *lhs = nullptr;
+  llvm::Value *rhs = nullptr;
+  if (match(target, m_Add(m_Value(lhs), m_Value(rhs))) && F) {
+    if (auto folded_rhs = foldConstAtEntryPC(rhs, *F))
+      return {*folded_rhs, lhs};
+    if (auto folded_lhs = foldConstAtEntryPC(lhs, *F))
+      return {*folded_lhs, rhs};
+  }
 
   return {0, target};
 }

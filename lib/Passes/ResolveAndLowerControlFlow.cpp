@@ -240,7 +240,7 @@ bool recoverJumpTables(llvm::Function &F,
         continue;
 
       // Unwrap RVA conversion if present.
-      auto [image_base, load_val] = jt::unwrapRVAConversion(target);
+      auto [image_base, load_val] = jt::unwrapRVAConversion(target, &F);
 
       // Strip zext/sext from load value.
       if (auto *zext = llvm::dyn_cast<llvm::ZExtInst>(load_val))
@@ -253,7 +253,8 @@ bool recoverJumpTables(llvm::Function &F,
         continue;
 
       // Decompose load pointer into base + idx * stride.
-      auto addr_info = jt::decomposeTableAddress(table_load->getPointerOperand());
+      auto addr_info =
+          jt::decomposeTableAddress(table_load->getPointerOperand(), &F);
       if (!addr_info)
         continue;
 
@@ -335,8 +336,9 @@ struct TableAccess {
   uint64_t image_base;
 };
 
-std::optional<TableAccess> analyzeTarget(llvm::Value *target) {
-  auto [image_base, load_val] = jt::unwrapRVAConversion(target);
+std::optional<TableAccess> analyzeTarget(llvm::Value *target,
+                                         llvm::Function &F) {
+  auto [image_base, load_val] = jt::unwrapRVAConversion(target, &F);
 
   if (auto *zext = llvm::dyn_cast<llvm::ZExtInst>(load_val))
     load_val = zext->getOperand(0);
@@ -347,7 +349,8 @@ std::optional<TableAccess> analyzeTarget(llvm::Value *target) {
   if (!table_load)
     return std::nullopt;
 
-  auto addr_info = jt::decomposeTableAddress(table_load->getPointerOperand());
+  auto addr_info =
+      jt::decomposeTableAddress(table_load->getPointerOperand(), &F);
   if (!addr_info)
     return std::nullopt;
 
@@ -394,7 +397,7 @@ bool symbolicJumpTableSolve(llvm::Function &F,
       if (llvm::isa<llvm::ConstantInt>(target))
         continue;
 
-      auto access = analyzeTarget(target);
+      auto access = analyzeTarget(target, F);
       if (!access)
         continue;
 

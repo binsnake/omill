@@ -286,9 +286,46 @@ static Value *buildStateFieldGEP(IRBuilder<> &Builder, Value *state_ptr,
   return gep;
 }
 
+static bool hasRemillControlTransfer(const Function &F) {
+  for (const auto &BB : F) {
+    for (const auto &I : BB) {
+      auto *CI = dyn_cast<CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *callee = CI->getCalledFunction();
+      if (!callee)
+        continue;
+      auto name = callee->getName();
+      if (name == "__remill_jump" || name == "__remill_function_call" ||
+          name == "__remill_function_return" ||
+          name == "__omill_dispatch_jump" || name == "__omill_dispatch_call") {
+        return true;
+      }
+      // Before full control-flow lowering, lifted traces can still contain
+      // remill helper calls (e.g. *_JMPI_*), not just __remill_* intrinsics.
+      // Treat these helpers as control-transfer to avoid collapsing NEXT_PC
+      // flow during PromoteStateToSSA.
+      if (name.contains_insensitive("jmpi") ||
+          name.contains_insensitive("jump") ||
+          name.contains_insensitive("function_call") ||
+          name.contains_insensitive("function_return")) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 static bool promoteStateToSSA(Function &F, const DataLayout &DL) {
   Value *state_ptr = (F.arg_size() > 0) ? F.getArg(0) : nullptr;
   if (!state_ptr)
+    return false;
+
+  // PromoteStateToSSA before control-flow lowering is unsafe on traces that
+  // still contain remill dispatch/transfer intrinsics. Flushing/reloading
+  // around these calls can over-constrain NEXT_PC/state flow and collapse
+  // traces to incorrect self-loops.
+  if (F.getName().starts_with("sub_") && hasRemillControlTransfer(F))
     return false;
 
   struct FieldInfo {
@@ -301,8 +338,6 @@ static bool promoteStateToSSA(Function &F, const DataLayout &DL) {
   };
 
   DenseMap<unsigned, FieldInfo> fields;
-  DenseSet<unsigned> first_access_seen;
-
   for (auto &BB : F) {
     for (auto &I : BB) {
       if (auto *LI = dyn_cast<LoadInst>(&I)) {
@@ -317,10 +352,6 @@ static bool promoteStateToSSA(Function &F, const DataLayout &DL) {
           info.type = LI->getType();
         }
         info.loads.push_back(LI);
-        if (!first_access_seen.count(u_off)) {
-          first_access_seen.insert(u_off);
-          info.is_live_in = true;
-        }
       }
 
       if (auto *SI = dyn_cast<StoreInst>(&I)) {
@@ -335,15 +366,20 @@ static bool promoteStateToSSA(Function &F, const DataLayout &DL) {
           info.type = SI->getValueOperand()->getType();
         }
         info.stores.push_back(SI);
-        if (!first_access_seen.count(u_off)) {
-          first_access_seen.insert(u_off);
-        }
       }
     }
   }
 
   if (fields.empty())
     return false;
+
+  // Be conservative across CFG order: any field that is ever loaded is a
+  // live-in. Using "first textual access" can misclassify fields when a store
+  // appears earlier in block order but does not dominate all loads.
+  for (auto &[offset, info] : fields) {
+    (void)offset;
+    info.is_live_in = !info.loads.empty();
+  }
 
   // Phase 2: Create allocas
   IRBuilder<> EntryBuilder(&F.getEntryBlock().front());

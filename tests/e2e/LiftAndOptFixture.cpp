@@ -14,10 +14,69 @@
 #include "omill/Analysis/CallingConventionAnalysis.h"
 #include "omill/Analysis/ExceptionInfo.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
+#include "omill/Omill.h"
+#include "omill/Support/MemoryLimit.h"
 
 #include <cstdlib>
+#include <optional>
 
 namespace omill::e2e {
+
+// Apply 32 GB memory limit before any test runs (gtest_main provides main()).
+static const bool kMemLimitSet = omill::setProcessMemoryLimit(
+    32ULL * 1024 * 1024 * 1024);
+
+namespace {
+
+std::optional<bool> parseBoolEnv(const char *name) {
+  const char *v = std::getenv(name);
+  if (!v || v[0] == '\0') {
+    return std::nullopt;
+  }
+  if ((v[0] == '1' && v[1] == '\0') ||
+      (v[0] == 't' && v[1] == '\0') ||
+      (v[0] == 'T' && v[1] == '\0')) {
+    return true;
+  }
+  if ((v[0] == '0' && v[1] == '\0') ||
+      (v[0] == 'f' && v[1] == '\0') ||
+      (v[0] == 'F' && v[1] == '\0')) {
+    return false;
+  }
+  return std::nullopt;
+}
+
+void maybeSetBoolFromEnv(const char *name, bool &out) {
+  if (auto v = parseBoolEnv(name); v.has_value()) {
+    out = *v;
+  }
+}
+
+void applyPipelineEnvOverrides(PipelineOptions &opts) {
+  maybeSetBoolFromEnv("OMILL_OPT_LOWER_INTRINSICS", opts.lower_intrinsics);
+  maybeSetBoolFromEnv("OMILL_OPT_OPTIMIZE_STATE", opts.optimize_state);
+  maybeSetBoolFromEnv("OMILL_OPT_STOP_AFTER_STATE",
+                      opts.stop_after_state_optimization);
+  maybeSetBoolFromEnv("OMILL_OPT_LOWER_CONTROL_FLOW", opts.lower_control_flow);
+  maybeSetBoolFromEnv("OMILL_OPT_RECOVER_ABI", opts.recover_abi);
+  maybeSetBoolFromEnv("OMILL_OPT_DEOBFUSCATE", opts.deobfuscate);
+  maybeSetBoolFromEnv("OMILL_OPT_RESOLVE_TARGETS",
+                      opts.resolve_indirect_targets);
+  maybeSetBoolFromEnv("OMILL_OPT_IPCP", opts.interprocedural_const_prop);
+}
+
+void logPipelineOptions(const PipelineOptions &opts) {
+  llvm::errs() << "[OPT] lower_intrinsics=" << opts.lower_intrinsics
+               << " optimize_state=" << opts.optimize_state
+               << " stop_after_state=" << opts.stop_after_state_optimization
+               << " lower_control_flow=" << opts.lower_control_flow
+               << " recover_abi=" << opts.recover_abi
+               << " deobfuscate=" << opts.deobfuscate
+               << " resolve_targets=" << opts.resolve_indirect_targets
+               << " ipcp=" << opts.interprocedural_const_prop << "\n";
+}
+
+}  // namespace
 
 void LiftAndOptFixture::SetUp() {
   arch_ = remill::Arch::Get(ctx_, remill::kOSWindows, remill::kArchAMD64_AVX);
@@ -132,38 +191,27 @@ void LiftAndOptFixture::optimizeWithMemoryMap(const PipelineOptions &opts,
 
   dumpIR("before");
 
-  // Run the main pipeline (without ABI recovery, even if requested).
-  PipelineOptions main_opts = opts;
+  PipelineOptions requested_opts = opts;
+  applyPipelineEnvOverrides(requested_opts);
+
+  // Run the main pipeline once (without ABI recovery, even if requested).
+  // Splitting state/control-flow phases can produce invalid intermediate CFGs
+  // for complex OLLVM functions (e.g. SHA256), so keep execution cohesive.
+  PipelineOptions main_opts = requested_opts;
   main_opts.recover_abi = false;
-
-  // Phase 0+1+2: intrinsic lowering + state optimization only.
-  // lower_control_flow=false skips phases 3a/3b.
+  logPipelineOptions(main_opts);
   {
-    PipelineOptions state_opts = main_opts;
-    state_opts.lower_control_flow = false;
-    state_opts.resolve_indirect_targets = false;
-    state_opts.interprocedural_const_prop = false;
     llvm::ModulePassManager MPM;
-    omill::buildPipeline(MPM, state_opts);
+    omill::buildPipeline(MPM, main_opts);
     MPM.run(*module_, MAM);
   }
 
+  // Keep this snapshot label for compatibility with existing IR dump tooling.
   dumpIR("after_state");
-
-  // Phase 3+: control flow recovery (skip already-run phases 1/2).
-  {
-    PipelineOptions cf_opts = main_opts;
-    cf_opts.lower_intrinsics = false;
-    cf_opts.optimize_state = false;
-    llvm::ModulePassManager MPM;
-    omill::buildPipeline(MPM, cf_opts);
-    MPM.run(*module_, MAM);
-  }
-
   dumpIR("after");
 
   // Run ABI recovery as a separate stage so we get a snapshot before and after.
-  if (opts.recover_abi) {
+  if (requested_opts.recover_abi) {
     llvm::ModulePassManager MPM;
     omill::buildABIRecoveryPipeline(MPM);
     MPM.run(*module_, MAM);

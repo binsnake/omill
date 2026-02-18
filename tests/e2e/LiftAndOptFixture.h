@@ -16,11 +16,13 @@
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/ExceptionInfo.h"
 #include "omill/Omill.h"
+#include "omill/Support/JumpTableDiscovery.h"
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -68,6 +70,37 @@ class BufferTraceManager : public remill::TraceManager {
     return GetLiftedTraceDeclaration(addr);
   }
 
+  /// Provide devirtualized jump table targets for indirect jumps.
+  /// Tries both RIP-relative and image-base-relative jump table patterns.
+  void ForEachDevirtualizedTarget(
+      const remill::Instruction &inst,
+      std::function<void(uint64_t, remill::DevirtualizedTargetKind)> func)
+      override {
+    if (!memory_map_)
+      return;
+
+    // Try image-base-relative pattern first (OLLVM CFF / MSVC).
+    auto targets = omill::discoverImageBaseRelativeTargets(
+        *memory_map_, memory_map_->imageBase(), inst.pc);
+
+    // Fall back to RIP-relative pattern (LLVM default).
+    if (targets.empty()) {
+      constexpr size_t kScanWindow = 4096;
+      uint64_t scan_start =
+          (inst.pc > kScanWindow) ? (inst.pc - kScanWindow) : 0;
+      size_t scan_len = static_cast<size_t>(inst.pc - scan_start) + 64;
+      targets = omill::discoverJumpTableTargets(
+          *memory_map_, scan_start, scan_len);
+    }
+
+    for (uint64_t target : targets) {
+      func(target, remill::DevirtualizedTargetKind::kTraceLocal);
+    }
+  }
+
+  /// Set the binary memory map for on-the-fly jump table discovery.
+  void setMemoryMap(const omill::BinaryMemoryMap *mem) { memory_map_ = mem; }
+
   const std::unordered_map<uint64_t, llvm::Function *> &traces() const {
     return traces_;
   }
@@ -79,6 +112,7 @@ class BufferTraceManager : public remill::TraceManager {
  private:
   std::unordered_map<uint64_t, uint8_t> code_;
   std::unordered_map<uint64_t, llvm::Function *> traces_;
+  const omill::BinaryMemoryMap *memory_map_ = nullptr;
   uint64_t base_addr_ = 0;
 };
 

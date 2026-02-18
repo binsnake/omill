@@ -1,5 +1,6 @@
 #include "omill/Passes/LowerRemillIntrinsics.h"
 
+#include <llvm/ADT/DenseSet.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
@@ -8,14 +9,25 @@
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Operator.h>
+#include <llvm/Support/raw_ostream.h>
 
 #include "omill/Analysis/LiftedFunctionMap.h"
 #include "omill/Utils/IntrinsicTable.h"
 #include "omill/Utils/LiftedNames.h"
 
+#include <cstdlib>
+
 namespace omill {
 
 namespace {
+
+bool debugJumpSelector() {
+  const char *v = std::getenv("OMILL_DEBUG_JUMP_SELECTOR");
+  if (!v || v[0] == '\0')
+    return false;
+  return (v[0] == '1' && v[1] == '\0') || (v[0] == 't' && v[1] == '\0') ||
+         (v[0] == 'T' && v[1] == '\0');
+}
 
 // ===----------------------------------------------------------------------===
 // Category 1: Flags — replace flag computation/comparison calls with arg0
@@ -742,7 +754,9 @@ bool lowerErrorAndMissing(llvm::Function &F, IntrinsicTable &table) {
     auto *new_term =
         Builder.CreateRet(llvm::PoisonValue::get(F.getReturnType()));
 
-    CI->replaceAllUsesWith(llvm::PoisonValue::get(CI->getType()));
+    // Preserve the threaded Memory* token instead of introducing poison.
+    // Some lifted traces still feed this value into fallback dispatch paths.
+    CI->replaceAllUsesWith(CI->getArgOperand(2));
     CI->eraseFromParent();
 
     while (&BB->back() != new_term) {
@@ -785,7 +799,9 @@ bool lowerFunctionReturn(llvm::Function &F, IntrinsicTable &table) {
     else
       new_term = Builder.CreateRet(CI->getArgOperand(2));
 
-    CI->replaceAllUsesWith(llvm::PoisonValue::get(CI->getType()));
+    // Preserve the threaded Memory* token instead of introducing poison.
+    // Some lifted traces still feed this value into fallback dispatch paths.
+    CI->replaceAllUsesWith(CI->getArgOperand(2));
     CI->eraseFromParent();
 
     while (&BB->back() != new_term) {
@@ -880,6 +896,9 @@ bool lowerJump(llvm::Function &F, IntrinsicTable &table,
   auto *lifted_fn_ty = llvm::FunctionType::get(
       mem_ptr_ty, {state_ptr_ty, i64_ty, mem_ptr_ty}, false);
 
+  llvm::DenseMap<uint64_t, llvm::BasicBlock *> inferred_pc_map;
+  bool inferred_pc_map_built = false;
+
   for (auto *CI : jump_calls) {
     llvm::IRBuilder<> Builder(CI);
     auto *BB = CI->getParent();
@@ -909,14 +928,65 @@ bool lowerJump(llvm::Function &F, IntrinsicTable &table,
     }
 
     if (!new_term) {
-      auto dispatcher =
-          M.getOrInsertFunction("__omill_dispatch_jump", lifted_fn_ty);
-      auto *result =
-          Builder.CreateCall(dispatcher, {state, target_pc, mem});
-      new_term = Builder.CreateRet(result);
+      // Fallback br selector: dispatch via __omill_dispatch_jump.
+      // Note: InlineJumpTargetsPass lowers most __remill_jump calls early
+      // (before state optimization) with proper PC→block switches.
+      // This path handles any remaining jumps that weren't lowered early.
+      auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+      llvm::SmallVector<std::pair<uint64_t, llvm::BasicBlock *>, 32> block_pcs;
+      for (auto &TargetBB : F) {
+        uint64_t pc = extractBlockPC(TargetBB.getName());
+        if (pc != 0)
+          block_pcs.push_back({pc, &TargetBB});
+      }
+
+      // If block_<pc> names were stripped, infer a small set of candidate
+      // targets from this specific jump value.
+      if (block_pcs.empty()) {
+        if (!inferred_pc_map_built) {
+          inferred_pc_map = collectBlockPCMap(F);
+          inferred_pc_map_built = true;
+        }
+        llvm::DenseSet<uint64_t> seen_pcs;
+        auto candidate_pcs = collectPossiblePCValues(target_pc, F, 32);
+        if (debugJumpSelector()) {
+          llvm::errs() << "[LowerJump] " << F.getName()
+                       << " inferred candidates=" << candidate_pcs.size()
+                       << " inferred_map=" << inferred_pc_map.size() << "\n";
+        }
+        for (uint64_t pc : candidate_pcs) {
+          if (!seen_pcs.insert(pc).second)
+            continue;
+          if (auto it = inferred_pc_map.find(pc); it != inferred_pc_map.end())
+            block_pcs.push_back({pc, it->second});
+        }
+      }
+      if (debugJumpSelector() && block_pcs.empty()) {
+        llvm::errs() << "[LowerJump] " << F.getName()
+                     << " produced empty selector; keeping dispatch fallback\n";
+      }
+
+      auto *fallback_bb = llvm::BasicBlock::Create(
+          Ctx, "jump_dispatch_fallback", &F);
+      {
+        llvm::IRBuilder<> FBBuilder(fallback_bb);
+        auto dispatcher =
+            M.getOrInsertFunction("__omill_dispatch_jump", lifted_fn_ty);
+        auto *result =
+            FBBuilder.CreateCall(dispatcher, {state, target_pc, mem});
+        FBBuilder.CreateRet(result);
+      }
+
+      auto *sw = Builder.CreateSwitch(target_pc, fallback_bb,
+                                      block_pcs.size());
+      for (auto [pc, target_bb] : block_pcs)
+        sw->addCase(llvm::ConstantInt::get(i64_ty, pc), target_bb);
+      new_term = sw;
     }
 
-    CI->replaceAllUsesWith(llvm::PoisonValue::get(CI->getType()));
+    // Preserve the threaded Memory* token instead of introducing poison.
+    // Some lifted traces still feed this value into fallback dispatch paths.
+    CI->replaceAllUsesWith(mem);
     CI->eraseFromParent();
 
     while (&BB->back() != new_term) {

@@ -14,6 +14,9 @@
 
 #include <gtest/gtest.h>
 
+#include "omill/Support/JumpTableDiscovery.h"
+
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -111,6 +114,10 @@ class OLLVMTest : public LiftAndOptFixture {
 
     setCode(text_copy_.data(), text_copy_.size(), shared_pe_->text_base);
     traceManager().setBaseAddr(export_va);
+
+    // Provide the binary memory map so the TraceLifter can discover jump
+    // table targets on-the-fly for each indirect jump instruction.
+    traceManager().setMemoryMap(&shared_pe_->memory_map);
 
     return lift();
   }
@@ -211,6 +218,15 @@ class OLLVMTest : public LiftAndOptFixture {
   // -----------------------------------------------------------------------
 
   llvm::Function *findNativeFunction() {
+    if (const char *forced = std::getenv("OMILL_NATIVE_FUNC")) {
+      if (forced[0] != '\0') {
+        if (auto *F = module()->getFunction(forced)) {
+          if (!F->isDeclaration()) {
+            return F;
+          }
+        }
+      }
+    }
     for (auto &F : *module())
       if (!F.isDeclaration() && F.getName().contains("_native"))
         return &F;
