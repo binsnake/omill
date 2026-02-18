@@ -1,4 +1,4 @@
-#include "omill/Passes/DeadStateFlagElimination.h"
+#include "omill/Passes/OptimizeState.h"
 
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
@@ -18,7 +18,7 @@ class DeadStateFlagEliminationTest : public ::testing::Test {
 
   void runPass(llvm::Function *F) {
     llvm::FunctionPassManager FPM;
-    FPM.addPass(omill::DeadStateFlagEliminationPass());
+    FPM.addPass(omill::OptimizeStatePass(omill::OptimizePhases::DeadFlags));
 
     llvm::PassBuilder PB;
     llvm::LoopAnalysisManager LAM;

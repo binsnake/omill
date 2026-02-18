@@ -1,4 +1,4 @@
-#include "omill/Passes/LowerFunctionCall.h"
+#include "omill/Passes/LowerRemillIntrinsics.h"
 
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
@@ -20,7 +20,7 @@ class LowerFunctionCallTest : public ::testing::Test {
 
   void runPass(llvm::Function *F) {
     llvm::FunctionPassManager FPM;
-    FPM.addPass(omill::LowerFunctionCallPass());
+    FPM.addPass(omill::LowerRemillIntrinsicsPass(omill::LowerCategories::Call));
 
     llvm::PassBuilder PB;
     llvm::LoopAnalysisManager LAM;

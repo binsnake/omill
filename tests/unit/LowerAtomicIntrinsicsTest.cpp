@@ -1,4 +1,4 @@
-#include "omill/Passes/LowerAtomicIntrinsics.h"
+#include "omill/Passes/LowerRemillIntrinsics.h"
 
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
@@ -18,7 +18,7 @@ class LowerAtomicIntrinsicsTest : public ::testing::Test {
 
   void runPass(llvm::Function *F) {
     llvm::FunctionPassManager FPM;
-    FPM.addPass(omill::LowerAtomicIntrinsicsPass());
+    FPM.addPass(omill::LowerRemillIntrinsicsPass(omill::LowerCategories::Atomics));
 
     llvm::PassBuilder PB;
     llvm::LoopAnalysisManager LAM;

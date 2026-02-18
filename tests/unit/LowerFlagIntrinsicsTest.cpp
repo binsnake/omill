@@ -1,4 +1,4 @@
-#include "omill/Passes/LowerFlagIntrinsics.h"
+#include "omill/Passes/LowerRemillIntrinsics.h"
 
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
@@ -84,7 +84,7 @@ TEST_F(LowerFlagIntrinsicsTest, RemovesFlagComputationCalls) {
 
   // Run the pass.
   llvm::FunctionPassManager FPM;
-  FPM.addPass(omill::LowerFlagIntrinsicsPass());
+  FPM.addPass(omill::LowerRemillIntrinsicsPass(omill::LowerCategories::Flags));
 
   llvm::PassBuilder PB;
   llvm::LoopAnalysisManager LAM;

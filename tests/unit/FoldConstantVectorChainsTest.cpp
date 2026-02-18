@@ -1,4 +1,4 @@
-#include "omill/Passes/FoldConstantVectorChains.h"
+#include "omill/Passes/SimplifyVectorReassembly.h"
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
@@ -19,7 +19,7 @@ class FoldConstantVectorChainsTest : public ::testing::Test {
 
   void runPass(llvm::Function &F) {
     llvm::FunctionPassManager FPM;
-    FPM.addPass(omill::FoldConstantVectorChainsPass());
+    FPM.addPass(omill::SimplifyVectorReassemblyPass());
 
     llvm::PassBuilder PB;
     llvm::LoopAnalysisManager LAM;

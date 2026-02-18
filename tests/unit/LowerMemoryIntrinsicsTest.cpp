@@ -1,4 +1,4 @@
-#include "omill/Passes/LowerMemoryIntrinsics.h"
+#include "omill/Passes/LowerRemillIntrinsics.h"
 
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
@@ -71,7 +71,7 @@ TEST_F(LowerMemoryIntrinsicsTest, LowersReadsToLoads) {
 
   // Run the pass.
   llvm::FunctionPassManager FPM;
-  FPM.addPass(omill::LowerMemoryIntrinsicsPass());
+  FPM.addPass(omill::LowerRemillIntrinsicsPass(omill::LowerCategories::Memory));
 
   llvm::PassBuilder PB;
   llvm::LoopAnalysisManager LAM;

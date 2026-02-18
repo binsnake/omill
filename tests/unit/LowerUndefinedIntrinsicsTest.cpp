@@ -1,4 +1,4 @@
-#include "omill/Passes/LowerUndefinedIntrinsics.h"
+#include "omill/Passes/LowerRemillIntrinsics.h"
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
@@ -19,7 +19,7 @@ class LowerUndefinedIntrinsicsTest : public ::testing::Test {
 
   void runPass(llvm::Function *F) {
     llvm::FunctionPassManager FPM;
-    FPM.addPass(omill::LowerUndefinedIntrinsicsPass());
+    FPM.addPass(omill::LowerRemillIntrinsicsPass(omill::LowerCategories::Undefined));
 
     llvm::PassBuilder PB;
     llvm::LoopAnalysisManager LAM;

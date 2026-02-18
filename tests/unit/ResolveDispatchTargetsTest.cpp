@@ -1,4 +1,4 @@
-#include "omill/Passes/ResolveDispatchTargets.h"
+#include "omill/Passes/ResolveAndLowerControlFlow.h"
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
@@ -15,7 +15,7 @@
 #include "omill/Analysis/LiftedFunctionMap.h"
 #include "omill/Passes/ConstantMemoryFolding.h"
 #include "omill/Passes/IterativeTargetResolution.h"
-#include "omill/Passes/LowerResolvedDispatchCalls.h"
+#include "omill/Passes/LowerRemillIntrinsics.h"
 
 #include <gtest/gtest.h>
 
@@ -74,7 +74,7 @@ class ResolveDispatchTargetsTest : public ::testing::Test {
 
     llvm::ModulePassManager MPM;
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(
-        omill::ResolveDispatchTargetsPass()));
+        omill::ResolveAndLowerControlFlowPass(omill::ResolvePhases::ResolveTargets)));
     MPM.run(*M, MAM);
   }
 

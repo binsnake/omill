@@ -1,12 +1,8 @@
 #include "omill/Utils/TranslationValidator.h"
 
-#include "omill/Passes/CoalesceByteReassembly.h"
-#include "omill/Passes/CollapsePartialXMMWrites.h"
-#include "omill/Passes/DeadStateRoundtripElimination.h"
-#include "omill/Passes/EliminateRedundantByteStores.h"
-#include "omill/Passes/FoldConstantVectorChains.h"
+#include "omill/Passes/OptimizeState.h"
 #include "omill/Passes/OutlineConstantStackData.h"
-#include "omill/Passes/SimplifyVectorFlagComputation.h"
+#include "omill/Passes/SimplifyVectorReassembly.h"
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
@@ -45,8 +41,13 @@ class SemanticVerificationTest : public ::testing::Test {
 
   template <typename PassT>
   void runPass(llvm::Function &F) {
+    runPassImpl(F, PassT());
+  }
+
+  template <typename PassT>
+  void runPassImpl(llvm::Function &F, PassT pass) {
     llvm::FunctionPassManager FPM;
-    FPM.addPass(PassT());
+    FPM.addPass(std::move(pass));
     llvm::PassBuilder PB;
     llvm::LoopAnalysisManager LAM;
     llvm::FunctionAnalysisManager FAM;
@@ -94,7 +95,7 @@ TEST_F(SemanticVerificationTest, CoalesceByteReassembly_TwoPiece) {
 
   omill::TranslationValidator validator(Z3Ctx);
   validator.snapshotBefore(*F);
-  runPass<omill::CoalesceByteReassemblyPass>(*F);
+  runPass<omill::SimplifyVectorReassemblyPass>(*F);
 
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
   auto res = validator.verify(*F);
@@ -144,7 +145,7 @@ TEST_F(SemanticVerificationTest, CoalesceByteReassembly_FourByte) {
 
   omill::TranslationValidator validator(Z3Ctx);
   validator.snapshotBefore(*F);
-  runPass<omill::CoalesceByteReassemblyPass>(*F);
+  runPass<omill::SimplifyVectorReassemblyPass>(*F);
 
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
   auto res = validator.verify(*F);
@@ -177,7 +178,7 @@ TEST_F(SemanticVerificationTest, CoalesceByteReassembly_Partial) {
 
   omill::TranslationValidator validator(Z3Ctx);
   validator.snapshotBefore(*F);
-  runPass<omill::CoalesceByteReassemblyPass>(*F);
+  runPass<omill::SimplifyVectorReassemblyPass>(*F);
 
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
   auto res = validator.verify(*F);
@@ -212,7 +213,7 @@ TEST_F(SemanticVerificationTest, CollapsePartialXMM_UpperHalf) {
 
   omill::TranslationValidator validator(Z3Ctx);
   validator.snapshotBefore(*F);
-  runPass<omill::CollapsePartialXMMWritesPass>(*F);
+  runPass<omill::SimplifyVectorReassemblyPass>(*F);
 
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
   auto res = validator.verify(*F);
@@ -243,7 +244,7 @@ TEST_F(SemanticVerificationTest, CollapsePartialXMM_LowerHalf) {
 
   omill::TranslationValidator validator(Z3Ctx);
   validator.snapshotBefore(*F);
-  runPass<omill::CollapsePartialXMMWritesPass>(*F);
+  runPass<omill::SimplifyVectorReassemblyPass>(*F);
 
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
   auto res = validator.verify(*F);
@@ -276,7 +277,7 @@ TEST_F(SemanticVerificationTest, SimplifyVectorFlag_AndMask) {
 
   omill::TranslationValidator validator(Z3Ctx);
   validator.snapshotBefore(*F);
-  runPass<omill::SimplifyVectorFlagComputationPass>(*F);
+  runPass<omill::SimplifyVectorReassemblyPass>(*F);
 
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
   auto res = validator.verify(*F);
@@ -302,7 +303,7 @@ TEST_F(SemanticVerificationTest, SimplifyVectorFlag_DirectExtract) {
 
   omill::TranslationValidator validator(Z3Ctx);
   validator.snapshotBefore(*F);
-  runPass<omill::SimplifyVectorFlagComputationPass>(*F);
+  runPass<omill::SimplifyVectorReassemblyPass>(*F);
 
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
   auto res = validator.verify(*F);
@@ -333,7 +334,7 @@ TEST_F(SemanticVerificationTest, SimplifyVectorFlag_Lshr) {
 
   omill::TranslationValidator validator(Z3Ctx);
   validator.snapshotBefore(*F);
-  runPass<omill::SimplifyVectorFlagComputationPass>(*F);
+  runPass<omill::SimplifyVectorReassemblyPass>(*F);
 
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
   auto res = validator.verify(*F);
@@ -377,7 +378,7 @@ TEST_F(SemanticVerificationTest, DeadStateRoundtrip_Simple) {
   omill::TranslationValidator validator(Z3Ctx);
   validator.setCompareOffsets({16, 17, 18, 19, 20, 21, 22, 23});
   validator.snapshotBefore(*F);
-  runPass<omill::DeadStateRoundtripEliminationPass>(*F);
+  runPassImpl(*F, omill::OptimizeStatePass(omill::OptimizePhases::Roundtrip));
 
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
   auto res = validator.verify(*F);
@@ -418,7 +419,7 @@ TEST_F(SemanticVerificationTest, DeadStateRoundtrip_NonRoundtripPreserved) {
   omill::TranslationValidator validator(Z3Ctx);
   validator.setCompareOffsets({16, 17, 18, 19, 20, 21, 22, 23});
   validator.snapshotBefore(*F);
-  runPass<omill::DeadStateRoundtripEliminationPass>(*F);
+  runPassImpl(*F, omill::OptimizeStatePass(omill::OptimizePhases::Roundtrip));
 
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
   auto res = validator.verify(*F);
@@ -459,7 +460,7 @@ TEST_F(SemanticVerificationTest, RedundantByteStore_Eliminated) {
   validator.setCompareOffsets(
       {464, 465, 466, 467, 468, 469, 470, 471});
   validator.snapshotBefore(*F);
-  runPass<omill::EliminateRedundantByteStoresPass>(*F);
+  runPassImpl(*F, omill::OptimizeStatePass(omill::OptimizePhases::RedundantBytes));
 
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
   auto res = validator.verify(*F);
@@ -496,7 +497,7 @@ TEST_F(SemanticVerificationTest, RedundantByteStore_DifferentValuePreserved) {
   validator.setCompareOffsets(
       {464, 465, 466, 467, 468, 469, 470, 471});
   validator.snapshotBefore(*F);
-  runPass<omill::EliminateRedundantByteStoresPass>(*F);
+  runPassImpl(*F, omill::OptimizeStatePass(omill::OptimizePhases::RedundantBytes));
 
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
   auto res = validator.verify(*F);
@@ -536,7 +537,7 @@ TEST_F(SemanticVerificationTest, FoldConstantVector_Shuffle) {
 
   omill::TranslationValidator validator(Z3Ctx);
   validator.snapshotBefore(*F);
-  runPass<omill::FoldConstantVectorChainsPass>(*F);
+  runPass<omill::SimplifyVectorReassemblyPass>(*F);
 
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
   auto res = validator.verify(*F);
@@ -563,7 +564,7 @@ TEST_F(SemanticVerificationTest, FoldConstantVector_InsertChain) {
 
   omill::TranslationValidator validator(Z3Ctx);
   validator.snapshotBefore(*F);
-  runPass<omill::FoldConstantVectorChainsPass>(*F);
+  runPass<omill::SimplifyVectorReassemblyPass>(*F);
 
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
   auto res = validator.verify(*F);

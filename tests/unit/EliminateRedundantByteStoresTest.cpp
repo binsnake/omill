@@ -1,4 +1,4 @@
-#include "omill/Passes/EliminateRedundantByteStores.h"
+#include "omill/Passes/OptimizeState.h"
 
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
@@ -18,7 +18,7 @@ class EliminateRedundantByteStoresTest : public ::testing::Test {
 
   void runPass(llvm::Function &F) {
     llvm::FunctionPassManager FPM;
-    FPM.addPass(omill::EliminateRedundantByteStoresPass());
+    FPM.addPass(omill::OptimizeStatePass(omill::OptimizePhases::RedundantBytes));
 
     llvm::PassBuilder PB;
     llvm::LoopAnalysisManager LAM;

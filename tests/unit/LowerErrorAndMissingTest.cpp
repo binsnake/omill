@@ -1,4 +1,4 @@
-#include "omill/Passes/LowerErrorAndMissing.h"
+#include "omill/Passes/LowerRemillIntrinsics.h"
 
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
@@ -18,7 +18,7 @@ class LowerErrorAndMissingTest : public ::testing::Test {
 
   void runPass(llvm::Function *F) {
     llvm::FunctionPassManager FPM;
-    FPM.addPass(omill::LowerErrorAndMissingPass());
+    FPM.addPass(omill::LowerRemillIntrinsicsPass(omill::LowerCategories::ErrorMissing));
 
     llvm::PassBuilder PB;
     llvm::LoopAnalysisManager LAM;

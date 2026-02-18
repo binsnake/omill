@@ -1,4 +1,4 @@
-#include "omill/Passes/PromoteStateToSSA.h"
+#include "omill/Passes/OptimizeState.h"
 
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
@@ -66,7 +66,7 @@ TEST_F(PromoteStateToSSATest, CreatesAllocasForStateFields) {
   EXPECT_EQ(allocas_before, 0u);
 
   llvm::FunctionPassManager FPM;
-  FPM.addPass(omill::PromoteStateToSSAPass());
+  FPM.addPass(omill::OptimizeStatePass(omill::OptimizePhases::Promote));
 
   llvm::PassBuilder PB;
   llvm::LoopAnalysisManager LAM;
@@ -98,7 +98,7 @@ TEST_F(PromoteStateToSSATest, SROAPromotesToSSA) {
 
   // Run PromoteStateToSSA then SROA.
   llvm::FunctionPassManager FPM;
-  FPM.addPass(omill::PromoteStateToSSAPass());
+  FPM.addPass(omill::OptimizeStatePass(omill::OptimizePhases::Promote));
   FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
 
   llvm::PassBuilder PB;
@@ -161,7 +161,7 @@ TEST_F(PromoteStateToSSATest, WideStoreOverlap) {
   B.CreateRet(mem);
 
   llvm::FunctionPassManager FPM;
-  FPM.addPass(omill::PromoteStateToSSAPass());
+  FPM.addPass(omill::OptimizeStatePass(omill::OptimizePhases::Promote));
 
   llvm::PassBuilder PB;
   llvm::LoopAnalysisManager LAM;
@@ -230,7 +230,7 @@ TEST_F(PromoteStateToSSATest, FlushBeforeStateCall) {
   B.CreateRet(call);
 
   llvm::FunctionPassManager FPM;
-  FPM.addPass(omill::PromoteStateToSSAPass());
+  FPM.addPass(omill::OptimizeStatePass(omill::OptimizePhases::Promote));
 
   llvm::PassBuilder PB;
   llvm::LoopAnalysisManager LAM;
@@ -308,7 +308,7 @@ TEST_F(PromoteStateToSSATest, MultipleFields) {
   B.CreateRet(mem);
 
   llvm::FunctionPassManager FPM;
-  FPM.addPass(omill::PromoteStateToSSAPass());
+  FPM.addPass(omill::OptimizeStatePass(omill::OptimizePhases::Promote));
 
   llvm::PassBuilder PB;
   llvm::LoopAnalysisManager LAM;
@@ -384,7 +384,7 @@ TEST_F(PromoteStateToSSATest, MultiBlockPHI) {
   MergeB.CreateRet(mem);
 
   llvm::FunctionPassManager FPM;
-  FPM.addPass(omill::PromoteStateToSSAPass());
+  FPM.addPass(omill::OptimizeStatePass(omill::OptimizePhases::Promote));
   FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
 
   llvm::PassBuilder PB;

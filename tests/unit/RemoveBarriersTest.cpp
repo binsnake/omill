@@ -1,4 +1,4 @@
-#include "omill/Passes/RemoveBarriers.h"
+#include "omill/Passes/LowerRemillIntrinsics.h"
 
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
@@ -80,7 +80,7 @@ TEST_F(RemoveBarriersTest, RemovesVolatileAsmAndBarrierIntrinsics) {
 
   // Run the pass.
   llvm::FunctionPassManager FPM;
-  FPM.addPass(omill::RemoveBarriersPass());
+  FPM.addPass(omill::LowerRemillIntrinsicsPass(omill::LowerCategories::Barriers));
 
   llvm::PassBuilder PB;
   llvm::LoopAnalysisManager LAM;

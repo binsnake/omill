@@ -3,7 +3,7 @@
 #include "CompileToNative.h"
 #include "X86Disassembler.h"
 
-#include "omill/Passes/LowerHyperCalls.h"
+#include "omill/Passes/LowerRemillIntrinsics.h"
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/IRBuilder.h>
@@ -58,7 +58,7 @@ class HyperCallRoundTripTest : public LiftAndOptFixture {
     // Run LowerHyperCalls.
     {
       llvm::FunctionPassManager FPM;
-      FPM.addPass(omill::LowerHyperCallsPass());
+      FPM.addPass(omill::LowerRemillIntrinsicsPass(omill::LowerCategories::HyperCalls));
 
       llvm::PassBuilder PB;
       llvm::LoopAnalysisManager LAM;

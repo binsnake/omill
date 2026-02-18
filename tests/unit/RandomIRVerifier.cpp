@@ -2,13 +2,9 @@
 
 #include "RandomIRVerifier.h"
 
-#include "omill/Passes/CoalesceByteReassembly.h"
-#include "omill/Passes/CollapsePartialXMMWrites.h"
-#include "omill/Passes/DeadStateRoundtripElimination.h"
-#include "omill/Passes/EliminateRedundantByteStores.h"
-#include "omill/Passes/FoldConstantVectorChains.h"
+#include "omill/Passes/OptimizeState.h"
 #include "omill/Passes/OutlineConstantStackData.h"
-#include "omill/Passes/SimplifyVectorFlagComputation.h"
+#include "omill/Passes/SimplifyVectorReassembly.h"
 #include "omill/Utils/TranslationValidator.h"
 
 #include <llvm/IR/Constants.h>
@@ -57,22 +53,16 @@ void RandomIRVerifier::runPassOnFunction(PassKind kind, llvm::Function &F) {
 
   switch (kind) {
     case PassKind::CoalesceByteReassembly:
-      FPM.addPass(CoalesceByteReassemblyPass());
-      break;
     case PassKind::CollapsePartialXMMWrites:
-      FPM.addPass(CollapsePartialXMMWritesPass());
-      break;
     case PassKind::SimplifyVectorFlagComputation:
-      FPM.addPass(SimplifyVectorFlagComputationPass());
+    case PassKind::FoldConstantVectorChains:
+      FPM.addPass(SimplifyVectorReassemblyPass());
       break;
     case PassKind::DeadStateRoundtripElimination:
-      FPM.addPass(DeadStateRoundtripEliminationPass());
+      FPM.addPass(OptimizeStatePass(OptimizePhases::Roundtrip));
       break;
     case PassKind::EliminateRedundantByteStores:
-      FPM.addPass(EliminateRedundantByteStoresPass());
-      break;
-    case PassKind::FoldConstantVectorChains:
-      FPM.addPass(FoldConstantVectorChainsPass());
+      FPM.addPass(OptimizeStatePass(OptimizePhases::RedundantBytes));
       break;
     case PassKind::OutlineConstantStackData:
       FPM.addPass(OutlineConstantStackDataPass());

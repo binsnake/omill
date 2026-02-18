@@ -1,4 +1,4 @@
-#include "omill/Passes/LowerJump.h"
+#include "omill/Passes/LowerRemillIntrinsics.h"
 
 #include "omill/Analysis/LiftedFunctionMap.h"
 
@@ -20,7 +20,7 @@ class LowerJumpTest : public ::testing::Test {
 
   void runPass(llvm::Function *F) {
     llvm::FunctionPassManager FPM;
-    FPM.addPass(omill::LowerJumpPass());
+    FPM.addPass(omill::LowerRemillIntrinsicsPass(omill::LowerCategories::Jump));
 
     llvm::PassBuilder PB;
     llvm::LoopAnalysisManager LAM;

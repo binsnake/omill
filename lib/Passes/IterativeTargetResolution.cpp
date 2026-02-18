@@ -12,10 +12,8 @@
 
 #include "omill/Passes/ConstantMemoryFolding.h"
 #include "omill/Passes/EliminateDeadPaths.h"
-#include "omill/Passes/LowerResolvedDispatchCalls.h"
-#include "omill/Passes/RecoverJumpTables.h"
-#include "omill/Passes/ResolveDispatchTargets.h"
-#include "omill/Passes/SymbolicJumpTableSolver.h"
+#include "omill/Passes/LowerRemillIntrinsics.h"
+#include "omill/Passes/ResolveAndLowerControlFlow.h"
 #if OMILL_ENABLE_Z3
 #include "omill/Passes/Z3DispatchSolver.h"
 #endif
@@ -77,13 +75,11 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
     // Step 2: Resolve dispatch targets and lower resolved calls.
     {
       llvm::FunctionPassManager FPM;
-      FPM.addPass(ResolveDispatchTargetsPass());
-      FPM.addPass(RecoverJumpTablesPass());
-      FPM.addPass(SymbolicJumpTableSolverPass());
+      FPM.addPass(ResolveAndLowerControlFlowPass());
 #if OMILL_ENABLE_Z3
       FPM.addPass(Z3DispatchSolverPass());
 #endif
-      FPM.addPass(LowerResolvedDispatchCallsPass());
+      FPM.addPass(LowerRemillIntrinsicsPass(LowerCategories::ResolvedDispatch));
       auto adaptor = llvm::createModuleToFunctionPassAdaptor(std::move(FPM));
       adaptor.run(M, MAM);
     }

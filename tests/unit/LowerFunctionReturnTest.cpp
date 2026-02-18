@@ -1,4 +1,4 @@
-#include "omill/Passes/LowerFunctionReturn.h"
+#include "omill/Passes/LowerRemillIntrinsics.h"
 
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
@@ -66,7 +66,7 @@ TEST_F(LowerFunctionReturnTest, ReplacesIntrinsicWithNativeReturn) {
   EXPECT_TRUE(has_remill_return);
 
   llvm::FunctionPassManager FPM;
-  FPM.addPass(omill::LowerFunctionReturnPass());
+  FPM.addPass(omill::LowerRemillIntrinsicsPass(omill::LowerCategories::Return));
 
   llvm::PassBuilder PB;
   llvm::LoopAnalysisManager LAM;

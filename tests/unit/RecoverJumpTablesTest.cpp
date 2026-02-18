@@ -1,4 +1,4 @@
-#include "omill/Passes/RecoverJumpTables.h"
+#include "omill/Passes/ResolveAndLowerControlFlow.h"
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
@@ -60,7 +60,7 @@ class RecoverJumpTablesTest : public ::testing::Test {
 
     llvm::ModulePassManager MPM;
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(
-        omill::RecoverJumpTablesPass()));
+        omill::ResolveAndLowerControlFlowPass(omill::ResolvePhases::RecoverTables)));
     MPM.run(*M, MAM);
   }
 

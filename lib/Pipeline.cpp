@@ -21,48 +21,30 @@
 #include "omill/Analysis/LiftedFunctionMap.h"
 #include "omill/Analysis/RemillIntrinsicAnalysis.h"
 #include "omill/Passes/CFGRecovery.h"
-#include "omill/Passes/DeadStateFlagElimination.h"
-#include "omill/Passes/DeadStateStoreElimination.h"
-#include "omill/Passes/LowerAtomicIntrinsics.h"
+#include "omill/Passes/OptimizeState.h"
+#include "omill/Passes/LowerRemillIntrinsics.h"
 #include "omill/Analysis/ExceptionInfo.h"
 #include "omill/Passes/ResolveForcedExceptions.h"
-#include "omill/Passes/LowerErrorAndMissing.h"
-#include "omill/Passes/LowerFlagIntrinsics.h"
-#include "omill/Passes/LowerFunctionCall.h"
-#include "omill/Passes/LowerFunctionReturn.h"
-#include "omill/Passes/LowerHyperCalls.h"
-#include "omill/Passes/LowerJump.h"
-#include "omill/Passes/LowerMemoryIntrinsics.h"
-#include "omill/Passes/LowerUndefinedIntrinsics.h"
 #include "omill/Passes/MemoryPointerElimination.h"
-#include "omill/Passes/PromoteStateToSSA.h"
 #include "omill/Passes/RecoverFunctionSignatures.h"
 #include "omill/Passes/RefineFunctionSignatures.h"
 #include "omill/Passes/RecoverStackFrame.h"
 #include "omill/Passes/RecoverStackFrameTypes.h"
 #include "omill/Passes/EliminateStateStruct.h"
-#include "omill/Passes/RemoveBarriers.h"
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/CallingConventionAnalysis.h"
 #include "omill/Passes/ConstantMemoryFolding.h"
 #include "omill/Passes/HashImportAnnotation.h"
 #include "omill/Passes/ResolveLazyImports.h"
-#include "omill/Passes/LowerResolvedDispatchCalls.h"
 #include "omill/Passes/FoldProgramCounter.h"
-#include "omill/Passes/CoalesceByteReassembly.h"
-#include "omill/Passes/CollapsePartialXMMWrites.h"
-#include "omill/Passes/DeadStateRoundtripElimination.h"
-#include "omill/Passes/EliminateRedundantByteStores.h"
-#include "omill/Passes/SimplifyVectorFlagComputation.h"
+#include "omill/Passes/SimplifyVectorReassembly.h"
 #include "omill/Passes/OutlineConstantStackData.h"
 #include "omill/Passes/RecoverGlobalTypes.h"
 #include "omill/Passes/ResolveIATCalls.h"
-#include "omill/Passes/ResolveDispatchTargets.h"
+#include "omill/Passes/ResolveAndLowerControlFlow.h"
 #include "omill/Passes/InterProceduralConstProp.h"
 #include "omill/Passes/IterativeTargetResolution.h"
 #include "omill/Passes/EliminateDeadPaths.h"
-#include "omill/Passes/FoldConstantVectorChains.h"
-#include "omill/Passes/ResolveNativeDispatch.h"
 #include "omill/Passes/RewriteLiftedCallsToNative.h"
 #if OMILL_ENABLE_Z3
 #include "omill/Passes/Z3DispatchSolver.h"
@@ -73,20 +55,6 @@
 
 namespace omill {
 
-/// Tiny module pass that marks __omill_native_dispatch with alwaysinline
-/// so the subsequent AlwaysInlinerPass eliminates it.
-struct InlineNativeDispatchPass
-    : public llvm::PassInfoMixin<InlineNativeDispatchPass> {
-  llvm::PreservedAnalyses run(llvm::Module &M,
-                              llvm::ModuleAnalysisManager &) {
-    auto *F = M.getFunction("__omill_native_dispatch");
-    if (!F || F->isDeclaration())
-      return llvm::PreservedAnalyses::all();
-    F->addFnAttr(llvm::Attribute::AlwaysInline);
-    return llvm::PreservedAnalyses::all();
-  }
-};
-
 static void addCleanupPasses(llvm::FunctionPassManager &FPM) {
   FPM.addPass(llvm::InstCombinePass());
   FPM.addPass(llvm::DCEPass());
@@ -96,11 +64,7 @@ static void addCleanupPasses(llvm::FunctionPassManager &FPM) {
 void buildIntrinsicLoweringPipeline(llvm::FunctionPassManager &FPM) {
   // Order matters: flags first (expose SSA values), barriers (unblock opts),
   // then memory (biggest IR change), atomics, hypercalls.
-  FPM.addPass(LowerFlagIntrinsicsPass());
-  FPM.addPass(RemoveBarriersPass());
-  FPM.addPass(LowerMemoryIntrinsicsPass());
-  FPM.addPass(LowerAtomicIntrinsicsPass());
-  FPM.addPass(LowerHyperCallsPass());
+  FPM.addPass(LowerRemillIntrinsicsPass(LowerCategories::Phase1));
 
   // Cleanup
   addCleanupPasses(FPM);
@@ -108,26 +72,25 @@ void buildIntrinsicLoweringPipeline(llvm::FunctionPassManager &FPM) {
 
 void buildStateOptimizationPipeline(llvm::FunctionPassManager &FPM,
                                     bool deobfuscate) {
-  // Dead flag elimination first — biggest bang for the buck (~50% stores gone).
-  FPM.addPass(DeadStateFlagEliminationPass());
-  FPM.addPass(DeadStateStoreEliminationPass());
+  // Recover stack frames before SROA/PromoteStateToSSA eliminates the
+  // State-based load chains.  This must run early for both deobfuscation
+  // and basic ABI recovery.
+  FPM.addPass(RecoverStackFramePass());
+  FPM.addPass(RecoverStackFrameTypesPass());
+  FPM.addPass(llvm::InstCombinePass());
 
-  // Promote remaining live State fields to SSA.
-  FPM.addPass(PromoteStateToSSAPass());
+  // Dead flag/store elimination + promote to SSA.
+  FPM.addPass(OptimizeStatePass(OptimizePhases::Early));
   FPM.addPass(MemoryPointerEliminationPass());
 
   // Let LLVM finish the job.
   FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
 
   if (deobfuscate) {
-    // When deobfuscation is enabled, recover stack frames after SROA merges
-    // RSP into a single SSA chain.  Skip GVN here — it would destroy the
+    // When deobfuscation is enabled, skip GVN here — it would destroy the
     // inttoptr patterns and forward-eliminate xorstr stores.  Phase 5 runs
     // GVN after ConstantMemoryFolding has folded the XOR operations and
     // OutlineConstantStackData has promoted the alloca to a global constant.
-    FPM.addPass(llvm::InstCombinePass());
-    FPM.addPass(RecoverStackFramePass());
-    FPM.addPass(RecoverStackFrameTypesPass());
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(llvm::EarlyCSEPass());
     FPM.addPass(llvm::DCEPass());
@@ -142,10 +105,7 @@ void buildStateOptimizationPipeline(llvm::FunctionPassManager &FPM,
 }
 
 void buildControlFlowPipeline(llvm::FunctionPassManager &FPM) {
-  FPM.addPass(LowerErrorAndMissingPass());
-  FPM.addPass(LowerFunctionReturnPass());
-  FPM.addPass(LowerFunctionCallPass());
-  FPM.addPass(LowerJumpPass());
+  FPM.addPass(LowerRemillIntrinsicsPass(LowerCategories::Phase3));
   FPM.addPass(CFGRecoveryPass());
 
   FPM.addPass(llvm::SimplifyCFGPass());
@@ -192,11 +152,6 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
-  // Inline __omill_native_dispatch into all callers while it's still a small
-  // switch.  Must happen BEFORE the cost-based inliner — otherwise the inliner
-  // pulls _native bodies into the dispatch, making it huge and recursive.
-  MPM.addPass(InlineNativeDispatchPass());
-  MPM.addPass(llvm::AlwaysInlinerPass());
   MPM.addPass(llvm::GlobalDCEPass());
 
   // Full optimization after inlining native wrappers.
@@ -205,11 +160,7 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(llvm::GVNPass());
-    FPM.addPass(FoldConstantVectorChainsPass());
-    FPM.addPass(llvm::InstCombinePass());
-    FPM.addPass(CollapsePartialXMMWritesPass());
-    FPM.addPass(CoalesceByteReassemblyPass());
-    FPM.addPass(SimplifyVectorFlagComputationPass());
+    FPM.addPass(SimplifyVectorReassemblyPass());
 #if OMILL_ENABLE_SIMPLIFIER
     FPM.addPass(SimplifyMBAPass());
 #endif
@@ -218,7 +169,6 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     FPM.addPass(llvm::createFunctionToLoopPassAdaptor(llvm::LoopDeletionPass()));
     FPM.addPass(llvm::ADCEPass());
     FPM.addPass(llvm::SimplifyCFGPass());
-    FPM.addPass(ResolveNativeDispatchPass());
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(llvm::SimplifyCFGPass());
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
@@ -232,10 +182,8 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM) {
   FPM.addPass(llvm::InstCombinePass());
   FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
   FPM.addPass(llvm::InstCombinePass());
-  FPM.addPass(CollapsePartialXMMWritesPass());
-  FPM.addPass(CoalesceByteReassemblyPass());
-  FPM.addPass(SimplifyVectorFlagComputationPass());
-  FPM.addPass(EliminateRedundantByteStoresPass());
+  FPM.addPass(SimplifyVectorReassemblyPass());
+  FPM.addPass(OptimizeStatePass(OptimizePhases::RedundantBytes));
 #if OMILL_ENABLE_SIMPLIFIER
   FPM.addPass(SimplifyMBAPass());
   FPM.addPass(llvm::InstCombinePass());
@@ -247,12 +195,9 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM) {
   // LLVM cleanup to fold constants exposed by memory folding.
   FPM.addPass(llvm::InstCombinePass());
   FPM.addPass(llvm::GVNPass());
-  FPM.addPass(FoldConstantVectorChainsPass());
+  FPM.addPass(SimplifyVectorReassemblyPass());
   FPM.addPass(llvm::InstCombinePass());
-  FPM.addPass(CollapsePartialXMMWritesPass());
-  FPM.addPass(CoalesceByteReassemblyPass());
-  FPM.addPass(SimplifyVectorFlagComputationPass());
-  FPM.addPass(DeadStateRoundtripEliminationPass());
+  FPM.addPass(OptimizeStatePass(OptimizePhases::Roundtrip));
   FPM.addPass(llvm::DCEPass());
   // Promote stack allocas with all-constant stores to global constants.
   // After xorstr folding, decrypted strings are constant stores to allocas;
@@ -264,7 +209,7 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM) {
   FPM.addPass(ResolveLazyImportsPass());
   // Lower resolved dispatch_calls to native Win64 ABI calls so State
   // no longer escapes, enabling SROA and dead loop elimination.
-  FPM.addPass(LowerResolvedDispatchCallsPass());
+  FPM.addPass(LowerRemillIntrinsicsPass(LowerCategories::ResolvedDispatch));
   // Clean up dead PEB-walking loop after import resolution.
   FPM.addPass(llvm::ADCEPass());
   FPM.addPass(llvm::SimplifyCFGPass());
@@ -331,14 +276,19 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     buildIntrinsicLoweringPipeline(FPM);
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
-
   // Phase 2: State Optimization
   if (opts.optimize_state) {
+    // Inline functions before state optimization to ensure stack frames
+    // can be recovered interprocedurally (e.g. OLLVM stack passing).
+    if (opts.deobfuscate) {
+       llvm::InlineParams Params = llvm::getInlineParams(2000); // Aggressive threshold
+       MPM.addPass(llvm::ModuleInlinerWrapperPass(Params));
+    }
+
     llvm::FunctionPassManager FPM;
     buildStateOptimizationPipeline(FPM, opts.deobfuscate);
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
-
   // Build the lifted function index before control flow passes need it.
   MPM.addPass(llvm::RequireAnalysisPass<LiftedFunctionAnalysis, llvm::Module>());
 
@@ -366,7 +316,6 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     // propagating R9 (synthetic DC address) to the resolver.
     MPM.addPass(llvm::GlobalDCEPass());
   }
-
   // Phase 3b: Remaining control flow recovery.
   if (opts.lower_control_flow) {
     llvm::FunctionPassManager FPM;
@@ -382,7 +331,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     FPM.addPass(FoldProgramCounterPass());
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(ResolveIATCallsPass());
-    FPM.addPass(LowerResolvedDispatchCallsPass());
+    FPM.addPass(LowerRemillIntrinsicsPass(LowerCategories::ResolvedDispatch));
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
@@ -404,8 +353,8 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     FPM.addPass(ConstantMemoryFoldingPass());
     FPM.addPass(llvm::GVNPass());
     FPM.addPass(llvm::InstCombinePass());
-    FPM.addPass(ResolveDispatchTargetsPass());
-    FPM.addPass(LowerResolvedDispatchCallsPass());
+    FPM.addPass(ResolveAndLowerControlFlowPass(ResolvePhases::ResolveTargets));
+    FPM.addPass(LowerRemillIntrinsicsPass(LowerCategories::ResolvedDispatch));
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
@@ -431,7 +380,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   // Late lowering: undefined values (after DCE removed most of them)
   {
     llvm::FunctionPassManager FPM;
-    FPM.addPass(LowerUndefinedIntrinsicsPass());
+    FPM.addPass(LowerRemillIntrinsicsPass(LowerCategories::Undefined));
     if (opts.run_cleanup_passes) {
       FPM.addPass(llvm::InstCombinePass());
       FPM.addPass(llvm::ADCEPass());

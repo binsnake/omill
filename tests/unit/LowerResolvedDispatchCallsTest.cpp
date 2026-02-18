@@ -1,4 +1,4 @@
-#include "omill/Passes/LowerResolvedDispatchCalls.h"
+#include "omill/Passes/LowerRemillIntrinsics.h"
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
@@ -19,7 +19,7 @@ class LowerResolvedDispatchCallsTest : public ::testing::Test {
 
   void runPass(llvm::Function *F) {
     llvm::FunctionPassManager FPM;
-    FPM.addPass(omill::LowerResolvedDispatchCallsPass());
+    FPM.addPass(omill::LowerRemillIntrinsicsPass(omill::LowerCategories::ResolvedDispatch));
 
     llvm::PassBuilder PB;
     llvm::LoopAnalysisManager LAM;

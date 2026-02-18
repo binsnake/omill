@@ -16,10 +16,8 @@
 
 #include "omill/Omill.h"
 #include "omill/Analysis/CallingConventionAnalysis.h"
-#include "omill/Passes/LowerFlagIntrinsics.h"
-#include "omill/Passes/LowerMemoryIntrinsics.h"
+#include "omill/Passes/LowerRemillIntrinsics.h"
 #include "omill/Passes/PassRegistry.h"
-#include "omill/Passes/RemoveBarriers.h"
 
 using namespace llvm;
 
@@ -169,13 +167,13 @@ int main(int argc, char **argv) {
   if (single_pass) {
     FunctionPassManager FPM;
     if (OnlyLowerFlags) {
-      FPM.addPass(omill::LowerFlagIntrinsicsPass());
+      FPM.addPass(omill::LowerRemillIntrinsicsPass(omill::LowerCategories::Flags));
     }
     if (OnlyRemoveBarriers) {
-      FPM.addPass(omill::RemoveBarriersPass());
+      FPM.addPass(omill::LowerRemillIntrinsicsPass(omill::LowerCategories::Barriers));
     }
     if (OnlyLowerMemory) {
-      FPM.addPass(omill::LowerMemoryIntrinsicsPass());
+      FPM.addPass(omill::LowerRemillIntrinsicsPass(omill::LowerCategories::Memory));
     }
     MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
   } else {

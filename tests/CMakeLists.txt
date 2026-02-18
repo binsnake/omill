@@ -73,7 +73,6 @@ add_executable(omill-unit-tests
   unit/FoldConstantVectorChainsTest.cpp
   unit/DeadStateRoundtripEliminationTest.cpp
   unit/EliminateRedundantByteStoresTest.cpp
-  unit/ResolveNativeDispatchTest.cpp
 )
 
 target_link_libraries(omill-unit-tests

@@ -1,4 +1,4 @@
-#include "omill/Passes/DeadStateRoundtripElimination.h"
+#include "omill/Passes/OptimizeState.h"
 
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
@@ -18,7 +18,7 @@ class DeadStateRoundtripEliminationTest : public ::testing::Test {
 
   void runPass(llvm::Function &F) {
     llvm::FunctionPassManager FPM;
-    FPM.addPass(omill::DeadStateRoundtripEliminationPass());
+    FPM.addPass(omill::OptimizeStatePass(omill::OptimizePhases::Roundtrip));
 
     llvm::PassBuilder PB;
     llvm::LoopAnalysisManager LAM;

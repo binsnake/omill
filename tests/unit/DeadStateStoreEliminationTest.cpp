@@ -1,4 +1,4 @@
-#include "omill/Passes/DeadStateStoreElimination.h"
+#include "omill/Passes/OptimizeState.h"
 
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
@@ -67,7 +67,7 @@ TEST_F(DeadStateStoreEliminationTest, EliminatesOverwrittenStore) {
 
   // Run the pass.
   llvm::FunctionPassManager FPM;
-  FPM.addPass(omill::DeadStateStoreEliminationPass());
+  FPM.addPass(omill::OptimizeStatePass(omill::OptimizePhases::DeadStores));
 
   llvm::PassBuilder PB;
   llvm::LoopAnalysisManager LAM;
@@ -123,7 +123,7 @@ TEST_F(DeadStateStoreEliminationTest, PreservesStoreBeforeLoad) {
   B.CreateRet(mem);
 
   llvm::FunctionPassManager FPM;
-  FPM.addPass(omill::DeadStateStoreEliminationPass());
+  FPM.addPass(omill::OptimizeStatePass(omill::OptimizePhases::DeadStores));
 
   llvm::PassBuilder PB;
   llvm::LoopAnalysisManager LAM;

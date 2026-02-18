@@ -1,4 +1,4 @@
-#include "omill/Passes/SimplifyVectorFlagComputation.h"
+#include "omill/Passes/SimplifyVectorReassembly.h"
 
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
@@ -18,7 +18,7 @@ class SimplifyVectorFlagComputationTest : public ::testing::Test {
 
   void runPass(llvm::Function &F) {
     llvm::FunctionPassManager FPM;
-    FPM.addPass(omill::SimplifyVectorFlagComputationPass());
+    FPM.addPass(omill::SimplifyVectorReassemblyPass());
 
     llvm::PassBuilder PB;
     llvm::LoopAnalysisManager LAM;

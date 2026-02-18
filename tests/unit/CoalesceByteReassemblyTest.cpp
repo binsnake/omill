@@ -1,4 +1,4 @@
-#include "omill/Passes/CoalesceByteReassembly.h"
+#include "omill/Passes/SimplifyVectorReassembly.h"
 
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
@@ -18,7 +18,7 @@ class CoalesceByteReassemblyTest : public ::testing::Test {
 
   void runPass(llvm::Function &F) {
     llvm::FunctionPassManager FPM;
-    FPM.addPass(omill::CoalesceByteReassemblyPass());
+    FPM.addPass(omill::SimplifyVectorReassemblyPass());
 
     llvm::PassBuilder PB;
     llvm::LoopAnalysisManager LAM;

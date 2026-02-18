@@ -1,9 +1,8 @@
 #include "omill/Utils/TranslationValidator.h"
 
-#include "omill/Passes/DeadStateFlagElimination.h"
-#include "omill/Passes/DeadStateStoreElimination.h"
+#include "omill/Passes/OptimizeState.h"
 #include "omill/Passes/MemoryPointerElimination.h"
-#include "omill/Passes/RemoveBarriers.h"
+#include "omill/Passes/LowerRemillIntrinsics.h"
 
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
@@ -100,7 +99,7 @@ TEST_F(TranslationValidationTest, DeadStoreEliminationPreservesSemantics) {
 
   // Run the pass.
   llvm::FunctionPassManager FPM;
-  FPM.addPass(omill::DeadStateStoreEliminationPass());
+  FPM.addPass(omill::OptimizeStatePass(omill::OptimizePhases::DeadStores));
 
   llvm::PassBuilder PB;
   llvm::LoopAnalysisManager LAM;
@@ -202,7 +201,7 @@ TEST_F(TranslationValidationTest, RemoveBarriersPreservesSemantics) {
   validator.snapshotBefore(*test_fn);
 
   llvm::FunctionPassManager FPM;
-  FPM.addPass(omill::RemoveBarriersPass());
+  FPM.addPass(omill::LowerRemillIntrinsicsPass(omill::LowerCategories::Barriers));
 
   llvm::PassBuilder PB;
   llvm::LoopAnalysisManager LAM;

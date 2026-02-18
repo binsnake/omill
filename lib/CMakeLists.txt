@@ -12,25 +12,14 @@ add_library(omill STATIC
   Analysis/ExceptionInfo.cpp
 
   # Passes - Stage 2: Intrinsic Lowering
-  Passes/LowerFlagIntrinsics.cpp
-  Passes/RemoveBarriers.cpp
-  Passes/LowerMemoryIntrinsics.cpp
-  Passes/LowerAtomicIntrinsics.cpp
-  Passes/LowerHyperCalls.cpp
-  Passes/LowerUndefinedIntrinsics.cpp
+  Passes/LowerRemillIntrinsics.cpp
 
   # Passes - Stage 3: State Optimization
-  Passes/DeadStateFlagElimination.cpp
-  Passes/DeadStateStoreElimination.cpp
-  Passes/PromoteStateToSSA.cpp
+  Passes/OptimizeState.cpp
   Passes/MemoryPointerElimination.cpp
 
   # Passes - Stage 4: Control Flow Recovery
-  Passes/LowerFunctionReturn.cpp
-  Passes/LowerFunctionCall.cpp
-  Passes/LowerJump.cpp
   Passes/ResolveForcedExceptions.cpp
-  Passes/LowerErrorAndMissing.cpp
   Passes/CFGRecovery.cpp
 
   # Analysis & Passes - Stage 5: ABI Recovery
@@ -49,24 +38,14 @@ add_library(omill STATIC
   Passes/HashImportAnnotation.cpp
   Passes/ResolveLazyImports.cpp
   Passes/RecoverGlobalTypes.cpp
-  Passes/LowerResolvedDispatchCalls.cpp
   Passes/FoldProgramCounter.cpp
   Passes/ResolveIATCalls.cpp
-  Passes/ResolveDispatchTargets.cpp
+  Passes/ResolveAndLowerControlFlow.cpp
   Passes/InterProceduralConstProp.cpp
   Passes/IterativeTargetResolution.cpp
   Passes/OutlineConstantStackData.cpp
-  Passes/CoalesceByteReassembly.cpp
-  Passes/DeadStateRoundtripElimination.cpp
-  Passes/CollapsePartialXMMWrites.cpp
-  Passes/EliminateRedundantByteStores.cpp
-  Passes/SimplifyVectorFlagComputation.cpp
-  Passes/RecoverJumpTables.cpp
-  Passes/SymbolicJumpTableSolver.cpp
+  Passes/SimplifyVectorReassembly.cpp
   Passes/EliminateDeadPaths.cpp
-  Passes/FoldConstantVectorChains.cpp
-  Passes/ResolveNativeDispatch.cpp
-
   # Pipeline
   Pipeline.cpp
   Passes/PassRegistry.cpp

@@ -1,4 +1,4 @@
-#include "omill/Passes/LowerHyperCalls.h"
+#include "omill/Passes/LowerRemillIntrinsics.h"
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
@@ -71,7 +71,7 @@ class HyperCallCodegenTest : public ::testing::Test {
     // Run LowerHyperCalls pass.
     {
       llvm::FunctionPassManager FPM;
-      FPM.addPass(omill::LowerHyperCallsPass());
+      FPM.addPass(omill::LowerRemillIntrinsicsPass(omill::LowerCategories::HyperCalls));
 
       llvm::PassBuilder PB;
       llvm::LoopAnalysisManager LAM;

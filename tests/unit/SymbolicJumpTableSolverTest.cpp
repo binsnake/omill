@@ -1,4 +1,4 @@
-#include "omill/Passes/SymbolicJumpTableSolver.h"
+#include "omill/Passes/ResolveAndLowerControlFlow.h"
 
 #include <llvm/Analysis/ScalarEvolution.h>
 #include <llvm/IR/Constants.h>
@@ -62,7 +62,7 @@ class SymbolicJumpTableSolverTest : public ::testing::Test {
 
     llvm::ModulePassManager MPM;
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(
-        omill::SymbolicJumpTableSolverPass()));
+        omill::ResolveAndLowerControlFlowPass(omill::ResolvePhases::SymbolicSolve)));
     MPM.run(*M, MAM);
   }
 
