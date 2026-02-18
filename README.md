@@ -62,10 +62,12 @@ cmake --build build-remill
 ### CMake options
 
 | Option | Default | Description |
-|--------|---------|-------------|
-| `OMILL_ENABLE_TOOLS` | `ON` | Build `omill-opt` CLI tool |
+|-|-|-|
+| `OMILL_ENABLE_TOOLS` | `ON` | Build `omill-opt` and `ollvm-obf` CLI tools |
 | `OMILL_ENABLE_TESTING` | `ON` | Build unit and e2e tests |
 | `OMILL_ENABLE_REMILL` | `OFF` | Build with remill for e2e testing |
+| `OMILL_ENABLE_Z3` | auto | Z3-based dispatch solver (auto-downloads Z3 4.13.4) |
+| `OMILL_ENABLE_SIMPLIFIER` | `OFF` | EqSat-based MBA simplification |
 
 ## Usage
 
@@ -99,7 +101,18 @@ MPM.run(*Module, MAM);
 
 ```bash
 omill-opt input.bc -o output.bc
+omill-opt input.bc -o output.bc --deobfuscate --resolve-targets --recover-abi
 ```
+
+### ollvm-obf CLI
+
+`ollvm-obf` applies OLLVM-style obfuscation to LLVM bitcode, useful for generating test inputs for the deobfuscation pipeline:
+
+```bash
+ollvm-obf input.bc -o output.bc --flatten --substitute --string-encrypt --const-unfold --vectorize
+```
+
+Supported transforms: control flow flattening, instruction substitution, string encryption, constant unfolding, and i32 vectorization (SSE2).
 
 ## Architecture
 
@@ -108,24 +121,36 @@ omill-opt input.bc -o output.bc
 The pipeline is organized into stages that progressively lower remill IR:
 
 | Stage | Passes | Purpose |
-|-------|--------|---------|
-| 1 | LowerFlagIntrinsics, RemoveBarriers, LowerMemoryIntrinsics, LowerAtomicIntrinsics, LowerHyperCalls | Replace remill intrinsics with native LLVM ops |
-| 2 | DeadStateFlagElimination, DeadStateStoreElimination, PromoteStateToSSA, MemoryPointerElimination | Optimize away unnecessary State accesses |
-| 3 | LowerErrorAndMissing, LowerFunctionReturn, LowerFunctionCall, LowerJump, CFGRecovery | Recover native control flow |
-| 3.5 | FoldProgramCounter, ResolveIATCalls, LowerResolvedDispatchCalls | Resolve static dispatch targets |
-| 3.6 | IterativeTargetResolution | Iteratively resolve indirect targets via optimization fixpoint |
+|-|-|-|
+| 0 | StripRemillIntrinsicBodies, AlwaysInlinerPass | Prepare lifted IR for processing |
+| 1 | LowerRemillIntrinsics (Phase1: flags, barriers, memory, atomics, hyper calls) | Replace remill intrinsics with native LLVM ops |
+| 2 | OptimizeState (DeadFlags, DeadStores, Promote), MemoryPointerElimination | Optimize away unnecessary State accesses |
+| 3 | LowerRemillIntrinsics (Phase3: error/missing, return, call, jump), CFGRecovery | Recover native control flow |
+| 3.5 | FoldProgramCounter, ResolveIATCalls, LowerRemillIntrinsics (ResolvedDispatch) | Resolve static dispatch targets |
+| 3.6 | IterativeTargetResolution (ResolveAndLowerControlFlow + Z3DispatchSolver loop) | Iteratively resolve indirect targets via optimization fixpoint |
 | 3.7 | InterProceduralConstProp | Propagate constants across call boundaries |
-| 4 | CallingConventionAnalysis, RecoverStackFrame, RecoverStackFrameTypes, RecoverFunctionSignatures, RefineFunctionSignatures, EliminateStateStruct | Recover ABI and remove State |
-| 5 | ConstantMemoryFolding, RecoverGlobalTypes, OutlineConstantStackData, HashImportAnnotation, ResolveLazyImports | Deobfuscation |
-| 6 | LowerUndefinedIntrinsics | Final cleanup |
+| 4 | CallingConventionAnalysis, RecoverStackFrame, RecoverStackFrameTypes, RecoverFunctionSignatures, RefineFunctionSignatures, RewriteLiftedCallsToNative, EliminateStateStruct | Recover ABI and remove State |
+| 5 | SimplifyVectorReassembly, ConstantMemoryFolding, RecoverGlobalTypes, OutlineConstantStackData, HashImportAnnotation, ResolveLazyImports, EliminateDeadPaths | Deobfuscation |
+| 6 | LowerRemillIntrinsics (Undefined) | Final cleanup |
+
+### Consolidated passes
+
+The pipeline uses 4 bitmask-configurable passes that each consolidate multiple related transformations, reducing IR traversal overhead:
+
+- **LowerRemillIntrinsicsPass** — 11 intrinsic categories (flags, barriers, memory, atomics, hyper calls, error/missing, return, call, jump, undefined, resolved dispatch) selected via `LowerCategories` bitmask
+- **OptimizeStatePass** — 5 state optimization phases (dead flags, dead stores, redundant bytes, promote-to-SSA, roundtrip elimination) selected via `OptimizePhases` bitmask
+- **ResolveAndLowerControlFlowPass** — 3 resolution phases (constant-PC dispatch, jump table recovery, symbolic/SCEV solving) selected via `ResolvePhases` bitmask
+- **SimplifyVectorReassemblyPass** — 4 XMM pattern matchers (constant vector folding, partial write collapse, byte reassembly coalescing, flag computation simplification)
 
 ### Analyses
 
 - **RemillIntrinsicAnalysis** — identifies and classifies remill intrinsic calls
 - **StateFieldAccessAnalysis** — tracks which State struct fields are read/written
 - **CallGraphAnalysis** — builds inter-procedural call graph with SCC computation
-- **CallingConventionAnalysis** — determines calling conventions from register usage
+- **CallingConventionAnalysis** — determines Win64 calling conventions from register usage (XMM0-3 param detection, callee-saved GPR filtering)
 - **BinaryMemoryMap** — provides constant memory contents from the original binary for folding
+- **LiftedFunctionMap** — maps program counter addresses to lifted `sub_<hex>` functions
+- **ExceptionInfo** — recovers structured exception handling metadata
 
 ### Project structure
 
@@ -141,10 +166,12 @@ omill/
 │   └── Pipeline.cpp        # Pipeline construction
 ├── tools/
 │   ├── omill-opt/          # Standalone optimizer tool
-│   └── omill-lift/         # Lifter tool (requires remill)
+│   ├── omill-lift/         # Lifter tool (requires remill)
+│   └── ollvm-obf/          # OLLVM-style obfuscation tool
 ├── tests/
-│   ├── unit/               # Unit tests
+│   ├── unit/               # Unit tests (266 tests)
 │   └── e2e/                # End-to-end tests (require remill)
+├── test_obf/               # Obfuscation round-trip test suite
 ├── third_party/
 │   └── remill/             # Remill submodule (binsnake fork)
 └── cmake/
