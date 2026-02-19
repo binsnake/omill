@@ -38,6 +38,20 @@ llvm::CallInst *findDispatchCall(llvm::BasicBlock *BB) {
   return nullptr;
 }
 
+/// Find a direct/indirect call in the given block.
+/// If `want_indirect` is true, only returns calls with no direct callee.
+llvm::CallInst *findAnyCall(llvm::BasicBlock *BB, bool want_indirect) {
+  for (auto &I : *BB) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+    if (!call)
+      continue;
+    if (want_indirect && call->getCalledFunction())
+      continue;
+    return call;
+  }
+  return nullptr;
+}
+
 /// Check if a store's pointer operand is a GEP to State+offset.
 bool isStoreToStateOffset(llvm::StoreInst *store, llvm::Value *state_ptr,
                           unsigned offset) {
@@ -50,6 +64,26 @@ bool isStoreToStateOffset(llvm::StoreInst *store, llvm::Value *state_ptr,
   return idx && idx->getZExtValue() == offset;
 }
 
+/// Build a return value representing the resolved function address.
+/// Supports common post-ABI native wrapper return types (i64 or pointer).
+llvm::Value *buildResolvedImportReturn(llvm::IRBuilder<> &Builder,
+                                       llvm::Function &F,
+                                       llvm::Function *resolved_fn,
+                                       llvm::StringRef func_name) {
+  llvm::Type *ret_ty = F.getReturnType();
+  if (ret_ty->isVoidTy()) {
+    return nullptr;
+  }
+  if (ret_ty->isIntegerTy()) {
+    return Builder.CreatePtrToInt(resolved_fn, ret_ty, func_name.str() + ".addr");
+  }
+  if (ret_ty->isPointerTy()) {
+    return Builder.CreatePointerCast(resolved_fn, ret_ty,
+                                     func_name.str() + ".ptr");
+  }
+  return nullptr;
+}
+
 }  // namespace
 
 llvm::PreservedAnalyses ResolveLazyImportsPass::run(
@@ -59,6 +93,11 @@ llvm::PreservedAnalyses ResolveLazyImportsPass::run(
 
   if (F.arg_size() == 0)
     return llvm::PreservedAnalyses::all();
+
+  // Only lifted functions have arg0 as an opaque State pointer.
+  // Post-ABI _native wrappers use register-typed arguments (typically i64).
+  llvm::Value *state_ptr =
+      F.getArg(0)->getType()->isPointerTy() ? F.getArg(0) : nullptr;
 
   // Collect annotated icmps using WeakVH so handles become null if
   // instructions are deleted by EliminateUnreachableBlocks in a prior
@@ -92,23 +131,37 @@ llvm::PreservedAnalyses ResolveLazyImportsPass::run(
       continue;
     llvm::StringRef func_name = fn_str->getString();
 
-    // Declare the resolved function as dllimport external.
-    auto *fn_type = llvm::FunctionType::get(llvm::Type::getVoidTy(Ctx), false);
-    auto fn_callee = M.getOrInsertFunction(func_name, fn_type);
-    auto *fn = llvm::dyn_cast<llvm::Function>(fn_callee.getCallee());
-    if (!fn)
-      continue;
-    fn->setDLLStorageClass(llvm::GlobalValue::DLLImportStorageClass);
-
     // Check if the icmp directly controls a conditional branch whose
-    // true-successor contains an __omill_dispatch_call.  This means the
-    // resolved import is actually CALLED (not just its address returned).
+    // true-successor contains a dispatch-like call.  This means the resolved
+    // import is actually CALLED (not just its address returned).
+    //
+    // Two forms are supported:
+    // 1) lifted: __omill_dispatch_call(...)
+    // 2) post-ABI native: indirect call through computed function pointer
     llvm::BasicBlock *icmp_bb = icmp->getParent();
     auto *br = llvm::dyn_cast<llvm::BranchInst>(icmp_bb->getTerminator());
     llvm::CallInst *dispatch = nullptr;
+    bool is_native_indirect_dispatch = false;
     if (br && br->isConditional() && br->getCondition() == icmp) {
       dispatch = findDispatchCall(br->getSuccessor(0));
+      if (!dispatch) {
+        dispatch = findAnyCall(br->getSuccessor(0), /*want_indirect=*/true);
+        is_native_indirect_dispatch = (dispatch != nullptr);
+      }
     }
+
+    // Declare the resolved function as dllimport external.
+    llvm::FunctionType *fn_type = nullptr;
+    if (dispatch && is_native_indirect_dispatch) {
+      fn_type = dispatch->getFunctionType();
+    } else {
+      fn_type = llvm::FunctionType::get(llvm::Type::getVoidTy(Ctx), false);
+    }
+    auto fn_callee = M.getOrInsertFunction(func_name, fn_type);
+    auto *fn = M.getFunction(func_name);
+    if (!fn)
+      continue;
+    fn->setDLLStorageClass(llvm::GlobalValue::DLLImportStorageClass);
 
     if (dispatch) {
       // === Import is called via __omill_dispatch_call ===
@@ -124,33 +177,38 @@ llvm::PreservedAnalyses ResolveLazyImportsPass::run(
       // resolution).  We insert a load of State+RAX right after the
       // dispatch_call and patch any later RAX stores to use that value.
       llvm::IRBuilder<> Builder(dispatch);
-      auto *fn_addr = Builder.CreatePtrToInt(fn, Builder.getInt64Ty(),
-                                             func_name.str() + ".addr");
-      dispatch->setArgOperand(1, fn_addr);
+      if (is_native_indirect_dispatch) {
+        dispatch->setCalledOperand(fn_callee.getCallee());
+      } else {
+        auto *fn_addr = Builder.CreatePtrToInt(fn, Builder.getInt64Ty(),
+                                               func_name.str() + ".addr");
+        dispatch->setArgOperand(1, fn_addr);
+      }
 
-      // Insert a load of State+RAX right after the dispatch_call to
-      // capture its return value before it gets overwritten.
-      auto *state_ptr = F.getArg(0);
-      Builder.SetInsertPoint(dispatch->getNextNode());
-      auto *rax_gep = Builder.CreateGEP(Builder.getInt8Ty(), state_ptr,
-                                        Builder.getInt64(kRAXOffset),
-                                        "rax.gep.post.call");
-      auto *rax_result = Builder.CreateLoad(Builder.getInt64Ty(), rax_gep,
-                                            "rax.after.call");
+      // Insert a load of State+RAX right after the dispatch_call to capture
+      // its return value before it gets overwritten.
+      if (state_ptr) {
+        Builder.SetInsertPoint(dispatch->getNextNode());
+        auto *rax_gep = Builder.CreateGEP(Builder.getInt8Ty(), state_ptr,
+                                          Builder.getInt64(kRAXOffset),
+                                          "rax.gep.post.call");
+        auto *rax_result = Builder.CreateLoad(Builder.getInt64Ty(), rax_gep,
+                                              "rax.after.call");
 
-      // Replace any subsequent stores to State+RAX in this block.
-      llvm::BasicBlock *dispatch_bb = dispatch->getParent();
-      bool past_load = false;
-      for (auto &I : *dispatch_bb) {
-        if (&I == rax_result) {
-          past_load = true;
-          continue;
-        }
-        if (!past_load)
-          continue;
-        if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&I)) {
-          if (isStoreToStateOffset(store, state_ptr, kRAXOffset)) {
-            store->setOperand(0, rax_result);
+        // Replace any subsequent stores to State+RAX in this block.
+        llvm::BasicBlock *dispatch_bb = dispatch->getParent();
+        bool past_load = false;
+        for (auto &I : *dispatch_bb) {
+          if (&I == rax_result) {
+            past_load = true;
+            continue;
+          }
+          if (!past_load)
+            continue;
+          if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+            if (isStoreToStateOffset(store, state_ptr, kRAXOffset)) {
+              store->setOperand(0, rax_result);
+            }
           }
         }
       }
@@ -188,13 +246,27 @@ llvm::PreservedAnalyses ResolveLazyImportsPass::run(
       auto *shortcut = llvm::BasicBlock::Create(Ctx, "resolved", &F);
       {
         llvm::IRBuilder<> Builder(shortcut);
-        auto *state_ptr = F.getArg(0);
-        auto *rax_gep = Builder.CreateGEP(Builder.getInt8Ty(), state_ptr,
-                                          Builder.getInt64(kRAXOffset));
-        auto *fn_addr = Builder.CreatePtrToInt(fn, Builder.getInt64Ty(),
-                                               func_name.str() + ".addr");
-        Builder.CreateStore(fn_addr, rax_gep);
-        Builder.CreateRet(llvm::PoisonValue::get(F.getReturnType()));
+        if (state_ptr) {
+          auto *rax_gep = Builder.CreateGEP(Builder.getInt8Ty(), state_ptr,
+                                            Builder.getInt64(kRAXOffset));
+          auto *fn_addr = Builder.CreatePtrToInt(fn, Builder.getInt64Ty(),
+                                                 func_name.str() + ".addr");
+          Builder.CreateStore(fn_addr, rax_gep);
+          Builder.CreateRet(llvm::PoisonValue::get(F.getReturnType()));
+        } else {
+          llvm::Value *retv =
+              buildResolvedImportReturn(Builder, F, fn, func_name);
+          if (!retv && !F.getReturnType()->isVoidTy()) {
+            // Unsupported native return type: leave this match untouched.
+            shortcut->eraseFromParent();
+            continue;
+          }
+          if (F.getReturnType()->isVoidTy()) {
+            Builder.CreateRetVoid();
+          } else {
+            Builder.CreateRet(retv);
+          }
+        }
       }
 
       preheader->getTerminator()->eraseFromParent();

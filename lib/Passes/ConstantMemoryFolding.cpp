@@ -1,5 +1,12 @@
 #include "omill/Passes/ConstantMemoryFolding.h"
 
+#include <cstdint>
+#include <cstring>
+#include <optional>
+
+#include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/Hashing.h>
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DataLayout.h>
 #include <llvm/IR/Function.h>
@@ -60,6 +67,160 @@ std::optional<uint64_t> resolveConstantAddress(llvm::Value *ptr,
   }
 
   return std::nullopt;
+}
+
+struct SymbolicAddress {
+  llvm::Value *base = nullptr;
+  int64_t offset = 0;
+};
+
+/// Resolve integer expression into (base + const_offset).
+/// Examples:
+///   add i64 %rsp, -56   -> {base=%rsp, offset=-56}
+///   sub i64 %x, 8       -> {base=%x, offset=-8}
+///   i64 %x              -> {base=%x, offset=0}
+std::optional<SymbolicAddress> resolveBasePlusConst(llvm::Value *V) {
+  if (auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(V)) {
+    if (BO->getOpcode() == llvm::Instruction::Add ||
+        BO->getOpcode() == llvm::Instruction::Sub) {
+      auto add_const = [&](llvm::Value *lhs, llvm::ConstantInt *rhs,
+                           bool negate_rhs) -> std::optional<SymbolicAddress> {
+        auto lhs_addr = resolveBasePlusConst(lhs);
+        if (!lhs_addr)
+          return std::nullopt;
+        int64_t c = rhs->getSExtValue();
+        lhs_addr->offset += negate_rhs ? -c : c;
+        return lhs_addr;
+      };
+
+      if (auto *CRHS = llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(1))) {
+        return add_const(BO->getOperand(0), CRHS,
+                         BO->getOpcode() == llvm::Instruction::Sub);
+      }
+      if (BO->getOpcode() == llvm::Instruction::Add) {
+        if (auto *CLHS =
+                llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(0))) {
+          return add_const(BO->getOperand(1), CLHS, false);
+        }
+      }
+    }
+  }
+
+  // Base value with zero offset.
+  return SymbolicAddress{V, 0};
+}
+
+/// Resolve pointer into (base + const_offset) when possible.
+/// Handles:
+///   inttoptr(base + const)
+///   gep(inttoptr(base + const), const)
+std::optional<SymbolicAddress> resolveSymbolicAddress(llvm::Value *ptr,
+                                                      const llvm::DataLayout &DL) {
+  ptr = ptr->stripPointerCasts();
+
+  if (auto *CE = llvm::dyn_cast<llvm::ConstantExpr>(ptr)) {
+    if (CE->getOpcode() == llvm::Instruction::IntToPtr) {
+      return resolveBasePlusConst(CE->getOperand(0));
+    }
+    if (CE->getOpcode() == llvm::Instruction::GetElementPtr) {
+      auto *GEP = llvm::cast<llvm::GEPOperator>(CE);
+      auto base = resolveSymbolicAddress(GEP->getPointerOperand(), DL);
+      if (!base)
+        return std::nullopt;
+      llvm::APInt gep_off(DL.getPointerSizeInBits(), 0);
+      if (!GEP->accumulateConstantOffset(DL, gep_off))
+        return std::nullopt;
+      base->offset += gep_off.getSExtValue();
+      return base;
+    }
+    return std::nullopt;
+  }
+
+  if (auto *ITP = llvm::dyn_cast<llvm::IntToPtrInst>(ptr)) {
+    return resolveBasePlusConst(ITP->getOperand(0));
+  }
+
+  if (auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(ptr)) {
+    auto base = resolveSymbolicAddress(GEP->getPointerOperand(), DL);
+    if (!base)
+      return std::nullopt;
+    llvm::APInt gep_off(DL.getPointerSizeInBits(), 0);
+    if (!GEP->accumulateConstantOffset(DL, gep_off))
+      return std::nullopt;
+    base->offset += gep_off.getSExtValue();
+    return base;
+  }
+
+  return std::nullopt;
+}
+
+struct ByteKey {
+  const llvm::Value *base = nullptr;
+  int64_t offset = 0;
+  bool operator==(const ByteKey &o) const {
+    return base == o.base && offset == o.offset;
+  }
+};
+
+struct ByteKeyInfo {
+  static inline ByteKey getEmptyKey() {
+    return ByteKey{llvm::DenseMapInfo<const llvm::Value *>::getEmptyKey(), 0};
+  }
+  static inline ByteKey getTombstoneKey() {
+    return ByteKey{llvm::DenseMapInfo<const llvm::Value *>::getTombstoneKey(), 0};
+  }
+  static unsigned getHashValue(const ByteKey &k) {
+    return llvm::hash_combine(k.base, k.offset);
+  }
+  static bool isEqual(const ByteKey &a, const ByteKey &b) { return a == b; }
+};
+
+std::optional<unsigned> loadOrStoreByteWidth(llvm::Type *ty) {
+  if (ty->isIntegerTy()) {
+    unsigned bits = ty->getIntegerBitWidth();
+    unsigned bytes = (bits + 7) / 8;
+    if (bytes > 8)
+      return std::nullopt;
+    return bytes;
+  }
+  if (ty->isFloatTy())
+    return 4;
+  if (ty->isDoubleTy())
+    return 8;
+  return std::nullopt;
+}
+
+std::optional<uint64_t> constantScalarBits(llvm::Value *v, llvm::Type *ty) {
+  if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(v)) {
+    return CI->getZExtValue();
+  }
+  if (auto *CF = llvm::dyn_cast<llvm::ConstantFP>(v)) {
+    if (ty->isFloatTy()) {
+      auto bits = CF->getValueAPF().bitcastToAPInt().getZExtValue();
+      return static_cast<uint32_t>(bits);
+    }
+    if (ty->isDoubleTy()) {
+      return CF->getValueAPF().bitcastToAPInt().getZExtValue();
+    }
+  }
+  return std::nullopt;
+}
+
+llvm::Constant *constantFromBits(llvm::Type *ty, uint64_t bits) {
+  if (ty->isIntegerTy())
+    return llvm::ConstantInt::get(ty, bits);
+  if (ty->isFloatTy()) {
+    uint32_t b = static_cast<uint32_t>(bits);
+    float f;
+    std::memcpy(&f, &b, 4);
+    return llvm::ConstantFP::get(ty, static_cast<double>(f));
+  }
+  if (ty->isDoubleTy()) {
+    double d;
+    std::memcpy(&d, &bits, 8);
+    return llvm::ConstantFP::get(ty, d);
+  }
+  return nullptr;
 }
 
 }  // namespace
@@ -164,6 +325,82 @@ llvm::PreservedAnalyses ConstantMemoryFoldingPass::run(
     LI->replaceAllUsesWith(replacement);
     LI->eraseFromParent();
     changed = true;
+  }
+
+  // Local fold: track constant bytes for stack-like symbolic addresses
+  // (inttoptr(base + const)) and fold subsequent scalar loads.
+  llvm::SmallVector<llvm::LoadInst *, 16> local_folded_loads;
+  for (auto &BB : F) {
+    llvm::DenseMap<ByteKey, uint8_t, ByteKeyInfo> local_const_bytes;
+    for (auto &I : BB) {
+      if (auto *CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
+        // Basic-block local mode: do not propagate constants across calls.
+        if (!CB->onlyReadsMemory()) {
+          local_const_bytes.clear();
+        }
+        continue;
+      }
+
+      if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+        auto addr = resolveSymbolicAddress(SI->getPointerOperand(), DL);
+        if (!addr) {
+          // Unknown memory write: invalidate tracked bytes.
+          local_const_bytes.clear();
+          continue;
+        }
+
+        auto width = loadOrStoreByteWidth(SI->getValueOperand()->getType());
+        if (!width)
+          continue;
+
+        auto bits = constantScalarBits(SI->getValueOperand(),
+                                       SI->getValueOperand()->getType());
+        for (unsigned i = 0; i < *width; ++i) {
+          ByteKey key{addr->base, addr->offset + static_cast<int64_t>(i)};
+          if (bits) {
+            local_const_bytes[key] = static_cast<uint8_t>((*bits >> (8 * i)) & 0xff);
+          } else {
+            local_const_bytes.erase(key);
+          }
+        }
+        continue;
+      }
+
+      auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I);
+      if (!LI)
+        continue;
+
+      auto addr = resolveSymbolicAddress(LI->getPointerOperand(), DL);
+      if (!addr)
+        continue;
+
+      auto width = loadOrStoreByteWidth(LI->getType());
+      if (!width)
+        continue;
+
+      uint64_t bits = 0;
+      bool all_present = true;
+      for (unsigned i = 0; i < *width; ++i) {
+        ByteKey key{addr->base, addr->offset + static_cast<int64_t>(i)};
+        auto it = local_const_bytes.find(key);
+        if (it == local_const_bytes.end()) {
+          all_present = false;
+          break;
+        }
+        bits |= static_cast<uint64_t>(it->second) << (8 * i);
+      }
+      if (!all_present)
+        continue;
+
+      if (auto *C = constantFromBits(LI->getType(), bits)) {
+        LI->replaceAllUsesWith(C);
+        local_folded_loads.push_back(LI);
+        changed = true;
+      }
+    }
+  }
+  for (auto *LI : local_folded_loads) {
+    LI->eraseFromParent();
   }
 
   return changed ? llvm::PreservedAnalyses::none()

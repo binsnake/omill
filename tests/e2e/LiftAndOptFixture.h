@@ -105,6 +105,9 @@ class BufferTraceManager : public remill::TraceManager {
     return traces_;
   }
 
+  /// Clear cached lifted traces (needed before re-lifting in the same fixture).
+  void clearTraces() { traces_.clear(); }
+
   uint64_t baseAddr() const { return base_addr_; }
 
   void setBaseAddr(uint64_t addr) { base_addr_ = addr; }
