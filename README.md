@@ -119,10 +119,12 @@ omill-opt input.bc -o output.bc --deobfuscate --resolve-targets --recover-abi
 `ollvm-obf` applies OLLVM-style obfuscation to LLVM bitcode, useful for generating test inputs for the deobfuscation pipeline:
 
 ```bash
-ollvm-obf input.bc -o output.bc --flatten --substitute --string-encrypt --const-unfold --vectorize
+ollvm-obf input.bc -o output.bc --flatten --substitute --string-encrypt --const-unfold --vectorize --seed=2976579765
 ```
 
 Supported transforms: control flow flattening, instruction substitution, string encryption, constant unfolding, and i32 vectorization (SSE2).
+Vectorization supports stack-data mutation (`--vectorize-data`, default on) and optional bitwise add/sub lowering (`--vectorize-bitwise`).
+All transforms are deterministic by default via a stable base seed (`--seed`).
 
 ### omill-lift CLI (requires remill)
 

@@ -5,6 +5,7 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
 
+#include <cstdint>
 #include <random>
 #include <vector>
 
@@ -87,8 +88,8 @@ static void substituteFunction(llvm::Function &F, std::mt19937 &rng) {
   }
 }
 
-void substituteModule(llvm::Module &M) {
-  std::mt19937 rng(123);
+void substituteModule(llvm::Module &M, uint32_t seed) {
+  std::mt19937 rng(seed);
   for (auto &F : M) {
     substituteFunction(F, rng);
   }

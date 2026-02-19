@@ -5,6 +5,7 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
 
+#include <cstdint>
 #include <random>
 #include <vector>
 
@@ -132,8 +133,8 @@ void unfoldConstantsFunction(llvm::Function &F, std::mt19937 &rng) {
 
 }  // namespace
 
-void unfoldConstantsModule(llvm::Module &M) {
-  std::mt19937 rng(456);
+void unfoldConstantsModule(llvm::Module &M, uint32_t seed) {
+  std::mt19937 rng(seed);
   for (auto &F : M) {
     unfoldConstantsFunction(F, rng);
   }

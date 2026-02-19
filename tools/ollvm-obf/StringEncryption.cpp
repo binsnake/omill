@@ -6,14 +6,15 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
 
+#include <cstdint>
 #include <random>
 #include <string>
 #include <vector>
 
 namespace ollvm {
 
-void encryptStringsModule(llvm::Module &M) {
-  std::mt19937 rng(456);
+void encryptStringsModule(llvm::Module &M, uint32_t seed) {
+  std::mt19937 rng(seed);
   std::uniform_int_distribution<int> key_dist(1, 255);
 
   auto &ctx = M.getContext();

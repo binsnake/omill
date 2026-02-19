@@ -6,6 +6,7 @@
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Intrinsics.h>
 
+#include <cstdint>
 #include <random>
 #include <vector>
 
@@ -310,8 +311,8 @@ static void flattenFunction(llvm::Function &F, std::mt19937 &rng) {
   }
 }
 
-void flattenModule(llvm::Module &M) {
-  std::mt19937 rng(42);
+void flattenModule(llvm::Module &M, uint32_t seed) {
+  std::mt19937 rng(seed);
   for (auto &F : M) {
     flattenFunction(F, rng);
   }

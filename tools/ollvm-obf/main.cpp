@@ -10,6 +10,8 @@
 #include <llvm/Support/ToolOutputFile.h>
 #include <llvm/Support/raw_ostream.h>
 
+#include <cstdint>
+
 #include "ConstantUnfolding.h"
 #include "Flattening.h"
 #include "StringEncryption.h"
@@ -46,6 +48,42 @@ static cl::opt<bool> DoVectorize("vectorize",
                                   cl::desc("Replace i32 scalar ops with SSE vector ops"),
                                   cl::init(false));
 
+static cl::opt<bool> DoVectorizeData(
+    "vectorize-data",
+    cl::desc("Enable vectorized i32 stack data mutation (lane-0 load/store)"),
+    cl::init(true));
+
+static cl::opt<bool> DoVectorizeBitwise(
+    "vectorize-bitwise",
+    cl::desc("Lower vectorized add/sub through bitwise ops (xor/and/shl)"),
+    cl::init(false));
+
+static cl::opt<unsigned> VectorizePercent(
+    "vectorize-percent",
+    cl::desc("Percent of eligible i32 scalar ops to vectorize (0-100)"),
+    cl::init(40));
+
+static cl::opt<unsigned> ObfSeed(
+    "seed",
+    cl::desc("Base RNG seed for deterministic obfuscation"),
+    cl::init(0xB16B00B5u));
+
+namespace {
+
+// Splitmix-style 32-bit mixer to derive independent deterministic seeds
+// for each transform from a single base seed.
+uint32_t mixSeed(uint32_t base, uint32_t salt) {
+  uint32_t x = base ^ salt;
+  x ^= x >> 16;
+  x *= 0x7feb352du;
+  x ^= x >> 15;
+  x *= 0x846ca68bu;
+  x ^= x >> 16;
+  return x;
+}
+
+}  // namespace
+
 int main(int argc, char **argv) {
   InitLLVM X(argc, argv);
   cl::ParseCommandLineOptions(argc, argv, "OLLVM-style obfuscation tool\n");
@@ -59,28 +97,34 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // Apply passes in order: string encryption first (before CFF moves blocks
-  // around), then substitution, then flattening, then constant unfolding and
-  // vectorize (after CFF so the restructured CFG doesn't break domination of
-  // the inserted instructions).
+  const uint32_t base_seed = static_cast<uint32_t>(ObfSeed);
+
+  // Apply passes in a fixed order for determinism and compatibility.
+  // Scalar->vector mutation must stay last so prior obfuscations (CFF/MBA/etc.)
+  // can reshape scalar IR first.
   if (DoStringEncrypt) {
-    ollvm::encryptStringsModule(*M);
+    ollvm::encryptStringsModule(*M, mixSeed(base_seed, 0x11A48D53u));
   }
 
   if (DoSubstitute) {
-    ollvm::substituteModule(*M);
+    ollvm::substituteModule(*M, mixSeed(base_seed, 0x5B2E6D4Fu));
   }
 
   if (DoFlatten) {
-    ollvm::flattenModule(*M);
+    ollvm::flattenModule(*M, mixSeed(base_seed, 0xA1F3707Bu));
   }
 
   if (DoConstUnfold) {
-    ollvm::unfoldConstantsModule(*M);
+    ollvm::unfoldConstantsModule(*M, mixSeed(base_seed, 0xC93A1E27u));
   }
 
+  // Must run last.
   if (DoVectorize) {
-    ollvm::vectorizeModule(*M);
+    ollvm::VectorizeOptions opts;
+    opts.vectorize_data = DoVectorizeData;
+    opts.vectorize_bitwise = DoVectorizeBitwise;
+    opts.transform_percent = VectorizePercent;
+    ollvm::vectorizeModule(*M, mixSeed(base_seed, 0x3D7C9A61u), opts);
   }
 
   // Verify.
