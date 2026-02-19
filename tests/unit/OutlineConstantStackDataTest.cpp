@@ -303,8 +303,8 @@ TEST_F(OutlineConstantStackDataTest, RejectsSizeLimitExceeded) {
   auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
   llvm::IRBuilder<> B(entry);
 
-  // alloca > 4096 bytes (the pass limit).
-  auto *alloca = B.CreateAlloca(llvm::ArrayType::get(B.getInt8Ty(), 8192));
+  // alloca > 65536 bytes (the pass limit).
+  auto *alloca = B.CreateAlloca(llvm::ArrayType::get(B.getInt8Ty(), 131072));
   B.CreateStore(B.getInt32(42), alloca);
 
   auto *val = B.CreateLoad(i32_ty, alloca);
