@@ -471,7 +471,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   // target discovery during lifting) survive — SimplifyCFG in Phase 1
   // cleanup merges blocks and destroys those names.  __remill_jump is
   // still present at this point (not lowered until Phase 3).
-  if (opts.deobfuscate) {
+  if (opts.deobfuscate && !envDisabled("OMILL_SKIP_INLINE_JUMP_TARGETS")) {
     MPM.addPass(InlineJumpTargetsPass());
   }
 

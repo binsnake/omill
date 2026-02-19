@@ -40,6 +40,14 @@ using namespace omill::e2e;
 
 namespace {
 
+bool wantVerboseLogs() {
+  const char *v = std::getenv("OMILL_E2E_VERBOSE");
+  if (!v || v[0] == '\0') return false;
+  return (v[0] == '1' && v[1] == '\0') ||
+         (v[0] == 't' && v[1] == '\0') ||
+         (v[0] == 'T' && v[1] == '\0');
+}
+
 // ============================================================================
 // Null symbol generator for JIT
 // ============================================================================
@@ -297,7 +305,9 @@ class OLLVMTest : public LiftAndOptFixture {
     if (!NF) return nullptr;
 
     std::string name = NF->getName().str();
-    llvm::errs() << "[JIT] Starting JIT for: " << name << "\n";
+    if (wantVerboseLogs()) {
+      llvm::errs() << "[JIT] Starting JIT for: " << name << "\n";
+    }
 
     // Strip non-native function bodies BEFORE serialization to avoid
     // serializing ~2000 remill semantic function bodies (tens of MB).
@@ -308,7 +318,9 @@ class OLLVMTest : public LiftAndOptFixture {
         F.setLinkage(llvm::GlobalValue::ExternalLinkage);
       }
     }
-    llvm::errs() << "[JIT] Stripped non-native bodies\n";
+    if (wantVerboseLogs()) {
+      llvm::errs() << "[JIT] Stripped non-native bodies\n";
+    }
 
     // GlobalDCE to remove unreferenced declarations/globals.
     {
@@ -328,7 +340,9 @@ class OLLVMTest : public LiftAndOptFixture {
       MPM.addPass(llvm::StripDeadPrototypesPass());
       MPM.run(*module(), MAM);
     }
-    llvm::errs() << "[JIT] GlobalDCE done\n";
+    if (wantVerboseLogs()) {
+      llvm::errs() << "[JIT] GlobalDCE done\n";
+    }
 
     // Bitcode round-trip into a fresh LLVMContext (LLJIT needs ownership).
     llvm::SmallString<0> buf;
@@ -336,7 +350,9 @@ class OLLVMTest : public LiftAndOptFixture {
       llvm::raw_svector_ostream os(buf);
       llvm::WriteBitcodeToFile(*module(), os);
     }
-    llvm::errs() << "[JIT] Bitcode serialized: " << buf.size() << " bytes\n";
+    if (wantVerboseLogs()) {
+      llvm::errs() << "[JIT] Bitcode serialized: " << buf.size() << " bytes\n";
+    }
 
     auto jit_ctx = std::make_unique<llvm::LLVMContext>();
     auto mem_buf = llvm::MemoryBuffer::getMemBuffer(
@@ -359,7 +375,9 @@ class OLLVMTest : public LiftAndOptFixture {
       return nullptr;
     }
     jit_ = std::move(*jit_or);
-    llvm::errs() << "[JIT] LLJIT created\n";
+    if (wantVerboseLogs()) {
+      llvm::errs() << "[JIT] LLJIT created\n";
+    }
 
     // Host process symbols (memcpy, etc.).
     auto gen = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
@@ -382,12 +400,18 @@ class OLLVMTest : public LiftAndOptFixture {
       llvm::consumeError(std::move(err));
       return nullptr;
     }
-    llvm::errs() << "[JIT] Module added to LLJIT\n";
+    if (wantVerboseLogs()) {
+      llvm::errs() << "[JIT] Module added to LLJIT\n";
+    }
 
     // Look up the native function.
-    llvm::errs() << "[JIT] Looking up: " << name << "\n";
+    if (wantVerboseLogs()) {
+      llvm::errs() << "[JIT] Looking up: " << name << "\n";
+    }
     auto sym_or = jit_->lookup(name);
-    llvm::errs() << "[JIT] Lookup complete\n";
+    if (wantVerboseLogs()) {
+      llvm::errs() << "[JIT] Lookup complete\n";
+    }
     EXPECT_TRUE(!!sym_or) << "Failed to look up " << name << " in JIT";
     if (!sym_or) {
       llvm::consumeError(sym_or.takeError());
@@ -447,7 +471,9 @@ TEST_F(OLLVMTest, CopyGreeting) {
   if (found_global || found_partial || found_stack) {
     SUCCEED() << "String encryption partially or fully recovered";
   } else {
-    llvm::errs() << "Note: String encryption recovery not yet implemented\n";
+    if (wantVerboseLogs()) {
+      llvm::errs() << "Note: String encryption recovery not yet implemented\n";
+    }
   }
 }
 
@@ -598,9 +624,13 @@ TEST_F(OLLVMTest, SHA256JIT) {
   auto fn = reinterpret_cast<uint64_t(*)(const uint8_t *, uint64_t, uint8_t *)>(addr);
   const uint8_t input[] = "Hello, World!";
   uint8_t digest[32] = {};
-  llvm::errs() << "[JIT] Calling SHA256 at " << addr << "\n";
+  if (wantVerboseLogs()) {
+    llvm::errs() << "[JIT] Calling SHA256 at " << addr << "\n";
+  }
   fn(input, 13, digest);
-  llvm::errs() << "[JIT] SHA256 returned\n";
+  if (wantVerboseLogs()) {
+    llvm::errs() << "[JIT] SHA256 returned\n";
+  }
 
   const uint8_t expected[32] = {
       0xdf, 0xfd, 0x60, 0x21, 0xbb, 0x2b, 0xd5, 0xb0,
@@ -657,9 +687,13 @@ TEST_F(OLLVMTest, SHA256JIT_Obfuscated) {
   auto fn = reinterpret_cast<uint64_t(*)(const uint8_t *, uint64_t, uint8_t *)>(addr);
   const uint8_t input[] = "Hello, World!";
   uint8_t digest[32] = {};
-  llvm::errs() << "[JIT] Calling SHA256 (Obfuscated) at " << addr << "\n";
+  if (wantVerboseLogs()) {
+    llvm::errs() << "[JIT] Calling SHA256 (Obfuscated) at " << addr << "\n";
+  }
   fn(input, 13, digest);
-  llvm::errs() << "[JIT] SHA256 (Obfuscated) returned\n";
+  if (wantVerboseLogs()) {
+    llvm::errs() << "[JIT] SHA256 (Obfuscated) returned\n";
+  }
 
   const uint8_t expected[32] = {
       0xdf, 0xfd, 0x60, 0x21, 0xbb, 0x2b, 0xd5, 0xb0,

@@ -18,17 +18,6 @@ namespace omill {
 
 namespace {
 
-/// Check if a function contains any __remill_jump calls.
-bool containsRemillJump(const llvm::Function &F) {
-  for (auto &BB : F)
-    for (auto &I : BB)
-      if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
-        if (auto *callee = CI->getCalledFunction())
-          if (callee->getName() == "__remill_jump")
-            return true;
-  return false;
-}
-
 /// Connect disconnected jump table target blocks to the function's CFG by
 /// replacing non-constant __remill_jump calls with switches over the known
 /// target PCs.  Only creates switch cases for disconnected blocks (lifted from
@@ -240,10 +229,12 @@ InlineJumpTargetsPass::run(llvm::Module &M,
   }
 
   // Step 4: Inline callee traces into the main function.
-  // Inline callees that either contain __remill_jump (original behavior) or
-  // had their jumps lowered to switches by Step 3 (CFF dispatch callees).
+  // Only inline callees that had their jumps lowered to switches by Step 3
+  // (CFF dispatch callees with disconnected jump table targets).
+  // Do NOT use containsRemillJump — nearly every lifted function has
+  // __remill_jump, and inlining all of them causes massive blowup.
   auto shouldInlineCallee = [&](const llvm::Function *callee) {
-    return containsRemillJump(*callee) || jump_lowered_fns.count(callee);
+    return jump_lowered_fns.count(callee);
   };
 
   bool did_inline = true;

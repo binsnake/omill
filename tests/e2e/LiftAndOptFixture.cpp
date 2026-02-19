@@ -7,6 +7,13 @@
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/raw_ostream.h>
 
+#if __has_include(<glog/logging.h>)
+#include <glog/logging.h>
+#define OMILL_E2E_HAS_GLOG 1
+#else
+#define OMILL_E2E_HAS_GLOG 0
+#endif
+
 #include <remill/BC/IntrinsicTable.h>
 
 #include "omill/Analysis/BinaryMemoryMap.h"
@@ -18,6 +25,7 @@
 #include "omill/Support/MemoryLimit.h"
 
 #include <cstdlib>
+#include <memory>
 #include <optional>
 
 namespace omill::e2e {
@@ -46,6 +54,51 @@ std::optional<bool> parseBoolEnv(const char *name) {
   return std::nullopt;
 }
 
+bool wantVerboseLogs() {
+  if (auto v = parseBoolEnv("OMILL_E2E_VERBOSE"); v.has_value()) {
+    return *v;
+  }
+  return false;
+}
+
+void setEnvIfUnset(const char *name, const char *value) {
+  const char *cur = std::getenv(name);
+  if (cur && cur[0] != '\0')
+    return;
+#if defined(_WIN32)
+  _putenv_s(name, value);
+#else
+  setenv(name, value, 0);
+#endif
+}
+
+void configureDefaultE2ELogging() {
+  // Some remill logs fire before glog is initialized in gtest_main mode.
+  // Initialize once in the fixture before any lifting/arch setup work.
+#if OMILL_E2E_HAS_GLOG
+  static bool glog_inited = false;
+  if (!glog_inited) {
+    google::InitGoogleLogging("omill-e2e-tests");
+    glog_inited = true;
+  }
+#endif
+
+  if (wantVerboseLogs()) {
+    return;
+  }
+  // Keep e2e output quiet by default. Users can override by explicitly
+  // setting glog env vars or enabling OMILL_E2E_VERBOSE=1.
+  setEnvIfUnset("GLOG_minloglevel", "2");
+#if OMILL_E2E_HAS_GLOG
+  if (FLAGS_minloglevel < 2) {
+    FLAGS_minloglevel = 2;
+  }
+  if (FLAGS_stderrthreshold < 3) {
+    FLAGS_stderrthreshold = 3;
+  }
+#endif
+}
+
 void maybeSetBoolFromEnv(const char *name, bool &out) {
   if (auto v = parseBoolEnv(name); v.has_value()) {
     out = *v;
@@ -66,6 +119,9 @@ void applyPipelineEnvOverrides(PipelineOptions &opts) {
 }
 
 void logPipelineOptions(const PipelineOptions &opts) {
+  if (!wantVerboseLogs()) {
+    return;
+  }
   llvm::errs() << "[OPT] lower_intrinsics=" << opts.lower_intrinsics
                << " optimize_state=" << opts.optimize_state
                << " stop_after_state=" << opts.stop_after_state_optimization
@@ -79,6 +135,7 @@ void logPipelineOptions(const PipelineOptions &opts) {
 }  // namespace
 
 void LiftAndOptFixture::SetUp() {
+  configureDefaultE2ELogging();
   arch_ = remill::Arch::Get(ctx_, remill::kOSWindows, remill::kArchAMD64_AVX);
   ASSERT_NE(arch_, nullptr) << "Failed to create AMD64 arch";
 }
@@ -170,9 +227,12 @@ void LiftAndOptFixture::optimizeWithMemoryMap(const PipelineOptions &opts,
   llvm::CGSCCAnalysisManager CGAM;
   llvm::ModuleAnalysisManager MAM;
 
-  // Register BinaryMemoryAnalysis BEFORE standard analyses so it takes priority.
-  MAM.registerPass([&] {
-    return omill::BinaryMemoryAnalysis(std::move(memory_map));
+  // Register BinaryMemoryAnalysis BEFORE standard analyses so it takes
+  // priority. Keep a stable copy because the analysis may be re-created.
+  auto memory_map_holder =
+      std::make_shared<BinaryMemoryMap>(std::move(memory_map));
+  MAM.registerPass([memory_map_holder] {
+    return omill::BinaryMemoryAnalysis(*memory_map_holder);
   });
 
   PB.registerModuleAnalyses(MAM);
@@ -194,28 +254,19 @@ void LiftAndOptFixture::optimizeWithMemoryMap(const PipelineOptions &opts,
   PipelineOptions requested_opts = opts;
   applyPipelineEnvOverrides(requested_opts);
 
-  // Run the main pipeline once (without ABI recovery, even if requested).
-  // Splitting state/control-flow phases can produce invalid intermediate CFGs
-  // for complex OLLVM functions (e.g. SHA256), so keep execution cohesive.
-  PipelineOptions main_opts = requested_opts;
-  main_opts.recover_abi = false;
-  logPipelineOptions(main_opts);
+  // Run the full requested pipeline in one pass so pass ordering matches
+  // production (including ABI recovery before deobfuscation when enabled).
+  logPipelineOptions(requested_opts);
   {
     llvm::ModulePassManager MPM;
-    omill::buildPipeline(MPM, main_opts);
+    omill::buildPipeline(MPM, requested_opts);
     MPM.run(*module_, MAM);
   }
 
-  // Keep this snapshot label for compatibility with existing IR dump tooling.
+  // Keep these snapshot labels for compatibility with existing IR dump tooling.
   dumpIR("after_state");
   dumpIR("after");
-
-  // Run ABI recovery as a separate stage so we get a snapshot before and after.
   if (requested_opts.recover_abi) {
-    llvm::ModulePassManager MPM;
-    omill::buildABIRecoveryPipeline(MPM);
-    MPM.run(*module_, MAM);
-
     dumpIR("after_abi");
   }
 
@@ -247,12 +298,17 @@ void LiftAndOptFixture::optimizeWithExceptions(
   llvm::CGSCCAnalysisManager CGAM;
   llvm::ModuleAnalysisManager MAM;
 
-  // Register custom analyses BEFORE standard ones.
-  MAM.registerPass([&] {
-    return omill::BinaryMemoryAnalysis(std::move(memory_map));
+  // Register custom analyses BEFORE standard ones. Keep stable copies because
+  // analyses may be re-created.
+  auto memory_map_holder =
+      std::make_shared<BinaryMemoryMap>(std::move(memory_map));
+  auto exc_info_holder =
+      std::make_shared<ExceptionInfo>(std::move(exc_info));
+  MAM.registerPass([memory_map_holder] {
+    return omill::BinaryMemoryAnalysis(*memory_map_holder);
   });
-  MAM.registerPass([&] {
-    return omill::ExceptionInfoAnalysis(std::move(exc_info));
+  MAM.registerPass([exc_info_holder] {
+    return omill::ExceptionInfoAnalysis(*exc_info_holder);
   });
 
   PB.registerModuleAnalyses(MAM);

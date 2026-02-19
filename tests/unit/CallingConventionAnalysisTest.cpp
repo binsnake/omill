@@ -158,6 +158,62 @@ TEST_F(CallingConventionAnalysisTest, DetectsWin64FourParams) {
   EXPECT_EQ(abi->params[3].reg_name, "R9");
 }
 
+TEST_F(CallingConventionAnalysisTest, NonEntryR8ReadDoesNotAddThirdParam) {
+  // Entry uses RCX/RDX (2 params). A later R8 read should not be treated as
+  // an additional ABI parameter.
+  auto M = createModuleWithState({
+      {"RCX", 16},
+      {"RDX", 24},
+  });
+
+  auto *test_fn = M->getFunction("sub_401000");
+  ASSERT_NE(test_fn, nullptr);
+  ASSERT_FALSE(test_fn->empty());
+
+  auto *ret_inst = llvm::dyn_cast<llvm::ReturnInst>(
+      test_fn->getEntryBlock().getTerminator());
+  ASSERT_NE(ret_inst, nullptr);
+  llvm::Value *ret_val = ret_inst->getReturnValue();
+
+  auto *late_bb = llvm::BasicBlock::Create(Ctx, "late", test_fn);
+  llvm::IRBuilder<> BE(ret_inst);
+  BE.CreateBr(late_bb);
+  ret_inst->eraseFromParent();
+
+  llvm::IRBuilder<> BL(late_bb);
+  auto *state = test_fn->getArg(0);
+  auto *r8_gep = BL.CreateConstGEP1_64(BL.getInt8Ty(), state, 64);
+  BL.CreateLoad(BL.getInt64Ty(), r8_gep, "late_r8");
+  BL.CreateRet(ret_val);
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+
+  auto result = MAM.getResult<omill::CallingConventionAnalysis>(*M);
+  auto *abi = result.getABI(test_fn);
+  ASSERT_NE(abi, nullptr);
+
+  EXPECT_EQ(abi->cc, omill::DetectedCC::kWin64);
+  EXPECT_EQ(abi->numParams(), 2u);
+  EXPECT_EQ(abi->params[0].reg_name, "RCX");
+  EXPECT_EQ(abi->params[1].reg_name, "RDX");
+
+  bool found_r8_extra = false;
+  for (auto off : abi->extra_gpr_live_ins) {
+    if (off == 64u) found_r8_extra = true;
+  }
+  EXPECT_FALSE(found_r8_extra);
+}
+
 TEST_F(CallingConventionAnalysisTest, DefaultsToWin64WhenNoParamRegsDetected) {
   // When no parameter registers are read in the entry block (e.g. obfuscated
   // functions with SSE mutation), default to Win64 with all 4 params.

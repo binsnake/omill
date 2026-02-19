@@ -64,7 +64,8 @@ int64_t resolveStateOffset(llvm::Value *ptr, const llvm::DataLayout &DL) {
 /// Compute live-in and live-out State field offsets for a function.
 void computeLiveness(llvm::Function &F, const llvm::DataLayout &DL,
                      llvm::DenseSet<unsigned> &live_in,
-                     llvm::DenseSet<unsigned> &live_out) {
+                     llvm::DenseSet<unsigned> &live_out,
+                     llvm::DenseSet<unsigned> &entry_live_in) {
   llvm::DenseSet<unsigned> ever_written;
   llvm::DenseSet<unsigned> written_in_entry;
 
@@ -77,6 +78,7 @@ void computeLiveness(llvm::Function &F, const llvm::DataLayout &DL,
           unsigned u = static_cast<unsigned>(off);
           if (!written_in_entry.count(u)) {
             live_in.insert(u);
+            entry_live_in.insert(u);
           }
         }
       }
@@ -116,6 +118,33 @@ void computeLiveness(llvm::Function &F, const llvm::DataLayout &DL,
   live_out = ever_written;
 }
 
+void addFieldOffsetIfPresent(const StateFieldMap &field_map,
+                             llvm::StringRef name,
+                             llvm::DenseSet<unsigned> &offsets) {
+  if (auto field = field_map.fieldByName(name); field.has_value()) {
+    offsets.insert(field->offset);
+  }
+}
+
+llvm::DenseSet<unsigned> collectWin64ParamRegisterOffsets(
+    const StateFieldMap &field_map) {
+  llvm::DenseSet<unsigned> offsets;
+
+  // Include common aliases because remill naming can vary by module
+  // (e.g. RCX vs CL, R8 vs R8D).
+  static constexpr const char *kParamRegAliases[] = {
+      "RCX", "ECX", "CX", "CL",
+      "RDX", "EDX", "DX", "DL",
+      "R8",  "R8D", "R8W", "R8B",
+      "R9",  "R9D", "R9W", "R9B",
+  };
+  for (auto *name : kParamRegAliases) {
+    addFieldOffsetIfPresent(field_map, name, offsets);
+  }
+
+  return offsets;
+}
+
 /// Count how many consecutive Win64 parameter registers are live-in.
 unsigned scoreWin64Params(const llvm::DenseSet<unsigned> &live_in,
                           const StateFieldMap &field_map) {
@@ -139,11 +168,12 @@ FunctionABI analyzeFunction(llvm::Function &F, const llvm::DataLayout &DL,
   if (F.isDeclaration() || F.empty()) return abi;
   if (F.arg_size() == 0) return abi;
 
-  llvm::DenseSet<unsigned> live_in, live_out;
-  computeLiveness(F, DL, live_in, live_out);
+  llvm::DenseSet<unsigned> live_in, live_out, entry_live_in;
+  computeLiveness(F, DL, live_in, live_out, entry_live_in);
 
-  // Win64 detection: check parameter registers RCX, RDX, R8, R9.
-  unsigned win64_score = scoreWin64Params(live_in, field_map);
+  // Win64 detection: use entry-block read-before-write signals only.
+  // Non-entry reads are often transformed temporaries, not true ABI params.
+  unsigned win64_score = scoreWin64Params(entry_live_in, field_map);
 
   if (win64_score > 0) {
     abi.cc = DetectedCC::kWin64;
@@ -267,9 +297,15 @@ FunctionABI analyzeFunction(llvm::Function &F, const llvm::DataLayout &DL,
     // Build set of offsets to exclude: standard params + callee-saved +
     // RSP/RIP + volatile scratch (RAX=return, R10/R11=scratch).
     // In Win64, only RCX/RDX/R8/R9 can be params, and those are already
-    // handled as standard params.  All other GPRs are either callee-saved,
+    // handled as standard params.  Exclude param-register offsets explicitly
+    // too, since some modules use alias names (e.g. R8D) that can evade the
+    // standard-param map and appear as false "extra" GPRs.
+    // All other GPRs are either callee-saved,
     // return value, stack pointer, program counter, or scratch.
     llvm::DenseSet<unsigned> excluded_offsets = standard_param_offsets;
+    auto win64_param_offsets = collectWin64ParamRegisterOffsets(field_map);
+    excluded_offsets.insert(win64_param_offsets.begin(),
+                            win64_param_offsets.end());
     for (unsigned i = 0; i < kWin64CalleeSavedCount; ++i) {
       auto field = field_map.fieldByName(kWin64CalleeSaved[i]);
       if (field)
