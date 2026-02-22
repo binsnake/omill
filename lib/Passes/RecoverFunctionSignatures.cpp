@@ -17,30 +17,33 @@ namespace {
 /// Build a native function type from recovered ABI info.
 llvm::FunctionType *buildNativeType(const FunctionABI &abi,
                                      llvm::LLVMContext &Ctx) {
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *xmm_ty = llvm::FixedVectorType::get(i64_ty, 2);
+
   llvm::Type *ret_ty;
   if (abi.ret.has_value()) {
-    // Return i64 for GPR returns (RAX).
-    ret_ty = llvm::Type::getInt64Ty(Ctx);
+    ret_ty = abi.ret->is_vector ? static_cast<llvm::Type *>(xmm_ty) : i64_ty;
   } else {
     ret_ty = llvm::Type::getVoidTy(Ctx);
   }
 
-  llvm::SmallVector<llvm::Type *, 6> param_types;
-  for (unsigned i = 0; i < abi.numParams(); ++i) {
-    // All GPR params are i64.
-    param_types.push_back(llvm::Type::getInt64Ty(Ctx));
-  }
+  llvm::SmallVector<llvm::Type *, 10> param_types;
 
-  // XMM live-ins are passed as <2 x i64> (128-bit) params after GPRs.
-  auto *xmm_ty = llvm::FixedVectorType::get(llvm::Type::getInt64Ty(Ctx), 2);
-  for (unsigned i = 0; i < abi.numXMMParams(); ++i) {
+  // GPR params (i64).
+  for (unsigned i = 0; i < abi.numParams(); ++i)
+    param_types.push_back(i64_ty);
+
+  // Stack-passed params (i64 each).
+  for (unsigned i = 0; i < abi.numStackParams(); ++i)
+    param_types.push_back(i64_ty);
+
+  // XMM live-ins (<2 x i64>).
+  for (unsigned i = 0; i < abi.numXMMParams(); ++i)
     param_types.push_back(xmm_ty);
-  }
 
-  // Extra GPR live-ins (callee-saved regs) as i64 params after XMMs.
-  for (unsigned i = 0; i < abi.numExtraGPRParams(); ++i) {
-    param_types.push_back(llvm::Type::getInt64Ty(Ctx));
-  }
+  // Extra GPR live-ins (i64).
+  for (unsigned i = 0; i < abi.numExtraGPRParams(); ++i)
+    param_types.push_back(i64_ty);
 
   return llvm::FunctionType::get(ret_ty, param_types, false);
 }
@@ -126,9 +129,28 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
     Builder.CreateStore(param, field_ptr);
   }
 
+  // Store stack-passed parameters to the caller's stack area.
+  // In the native wrapper, we need to store them at the appropriate
+  // RSP-relative offsets so the lifted function can read them.
+  if (auto rsp = field_map.fieldByName("RSP"); rsp.has_value()) {
+    for (unsigned i = 0; i < abi.numStackParams(); ++i) {
+      unsigned arg_idx = abi.numParams() + i;
+      auto *param = native_fn->getArg(arg_idx);
+      // Store at RSP + stack_offset (the callee will load from there).
+      auto *rsp_ptr = buildStateGEP(Builder, state_alloca, rsp->offset);
+      auto *rsp_val = Builder.CreateLoad(Builder.getInt64Ty(), rsp_ptr, "rsp");
+      auto *addr = Builder.CreateAdd(
+          rsp_val, Builder.getInt64(abi.stack_params[i].stack_offset));
+      auto *ptr = Builder.CreateIntToPtr(addr,
+          llvm::PointerType::get(Builder.getContext(), 0));
+      Builder.CreateStore(param, ptr);
+    }
+  }
+
   // Store XMM parameters into State vector register slots.
   for (unsigned i = 0; i < abi.numXMMParams(); ++i) {
-    auto *param = native_fn->getArg(abi.numParams() + i);
+    unsigned arg_idx = abi.numParams() + abi.numStackParams() + i;
+    auto *param = native_fn->getArg(arg_idx);
     auto *field_ptr = buildStateGEP(Builder, state_alloca,
                                      abi.xmm_live_ins[i]);
     Builder.CreateStore(param, field_ptr);
@@ -136,7 +158,8 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
 
   // Store extra GPR parameters into State fields.
   for (unsigned i = 0; i < abi.numExtraGPRParams(); ++i) {
-    unsigned arg_idx = abi.numParams() + abi.numXMMParams() + i;
+    unsigned arg_idx = abi.numParams() + abi.numStackParams() +
+                       abi.numXMMParams() + i;
     auto *param = native_fn->getArg(arg_idx);
     auto *field_ptr = buildStateGEP(Builder, state_alloca,
                                      abi.extra_gpr_live_ins[i]);
@@ -169,7 +192,13 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
   if (abi.ret.has_value()) {
     auto *ret_ptr = buildStateGEP(Builder, state_alloca,
                                    abi.ret->state_offset);
-    auto *ret_val = Builder.CreateLoad(Builder.getInt64Ty(), ret_ptr, "retval");
+    llvm::Type *load_ty;
+    if (abi.ret->is_vector) {
+      load_ty = llvm::FixedVectorType::get(Builder.getInt64Ty(), 2);
+    } else {
+      load_ty = Builder.getInt64Ty();
+    }
+    auto *ret_val = Builder.CreateLoad(load_ty, ret_ptr, "retval");
     Builder.CreateRet(ret_val);
   } else {
     Builder.CreateRetVoid();

@@ -445,6 +445,15 @@ llvm::PreservedAnalyses StackConcretizationPass::run(
       auto *frame_alloca =
           EntryBuilder.CreateAlloca(frame_ty, nullptr, "concrete_stack");
 
+      // Attach metadata recording the RSP base offset so downstream passes
+      // (e.g. CallingConventionAnalysis) can reconstruct original offsets.
+      auto &Ctx = F.getContext();
+      auto *md_offset = llvm::ConstantAsMetadata::get(
+          llvm::ConstantInt::get(i64_ty, min_off));
+      frame_alloca->setMetadata(
+          "omill.stack.base_offset",
+          llvm::MDNode::get(Ctx, {md_offset}));
+
       for (auto *itp : all_itp) {
         int64_t const_off = 0;
         if (!traceToBase(itp->getOperand(0), base, const_off))

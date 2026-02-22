@@ -27,9 +27,17 @@ struct RecoveredParam {
 
 /// Describes the recovered return value.
 struct RecoveredReturn {
-  std::string reg_name;   // Typically "RAX"
+  std::string reg_name;   // Typically "RAX" or "XMM0"
   unsigned state_offset;
   unsigned size;
+  bool is_vector = false; // True for XMM0 (<2 x i64>) returns
+};
+
+/// Describes a stack-passed parameter (5th+ in Win64).
+struct RecoveredStackParam {
+  int64_t stack_offset;   // Offset from caller RSP (e.g., 0x28 for 5th arg)
+  unsigned size;          // Size in bytes (typically 8)
+  unsigned index;         // Overall parameter index (4-based for Win64)
 };
 
 /// Per-function calling convention analysis result.
@@ -57,6 +65,9 @@ struct FunctionABI {
   /// as extra <2 x i64> parameters after the GPR params.
   llvm::SmallVector<unsigned, 4> xmm_live_ins;
 
+  /// Stack-passed parameters (5th+ in Win64), detected from callsite analysis.
+  llvm::SmallVector<RecoveredStackParam, 4> stack_params;
+
   /// Extra GPR live-ins that are NOT standard Win64 params (callee-saved regs
   /// like RBX, RSI, R14 that the function reads before writing).  These are
   /// passed as extra i64 parameters after XMM params.
@@ -66,8 +77,10 @@ struct FunctionABI {
   unsigned numParams() const { return params.size(); }
   unsigned numXMMParams() const { return xmm_live_ins.size(); }
   unsigned numExtraGPRParams() const { return extra_gpr_live_ins.size(); }
+  unsigned numStackParams() const { return stack_params.size(); }
   unsigned totalNativeParams() const {
-    return numParams() + numXMMParams() + numExtraGPRParams();
+    return numParams() + numStackParams() + numXMMParams() +
+           numExtraGPRParams();
   }
 };
 

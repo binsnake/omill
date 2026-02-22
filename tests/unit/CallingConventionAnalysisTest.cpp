@@ -402,4 +402,344 @@ TEST_F(CallingConventionAnalysisTest, VoidReturnWrapper) {
   EXPECT_TRUE(abi->isVoid());
 }
 
+// ===----------------------------------------------------------------------===
+// Test: Callsite-driven param count refinement
+// ===----------------------------------------------------------------------===
+
+TEST_F(CallingConventionAnalysisTest, CallsiteRefinesParamCount) {
+  // Callee body has no visible param reads (obfuscated).
+  // But the caller stores RCX, RDX, R8, R9 before calling it.
+  // The callsite analysis should detect 4 params.
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *state_ty = llvm::StructType::create(Ctx, "struct.State");
+  auto *arr_ty = llvm::ArrayType::get(llvm::Type::getInt8Ty(Ctx), 3504);
+  state_ty->setBody({arr_ty});
+
+  // __remill_basic_block with register GEPs.
+  auto *bb_fn_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *bb_fn = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "__remill_basic_block", *M);
+  auto *bb_entry = llvm::BasicBlock::Create(Ctx, "entry", bb_fn);
+  llvm::IRBuilder<> BBB(bb_entry);
+  auto *bb_state = bb_fn->getArg(0);
+  struct RegDef { const char *name; unsigned offset; };
+  RegDef all_regs[] = {
+      {"RAX", 0}, {"RBX", 8}, {"RCX", 16}, {"RDX", 24},
+      {"RSI", 32}, {"RDI", 40}, {"RSP", 48}, {"RBP", 56},
+      {"R8", 64}, {"R9", 72}, {"R10", 80}, {"R11", 88},
+      {"R12", 96}, {"R13", 104}, {"R14", 112}, {"R15", 120},
+      {"RIP", 128},
+  };
+  for (auto &reg : all_regs) {
+    auto *gep = BBB.CreateGEP(BBB.getInt64Ty(), bb_state,
+                              BBB.getInt64(reg.offset / 8));
+    gep->setName(reg.name);
+  }
+  BBB.CreateRet(bb_fn->getArg(2));
+
+  // Callee: lifted function with no visible param reads (obfuscated body).
+  auto *fn_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *callee_fn = llvm::Function::Create(
+      fn_ty, llvm::Function::ExternalLinkage, "sub_402000", *M);
+  auto *callee_entry = llvm::BasicBlock::Create(Ctx, "entry", callee_fn);
+  llvm::IRBuilder<> CB(callee_entry);
+  // Just return — no param reads, so body analysis detects 0 params.
+  // But fallback defaults to 4 params.  Callsite should confirm this.
+  CB.CreateRet(callee_fn->getArg(2));
+
+  // Caller: stores RCX, RDX, R8 before dispatch_call to callee.
+  auto *caller_fn = llvm::Function::Create(
+      fn_ty, llvm::Function::ExternalLinkage, "sub_401000", *M);
+  auto *caller_entry = llvm::BasicBlock::Create(Ctx, "entry", caller_fn);
+  llvm::IRBuilder<> B(caller_entry);
+
+  auto *state = caller_fn->getArg(0);
+  auto *mem = caller_fn->getArg(2);
+
+  // Store RCX (offset 16), RDX (24), R8 (64).
+  B.CreateStore(B.getInt64(100),
+                B.CreateConstGEP1_64(B.getInt8Ty(), state, 16));
+  B.CreateStore(B.getInt64(200),
+                B.CreateConstGEP1_64(B.getInt8Ty(), state, 24));
+  B.CreateStore(B.getInt64(300),
+                B.CreateConstGEP1_64(B.getInt8Ty(), state, 64));
+
+  // dispatch_call to callee.
+  auto *dispatch_fn = llvm::Function::Create(
+      fn_ty, llvm::Function::ExternalLinkage, "__omill_dispatch_call", *M);
+  auto *va = B.getInt64(0x402000);
+  B.CreateCall(dispatch_fn, {state, va, mem});
+
+  // Store RAX to mark function non-void.
+  B.CreateStore(B.getInt64(42),
+                B.CreateConstGEP1_64(B.getInt8Ty(), state, 0));
+  B.CreateRet(mem);
+
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+
+  auto result = MAM.getResult<omill::CallingConventionAnalysis>(*M);
+
+  // Callee should have at least 3 params from callsite evidence.
+  auto *abi = result.getABI(callee_fn);
+  ASSERT_NE(abi, nullptr);
+  // The callee body defaults to 4 params (no param reads → fallback).
+  // Callsite shows 3 consecutive (RCX, RDX, R8 but not R9).
+  // The max of body(4) and callsite(3) = 4.
+  EXPECT_GE(abi->numParams(), 3u);
+}
+
+// ===----------------------------------------------------------------------===
+// Test: Stack argument detection from callsite
+// ===----------------------------------------------------------------------===
+
+TEST_F(CallingConventionAnalysisTest, CallsiteDetectsStackArgs) {
+  // Caller stores to RSP+0x28 and RSP+0x30 (5th and 6th args) via inttoptr
+  // before dispatch_call.  The analysis should detect 2 stack params.
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *state_ty = llvm::StructType::create(Ctx, "struct.State");
+  auto *arr_ty = llvm::ArrayType::get(llvm::Type::getInt8Ty(Ctx), 3504);
+  state_ty->setBody({arr_ty});
+
+  auto *bb_fn_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *bb_fn = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "__remill_basic_block", *M);
+  auto *bb_entry = llvm::BasicBlock::Create(Ctx, "entry", bb_fn);
+  llvm::IRBuilder<> BBB(bb_entry);
+  auto *bb_state = bb_fn->getArg(0);
+  struct RegDef { const char *name; unsigned offset; };
+  RegDef all_regs[] = {
+      {"RAX", 0}, {"RBX", 8}, {"RCX", 16}, {"RDX", 24},
+      {"RSI", 32}, {"RDI", 40}, {"RSP", 48}, {"RBP", 56},
+      {"R8", 64}, {"R9", 72}, {"R10", 80}, {"R11", 88},
+      {"R12", 96}, {"R13", 104}, {"R14", 112}, {"R15", 120},
+      {"RIP", 128},
+  };
+  for (auto &reg : all_regs) {
+    auto *gep = BBB.CreateGEP(BBB.getInt64Ty(), bb_state,
+                              BBB.getInt64(reg.offset / 8));
+    gep->setName(reg.name);
+  }
+  BBB.CreateRet(bb_fn->getArg(2));
+
+  auto *fn_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+
+  // Callee: reads RCX only.
+  auto *callee_fn = llvm::Function::Create(
+      fn_ty, llvm::Function::ExternalLinkage, "sub_403000", *M);
+  auto *callee_entry = llvm::BasicBlock::Create(Ctx, "entry", callee_fn);
+  llvm::IRBuilder<> CB(callee_entry);
+  CB.CreateLoad(i64_ty,
+                CB.CreateConstGEP1_64(CB.getInt8Ty(), callee_fn->getArg(0), 16),
+                "rcx_val");
+  CB.CreateStore(CB.getInt64(42),
+                 CB.CreateConstGEP1_64(CB.getInt8Ty(), callee_fn->getArg(0), 0));
+  CB.CreateRet(callee_fn->getArg(2));
+
+  // Caller: stores all 4 GPR params + 2 stack args, then dispatch_call.
+  auto *caller_fn = llvm::Function::Create(
+      fn_ty, llvm::Function::ExternalLinkage, "sub_401000", *M);
+  auto *caller_entry = llvm::BasicBlock::Create(Ctx, "entry", caller_fn);
+  llvm::IRBuilder<> B(caller_entry);
+
+  auto *state = caller_fn->getArg(0);
+  auto *mem = caller_fn->getArg(2);
+
+  // Store all 4 GPR params.
+  B.CreateStore(B.getInt64(1),
+                B.CreateConstGEP1_64(B.getInt8Ty(), state, 16));  // RCX
+  B.CreateStore(B.getInt64(2),
+                B.CreateConstGEP1_64(B.getInt8Ty(), state, 24));  // RDX
+  B.CreateStore(B.getInt64(3),
+                B.CreateConstGEP1_64(B.getInt8Ty(), state, 64));  // R8
+  B.CreateStore(B.getInt64(4),
+                B.CreateConstGEP1_64(B.getInt8Ty(), state, 72));  // R9
+
+  // Store stack args at RSP+0x28 and RSP+0x30 via inttoptr(RSP + offset).
+  auto *rsp_val = B.CreateLoad(
+      i64_ty, B.CreateConstGEP1_64(B.getInt8Ty(), state, 48), "rsp");
+  auto *addr5 = B.CreateAdd(rsp_val, B.getInt64(0x28));
+  auto *ptr5 = B.CreateIntToPtr(addr5, ptr_ty);
+  B.CreateStore(B.getInt64(5), ptr5);
+
+  auto *addr6 = B.CreateAdd(rsp_val, B.getInt64(0x30));
+  auto *ptr6 = B.CreateIntToPtr(addr6, ptr_ty);
+  B.CreateStore(B.getInt64(6), ptr6);
+
+  // dispatch_call to callee.
+  auto *dispatch_fn = llvm::Function::Create(
+      fn_ty, llvm::Function::ExternalLinkage, "__omill_dispatch_call", *M);
+  B.CreateCall(dispatch_fn, {state, B.getInt64(0x403000), mem});
+
+  B.CreateStore(B.getInt64(99),
+                B.CreateConstGEP1_64(B.getInt8Ty(), state, 0));
+  B.CreateRet(mem);
+
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+
+  auto result = MAM.getResult<omill::CallingConventionAnalysis>(*M);
+
+  auto *abi = result.getABI(callee_fn);
+  ASSERT_NE(abi, nullptr);
+
+  // Should have 4 GPR params (callsite evidence).
+  EXPECT_EQ(abi->numParams(), 4u);
+
+  // Should have 2 stack params (RSP+0x28 and RSP+0x30).
+  EXPECT_EQ(abi->numStackParams(), 2u);
+  if (abi->numStackParams() >= 2u) {
+    EXPECT_EQ(abi->stack_params[0].stack_offset, 0x28);
+    EXPECT_EQ(abi->stack_params[1].stack_offset, 0x30);
+  }
+}
+
+// ===----------------------------------------------------------------------===
+// Test: Stack arg detection via concrete_stack alloca with metadata
+// ===----------------------------------------------------------------------===
+
+TEST_F(CallingConventionAnalysisTest, CallsiteDetectsStackArgsFromMetadata) {
+  // Same as above but using a concrete_stack alloca with metadata
+  // (simulating post-StackConcretization IR).
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *i8_ty = llvm::Type::getInt8Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *state_ty = llvm::StructType::create(Ctx, "struct.State");
+  auto *state_arr_ty = llvm::ArrayType::get(i8_ty, 3504);
+  state_ty->setBody({state_arr_ty});
+
+  auto *bb_fn_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *bb_fn = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "__remill_basic_block", *M);
+  auto *bb_entry = llvm::BasicBlock::Create(Ctx, "entry", bb_fn);
+  llvm::IRBuilder<> BBB(bb_entry);
+  auto *bb_state = bb_fn->getArg(0);
+  struct RegDef { const char *name; unsigned offset; };
+  RegDef all_regs[] = {
+      {"RAX", 0}, {"RBX", 8}, {"RCX", 16}, {"RDX", 24},
+      {"RSI", 32}, {"RDI", 40}, {"RSP", 48}, {"RBP", 56},
+      {"R8", 64}, {"R9", 72}, {"R10", 80}, {"R11", 88},
+      {"R12", 96}, {"R13", 104}, {"R14", 112}, {"R15", 120},
+      {"RIP", 128},
+  };
+  for (auto &reg : all_regs) {
+    auto *gep = BBB.CreateGEP(BBB.getInt64Ty(), bb_state,
+                              BBB.getInt64(reg.offset / 8));
+    gep->setName(reg.name);
+  }
+  BBB.CreateRet(bb_fn->getArg(2));
+
+  auto *fn_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+
+  // Callee.
+  auto *callee_fn = llvm::Function::Create(
+      fn_ty, llvm::Function::ExternalLinkage, "sub_404000", *M);
+  auto *callee_entry = llvm::BasicBlock::Create(Ctx, "entry", callee_fn);
+  llvm::IRBuilder<> CB(callee_entry);
+  CB.CreateStore(CB.getInt64(42),
+                 CB.CreateConstGEP1_64(CB.getInt8Ty(), callee_fn->getArg(0), 0));
+  CB.CreateRet(callee_fn->getArg(2));
+
+  // Caller with concrete_stack alloca.
+  auto *caller_fn = llvm::Function::Create(
+      fn_ty, llvm::Function::ExternalLinkage, "sub_401000", *M);
+  auto *caller_entry = llvm::BasicBlock::Create(Ctx, "entry", caller_fn);
+  llvm::IRBuilder<> B(caller_entry);
+
+  auto *state = caller_fn->getArg(0);
+  auto *mem = caller_fn->getArg(2);
+
+  // Create concrete_stack alloca with metadata: base RSP offset = 0.
+  // So GEP at index 0x28 = RSP+0x28 (5th arg).
+  auto *frame_ty = llvm::ArrayType::get(i8_ty, 0x40);  // covers 0x00..0x3F
+  auto *frame_alloca = B.CreateAlloca(frame_ty, nullptr, "concrete_stack");
+  auto *md_offset = llvm::ConstantAsMetadata::get(B.getInt64(0));
+  frame_alloca->setMetadata(
+      "omill.stack.base_offset",
+      llvm::MDNode::get(Ctx, {md_offset}));
+
+  // Store RCX param.
+  B.CreateStore(B.getInt64(1),
+                B.CreateConstGEP1_64(B.getInt8Ty(), state, 16));
+
+  // Store stack arg at GEP offset 0x28 (RSP+0x28 because base=0).
+  auto *stack_ptr5 = B.CreateConstGEP1_64(i8_ty, frame_alloca, 0x28);
+  B.CreateStore(B.getInt64(5), stack_ptr5);
+
+  // dispatch_call.
+  auto *dispatch_fn = llvm::Function::Create(
+      fn_ty, llvm::Function::ExternalLinkage, "__omill_dispatch_call", *M);
+  B.CreateCall(dispatch_fn, {state, B.getInt64(0x404000), mem});
+  B.CreateStore(B.getInt64(99),
+                B.CreateConstGEP1_64(B.getInt8Ty(), state, 0));
+  B.CreateRet(mem);
+
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+
+  auto result = MAM.getResult<omill::CallingConventionAnalysis>(*M);
+
+  auto *abi = result.getABI(callee_fn);
+  ASSERT_NE(abi, nullptr);
+
+  // Should detect 1 stack param from the metadata-annotated alloca.
+  EXPECT_GE(abi->numStackParams(), 1u);
+  if (abi->numStackParams() >= 1u) {
+    EXPECT_EQ(abi->stack_params[0].stack_offset, 0x28);
+  }
+}
+
 }  // namespace

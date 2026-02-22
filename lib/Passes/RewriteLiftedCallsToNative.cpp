@@ -46,6 +46,13 @@ void buildStateStore(llvm::IRBuilder<> &Builder, llvm::Value *state_ptr,
   Builder.CreateStore(val, gep);
 }
 
+void buildStateStoreVec(llvm::IRBuilder<> &Builder, llvm::Value *state_ptr,
+                        uint64_t offset, llvm::Value *val) {
+  auto *gep = Builder.CreateGEP(Builder.getInt8Ty(), state_ptr,
+                                Builder.getInt64(offset));
+  Builder.CreateStore(val, gep);
+}
+
 llvm::Value *normalizeJumpTargetPC(llvm::IRBuilder<> &Builder,
                                    llvm::Value *target_pc,
                                    const BinaryMemoryMap *map) {
@@ -281,21 +288,38 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
 
         llvm::IRBuilder<> Builder(cand.call);
 
-        llvm::SmallVector<llvm::Value *, 8> args;
+        llvm::SmallVector<llvm::Value *, 12> args;
+
+        // GPR params from State.
         for (auto &param : abi->params) {
           args.push_back(buildStateLoad(
               Builder, cand.state_ptr, param.state_offset,
               llvm::StringRef(param.reg_name).lower()));
         }
 
-        // Pass XMM live-in values from State as extra <2 x i64> args.
+        // Stack-passed params: load from caller's RSP-relative stack area.
+        for (auto &sp : abi->stack_params) {
+          // Load RSP, add stack_offset, load the value from that address.
+          auto *rsp_val = buildStateLoad(Builder, cand.state_ptr,
+                                         48, "rsp_for_stack");
+          auto *addr = Builder.CreateAdd(
+              rsp_val, Builder.getInt64(sp.stack_offset),
+              "stack_arg_addr");
+          auto *ptr = Builder.CreateIntToPtr(
+              addr, llvm::PointerType::get(Builder.getContext(), 0));
+          auto *val = Builder.CreateLoad(Builder.getInt64Ty(), ptr,
+                                         "stack_arg");
+          args.push_back(val);
+        }
+
+        // XMM live-in values from State as extra <2 x i64> args.
         for (auto xmm_off : abi->xmm_live_ins) {
           args.push_back(buildStateLoadVec(
               Builder, cand.state_ptr, xmm_off,
               "xmm_" + llvm::Twine(xmm_off)));
         }
 
-        // Pass extra GPR live-in values from State as extra i64 args.
+        // Extra GPR live-in values from State as extra i64 args.
         for (auto gpr_off : abi->extra_gpr_live_ins) {
           args.push_back(buildStateLoad(
               Builder, cand.state_ptr, gpr_off,
@@ -308,8 +332,13 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
                                               : "");
 
         if (abi->ret.has_value()) {
-          buildStateStore(Builder, cand.state_ptr, abi->ret->state_offset,
-                          result);
+          if (abi->ret->is_vector) {
+            buildStateStoreVec(Builder, cand.state_ptr,
+                               abi->ret->state_offset, result);
+          } else {
+            buildStateStore(Builder, cand.state_ptr,
+                            abi->ret->state_offset, result);
+          }
         }
       } else {
         // Dynamic dispatch_call target: emit an indirect call through target PC.

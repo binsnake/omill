@@ -1,10 +1,14 @@
 #include "omill/Analysis/CallingConventionAnalysis.h"
 
 #include <llvm/ADT/DenseSet.h>
+#include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/Metadata.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Operator.h>
+
+#include <algorithm>
 
 #include "omill/Utils/LiftedNames.h"
 #include "omill/Utils/StateFieldMap.h"
@@ -208,14 +212,41 @@ FunctionABI analyzeFunction(llvm::Function &F, const llvm::DataLayout &DL,
     }
   }
 
-  // Return value: RAX for integer, XMM0 for float (check RAX first).
+  // Return value: RAX for integer, XMM0 for float.
+  // Check RAX first (most common); fall back to XMM0 if RAX is not live-out.
   auto rax_field = field_map.fieldByName("RAX");
   if (rax_field && live_out.count(rax_field->offset)) {
     RecoveredReturn ret;
     ret.reg_name = "RAX";
     ret.state_offset = rax_field->offset;
     ret.size = rax_field->size;
+    ret.is_vector = false;
     abi.ret = ret;
+  } else {
+    // XMM0 return: Win64 returns floats/doubles in XMM0 (first vector reg).
+    // Use the field map to find vector registers dynamically.
+    for (auto off : live_out) {
+      auto field = field_map.fieldAtOffset(off);
+      if (!field)
+        continue;
+      if (field->category != StateFieldCategory::kVector)
+        continue;
+      // Only XMM0 can be a return register.  Check if this is the first
+      // vector register base (offset within the first 64-byte VectorReg).
+      // VectorReg[0] base is the field's parent offset.
+      unsigned vreg_idx = 0;
+      if (off >= 16 && off < 2064)
+        vreg_idx = (off - 16) / 64;
+      if (vreg_idx == 0) {
+        RecoveredReturn ret;
+        ret.reg_name = "XMM0";
+        ret.state_offset = field->offset;
+        ret.size = 16;
+        ret.is_vector = true;
+        abi.ret = ret;
+        break;
+      }
+    }
   }
 
   // Detect XMM/vector live-ins.  In Win64 ABI, only XMM0-XMM3 can be
@@ -465,6 +496,228 @@ static void propagateCalleeXMMLiveIns(
   }
 }
 
+/// Win64 shadow space size (bytes).
+static constexpr int64_t kShadowSpaceEnd = 0x28;  // 5th arg starts at RSP+0x28
+
+/// Try to resolve a store pointer to a stack offset relative to RSP.
+/// Returns the RSP-relative offset if the pointer is a GEP into a
+/// concrete_stack alloca with omill.stack.base_offset metadata, or an
+/// inttoptr(RSP + offset) pattern.
+std::optional<int64_t> resolveStackOffset(llvm::Value *ptr,
+                                           const llvm::DataLayout &DL) {
+  // Pattern 1: GEP into concrete_stack alloca with metadata.
+  if (auto *GEP = llvm::dyn_cast<llvm::GEPOperator>(ptr)) {
+    llvm::APInt ap_offset(64, 0);
+    if (!GEP->accumulateConstantOffset(DL, ap_offset))
+      return std::nullopt;
+    auto *base_alloca = llvm::dyn_cast<llvm::AllocaInst>(
+        GEP->getPointerOperand()->stripPointerCasts());
+    if (!base_alloca)
+      return std::nullopt;
+    auto *md = base_alloca->getMetadata("omill.stack.base_offset");
+    if (!md || md->getNumOperands() == 0)
+      return std::nullopt;
+    auto *ci = llvm::mdconst::dyn_extract<llvm::ConstantInt>(
+        md->getOperand(0));
+    if (!ci)
+      return std::nullopt;
+    int64_t base_rsp_offset = ci->getSExtValue();
+    int64_t gep_offset = ap_offset.getSExtValue();
+    return base_rsp_offset + gep_offset;
+  }
+
+  // Pattern 2: inttoptr(add(load(State+48), const)).
+  if (auto *ITP = llvm::dyn_cast<llvm::IntToPtrInst>(ptr)) {
+    auto *val = ITP->getOperand(0);
+    // add(rsp_load, offset)
+    if (auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(val)) {
+      if (BO->getOpcode() != llvm::Instruction::Add)
+        return std::nullopt;
+      auto *CI = llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(1));
+      if (!CI)
+        return std::nullopt;
+      // Check if operand 0 is a load from State+48 (RSP).
+      auto *LI = llvm::dyn_cast<llvm::LoadInst>(BO->getOperand(0));
+      if (!LI)
+        return std::nullopt;
+      int64_t state_off = resolveStateOffset(LI->getPointerOperand(), DL);
+      if (state_off != 48)  // RSP offset
+        return std::nullopt;
+      return CI->getSExtValue();
+    }
+  }
+
+  return std::nullopt;
+}
+
+/// Information about a single callsite for stack arg analysis.
+struct CallsiteInfo {
+  const llvm::Function *callee_def = nullptr;
+  unsigned gpr_param_count = 0;
+  llvm::SmallVector<int64_t, 4> stack_arg_offsets;  // RSP+offset for each
+};
+
+/// Analyze a single callsite: count register params stored and detect
+/// stack arg stores in the same basic block before the call.
+CallsiteInfo analyzeCallsite(llvm::CallInst *CI, const llvm::DataLayout &DL,
+    const StateFieldMap &field_map,
+    const llvm::DenseMap<uint64_t, const llvm::Function *> &va_to_def) {
+  CallsiteInfo info;
+
+  // Resolve callee.
+  auto *callee = CI->getCalledFunction();
+  if (!callee)
+    return info;
+
+  uint64_t callee_va = 0;
+  if (callee->getName() == "__omill_dispatch_call" ||
+      callee->getName() == "__omill_dispatch_jump") {
+    // Target PC is the second arg.
+    if (CI->arg_size() >= 2) {
+      if (auto *pc_ci = llvm::dyn_cast<llvm::ConstantInt>(CI->getArgOperand(1)))
+        callee_va = pc_ci->getZExtValue();
+    }
+  } else if (isLiftedFunction(*callee)) {
+    callee_va = extractEntryVA(callee->getName());
+  }
+
+  if (callee_va == 0)
+    return info;
+  auto def_it = va_to_def.find(callee_va);
+  if (def_it == va_to_def.end())
+    return info;
+  info.callee_def = def_it->second;
+
+  // Walk backwards in the basic block from the call.
+  auto *BB = CI->getParent();
+  llvm::DenseSet<unsigned> gpr_param_offsets;
+
+  // Collect Win64 param register offsets.
+  auto win64_offsets = collectWin64ParamRegisterOffsets(field_map);
+
+  for (auto it = CI->getReverseIterator(); it != BB->rend(); ++it) {
+    auto *SI = llvm::dyn_cast<llvm::StoreInst>(&*it);
+    if (!SI)
+      continue;
+
+    // Check if it's a State struct store (param register).
+    int64_t state_off = resolveStateOffset(SI->getPointerOperand(), DL);
+    if (state_off >= 0 && win64_offsets.count(static_cast<unsigned>(state_off))) {
+      gpr_param_offsets.insert(static_cast<unsigned>(state_off));
+      continue;
+    }
+
+    // Check if it's a stack store (RSP + offset >= 0x28).
+    auto stack_off = resolveStackOffset(SI->getPointerOperand(), DL);
+    if (stack_off && *stack_off >= kShadowSpaceEnd) {
+      info.stack_arg_offsets.push_back(*stack_off);
+    }
+  }
+
+  // Count consecutive GPR params.
+  static constexpr const char *kParamOrder[] = {"RCX", "RDX", "R8", "R9"};
+  for (unsigned i = 0; i < 4; ++i) {
+    auto field = field_map.fieldByName(kParamOrder[i]);
+    if (!field || !gpr_param_offsets.count(field->offset))
+      break;
+    info.gpr_param_count = i + 1;
+  }
+
+  // Deduplicate and sort stack arg offsets.
+  llvm::sort(info.stack_arg_offsets);
+  info.stack_arg_offsets.erase(
+      std::unique(info.stack_arg_offsets.begin(),
+                 info.stack_arg_offsets.end()),
+      info.stack_arg_offsets.end());
+
+  return info;
+}
+
+/// Refine function ABIs by analyzing callsites across the module.
+/// This catches stack arguments (5th+ Win64 params) and corrects param counts
+/// when the callee body analysis was imprecise due to obfuscation.
+static void refineFromCallsites(
+    llvm::Module &M,
+    llvm::DenseMap<const llvm::Function *, FunctionABI> &abis,
+    const StateFieldMap &field_map) {
+  auto &DL = M.getDataLayout();
+
+  // Build VA → definition map.
+  llvm::DenseMap<uint64_t, const llvm::Function *> va_to_def;
+  for (auto &[func, abi] : abis) {
+    uint64_t va = extractEntryVA(func->getName());
+    if (va != 0)
+      va_to_def[va] = func;
+  }
+
+  // For each callee, collect callsite evidence across all callers.
+  struct CalleeEvidence {
+    unsigned max_gpr_params = 0;
+    llvm::DenseSet<int64_t> all_stack_offsets;
+  };
+  llvm::DenseMap<const llvm::Function *, CalleeEvidence> evidence;
+
+  for (auto &F : M) {
+    if (F.isDeclaration() || F.arg_size() == 0)
+      continue;
+
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+        if (!CI)
+          continue;
+
+        auto cs = analyzeCallsite(CI, DL, field_map, va_to_def);
+        if (!cs.callee_def)
+          continue;
+
+        auto &ev = evidence[cs.callee_def];
+        ev.max_gpr_params = std::max(ev.max_gpr_params, cs.gpr_param_count);
+        for (auto off : cs.stack_arg_offsets)
+          ev.all_stack_offsets.insert(off);
+      }
+    }
+  }
+
+  // Apply evidence to ABIs.
+  for (auto &[func, ev] : evidence) {
+    auto abi_it = abis.find(func);
+    if (abi_it == abis.end())
+      continue;
+    auto &abi = abi_it->second;
+
+    // Upgrade GPR param count if callsite evidence is stronger.
+    if (ev.max_gpr_params > abi.numParams()) {
+      abi.params.clear();
+      for (unsigned i = 0; i < ev.max_gpr_params; ++i) {
+        auto field = field_map.fieldByName(kWin64ParamRegs[i]);
+        if (!field) break;
+        RecoveredParam param;
+        param.reg_name = kWin64ParamRegs[i];
+        param.state_offset = field->offset;
+        param.size = field->size;
+        param.index = i;
+        abi.params.push_back(param);
+      }
+    }
+
+    // Add stack parameters.
+    if (!ev.all_stack_offsets.empty()) {
+      llvm::SmallVector<int64_t, 8> sorted_offsets(
+          ev.all_stack_offsets.begin(), ev.all_stack_offsets.end());
+      llvm::sort(sorted_offsets);
+
+      for (size_t i = 0; i < sorted_offsets.size(); ++i) {
+        RecoveredStackParam sp;
+        sp.stack_offset = sorted_offsets[i];
+        sp.size = 8;  // Win64: all stack args are 8-byte slots
+        sp.index = abi.numParams() + static_cast<unsigned>(i);
+        abi.stack_params.push_back(sp);
+      }
+    }
+  }
+}
+
 CallingConventionInfo CallingConventionAnalysis::run(
     llvm::Module &M, llvm::ModuleAnalysisManager &MAM) {
   CallingConventionInfo result;
@@ -479,6 +732,9 @@ CallingConventionInfo CallingConventionAnalysis::run(
 
   // Propagate callee XMM live-ins to callers (transitive closure).
   propagateCalleeXMMLiveIns(M, result.function_abis);
+
+  // Refine ABIs with callsite evidence (stack args, param count).
+  refineFromCallsites(M, result.function_abis, field_map);
 
   return result;
 }
