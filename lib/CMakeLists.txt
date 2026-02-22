@@ -60,6 +60,7 @@ add_library(omill STATIC
   Passes/StackConcretization.cpp
   Passes/DeadStateStoreDSE.cpp
   Passes/TypeRecovery.cpp
+  Passes/VMHandlerInliner.cpp
   Passes/IterativeBlockDiscovery.cpp
   Passes/MergeBlockFunctions.cpp
   BC/BlockLifterAnalysis.cpp

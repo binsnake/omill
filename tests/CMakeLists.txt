@@ -88,6 +88,7 @@ add_executable(omill-unit-tests
   unit/StackConcretizationTest.cpp
   unit/DeadStateStoreDSETest.cpp
   unit/TypeRecoveryTest.cpp
+  unit/VMHandlerInlinerTest.cpp
 )
 
 target_link_libraries(omill-unit-tests

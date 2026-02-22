@@ -69,6 +69,7 @@
 #include "omill/Passes/SynthesizeFlags.h"
 #include "omill/Passes/StackConcretization.h"
 #include "omill/Passes/TypeRecovery.h"
+#include "omill/Passes/VMHandlerInliner.h"
 #include "omill/Passes/RewriteLiftedCallsToNative.h"
 #if OMILL_ENABLE_Z3
 #include "omill/Passes/Z3DispatchSolver.h"
@@ -887,6 +888,21 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     MPM.addPass(llvm::RequireAnalysisPass<BinaryMemoryAnalysis, llvm::Module>());
     llvm::FunctionPassManager FPM;
     buildDeobfuscationPipeline(FPM);
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+  }
+
+  // Inline VM handler functions identified by callsite frequency analysis.
+  // After deobfuscation has simplified individual functions, small functions
+  // called from multiple dispatch sites are likely VM handlers.  Inlining
+  // exposes their bodies to further optimization.
+  if (opts.deobfuscate && !envDisabled("OMILL_SKIP_VM_HANDLER_INLINE")) {
+    MPM.addPass(VMHandlerInlinerPass());
+    // Re-run function-level cleanup after inlining.
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::GVNPass());
+    FPM.addPass(llvm::ADCEPass());
+    FPM.addPass(llvm::SimplifyCFGPass());
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
