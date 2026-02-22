@@ -68,6 +68,7 @@
 #include "omill/Passes/PointersHoisting.h"
 #include "omill/Passes/SynthesizeFlags.h"
 #include "omill/Passes/StackConcretization.h"
+#include "omill/Passes/TypeRecovery.h"
 #include "omill/Passes/RewriteLiftedCallsToNative.h"
 #if OMILL_ENABLE_Z3
 #include "omill/Passes/Z3DispatchSolver.h"
@@ -515,6 +516,7 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(llvm::GVNPass());
     FPM.addPass(PointersHoistingPass());
+    FPM.addPass(TypeRecoveryPass());
     FPM.addPass(llvm::createFunctionToLoopPassAdaptor(llvm::LoopDeletionPass()));
     FPM.addPass(llvm::ADCEPass());
     FPM.addPass(llvm::SimplifyCFGPass());
@@ -610,6 +612,7 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM) {
   if (!envDisabled("OMILL_SKIP_DEOBF_FINAL_CLEANUP")) {
     FPM.addPass(KnownIndexSelectPass());
     FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(TypeRecoveryPass());
     FPM.addPass(llvm::ADCEPass());
     FPM.addPass(llvm::SimplifyCFGPass());
   }

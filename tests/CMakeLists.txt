@@ -87,6 +87,7 @@ add_executable(omill-unit-tests
   unit/SegmentsAATest.cpp
   unit/StackConcretizationTest.cpp
   unit/DeadStateStoreDSETest.cpp
+  unit/TypeRecoveryTest.cpp
 )
 
 target_link_libraries(omill-unit-tests
