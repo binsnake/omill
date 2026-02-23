@@ -350,8 +350,12 @@ bool TraceLifter::Impl::Lift(
 
       inst.Reset();
 
-      std::ignore = arch->DecodeInstruction(
+      auto decode_ok = arch->DecodeInstruction(
           inst_addr, inst_bytes, inst, this->arch->CreateInitialContext());
+      if (!decode_ok) {
+        llvm::errs() << "omill: TraceLifter: decode failed at 0x"
+                     << llvm::Twine::utohexstr(inst_addr) << "\n";
+      }
 
       auto lift_status =
           inst.GetLifter()->LiftIntoBlock(inst, block, state_ptr);

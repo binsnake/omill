@@ -203,12 +203,10 @@ void buildStateOptimizationPipeline(llvm::FunctionPassManager &FPM,
     // OutlineConstantStackData has promoted the alloca to a global constant.
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(llvm::EarlyCSEPass());
-    FPM.addPass(llvm::DCEPass());
     FPM.addPass(llvm::SimplifyCFGPass());
   } else {
     FPM.addPass(llvm::EarlyCSEPass());
     FPM.addPass(llvm::InstCombinePass());
-    FPM.addPass(llvm::DCEPass());
     FPM.addPass(llvm::SimplifyCFGPass());
     FPM.addPass(llvm::GVNPass());
   }
@@ -482,21 +480,15 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     MPM.addPass(RewriteLiftedCallsToNativePass());
   }
 
-  // Eliminate dead stores to volatile State fields at call boundaries.
-  // After inlining, the State alloca is local; volatile fields (RAX, RCX,
-  // RDX, R8-R11, XMM0-5) are clobbered by native calls and dead at return.
-  // Running before SROA makes decomposition more likely to succeed.
-  if (!envDisabled("OMILL_SKIP_ABI_DEAD_STATE_STORE_DSE")) {
+  // Eliminate dead stores to volatile State fields, then decompose the State
+  // alloca via SROA.  Running DSE first makes SROA more likely to succeed.
+  // Merged into a single module traversal to avoid adaptor overhead.
+  {
     llvm::FunctionPassManager FPM;
-    FPM.addPass(DeadStateStoreDSEPass());
-    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
-  }
-
-  // SROA only: decompose State alloca to expose SSA values for dispatch
-  // resolution.  No InstCombine, GVN, or SimplifyCFG yet.
-  if (!envDisabled("OMILL_SKIP_ABI_SROA")) {
-    llvm::FunctionPassManager FPM;
-    FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+    if (!envDisabled("OMILL_SKIP_ABI_DEAD_STATE_STORE_DSE"))
+      FPM.addPass(DeadStateStoreDSEPass());
+    if (!envDisabled("OMILL_SKIP_ABI_SROA"))
+      FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
@@ -505,9 +497,9 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
   }
 
   // Full optimization after inlining native wrappers.
+  // SROA already ran above; start with InstCombine on the decomposed SSA.
   if (!envDisabled("OMILL_SKIP_ABI_FINAL_OPT")) {
     llvm::FunctionPassManager FPM;
-    FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(llvm::GVNPass());
     FPM.addPass(SimplifyVectorReassemblyPass());

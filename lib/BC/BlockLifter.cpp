@@ -285,8 +285,12 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
     }
 
     inst.Reset();
-    std::ignore = arch->DecodeInstruction(current_pc, inst_bytes, inst,
-                                          arch->CreateInitialContext());
+    auto decode_ok = arch->DecodeInstruction(current_pc, inst_bytes, inst,
+                                              arch->CreateInitialContext());
+    if (!decode_ok) {
+      llvm::errs() << "omill: BlockLifter: decode failed at 0x"
+                   << llvm::Twine::utohexstr(current_pc) << "\n";
+    }
 
     auto lift_status =
         inst.GetLifter()->LiftIntoBlock(inst, current_block, state_ptr);

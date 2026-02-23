@@ -750,11 +750,10 @@ TEST_F(DeobfuscationTest, CloakworkCombinedConstStackPromotion) {
 // std::recursive_mutex, SIMD intrinsics) resulting in 100+ lifted functions
 // and ~185K lines of IR.
 //
-// NOTE: i32 and i64 variants currently trigger an access violation (SEH
-// 0xc0000005) during pipeline optimization. The i8 variant uses plain
-// shifts (no rotate intrinsics) and optimizes successfully. The i32/i64
-// paths use _rotl/_rotr which generate different IR patterns that trigger
-// the crash. These are marked DISABLED_ until the pipeline bug is fixed.
+// NOTE: i32 and i64 variants previously crashed with SEH 0xc0000005 due to
+// malformed PHI nodes from missing removePredecessor() calls in
+// LowerFunctionReturn/LowerJump/LowerErrorAndMissing.  Fixed; all variants
+// now pass successfully.
 //
 // Verified anchor points (from i8 output, ~185K lines → ~54K lines):
 //   1. ~1,682 shift ops (shl/lshr) from shift-based mutation

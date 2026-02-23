@@ -87,6 +87,11 @@ static cl::opt<bool> BlockLift(
     cl::desc("Use blocks-as-functions architecture for iterative discovery"),
     cl::init(false));
 
+static cl::opt<bool> DumpIR(
+    "dump-ir",
+    cl::desc("Dump before/after IR to before.ll, after.ll, after_abi.ll"),
+    cl::init(false));
+
 namespace {
 
 /// In-memory trace manager for remill lifting.
@@ -460,8 +465,7 @@ int main(int argc, char **argv) {
   }
   errs() << "Lifting complete\n";
 
-  // Dump before IR
-  {
+  if (DumpIR) {
     std::error_code ec;
     raw_fd_ostream os("before.ll", ec, sys::fs::OF_Text);
     if (!ec) {
@@ -562,8 +566,7 @@ int main(int argc, char **argv) {
   }
   errs() << "Main pipeline complete\n";
 
-  // Dump after IR
-  {
+  if (DumpIR) {
     std::error_code ec;
     raw_fd_ostream os("after.ll", ec, sys::fs::OF_Text);
     if (!ec) {
@@ -595,8 +598,7 @@ int main(int argc, char **argv) {
   module->print(Out.os(), nullptr);
   Out.keep();
 
-  // Also write after_abi.ll
-  {
+  if (DumpIR) {
     std::error_code ec;
     raw_fd_ostream os("after_abi.ll", ec, sys::fs::OF_Text);
     if (!ec) {
