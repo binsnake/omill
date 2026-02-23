@@ -225,6 +225,9 @@ bool applyRedirects(const DispatcherInfo &info,
 
 llvm::PreservedAnalyses ControlFlowUnflattenerPass::run(
     llvm::Function &F, llvm::FunctionAnalysisManager &FAM) {
+  if (F.isDeclaration())
+    return llvm::PreservedAnalyses::all();
+
   bool changed = false;
 
   // Iterate to fixpoint: each successful batch may expose further

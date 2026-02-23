@@ -227,6 +227,9 @@ llvm::Constant *constantFromBits(llvm::Type *ty, uint64_t bits) {
 
 llvm::PreservedAnalyses ConstantMemoryFoldingPass::run(
     llvm::Function &F, llvm::FunctionAnalysisManager &AM) {
+  if (F.isDeclaration())
+    return llvm::PreservedAnalyses::all();
+
   auto &MAMProxy = AM.getResult<llvm::ModuleAnalysisManagerFunctionProxy>(F);
   auto *map = MAMProxy.getCachedResult<BinaryMemoryAnalysis>(*F.getParent());
   if (!map || map->empty())

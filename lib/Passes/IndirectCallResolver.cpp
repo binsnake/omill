@@ -310,6 +310,9 @@ bool resolveDispatchJump(llvm::CallInst *call, uint64_t resolved_pc,
 
 llvm::PreservedAnalyses IndirectCallResolverPass::run(
     llvm::Function &F, llvm::FunctionAnalysisManager &AM) {
+  if (F.isDeclaration())
+    return llvm::PreservedAnalyses::all();
+
   auto &MAMProxy = AM.getResult<llvm::ModuleAnalysisManagerFunctionProxy>(F);
   auto *map = MAMProxy.getCachedResult<BinaryMemoryAnalysis>(*F.getParent());
   if (!map)

@@ -685,6 +685,9 @@ static bool simplifyVectorFlagComputation(llvm::Function &F) {
 
 llvm::PreservedAnalyses SimplifyVectorReassemblyPass::run(
     llvm::Function &F, llvm::FunctionAnalysisManager &AM) {
+  if (F.isDeclaration())
+    return llvm::PreservedAnalyses::all();
+
   bool changed = false;
 
   changed |= foldConstantVectorChains(F);

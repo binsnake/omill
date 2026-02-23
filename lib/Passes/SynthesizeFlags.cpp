@@ -94,6 +94,9 @@ bool trySynthesizeSignedLessThan(llvm::BinaryOperator *xorInst,
 
 llvm::PreservedAnalyses SynthesizeFlagsPass::run(
     llvm::Function &F, llvm::FunctionAnalysisManager &FAM) {
+  if (F.isDeclaration())
+    return llvm::PreservedAnalyses::all();
+
   bool changed = false;
   llvm::SmallVector<llvm::Instruction *, 16> to_erase;
 

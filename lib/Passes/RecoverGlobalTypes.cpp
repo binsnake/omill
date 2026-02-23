@@ -124,6 +124,9 @@ llvm::GlobalVariable *getOrCreateStringGlobal(
 
 llvm::PreservedAnalyses RecoverGlobalTypesPass::run(
     llvm::Function &F, llvm::FunctionAnalysisManager &AM) {
+  if (F.isDeclaration())
+    return llvm::PreservedAnalyses::all();
+
   auto &MAMProxy = AM.getResult<llvm::ModuleAnalysisManagerFunctionProxy>(F);
   auto *map = MAMProxy.getCachedResult<BinaryMemoryAnalysis>(*F.getParent());
   if (!map || map->empty())
