@@ -97,6 +97,7 @@ add_executable(omill-unit-tests
   unit/LiftedNamesTest.cpp
   unit/BinaryMemoryMapTest.cpp
   unit/StateFieldAccessAnalysisTest.cpp
+  unit/RemillIntrinsicAnalysisTest.cpp
 )
 
 target_link_libraries(omill-unit-tests

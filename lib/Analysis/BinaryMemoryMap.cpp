@@ -9,10 +9,11 @@ llvm::AnalysisKey BinaryMemoryAnalysis::Key;
 
 void BinaryMemoryMap::addRegion(uint64_t base, const uint8_t *data,
                                 size_t size) {
-  regions_.push_back({base, data, size});
-  // Keep sorted by base address for binary search.
-  std::sort(regions_.begin(), regions_.end(),
-            [](const Region &a, const Region &b) { return a.base < b.base; });
+	Region r{base, data, size};
+	auto it = std::lower_bound(
+			regions_.begin(), regions_.end(), r,
+			[](const Region &a, const Region &b) { return a.base < b.base; });
+	regions_.insert(it, r);	// Maintain sorted order for binary search.
 }
 
 bool BinaryMemoryMap::read(uint64_t addr, uint8_t *out, unsigned size) const {

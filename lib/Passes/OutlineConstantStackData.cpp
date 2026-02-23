@@ -26,33 +26,41 @@ bool analyzeIntUses(llvm::Value *ival, llvm::AllocaInst *AI,
 
 std::optional<int64_t> getConstantOffsetFromInt(llvm::Value *ival,
                                                 llvm::AllocaInst *AI,
-                                                const llvm::DataLayout &DL);
+                                                const llvm::DataLayout &DL,
+                                                unsigned depth = 0);
 
 std::optional<int64_t> getConstantOffsetFromPtr(llvm::Value *ptr,
                                                 llvm::AllocaInst *AI,
-                                                const llvm::DataLayout &DL) {
+                                                const llvm::DataLayout &DL,
+                                                unsigned depth = 0) {
   if (ptr == AI) {
     return 0;
   }
 
+  if (depth > 64)
+    return std::nullopt;
   if (auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(ptr)) {
     llvm::APInt gep_off(64, 0);
     if (!GEP->accumulateConstantOffset(DL, gep_off)) {
       return std::nullopt;
     }
-    auto base = getConstantOffsetFromPtr(GEP->getPointerOperand(), AI, DL);
+    auto base = getConstantOffsetFromPtr(GEP->getPointerOperand(), AI, DL, depth + 1);
     if (!base.has_value()) {
       return std::nullopt;
     }
-    return *base + gep_off.getSExtValue();
+    int64_t gep_delta = gep_off.getSExtValue();
+    int64_t result;
+    if (__builtin_add_overflow(*base, gep_delta, &result))
+      return std::nullopt;
+    return result;
   }
 
   if (auto *ITP = llvm::dyn_cast<llvm::IntToPtrInst>(ptr)) {
-    return getConstantOffsetFromInt(ITP->getOperand(0), AI, DL);
+    return getConstantOffsetFromInt(ITP->getOperand(0), AI, DL, depth + 1);
   }
 
   if (auto *BC = llvm::dyn_cast<llvm::BitCastInst>(ptr)) {
-    return getConstantOffsetFromPtr(BC->getOperand(0), AI, DL);
+    return getConstantOffsetFromPtr(BC->getOperand(0), AI, DL, depth + 1);
   }
 
   return std::nullopt;
@@ -60,11 +68,14 @@ std::optional<int64_t> getConstantOffsetFromPtr(llvm::Value *ptr,
 
 std::optional<int64_t> getConstantOffsetFromInt(llvm::Value *ival,
                                                 llvm::AllocaInst *AI,
-                                                const llvm::DataLayout &DL) {
+                                                const llvm::DataLayout &DL,
+                                                unsigned depth) {
   if (auto *PTI = llvm::dyn_cast<llvm::PtrToIntInst>(ival)) {
-    return getConstantOffsetFromPtr(PTI->getPointerOperand(), AI, DL);
+    return getConstantOffsetFromPtr(PTI->getPointerOperand(), AI, DL, depth + 1);
   }
 
+  if (depth > 64)
+    return std::nullopt;
   if (auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(ival)) {
     auto opcode = BO->getOpcode();
     if (opcode != llvm::Instruction::Add && opcode != llvm::Instruction::Sub) {
@@ -72,21 +83,31 @@ std::optional<int64_t> getConstantOffsetFromInt(llvm::Value *ival,
     }
 
     if (auto *C = llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(1))) {
-      auto base = getConstantOffsetFromInt(BO->getOperand(0), AI, DL);
+      auto base = getConstantOffsetFromInt(BO->getOperand(0), AI, DL, depth + 1);
       if (!base.has_value()) {
         return std::nullopt;
       }
       int64_t delta = C->getSExtValue();
-      return opcode == llvm::Instruction::Sub ? (*base - delta)
-                                              : (*base + delta);
+      int64_t result;
+      if (opcode == llvm::Instruction::Sub) {
+        if (__builtin_sub_overflow(*base, delta, &result))
+          return std::nullopt;
+      } else {
+        if (__builtin_add_overflow(*base, delta, &result))
+          return std::nullopt;
+      }
+      return result;
     }
     if (opcode == llvm::Instruction::Add) {
       if (auto *C = llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(0))) {
-        auto base = getConstantOffsetFromInt(BO->getOperand(1), AI, DL);
+        auto base = getConstantOffsetFromInt(BO->getOperand(1), AI, DL, depth + 1);
         if (!base.has_value()) {
           return std::nullopt;
         }
-        return *base + C->getSExtValue();
+        int64_t result;
+        if (__builtin_add_overflow(*base, C->getSExtValue(), &result))
+          return std::nullopt;
+        return result;
       }
     }
     return std::nullopt;
@@ -97,7 +118,7 @@ std::optional<int64_t> getConstantOffsetFromInt(llvm::Value *ival,
       case llvm::Instruction::SExt:
       case llvm::Instruction::ZExt:
       case llvm::Instruction::Trunc:
-        return getConstantOffsetFromInt(Cast->getOperand(0), AI, DL);
+        return getConstantOffsetFromInt(Cast->getOperand(0), AI, DL, depth + 1);
       default:
         return std::nullopt;
     }
@@ -110,11 +131,14 @@ std::optional<llvm::APInt> tryEvaluateIntValue(llvm::Value *V,
                                                llvm::AllocaInst *AI,
                                                const llvm::DataLayout &DL,
                                                const std::vector<uint8_t> &bytes,
-                                               uint64_t size) {
+                                               uint64_t size,
+                                               unsigned depth = 0) {
   if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(V)) {
     return CI->getValue();
   }
 
+  if (depth > 64)
+    return std::nullopt;
   if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(V)) {
     auto *ITy = llvm::dyn_cast<llvm::IntegerType>(LI->getType());
     if (!ITy) {
@@ -140,7 +164,7 @@ std::optional<llvm::APInt> tryEvaluateIntValue(llvm::Value *V,
   }
 
   if (auto *Cast = llvm::dyn_cast<llvm::CastInst>(V)) {
-    auto in = tryEvaluateIntValue(Cast->getOperand(0), AI, DL, bytes, size);
+    auto in = tryEvaluateIntValue(Cast->getOperand(0), AI, DL, bytes, size, depth + 1);
     if (!in.has_value()) {
       return std::nullopt;
     }
@@ -158,8 +182,8 @@ std::optional<llvm::APInt> tryEvaluateIntValue(llvm::Value *V,
   }
 
   if (auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(V)) {
-    auto lhs = tryEvaluateIntValue(BO->getOperand(0), AI, DL, bytes, size);
-    auto rhs = tryEvaluateIntValue(BO->getOperand(1), AI, DL, bytes, size);
+    auto lhs = tryEvaluateIntValue(BO->getOperand(0), AI, DL, bytes, size, depth + 1);
+    auto rhs = tryEvaluateIntValue(BO->getOperand(1), AI, DL, bytes, size, depth + 1);
     if (!lhs.has_value() || !rhs.has_value()) {
       return std::nullopt;
     }
@@ -205,8 +229,14 @@ bool analyzeUses(llvm::Value *ptr, llvm::AllocaInst *AI,
     if (auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(U)) {
       llvm::APInt gep_off(64, 0);
       bool constant_gep = GEP->accumulateConstantOffset(DL, gep_off);
-      int64_t new_off =
-          base_offset + (constant_gep ? gep_off.getSExtValue() : 0);
+      int64_t new_off;
+      if (constant_gep) {
+        int64_t delta = gep_off.getSExtValue();
+        if (__builtin_add_overflow(base_offset, delta, &new_off))
+          return false;
+      } else {
+        new_off = base_offset;
+      }
       if (!analyzeUses(GEP, AI, DL, new_off, offset_known && constant_gep,
                        stores, dead, has_non_entry_store, saw_load))
         return false;
@@ -285,7 +315,13 @@ bool analyzeIntUses(llvm::Value *ival, llvm::AllocaInst *AI,
         }
       }
 
-      int64_t new_off = base_offset + (has_const_delta ? delta : 0);
+      int64_t new_off;
+      if (has_const_delta) {
+        if (__builtin_add_overflow(base_offset, delta, &new_off))
+          return false;
+      } else {
+        new_off = base_offset;
+      }
       if (!analyzeIntUses(BO, AI, DL, new_off,
                           offset_known && has_const_delta, stores, dead,
                           has_non_entry_store, saw_load)) {

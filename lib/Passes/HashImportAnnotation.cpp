@@ -64,10 +64,12 @@ static const ImportHashDB &getSharedDB() {
 
 llvm::PreservedAnalyses HashImportAnnotationPass::run(
     llvm::Function &F, llvm::FunctionAnalysisManager &AM) {
+  if (F.isDeclaration())
+    return llvm::PreservedAnalyses::all();
+
   const auto &db = getSharedDB();
 
-  llvm::DominatorTree DT(F);
-  llvm::LoopInfo LI(DT);
+  auto &LI = AM.getResult<llvm::LoopAnalysis>(F);
 
   bool changed = false;
   auto &Ctx = F.getContext();
