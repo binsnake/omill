@@ -59,6 +59,10 @@ add_library(omill STATIC
   Passes/SynthesizeFlags.cpp
   Passes/StackConcretization.cpp
   Passes/DeadStateStoreDSE.cpp
+  Passes/ExpandI128DivRem.cpp
+  Passes/StripCompilerUsed.cpp
+  Passes/EliminateDeadTraceCounters.cpp
+  Passes/MergeBytePhis.cpp
   Passes/TypeRecovery.cpp
   Passes/VMHandlerInliner.cpp
   Passes/IterativeBlockDiscovery.cpp

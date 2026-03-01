@@ -520,9 +520,15 @@ int main(int argc, char **argv) {
   ModuleAnalysisManager MAM;
 
   // Register custom module analyses first and keep backing storage stable.
+  omill::BinaryMemoryMap raw_memory_map;
+  if (RawBinary) {
+    raw_memory_map.addRegion(BaseAddress, raw_code.data(), raw_code.size());
+    raw_memory_map.setImageBase(BaseAddress);
+    raw_memory_map.setImageSize(raw_code.size());
+  }
   auto memory_map_holder =
       std::make_shared<omill::BinaryMemoryMap>(
-          RawBinary ? omill::BinaryMemoryMap() : pe.memory_map);
+          RawBinary ? std::move(raw_memory_map) : pe.memory_map);
   MAM.registerPass([memory_map_holder] {
     return omill::BinaryMemoryAnalysis(*memory_map_holder);
   });

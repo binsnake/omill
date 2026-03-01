@@ -79,6 +79,10 @@
 #if OMILL_ENABLE_SIMPLIFIER
 #include "omill/Passes/SimplifyMBA.h"
 #endif
+#include "omill/Passes/ExpandI128DivRem.h"
+#include "omill/Passes/StripCompilerUsed.h"
+#include "omill/Passes/EliminateDeadTraceCounters.h"
+#include "omill/Passes/MergeBytePhis.h"
 
 namespace omill {
 
@@ -498,6 +502,13 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     MPM.addPass(llvm::GlobalDCEPass());
   }
 
+  // Expand i128 sdiv/srem/udiv/urem into 64-bit operations so the x86
+  // backend doesn't lower them to __divti3/__modti3 library calls.
+  if (!envDisabled("OMILL_SKIP_EXPAND_I128_DIVREM")) {
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(ExpandI128DivRemPass());
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+  }
   // Full optimization after inlining native wrappers.
   // SROA already ran above; start with InstCombine on the decomposed SSA.
   if (!envDisabled("OMILL_SKIP_ABI_FINAL_OPT")) {
@@ -529,6 +540,24 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     FPM.addPass(llvm::DCEPass());
     FPM.addPass(llvm::SimplifyCFGPass());
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+  }
+
+  // Eliminate obfuscation trace counters (NEXT_PC chains) and merge
+  // byte-level PHI nodes back into wider values.
+  if (!envDisabled("OMILL_SKIP_ABI_DEAD_TRACE_COUNTERS")) {
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(EliminateDeadTraceCountersPass());
+    FPM.addPass(MergeBytePhisPass());
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::ADCEPass());  // ADCE kills cyclic dead phi chains (NEXT_PC)
+    FPM.addPass(llvm::SimplifyCFGPass());
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+  }
+
+  // Strip @llvm.compiler.used and run GlobalDCE to remove dead ISEL stubs.
+  if (!envDisabled("OMILL_SKIP_STRIP_COMPILER_USED")) {
+    MPM.addPass(StripCompilerUsedPass());
+    MPM.addPass(llvm::GlobalDCEPass());
   }
 }
 
