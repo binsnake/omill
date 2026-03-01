@@ -410,12 +410,29 @@ llvm::FunctionCallee getOrDeclareHelper(llvm::Module &M, llvm::StringRef name,
 }
 
 enum SyncHyperCallID : uint32_t {
+  kAssertPrivileged = 1,
+  kAMD64EmulateInstruction = 257,
   kX86CPUID = 258,
   kX86ReadTSC = 259,
   kX86ReadTSCP = 260,
+  kX86LoadGlobalDescriptorTable = 261,
+  kX86LoadInterruptDescriptorTable = 262,
+  kX86ReadModelSpecificRegister = 263,
+  kX86WriteModelSpecificRegister = 264,
+  kX86WriteBackInvalidate = 265,
+  kAMD64SetControlReg0 = 278,
+  kAMD64SetControlReg1 = 279,
+  kAMD64SetControlReg2 = 280,
+  kAMD64SetControlReg3 = 281,
+  kAMD64SetControlReg4 = 282,
+  kAMD64SetControlReg8 = 283,
+  kX86SysCall = 284,
+  kX86SysEnter = 285,
+  kX86SysExit = 286,
 };
 
-enum StateGPROffset : uint64_t {
+enum StateFieldOffset : uint64_t {
+  kAddrToLoad = 8,  // ArchState.addr_to_load union at offset 8
   kRAX = 2216,
   kRBX = 2232,
   kRCX = 2248,
@@ -504,6 +521,153 @@ void emitRDTSCP(llvm::CallInst *CI) {
   CI->eraseFromParent();
 }
 
+/// Lower kAssertPrivileged / kAMD64EmulateInstruction: NOP — just erase.
+void emitNopHyperCall(llvm::CallInst *CI) {
+  llvm::Value *mem = CI->getArgOperand(1);
+  CI->replaceAllUsesWith(mem);
+  CI->eraseFromParent();
+}
+
+/// Lower RDMSR: read ECX (MSR index), emit rdmsr, write EAX:EDX.
+void emitRDMSR(llvm::CallInst *CI) {
+  llvm::IRBuilder<> B(CI);
+  auto &Ctx = CI->getContext();
+  auto *i32_ty = llvm::Type::getInt32Ty(Ctx);
+  llvm::Value *state = CI->getArgOperand(0);
+  llvm::Value *mem = CI->getArgOperand(1);
+
+  auto *ecx = B.CreateLoad(i32_ty, stateFieldPtr(B, state, kRCX), "msr.idx");
+
+  auto *asm_ty = llvm::FunctionType::get(
+      llvm::StructType::get(i32_ty, i32_ty), {i32_ty}, false);
+  auto *ia = llvm::InlineAsm::get(
+      asm_ty, "rdmsr",
+      "={eax},={edx},{ecx},~{dirflag},~{fpsr},~{flags}", true);
+  auto *result = B.CreateCall(asm_ty, ia, {ecx}, "rdmsr");
+
+  B.CreateStore(B.CreateExtractValue(result, 0), stateFieldPtr(B, state, kRAX));
+  B.CreateStore(B.CreateExtractValue(result, 1), stateFieldPtr(B, state, kRDX));
+
+  CI->replaceAllUsesWith(mem);
+  CI->eraseFromParent();
+}
+
+/// Lower WRMSR: read ECX/EAX/EDX from state, emit wrmsr.
+void emitWRMSR(llvm::CallInst *CI) {
+  llvm::IRBuilder<> B(CI);
+  auto &Ctx = CI->getContext();
+  auto *i32_ty = llvm::Type::getInt32Ty(Ctx);
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+  llvm::Value *state = CI->getArgOperand(0);
+  llvm::Value *mem = CI->getArgOperand(1);
+
+  auto *ecx = B.CreateLoad(i32_ty, stateFieldPtr(B, state, kRCX), "msr.idx");
+  auto *eax = B.CreateLoad(i32_ty, stateFieldPtr(B, state, kRAX), "msr.lo");
+  auto *edx = B.CreateLoad(i32_ty, stateFieldPtr(B, state, kRDX), "msr.hi");
+
+  auto *asm_ty = llvm::FunctionType::get(void_ty, {i32_ty, i32_ty, i32_ty}, false);
+  auto *ia = llvm::InlineAsm::get(
+      asm_ty, "wrmsr",
+      "{ecx},{eax},{edx},~{dirflag},~{fpsr},~{flags}", true);
+  B.CreateCall(asm_ty, ia, {ecx, eax, edx});
+
+  CI->replaceAllUsesWith(mem);
+  CI->eraseFromParent();
+}
+
+/// Lower LGDT: read addr_to_load from state, emit lgdt.
+void emitLGDT(llvm::CallInst *CI) {
+  llvm::IRBuilder<> B(CI);
+  auto &Ctx = CI->getContext();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+  llvm::Value *state = CI->getArgOperand(0);
+  llvm::Value *mem = CI->getArgOperand(1);
+
+  auto *addr = B.CreateLoad(i64_ty, stateFieldPtr(B, state, kAddrToLoad), "gdtr.addr");
+  auto *ptr = B.CreateIntToPtr(addr, llvm::PointerType::getUnqual(Ctx));
+
+  auto *asm_ty = llvm::FunctionType::get(void_ty, {llvm::PointerType::getUnqual(Ctx)}, false);
+  auto *ia = llvm::InlineAsm::get(asm_ty, "lgdt ($0)", "r,~{memory}", true);
+  B.CreateCall(asm_ty, ia, {ptr});
+
+  CI->replaceAllUsesWith(mem);
+  CI->eraseFromParent();
+}
+
+/// Lower LIDT: read addr_to_load from state, emit lidt.
+void emitLIDT(llvm::CallInst *CI) {
+  llvm::IRBuilder<> B(CI);
+  auto &Ctx = CI->getContext();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+  llvm::Value *state = CI->getArgOperand(0);
+  llvm::Value *mem = CI->getArgOperand(1);
+
+  auto *addr = B.CreateLoad(i64_ty, stateFieldPtr(B, state, kAddrToLoad), "idtr.addr");
+  auto *ptr = B.CreateIntToPtr(addr, llvm::PointerType::getUnqual(Ctx));
+
+  auto *asm_ty = llvm::FunctionType::get(void_ty, {llvm::PointerType::getUnqual(Ctx)}, false);
+  auto *ia = llvm::InlineAsm::get(asm_ty, "lidt ($0)", "r,~{memory}", true);
+  B.CreateCall(asm_ty, ia, {ptr});
+
+  CI->replaceAllUsesWith(mem);
+  CI->eraseFromParent();
+}
+
+/// Lower WBINVD: no-operand cache invalidate.
+void emitWBINVD(llvm::CallInst *CI) {
+  llvm::IRBuilder<> B(CI);
+  auto *void_ty = llvm::Type::getVoidTy(CI->getContext());
+  llvm::Value *mem = CI->getArgOperand(1);
+
+  auto *asm_ty = llvm::FunctionType::get(void_ty, {}, false);
+  auto *ia = llvm::InlineAsm::get(asm_ty, "wbinvd", "~{memory}", true);
+  B.CreateCall(asm_ty, ia, {});
+
+  CI->replaceAllUsesWith(mem);
+  CI->eraseFromParent();
+}
+
+/// Lower SYSCALL/SYSENTER/SYSEXIT: emit the raw instruction.
+void emitBarePrivilegedInsn(llvm::CallInst *CI, const char *mnemonic) {
+  llvm::IRBuilder<> B(CI);
+  auto *void_ty = llvm::Type::getVoidTy(CI->getContext());
+  llvm::Value *mem = CI->getArgOperand(1);
+
+  auto *asm_ty = llvm::FunctionType::get(void_ty, {}, false);
+  auto *ia = llvm::InlineAsm::get(
+      asm_ty, mnemonic,
+      "~{rcx},~{r11},~{memory},~{dirflag},~{fpsr},~{flags}", true);
+  B.CreateCall(asm_ty, ia, {});
+
+  CI->replaceAllUsesWith(mem);
+  CI->eraseFromParent();
+}
+
+/// Lower MOV CRn: emit mov to control register inline asm.
+/// The source value is already stored to the destination by remill semantics;
+/// we read the written value from state and emit the actual mov crN, reg.
+void emitWriteControlReg(llvm::CallInst *CI, unsigned cr_num) {
+  llvm::IRBuilder<> B(CI);
+  auto &Ctx = CI->getContext();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+  llvm::Value *state = CI->getArgOperand(0);
+  llvm::Value *mem = CI->getArgOperand(1);
+
+  // The source register value was already written to the destination by
+  // WRITE_CONTROL_REG semantics.  We use RAX as the transfer register.
+  auto *val = B.CreateLoad(i64_ty, stateFieldPtr(B, state, kRAX), "cr.val");
+
+  std::string asm_str = "mov %cr" + std::to_string(cr_num) + ", $0";
+  auto *asm_ty = llvm::FunctionType::get(void_ty, {i64_ty}, false);
+  auto *ia = llvm::InlineAsm::get(asm_ty, asm_str, "r,~{memory}", true);
+  B.CreateCall(asm_ty, ia, {val});
+
+  CI->replaceAllUsesWith(mem);
+  CI->eraseFromParent();
+}
 void emitGenericSyncStub(llvm::CallInst *CI) {
   llvm::IRBuilder<> Builder(CI);
   auto &M = *CI->getModule();
@@ -531,6 +695,10 @@ void lowerSyncHyperCall(llvm::CallInst *CI) {
   }
 
   switch (ci->getZExtValue()) {
+    case kAssertPrivileged:
+    case kAMD64EmulateInstruction:
+      emitNopHyperCall(CI);
+      break;
     case kX86CPUID:
       emitCPUID(CI);
       break;
@@ -539,6 +707,48 @@ void lowerSyncHyperCall(llvm::CallInst *CI) {
       break;
     case kX86ReadTSCP:
       emitRDTSCP(CI);
+      break;
+    case kX86ReadModelSpecificRegister:
+      emitRDMSR(CI);
+      break;
+    case kX86WriteModelSpecificRegister:
+      emitWRMSR(CI);
+      break;
+    case kX86LoadGlobalDescriptorTable:
+      emitLGDT(CI);
+      break;
+    case kX86LoadInterruptDescriptorTable:
+      emitLIDT(CI);
+      break;
+    case kX86WriteBackInvalidate:
+      emitWBINVD(CI);
+      break;
+    case kAMD64SetControlReg0:
+      emitWriteControlReg(CI, 0);
+      break;
+    case kAMD64SetControlReg1:
+      emitWriteControlReg(CI, 1);
+      break;
+    case kAMD64SetControlReg2:
+      emitWriteControlReg(CI, 2);
+      break;
+    case kAMD64SetControlReg3:
+      emitWriteControlReg(CI, 3);
+      break;
+    case kAMD64SetControlReg4:
+      emitWriteControlReg(CI, 4);
+      break;
+    case kAMD64SetControlReg8:
+      emitWriteControlReg(CI, 8);
+      break;
+    case kX86SysCall:
+      emitBarePrivilegedInsn(CI, "syscall");
+      break;
+    case kX86SysEnter:
+      emitBarePrivilegedInsn(CI, "sysenter");
+      break;
+    case kX86SysExit:
+      emitBarePrivilegedInsn(CI, "sysexit");
       break;
     default:
       emitGenericSyncStub(CI);

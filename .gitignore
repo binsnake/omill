@@ -30,3 +30,8 @@ cmake-build-*/
 *.log
 *.ps1
 *.bin
+
+# Private (non-redistributable) obfuscation passes
+tools/ollvm-obf/private/
+/tools/__pycache__
+*.obj

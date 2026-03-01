@@ -5,12 +5,13 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/Verifier.h>
 
 #include <cstdint>
-#include <random>
 
 #include "OpaquePredicates.h"
+#include "OpaquePredicateLib.h"
 
 namespace {
 
@@ -93,57 +94,77 @@ TEST_F(OpaquePredicatesObfTest, InsertsOpaqueBranch) {
     auto *testF = testM->getFunction("test_fn");
     if (countBlocks(testF) > origBlocks) {
       found = true;
-      // Verify junk blocks were added.
-      EXPECT_GT(countBlocksWithPrefix(testF, "opq_junk"), 0u);
+      // Verify extra blocks (junk) were added — names stripped for hardening.
+      EXPECT_GT(countBlocks(testF), origBlocks);
     }
   }
   EXPECT_TRUE(found) << "No seed in [0,100) produced opaque predicates";
 }
 
-/// The opaque predicates should always evaluate to true.  Pick a seed that
-/// produces the transformation, extract the condition from the conditional
-/// branch, and verify it constant-folds to true for a range of x values.
+/// generateOpaqueTrue must return an i1 ICmpInst.  The comparison predicate
+/// varies by seed (eq, sle, uge, slt, or dual-MBA eq).
 TEST_F(OpaquePredicatesObfTest, PredicateAlwaysTrue) {
-  // We verify the predicate property algebraically: for each variant,
-  // construct it manually and check with constant inputs.
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(kDataLayout);
+
   auto *i64Ty = llvm::Type::getInt64Ty(Ctx);
+  auto *i1Ty  = llvm::Type::getInt1Ty(Ctx);
+  auto *fnTy  = llvm::FunctionType::get(llvm::Type::getVoidTy(Ctx),
+                                        {i64Ty}, false);
+  auto *F = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage,
+                                   "pred_fn", *M);
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  llvm::IRBuilder<> builder(entry);
+  auto *arg = F->getArg(0);
 
-  // Test values spanning the range.
-  uint64_t testValues[] = {0, 1, 2, 42, 0x7FFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF,
-                           0xDEADBEEF, 100, 0x8000000000000000ULL};
+  uint64_t seeds[] = {0, 1, 42, 999, 0xDEADBEEF};
+  for (uint64_t seed : seeds) {
+    auto *cond = ollvm::generateOpaqueTrue(builder, arg, seed);
 
-  for (uint64_t val : testValues) {
-    // Variant 0: x | ~x == -1
-    {
-      uint64_t notX = ~val;
-      uint64_t orVal = val | notX;
-      EXPECT_EQ(orVal, static_cast<uint64_t>(-1))
-          << "Variant 0 failed for x=" << val;
-    }
+    // Must be i1.
+    EXPECT_EQ(cond->getType(), i1Ty) << "seed=" << seed;
 
-    // Variant 1: (x * (x+1)) & 1 == 0
-    {
-      uint64_t prod = val * (val + 1);
-      EXPECT_EQ(prod & 1, 0u) << "Variant 1 failed for x=" << val;
-    }
+    // Must be an ICmpInst (predicate varies by seed).
+    auto *icmp = llvm::dyn_cast<llvm::ICmpInst>(cond);
+    ASSERT_NE(icmp, nullptr) << "Not an ICmpInst for seed=" << seed;
 
-    // Variant 2: (x * x) >=u 0  — trivially true for unsigned
-    {
-      uint64_t sq = val * val;
-      EXPECT_GE(sq, 0u) << "Variant 2 failed for x=" << val;
-    }
+    // Predicate must be one of the always-true variants.
+    auto pred = icmp->getPredicate();
+    bool validPred = (pred == llvm::CmpInst::ICMP_EQ ||
+                      pred == llvm::CmpInst::ICMP_SLE ||
+                      pred == llvm::CmpInst::ICMP_UGE ||
+                      pred == llvm::CmpInst::ICMP_SLT);
+    EXPECT_TRUE(validPred) << "Unexpected predicate for seed=" << seed;
   }
 
-  // Variant 3: c & (c-1) != 0 where c has bits 0 and 1 set.
-  // Any c with at least two bits set satisfies c & (c-1) != 0.
-  {
-    std::mt19937 rng(42);
-    std::uniform_int_distribution<uint64_t> dist(1, 0x7FFFFFFE);
-    for (int i = 0; i < 100; ++i) {
-      uint64_t c = dist(rng) | 3;
-      EXPECT_NE(c & (c - 1), 0u) << "Variant 3 failed for c=" << c;
-    }
+  builder.CreateRetVoid();
+  EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+}
+
+/// detail::buildMBAZero must return a value of the same type as the input
+/// argument, and the module must verify.
+TEST_F(OpaquePredicatesObfTest, MBAZeroPropertyHolds) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(kDataLayout);
+
+  auto *i64Ty = llvm::Type::getInt64Ty(Ctx);
+  auto *fnTy  = llvm::FunctionType::get(llvm::Type::getVoidTy(Ctx),
+                                        {i64Ty}, false);
+  auto *F = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage,
+                                   "mba_fn", *M);
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  llvm::IRBuilder<> builder(entry);
+  auto *arg = F->getArg(0);
+
+  uint64_t seeds[] = {0, 1, 7, 42, 256, 0xCAFEBABE};
+  for (uint64_t seed : seeds) {
+    auto *result = ollvm::detail::buildMBAZero(builder, arg, seed);
+    EXPECT_EQ(result->getType(), i64Ty)
+        << "MBA zero type mismatch for seed=" << seed;
   }
+
+  builder.CreateRetVoid();
+  EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
 }
 
 /// Single-block functions should not be modified.

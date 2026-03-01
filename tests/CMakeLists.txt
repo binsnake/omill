@@ -95,9 +95,12 @@ add_executable(omill-unit-tests
   unit/ResolveAndLowerControlFlowTest.cpp
   unit/InlineJumpTargetsTest.cpp
   unit/LiftedNamesTest.cpp
+  unit/LiftedFunctionMapTest.cpp
   unit/BinaryMemoryMapTest.cpp
+  unit/ExceptionInfoTest.cpp
   unit/StateFieldAccessAnalysisTest.cpp
   unit/RemillIntrinsicAnalysisTest.cpp
+  unit/PipelineTest.cpp
 )
 
 target_link_libraries(omill-unit-tests
@@ -274,7 +277,24 @@ if(OMILL_ENABLE_TOOLS)
 
   # OLLVM obfuscation pass unit tests (compile pass sources directly).
   add_executable(omill-ollvm-obf-unit-tests
+    unit/ArithmeticEncodingObfTest.cpp
+    unit/BMIMutationObfTest.cpp
+    unit/BogusControlFlowObfTest.cpp
+    unit/CodeCloningObfTest.cpp
+    unit/ConstantUnfoldingObfTest.cpp
+    unit/FlatteningObfTest.cpp
+    unit/FunctionOutliningObfTest.cpp
+    unit/IfConversionObfTest.cpp
+    unit/InstructionSchedulingObfTest.cpp
+    unit/LoopToRecursionObfTest.cpp
     unit/OpaquePredicatesObfTest.cpp
+    unit/OpaquePredicateLibObfTest.cpp
+    unit/PassFilterObfTest.cpp
+    unit/RegisterPressureObfTest.cpp
+    unit/StackRandomizationObfTest.cpp
+    unit/SubstitutionObfTest.cpp
+    unit/StringEncryptionObfTest.cpp
+    unit/VectorizeObfTest.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../tools/ollvm-obf/OpaquePredicates.cpp
   )
 
@@ -295,6 +315,18 @@ if(OMILL_ENABLE_TOOLS)
   gtest_discover_tests(omill-ollvm-obf-unit-tests
     PROPERTIES TIMEOUT 30
   )
+
+  # Private pass unit tests (only when private/ directory exists).
+  if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../tools/ollvm-obf/private")
+    target_sources(omill-ollvm-obf-unit-tests PRIVATE
+      unit/CustomABIObfTest.cpp
+      unit/InterproceduralObfTest.cpp
+      unit/InternalizeModuleObfTest.cpp
+    )
+    target_include_directories(omill-ollvm-obf-unit-tests PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/../tools/ollvm-obf/private
+    )
+  endif()
 endif()
 
 # E2E tests (require remill + Zydis)

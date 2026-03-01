@@ -105,8 +105,8 @@ static cl::opt<bool> IPCP(
     cl::desc("Enable interprocedural constant propagation"),
     cl::init(false));
 
-static cl::opt<bool> TimePasses(
-    "time-passes",
+static cl::opt<bool> OmillTimePasses(
+    "omill-time-passes",
     cl::desc("Time each pass, printing elapsed time on exit"),
     cl::init(false));
 
@@ -139,7 +139,7 @@ int main(int argc, char **argv) {
 
   // Set up pass timing instrumentation.
   PassInstrumentationCallbacks PIC;
-  TimePassesHandler TimingHandler(TimePasses);
+  TimePassesHandler TimingHandler(OmillTimePasses);
   TimingHandler.registerCallbacks(PIC);
 
   // Set up pass infrastructure
@@ -185,7 +185,7 @@ int main(int argc, char **argv) {
   // Run the pipeline
   MPM.run(*M, MAM);
 
-  if (TimePasses)
+  if (OmillTimePasses)
     TimingHandler.print();
 
   // Verify

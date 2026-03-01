@@ -1,7 +1,10 @@
 #include "ConstantUnfolding.h"
+#include "OpaquePredicateLib.h"
+#include "PassFilter.h"
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
+#include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
 
@@ -16,13 +19,12 @@ namespace {
 /// Return true if operand index `idx` of `I` can safely be replaced by a
 /// non-constant value.
 bool isOperandReplaceable(llvm::Instruction *I, unsigned idx) {
-  // Only allow operands of binary ops, icmp, and store value operand.
   if (llvm::isa<llvm::BinaryOperator>(I))
     return true;
   if (llvm::isa<llvm::ICmpInst>(I))
     return true;
   if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(I))
-    return idx == 0;  // value operand only, not pointer
+    return idx == 0;
   return false;
 }
 
@@ -32,15 +34,30 @@ struct UnfoldCandidate {
   llvm::ConstantInt *ci;
 };
 
-void unfoldConstantsFunction(llvm::Function &F, std::mt19937 &rng) {
-  if (F.isDeclaration())
+/// Emit a volatile load of the anchor, truncated/zext'd to `targetTy`.
+llvm::Value *emitAnchorLoad(llvm::IRBuilder<> &builder,
+                            llvm::GlobalVariable *anchor,
+                            llvm::IntegerType *targetTy) {
+  auto *i64Ty = anchor->getValueType();
+  auto *load = builder.CreateLoad(i64Ty, anchor, true, "");
+
+  unsigned targetBits = targetTy->getBitWidth();
+  if (targetBits == 64)
+    return load;
+  if (targetBits < 64)
+    return builder.CreateTrunc(load, targetTy, "");
+  return builder.CreateZExt(load, targetTy, "");
+}
+
+void unfoldConstantsFunction(llvm::Function &F, std::mt19937 &rng,
+                             llvm::GlobalVariable *anchor,
+                             const FilterConfig &cfg) {
+  if (shouldSkipFunction(F, cfg))
     return;
 
-  // Collect candidates first to avoid iterator invalidation.
   std::vector<UnfoldCandidate> work;
   for (auto &BB : F) {
     for (auto &I : BB) {
-      // Skip PHI nodes entirely.
       if (llvm::isa<llvm::PHINode>(&I))
         continue;
 
@@ -48,10 +65,8 @@ void unfoldConstantsFunction(llvm::Function &F, std::mt19937 &rng) {
         auto *ci = llvm::dyn_cast<llvm::ConstantInt>(I.getOperand(i));
         if (!ci)
           continue;
-        // Skip i1 booleans.
-        if (ci->getBitWidth() == 1)
+        if (ci->getBitWidth() == 1 || ci->getBitWidth() > 64)
           continue;
-        // Skip small constants (0, 1, -1) — not worth unfolding.
         int64_t val = ci->getSExtValue();
         if (val == 0 || val == 1 || val == -1)
           continue;
@@ -62,81 +77,108 @@ void unfoldConstantsFunction(llvm::Function &F, std::mt19937 &rng) {
     }
   }
 
+  // Retrieve the anchor's compile-time init value for XOR compensation.
+  uint64_t R = llvm::cast<llvm::ConstantInt>(anchor->getInitializer())
+                   ->getZExtValue();
+
+  // Insert an opaque store into the anchor in the entry block so that
+  // constant-propagation cannot prove the global read-only.
+  if (!work.empty()) {
+    auto &entryBB = F.getEntryBlock();
+    llvm::IRBuilder<> entryBuilder(&entryBB, entryBB.getFirstInsertionPt());
+    auto *i64Ty = anchor->getValueType();
+    auto *curVal = entryBuilder.CreateLoad(i64Ty, anchor, true, "");
+    auto *noise = detail::buildMBAZero(entryBuilder, curVal, rng());
+    auto *newVal = entryBuilder.CreateXor(curVal, noise, "");
+    entryBuilder.CreateStore(newVal, anchor);
+  }
+
   std::uniform_int_distribution<int> percent(0, 99);
-  std::uniform_int_distribution<int> strategy_dist(0, 3);
-  std::uniform_int_distribution<uint64_t> key_dist(1, 0xFFFF);
+  std::uniform_int_distribution<int> strategy_dist(0, 2);
 
   for (auto &cand : work) {
-    // Apply to ~40% of candidates.
+    if (!shouldTransform(rng, cfg)) continue;
     if (percent(rng) >= 40)
       continue;
 
     auto *ci = cand.ci;
-    auto *ty = ci->getType();
+    auto *ty = llvm::cast<llvm::IntegerType>(ci->getType());
     uint64_t C = ci->getZExtValue();
-    unsigned bits = ci->getBitWidth();
 
     llvm::IRBuilder<> builder(cand.inst);
     llvm::Value *replacement = nullptr;
 
+    // Load volatile anchor (opaque to optimizer).
+    llvm::Value *anchorVal = emitAnchorLoad(builder, anchor, ty);
+
+    // Truncate R to target bitwidth for XOR compensation.
+    unsigned bits = ty->getBitWidth();
+    uint64_t Rtrunc = (bits < 64) ? (R & ((1ULL << bits) - 1)) : R;
+
     int strat = strategy_dist(rng);
-    uint64_t K = key_dist(rng);
 
     switch (strat) {
     case 0: {
-      // Add/Sub: C => (C + K) - K
-      auto *sum = llvm::ConstantInt::get(ty, C + K);
-      auto *key = llvm::ConstantInt::get(ty, K);
-      replacement = builder.CreateSub(sum, key);
+      // (C ^ R_trunc) ^ anchor_load ^ mba_zero(anchor_load)
+      // At runtime: (C^R) ^ R ^ 0 = C
+      auto *cVal = llvm::ConstantInt::get(ty, C ^ Rtrunc);
+      auto *xored = builder.CreateXor(cVal, anchorVal, "");
+      auto *mbaZero = detail::buildMBAZero(builder, anchorVal, rng());
+      replacement = builder.CreateXor(xored, mbaZero, "");
       break;
     }
     case 1: {
-      // XOR: C => (C ^ K) ^ K
-      auto *xored = llvm::ConstantInt::get(ty, C ^ K);
-      auto *key = llvm::ConstantInt::get(ty, K);
-      replacement = builder.CreateXor(xored, key);
+      // (C + anchor_load) - anchor_load + mba_zero(anchor_load)
+      // Works for any anchor value: C + R - R + 0 = C
+      auto *cVal = llvm::ConstantInt::get(ty, C);
+      auto *added = builder.CreateAdd(cVal, anchorVal, "");
+      auto *subbed = builder.CreateSub(added, anchorVal, "");
+      auto *mbaZero = detail::buildMBAZero(builder, anchorVal, rng());
+      replacement = builder.CreateAdd(subbed, mbaZero, "");
       break;
     }
     case 2: {
-      // Mul/Div (power of 2): C => (C / 2^k) * 2^k
-      // Only when C is divisible by 2^k.
-      unsigned k = 1 + (K % std::min(bits - 1, 4u));  // shift 1..4
-      uint64_t divisor = 1ULL << k;
-      if (C != 0 && (C % divisor) == 0) {
-        auto *divided = llvm::ConstantInt::get(ty, C / divisor);
-        auto *mul_val = llvm::ConstantInt::get(ty, divisor);
-        replacement = builder.CreateMul(divided, mul_val);
-      } else {
-        // Fall back to add/sub.
-        auto *sum = llvm::ConstantInt::get(ty, C + K);
-        auto *key = llvm::ConstantInt::get(ty, K);
-        replacement = builder.CreateSub(sum, key);
-      }
-      break;
-    }
-    case 3: {
-      // Rotate via add/sub with different key: C => (C + K1) - K1
-      // (second add/sub variant with larger key range for diversity)
-      uint64_t K2 = K * 257 + 13;  // different key from case 0
-      auto *sum = llvm::ConstantInt::get(ty, C + K2);
-      auto *key = llvm::ConstantInt::get(ty, K2);
-      replacement = builder.CreateSub(sum, key);
+      // (C | anchor_load) & (C | ~anchor_load)
+      // = C | (anchor_load & ~anchor_load) = C | 0 = C  (any anchor value)
+      auto *cVal = llvm::ConstantInt::get(ty, C);
+      auto *or1 = builder.CreateOr(cVal, anchorVal, "");
+      auto *notAnc = builder.CreateNot(anchorVal, "");
+      auto *or2 = builder.CreateOr(cVal, notAnc, "");
+      replacement = builder.CreateAnd(or1, or2, "");
       break;
     }
     }
 
-    if (replacement) {
+    if (replacement)
       cand.inst->setOperand(cand.operand_idx, replacement);
-    }
   }
 }
 
 }  // namespace
 
-void unfoldConstantsModule(llvm::Module &M, uint32_t seed) {
+void unfoldConstantsModule(llvm::Module &M, uint32_t seed,
+                           const FilterConfig &cfg) {
   std::mt19937 rng(seed);
+  auto &ctx = M.getContext();
+  auto *i64Ty = llvm::Type::getInt64Ty(ctx);
+
+  // Create 3-5 unnamed anchor globals with distinct random non-zero inits.
+  unsigned numAnchors =
+      std::uniform_int_distribution<unsigned>(3, 5)(rng);
+  llvm::SmallVector<llvm::GlobalVariable *, 5> anchors;
+  for (unsigned i = 0; i < numAnchors; ++i) {
+    uint64_t initVal = rng();
+    if (initVal == 0) initVal = 1;
+    auto *gv = new llvm::GlobalVariable(
+        M, i64Ty, false, llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantInt::get(i64Ty, initVal), "");
+    anchors.push_back(gv);
+  }
+
   for (auto &F : M) {
-    unfoldConstantsFunction(F, rng);
+    auto *anchor =
+        anchors[std::uniform_int_distribution<unsigned>(0, numAnchors - 1)(rng)];
+    unfoldConstantsFunction(F, rng, anchor, cfg);
   }
 }
 

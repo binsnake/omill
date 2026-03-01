@@ -1,4 +1,6 @@
 #include "BogusControlFlow.h"
+#include "PassFilter.h"
+#include "OpaquePredicateLib.h"
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
@@ -12,21 +14,6 @@
 #include <vector>
 
 namespace ollvm {
-
-/// Build an opaque predicate that always evaluates to true:
-///   (x * (x + 1)) % 2 == 0
-/// This holds for all integers since x*(x+1) is always even.
-static llvm::Value *buildOpaqueTruePredicate(llvm::IRBuilder<> &builder,
-                                             llvm::Value *x) {
-  auto *ty = x->getType();
-  auto *one = llvm::ConstantInt::get(ty, 1);
-  auto *two = llvm::ConstantInt::get(ty, 2);
-  auto *zero = llvm::ConstantInt::get(ty, 0);
-  auto *xPlus1 = builder.CreateAdd(x, one, "opq.xp1");
-  auto *mul = builder.CreateMul(x, xPlus1, "opq.mul");
-  auto *rem = builder.CreateURem(mul, two, "opq.rem");
-  return builder.CreateICmpEQ(rem, zero, "opq.cond");
-}
 
 /// Determine whether a basic block is eligible for BCF.
 /// The block must end with an unconditional branch (not entry, not return,
@@ -69,6 +56,15 @@ static void mutateClonedInstruction(llvm::Instruction *I,
     return;
   }
 
+  // Skip instructions where mutating constants would create invalid IR:
+  // GEPs (struct indices), calls (intrinsic IDs), switches, etc.
+  if (llvm::isa<llvm::GetElementPtrInst>(I) ||
+      llvm::isa<llvm::CallBase>(I) ||
+      llvm::isa<llvm::SwitchInst>(I) ||
+      llvm::isa<llvm::ExtractValueInst>(I) ||
+      llvm::isa<llvm::InsertValueInst>(I))
+    return;
+
   for (unsigned i = 0, e = I->getNumOperands(); i < e; ++i) {
     if (auto *ci = llvm::dyn_cast<llvm::ConstantInt>(I->getOperand(i))) {
       if (ci->getBitWidth() >= 8 && !ci->isZero()) {
@@ -81,9 +77,76 @@ static void mutateClonedInstruction(llvm::Instruction *I,
   }
 }
 
+/// Create a junk (bogus) block that references real program values,
+/// making it harder to distinguish from live code via static analysis.
+static llvm::BasicBlock *createJunkBlock(llvm::Function &F,
+                                         llvm::BasicBlock *target,
+                                         std::mt19937 &rng,
+                                         llvm::AllocaInst *sinkAlloca) {
+  auto &ctx = F.getContext();
+  auto *i64Ty = llvm::Type::getInt64Ty(ctx);
+  auto *junkBB = llvm::BasicBlock::Create(ctx, "", &F);
+  llvm::IRBuilder<> builder(junkBB);
+
+  // Collect source values: function args + feedback from sinkAlloca.
+  std::vector<llvm::Value *> sources;
+
+  // Load from sinkAlloca (creates feedback loop that looks like state).
+  sources.push_back(builder.CreateLoad(i64Ty, sinkAlloca, ""));
+
+  // Add function arguments as sources.
+  for (auto &arg : F.args()) {
+    if (arg.getType()->isIntegerTy()) {
+      auto *ext = builder.CreateZExtOrTrunc(&arg, i64Ty, "");
+      sources.push_back(ext);
+    } else if (arg.getType()->isPointerTy()) {
+      sources.push_back(builder.CreatePtrToInt(&arg, i64Ty, ""));
+    }
+  }
+
+  // If only the sinkAlloca load is available (no args), add constants
+  // so we still get non-trivial arithmetic.
+  if (sources.size() < 2) {
+    std::uniform_int_distribution<uint64_t> cDist(1, 0xFFFFFFFF);
+    sources.push_back(llvm::ConstantInt::get(i64Ty, cDist(rng)));
+    sources.push_back(llvm::ConstantInt::get(i64Ty, cDist(rng)));
+  }
+
+  // Generate 3-6 random arithmetic operations chaining source values.
+  std::uniform_int_distribution<int> opCountDist(3, 6);
+  std::uniform_int_distribution<int> opKindDist(0, 5);
+  int opCount = opCountDist(rng);
+
+  auto pickSource = [&](std::mt19937 &r) -> llvm::Value * {
+    std::uniform_int_distribution<size_t> idx(0, sources.size() - 1);
+    return sources[idx(r)];
+  };
+
+  llvm::Value *acc = pickSource(rng);
+  for (int i = 0; i < opCount; ++i) {
+    llvm::Value *operand = pickSource(rng);
+    switch (opKindDist(rng)) {
+    case 0: acc = builder.CreateAdd(acc, operand, ""); break;
+    case 1: acc = builder.CreateSub(acc, operand, ""); break;
+    case 2: acc = builder.CreateXor(acc, operand, ""); break;
+    case 3: acc = builder.CreateMul(acc, operand, ""); break;
+    case 4: acc = builder.CreateAnd(acc, operand, ""); break;
+    case 5: acc = builder.CreateOr(acc, operand, ""); break;
+    }
+  }
+
+  // Store final result to sinkAlloca (makes computation look live).
+  builder.CreateStore(acc, sinkAlloca);
+
+  // Branch unconditionally to the real target.
+  builder.CreateBr(target);
+  return junkBB;
+}
+
 static void insertBogusControlFlowFunction(llvm::Function &F,
-                                           std::mt19937 &rng) {
-  if (F.isDeclaration() || F.size() <= 1)
+                                           std::mt19937 &rng,
+                                           const FilterConfig &cfg) {
+  if (shouldSkipFunction(F, cfg) || F.size() <= 1)
     return;
 
   std::vector<llvm::BasicBlock *> candidates;
@@ -99,7 +162,7 @@ static void insertBogusControlFlowFunction(llvm::Function &F,
   std::uniform_int_distribution<int> percent(0, 99);
   std::vector<llvm::BasicBlock *> selected;
   for (auto *BB : candidates) {
-    if (percent(rng) < 30)
+    if (shouldTransform(rng, cfg) && percent(rng) < 30)
       selected.push_back(BB);
   }
 
@@ -119,72 +182,62 @@ static void insertBogusControlFlowFunction(llvm::Function &F,
       }
     }
     if (!opaqueInput) {
+      // Try pointer args — PtrToInt only valid on pointer types.
+      for (auto &arg : F.args()) {
+        if (arg.getType()->isPointerTy()) {
+          auto &entry = F.getEntryBlock();
+          llvm::IRBuilder<> entryBuilder(&entry,
+                                         entry.getFirstInsertionPt());
+          opaqueInput = entryBuilder.CreatePtrToInt(&arg, i32Ty);
+          break;
+        }
+      }
+    }
+    if (!opaqueInput) {
+      // No integer or pointer args — fall back to global variable.
+      auto *M = F.getParent();
+      auto *gv = new llvm::GlobalVariable(
+          *M, i32Ty, /*isConstant=*/false,
+          llvm::GlobalValue::PrivateLinkage,
+          llvm::ConstantInt::get(i32Ty, 0));
       auto &entry = F.getEntryBlock();
       llvm::IRBuilder<> entryBuilder(&entry, entry.getFirstInsertionPt());
-      opaqueInput =
-          entryBuilder.CreatePtrToInt(&*F.arg_begin(), i32Ty, "opq.ptr2int");
+      opaqueInput = entryBuilder.CreateLoad(i32Ty, gv,
+                                             /*isVolatile=*/true);
     }
   } else {
     auto *M = F.getParent();
     auto *gv = new llvm::GlobalVariable(
         *M, i32Ty, /*isConstant=*/false, llvm::GlobalValue::PrivateLinkage,
-        llvm::ConstantInt::get(i32Ty, 0), "bcf_opaque_var");
+        llvm::ConstantInt::get(i32Ty, 0));
     auto &entry = F.getEntryBlock();
     llvm::IRBuilder<> entryBuilder(&entry, entry.getFirstInsertionPt());
-    auto *load = entryBuilder.CreateLoad(i32Ty, gv, /*isVolatile=*/true,
-                                         "opq.load");
+    auto *load = entryBuilder.CreateLoad(i32Ty, gv, /*isVolatile=*/true);
     opaqueInput = load;
   }
 
   // Strategy: for each selected block ending with `br successor`:
-  //   1. Create a junk block with mutated copies of origBB's instructions
-  //      that branches to `successor`.
+  //   1. Create a junk block with correlated arithmetic referencing
+  //      real function arguments and a persistent sink alloca.
   //   2. Replace origBB's unconditional `br successor` with
   //      `br opaque_true, successor, junkBB`.
   //   3. Update PHI nodes in successor for the new junkBB predecessor.
   //
   // This preserves domination since origBB is never moved or split.
 
+  // Create a sink alloca in the entry block for junk block state.
+  auto *i64Ty = llvm::Type::getInt64Ty(ctx);
+  auto &entryBB = F.getEntryBlock();
+  llvm::IRBuilder<> allocaBuilder(&entryBB, entryBB.getFirstInsertionPt());
+  auto *sinkAlloca = allocaBuilder.CreateAlloca(i64Ty, nullptr, "");
+  allocaBuilder.CreateStore(llvm::ConstantInt::get(i64Ty, 0), sinkAlloca);
+
   for (auto *origBB : selected) {
     auto *br = llvm::cast<llvm::BranchInst>(origBB->getTerminator());
     auto *successor = br->getSuccessor(0);
 
-    // Create the junk (bogus) block.
-    auto *junkBB = llvm::BasicBlock::Create(
-        ctx, origBB->getName() + ".bcf_bogus", &F);
-
-    // Clone non-terminator instructions from origBB into junkBB.
-    llvm::ValueToValueMapTy vmap;
-    for (auto &I : *origBB) {
-      if (I.isTerminator()) break;
-      // Skip PHI nodes in the clone — they reference predecessors of origBB
-      // that don't apply to junkBB.
-      if (llvm::isa<llvm::PHINode>(&I)) continue;
-      auto *cloned = I.clone();
-      cloned->setName(I.getName() + ".bogus");
-      cloned->insertInto(junkBB, junkBB->end());
-      vmap[&I] = cloned;
-    }
-
-    // Remap operands within the cloned block.
-    for (auto &I : *junkBB) {
-      for (unsigned i = 0, e = I.getNumOperands(); i < e; ++i) {
-        auto it = vmap.find(I.getOperand(i));
-        if (it != vmap.end())
-          I.setOperand(i, it->second);
-      }
-    }
-
-    // Mutate some cloned instructions.
-    std::vector<llvm::Instruction *> clonedInsts;
-    for (auto &I : *junkBB)
-      clonedInsts.push_back(&I);
-    for (auto *I : clonedInsts)
-      mutateClonedInstruction(I, rng);
-
-    // junkBB branches unconditionally to successor.
-    llvm::IRBuilder<> junkBuilder(junkBB);
-    junkBuilder.CreateBr(successor);
+    // Create the junk (bogus) block with correlated values.
+    auto *junkBB = createJunkBlock(F, successor, rng, sinkAlloca);
 
     // Update PHI nodes in successor: junkBB is a new predecessor.
     // Use undef since the junk path is always dead.
@@ -194,19 +247,27 @@ static void insertBogusControlFlowFunction(llvm::Function &F,
       phi->addIncoming(llvm::UndefValue::get(phi->getType()), junkBB);
     }
 
-    // Replace origBB's unconditional branch with conditional:
-    // true (always taken) → successor, false → junkBB.
+    // Replace origBB's unconditional branch with conditional.
+    // Randomly flip polarity: ~50% true-branch-is-real, ~50% false-branch-is-real.
     llvm::IRBuilder<> builder(br);
-    auto *cond = buildOpaqueTruePredicate(builder, opaqueInput);
+    std::uniform_int_distribution<int> flipDist(0, 1);
+    bool flip = flipDist(rng);
+    auto *cond = flip
+        ? ollvm::generateOpaqueFalse(builder, opaqueInput, rng())
+        : ollvm::generateOpaqueTrue(builder, opaqueInput, rng());
     br->eraseFromParent();
-    llvm::BranchInst::Create(successor, junkBB, cond, origBB);
+    if (flip)
+      llvm::BranchInst::Create(junkBB, successor, cond, origBB);
+    else
+      llvm::BranchInst::Create(successor, junkBB, cond, origBB);
   }
 }
 
-void insertBogusControlFlowModule(llvm::Module &M, uint32_t seed) {
+void insertBogusControlFlowModule(llvm::Module &M, uint32_t seed,
+                                  const FilterConfig &cfg) {
   std::mt19937 rng(seed);
   for (auto &F : M) {
-    insertBogusControlFlowFunction(F, rng);
+    insertBogusControlFlowFunction(F, rng, cfg);
   }
 }
 

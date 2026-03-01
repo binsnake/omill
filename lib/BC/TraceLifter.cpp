@@ -359,10 +359,16 @@ bool TraceLifter::Impl::Lift(
 
       auto lift_status =
           inst.GetLifter()->LiftIntoBlock(inst, block, state_ptr);
-      if (remill::kLiftedInstruction != lift_status) {
+      if (remill::kLiftedInstruction != lift_status &&
+          remill::kLiftedUnsupportedInstruction != lift_status) {
         remill::AddTerminatingTailCall(block, intrinsics->error, *intrinsics);
         continue;
       }
+
+      // For unsupported-but-decoded instructions (e.g. VERR, VERW),
+      // semantics were emitted as a sync_hyper_call by the ISEL fallback.
+      // The instruction's category and next_pc are still valid, so we
+      // fall through to the category switch to continue the trace.
 
       // Handle lifting a delayed instruction.
       auto try_delay = arch->MayHaveDelaySlot(inst);

@@ -1,0 +1,7 @@
+#pragma once
+#include <llvm/IR/Module.h>
+#include "PassFilter.h"
+#include <cstdint>
+namespace ollvm {
+void outlineFunctionsModule(llvm::Module &M, uint32_t seed, const FilterConfig &cfg);
+}  // namespace ollvm

@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ollvm-msbuild.targets: MSBuild integration for OLLVM whole-program LTO obfuscation.
+
+  Import this file in your .vcxproj to add an obfuscation build step that runs
+  ollvm-lto.py after normal compilation.
+
+  Usage:
+    1. Add this import near the bottom of your .vcxproj (after Microsoft.Cpp.targets):
+
+       <Import Project="path/to/ollvm-msbuild.targets" />
+
+    2. Enable obfuscation for the desired configuration(s):
+
+       <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='DebugOpt|x64'">
+         <OllvmLtoEnabled>true</OllvmLtoEnabled>
+       </PropertyGroup>
+
+    3. Optionally override defaults:
+
+       <PropertyGroup>
+         <OllvmLtoPython>C:\Python312\python.exe</OllvmLtoPython>
+         <OllvmLtoPreserve>DriverEntry,__chkstk,MyExport</OllvmLtoPreserve>
+         <OllvmLtoJobs>4</OllvmLtoJobs>
+         <OllvmLtoFlags>see defaults in PropertyGroup below</OllvmLtoFlags>
+         <OllvmLtoOutput>$(IntDir)$(TargetName)_obf.obj</OllvmLtoOutput>
+       </PropertyGroup>
+
+  Properties:
+    OllvmLtoEnabled    Set to 'true' to enable the obfuscation step (default: false)
+    OllvmLtoPython     Path to the Python interpreter (default: python)
+    OllvmLtoScript     Path to ollvm-lto.py (default: alongside this .targets file)
+    OllvmLtoPreserve   Extra symbols to preserve (default: auto-detected from DEF)
+    OllvmLtoJobs       Parallel compilation jobs (default: NUMBER_OF_PROCESSORS)
+    OllvmLtoFlags      Flags passed to ollvm-obf (default: full obfuscation suite)
+    OllvmLtoOutput     Output .obj path (default: $(IntDir)$(TargetName)_lto.obj)
+
+  Per-file exclusion (inside ClCompile items):
+    OllvmExclude       Set to 'true' to skip obfuscation for this file.
+                       Supports per-config conditions.
+
+  Notes:
+    Works with ClangCL toolset (V143, LLVM_v143, etc.).
+    ollvm-lto.py resolves source paths relative to the .vcxproj directory.
+    Preserve symbols are auto-detected from the project's .def file.
+    The target runs AfterBuild so all normal compilation completes first.
+-->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <!-- ══════════════════════════════════════════════════════════════════════
+       Default property values — override these in your .vcxproj before
+       importing, or in a PropertyGroup after importing.
+       ══════════════════════════════════════════════════════════════════════ -->
+  <PropertyGroup>
+    <OllvmLtoEnabled Condition="'$(OllvmLtoEnabled)'==''">false</OllvmLtoEnabled>
+    <OllvmLtoPython Condition="'$(OllvmLtoPython)'==''">python</OllvmLtoPython>
+    <OllvmLtoScript Condition="'$(OllvmLtoScript)'==''">$(MSBuildThisFileDirectory)ollvm-lto.py</OllvmLtoScript>
+    <OllvmLtoPreserve Condition="'$(OllvmLtoPreserve)'==''"></OllvmLtoPreserve>
+    <OllvmLtoJobs Condition="'$(OllvmLtoJobs)'==''">$(NUMBER_OF_PROCESSORS)</OllvmLtoJobs>
+    <OllvmLtoFlags Condition="'$(OllvmLtoFlags)'==''">--substitute --opaque-predicates --bogus-control-flow --flatten --const-unfold --string-encrypt --bmi-mutate --if-convert --code-clone --schedule-instructions --arith-encode --stack-randomize --vectorize --vectorize-percent=5 --internalize-all --internalize --dead-memory --opaque-addressing --entangle-arithmetic --opaque-constants --encode-literals --indirect-calls --cfi-poisoning --anti-symbolic --interproc-obf --skip-inline-asm --min-instructions=10 --transform-percent=38 --reg-pressure --verify-each</OllvmLtoFlags>
+    <OllvmLtoOutput Condition="'$(OllvmLtoOutput)'==''">$(IntDir)$(TargetName)_lto.obj</OllvmLtoOutput>
+  </PropertyGroup>
+
+  <!-- ══════════════════════════════════════════════════════════════════════
+       OllvmLto target — runs after build when enabled.
+       ══════════════════════════════════════════════════════════════════════ -->
+  <Target Name="OllvmLto" AfterTargets="Build" Condition="'$(OllvmLtoEnabled)'=='true'">
+
+    <Message Importance="high"
+             Text="[OLLVM] Starting whole-program LTO obfuscation..." />
+
+    <Message Importance="normal"
+             Text="[OLLVM] Config: $(Configuration)|$(Platform)" />
+    <Message Importance="normal"
+             Text="[OLLVM] Output: $(OllvmLtoOutput)" />
+    <Message Importance="normal"
+             Text="[OLLVM] Preserve: $(OllvmLtoPreserve)" />
+    <Message Importance="normal"
+             Text="[OLLVM] Jobs: $(OllvmLtoJobs)" />
+
+    <Exec Command="&quot;$(OllvmLtoPython)&quot; &quot;$(OllvmLtoScript)&quot; --vcxproj=&quot;$(MSBuildProjectFullPath)&quot; --config=&quot;$(Configuration)|$(Platform)&quot; --int-dir=&quot;$(IntDir)&quot; --out=&quot;$(OllvmLtoOutput)&quot; --preserve=&quot;$(OllvmLtoPreserve)&quot; --jobs=$(OllvmLtoJobs) --ollvm-flags=&quot;$(OllvmLtoFlags)&quot;"
+          WorkingDirectory="$(ProjectDir)"
+          ConsoleToMSBuild="true" />
+
+    <Message Importance="high"
+             Text="[OLLVM] Obfuscation complete: $(OllvmLtoOutput)" />
+
+  </Target>
+
+</Project>

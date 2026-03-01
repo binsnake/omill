@@ -139,38 +139,31 @@ TEST_F(BogusControlFlowObfTest, InsertsClonedBlocks) {
       << "BCF should insert additional blocks";
 }
 
-TEST_F(BogusControlFlowObfTest, OpaqueBranchAlwaysTrue) {
+TEST_F(BogusControlFlowObfTest, OpaqueBranchHasMBAPredicate) {
   auto M = createModule();
   createManyBlockFunction(*M, "test_fn", 20);
   ollvm::insertBogusControlFlowModule(*M, 42);
 
   auto *F = M->getFunction("test_fn");
-  // Find dispatch blocks (they contain the opaque predicate pattern).
-  // Look for ICmp instructions comparing urem result with 0.
-  bool foundOpaquePredicate = false;
+  // After BCF, dispatch blocks contain MBA-based opaque predicates:
+  // a conditional branch whose condition is an ICmpInst.  The predicate
+  // and polarity vary (eq/sle/uge/slt/ne/sgt/ugt for anti-fingerprinting).
+  // The original function had only unconditional branches, so any
+  // conditional branch is BCF-injected.
+  bool foundMBACondBranch = false;
   for (auto &BB : *F) {
-    for (auto &I : BB) {
-      if (auto *icmp = llvm::dyn_cast<llvm::ICmpInst>(&I)) {
-        if (icmp->getPredicate() == llvm::CmpInst::ICMP_EQ) {
-          // Check if comparing a urem with 0.
-          if (auto *rem = llvm::dyn_cast<llvm::BinaryOperator>(
-                  icmp->getOperand(0))) {
-            if (rem->getOpcode() == llvm::Instruction::URem) {
-              foundOpaquePredicate = true;
-              // Verify it's x*(x+1) % 2 == 0 structure.
-              if (auto *ci =
-                      llvm::dyn_cast<llvm::ConstantInt>(rem->getOperand(1))) {
-                EXPECT_EQ(ci->getZExtValue(), 2u)
-                    << "Opaque predicate should use mod 2";
-              }
-            }
-          }
-        }
-      }
-    }
+    auto *BI = llvm::dyn_cast<llvm::BranchInst>(BB.getTerminator());
+    if (!BI || !BI->isConditional())
+      continue;
+    auto *ICmp = llvm::dyn_cast<llvm::ICmpInst>(BI->getCondition());
+    if (!ICmp)
+      continue;
+    // Any ICmpInst-based conditional branch is a BCF opaque predicate.
+    foundMBACondBranch = true;
+    break;
   }
-  EXPECT_TRUE(foundOpaquePredicate)
-      << "Should find at least one opaque predicate (x*(x+1))%%2==0";
+  EXPECT_TRUE(foundMBACondBranch)
+      << "Should find at least one conditional branch with an ICmpInst condition";
 }
 
 TEST_F(BogusControlFlowObfTest, SkipsEntryBlock) {
@@ -298,6 +291,150 @@ TEST_F(BogusControlFlowObfTest, SkipsBlocksWithPHI) {
 
   // Module should still verify.
   EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+}
+
+TEST_F(BogusControlFlowObfTest, JunkBlocksReferenceFunctionArgs) {
+  auto M = createModule();
+  createManyBlockFunction(*M, "test_fn", 20);
+  auto *F = M->getFunction("test_fn");
+  unsigned blocksBefore = countBlocks(*F);
+
+  ollvm::insertBogusControlFlowModule(*M, 42);
+
+  unsigned blocksAfter = countBlocks(*F);
+  ASSERT_GT(blocksAfter, blocksBefore) << "BCF must insert junk blocks";
+
+  // Junk blocks are new blocks not in the original set. They should contain
+  // instructions that use function arguments (the i64 arg).
+  auto *arg0 = F->getArg(0);
+  bool foundArgUseInJunk = false;
+  for (auto &BB : *F) {
+    // Skip named blocks (original blocks have names; junk blocks have empty names).
+    if (!BB.getName().empty())
+      continue;
+    for (auto &I : BB) {
+      for (unsigned i = 0, e = I.getNumOperands(); i < e; ++i) {
+        // Check if operand is a zext/trunc of arg0, or arg0 directly.
+        if (I.getOperand(i) == arg0) {
+          foundArgUseInJunk = true;
+          break;
+        }
+        // The arg gets ZExtOrTrunc'd to i64 — check if operand is a cast of arg.
+        if (auto *cast = llvm::dyn_cast<llvm::CastInst>(I.getOperand(i))) {
+          if (cast->getOperand(0) == arg0) {
+            foundArgUseInJunk = true;
+            break;
+          }
+        }
+      }
+      if (foundArgUseInJunk) break;
+    }
+    if (foundArgUseInJunk) break;
+  }
+  EXPECT_TRUE(foundArgUseInJunk)
+      << "Junk blocks should reference real function arguments";
+}
+
+TEST_F(BogusControlFlowObfTest, JunkBlocksHaveSinkAlloca) {
+  auto M = createModule();
+  createManyBlockFunction(*M, "test_fn", 20);
+  auto *F = M->getFunction("test_fn");
+
+  ollvm::insertBogusControlFlowModule(*M, 42);
+
+  // The entry block should contain an alloca for the sink.
+  auto &entryBB = F->getEntryBlock();
+  llvm::AllocaInst *sinkAlloca = nullptr;
+  for (auto &I : entryBB) {
+    if (auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
+      if (AI->getAllocatedType()->isIntegerTy(64)) {
+        sinkAlloca = AI;
+        break;
+      }
+    }
+  }
+  ASSERT_NE(sinkAlloca, nullptr)
+      << "Should find an i64 sink alloca in the entry block";
+
+  // Junk blocks should both load from and store to the sink alloca.
+  bool foundLoad = false;
+  bool foundStore = false;
+  for (auto &BB : *F) {
+    if (!BB.getName().empty()) continue;
+    for (auto &I : BB) {
+      if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I)) {
+        if (LI->getPointerOperand() == sinkAlloca)
+          foundLoad = true;
+      }
+      if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+        if (SI->getPointerOperand() == sinkAlloca)
+          foundStore = true;
+      }
+    }
+  }
+  EXPECT_TRUE(foundLoad) << "Junk blocks should load from sink alloca";
+  EXPECT_TRUE(foundStore) << "Junk blocks should store to sink alloca";
+}
+
+TEST_F(BogusControlFlowObfTest, JunkBlocksHaveMultipleArithOps) {
+  auto M = createModule();
+  createManyBlockFunction(*M, "test_fn", 20);
+  auto *F = M->getFunction("test_fn");
+
+  ollvm::insertBogusControlFlowModule(*M, 42);
+
+  // Each junk block should have at least 3 binary arithmetic operations.
+  for (auto &BB : *F) {
+    if (!BB.getName().empty()) continue;
+    unsigned arithCount = 0;
+    for (auto &I : BB) {
+      if (llvm::isa<llvm::BinaryOperator>(&I))
+        ++arithCount;
+    }
+    // Each junk block should have 3-6 arithmetic ops (per createJunkBlock).
+    EXPECT_GE(arithCount, 3u)
+        << "Junk block should have at least 3 arithmetic operations";
+    EXPECT_LE(arithCount, 6u)
+        << "Junk block should have at most 6 arithmetic operations";
+  }
+}
+
+TEST_F(BogusControlFlowObfTest, JunkBlocksVerifyWithPointerArgs) {
+  // Test with a function that has pointer arguments (PtrToInt path).
+  auto M = createModule();
+  auto *i64Ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptrTy = llvm::PointerType::get(Ctx, 0);
+  auto *fnTy = llvm::FunctionType::get(i64Ty, {ptrTy, ptrTy}, false);
+  auto *F = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage,
+                                   "ptr_fn", *M);
+
+  auto *entryBB = llvm::BasicBlock::Create(Ctx, "entry", F);
+  llvm::IRBuilder<> entryBuilder(entryBB);
+  auto *val = entryBuilder.CreatePtrToInt(F->getArg(0), i64Ty);
+
+  // Create several blocks so BCF has targets.
+  auto *prevBB = entryBB;
+  llvm::Value *acc = val;
+  for (unsigned i = 0; i < 15; ++i) {
+    auto *bb = llvm::BasicBlock::Create(Ctx, "b" + std::to_string(i), F);
+    llvm::IRBuilder<>(prevBB).CreateBr(bb);
+    llvm::IRBuilder<> b(bb);
+    acc = b.CreateAdd(acc, llvm::ConstantInt::get(i64Ty, i + 1));
+    acc = b.CreateXor(acc, llvm::ConstantInt::get(i64Ty, 0xAB));
+    prevBB = bb;
+  }
+  auto *exitBB = llvm::BasicBlock::Create(Ctx, "exit", F);
+  llvm::IRBuilder<>(prevBB).CreateBr(exitBB);
+  llvm::IRBuilder<>(exitBB).CreateRet(acc);
+
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+
+  ollvm::insertBogusControlFlowModule(*M, 77);
+
+  std::string errStr;
+  llvm::raw_string_ostream errOS(errStr);
+  EXPECT_FALSE(llvm::verifyModule(*M, &errOS))
+      << "Module with pointer-arg function should verify after BCF: " << errStr;
 }
 
 }  // namespace

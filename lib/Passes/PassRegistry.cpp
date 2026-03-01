@@ -10,6 +10,7 @@ namespace omill {
 
 void registerAnalyses(llvm::FunctionAnalysisManager &FAM) {
   FAM.registerPass([&] { return RemillIntrinsicAnalysis(); });
+  FAM.registerPass([&] { return SegmentsAA(); });
 }
 
 void registerPassBuilderCallbacks(llvm::PassBuilder &PB) {

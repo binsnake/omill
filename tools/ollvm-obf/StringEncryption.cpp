@@ -1,5 +1,7 @@
 #include "StringEncryption.h"
 
+#include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/GlobalVariable.h>
@@ -15,11 +17,11 @@ namespace ollvm {
 
 void encryptStringsModule(llvm::Module &M, uint32_t seed) {
   std::mt19937 rng(seed);
-  std::uniform_int_distribution<int> key_dist(1, 255);
 
   auto &ctx = M.getContext();
   auto *i8_ty = llvm::Type::getInt8Ty(ctx);
   auto *i32_ty = llvm::Type::getInt32Ty(ctx);
+  auto *i64_ty = llvm::Type::getInt64Ty(ctx);
 
   // Collect string globals to encrypt.
   struct StringInfo {
@@ -49,151 +51,196 @@ void encryptStringsModule(llvm::Module &M, uint32_t seed) {
     strings.push_back({&GV, raw.str()});
   }
 
-  unsigned counter = 0;
   for (auto &info : strings) {
-    uint8_t key = static_cast<uint8_t>(key_dist(rng));
+    uint32_t key = rng();
+    if (key == 0) key = 1;  // Avoid degenerate zero key.
     size_t len = info.data.size();
 
-    // Create encrypted data.
+    // Encrypt with rolling feedback cipher.
+    // state = (uint8_t)(key & 0xFF)
+    // for each byte: enc[i] = data[i] ^ state;
+    //                state = (state*31 + 17 + enc[i]) & 0xFF
     std::vector<uint8_t> encrypted(len);
+    uint8_t state = static_cast<uint8_t>(key & 0xFF);
     for (size_t i = 0; i < len; ++i) {
-      encrypted[i] = static_cast<uint8_t>(info.data[i]) ^ key;
+      encrypted[i] = static_cast<uint8_t>(info.data[i]) ^ state;
+      state = static_cast<uint8_t>((state * 31 + 17 + encrypted[i]) & 0xFF);
     }
 
-    // Create @.enc_str_N global (non-constant, so it lands in .data/.rdata).
+    // Create encrypted data global (no name).
     auto *enc_data = llvm::ConstantDataArray::get(
         ctx, llvm::ArrayRef<uint8_t>(encrypted));
     auto *enc_gv = new llvm::GlobalVariable(
         M, enc_data->getType(), true, llvm::GlobalValue::PrivateLinkage,
-        enc_data, ".enc_str_" + std::to_string(counter));
+        enc_data, "");
 
-    // Create @.enc_key_N global.
-    auto *key_val = llvm::ConstantInt::get(i8_ty, key);
+    // Create per-string i32 key global (no name).
+    auto *key_val = llvm::ConstantInt::get(i32_ty, key);
     auto *key_gv = new llvm::GlobalVariable(
-        M, i8_ty, true, llvm::GlobalValue::PrivateLinkage, key_val,
-        ".enc_key_" + std::to_string(counter));
+        M, i32_ty, true, llvm::GlobalValue::PrivateLinkage, key_val, "");
 
-    // Replace each use of the original global with inline decryption.
-    // We need to collect uses first since we modify them.
-    std::vector<llvm::Use *> uses;
+    auto *arr_ty = llvm::ArrayType::get(i8_ty, len);
+
+    // Group uses by function.  A ConstantExpr user may be referenced from
+    // multiple functions — record each instruction-level use site separately.
+    struct UseSite {
+      llvm::Use *string_use;       // Use in GV's use list (null for CE path).
+      llvm::Instruction *inst;     // Instruction that transitively uses GV.
+      llvm::ConstantExpr *via_ce;  // Non-null if use is through a ConstantExpr.
+    };
+    llvm::DenseMap<llvm::Function *, llvm::SmallVector<UseSite, 4>> func_uses;
+
     for (auto &U : info.gv->uses()) {
-      uses.push_back(&U);
-    }
-
-    for (auto *U : uses) {
-      auto *user = U->getUser();
-
-      // Find the function containing this use.
-      llvm::Instruction *insert_pt = nullptr;
+      auto *user = U.getUser();
       if (auto *inst = llvm::dyn_cast<llvm::Instruction>(user)) {
-        insert_pt = inst;
+        auto *F = inst->getFunction();
+        if (F)
+          func_uses[F].push_back({&U, inst, nullptr});
       } else if (auto *ce = llvm::dyn_cast<llvm::ConstantExpr>(user)) {
-        // For constant expressions (like GEP of global), find an instruction
-        // user of the constant expr.
         for (auto &CEU : ce->uses()) {
-          if (auto *inst = llvm::dyn_cast<llvm::Instruction>(CEU.getUser())) {
-            insert_pt = inst;
-            break;
+          if (auto *inst =
+                  llvm::dyn_cast<llvm::Instruction>(CEU.getUser())) {
+            auto *F = inst->getFunction();
+            if (F)
+              func_uses[F].push_back({nullptr, inst, ce});
           }
         }
       }
+    }
 
-      if (!insert_pt)
-        continue;
-
-      llvm::Function *F = insert_pt->getFunction();
-      if (!F)
-        continue;
-
-      // Insert decryption at the function entry (after allocas).
+    for (auto &[F, sites] : func_uses) {
+      // One decryption buffer per (string, function) pair.
       llvm::BasicBlock &entry = F->getEntryBlock();
-      llvm::Instruction *alloca_insert = &*entry.getFirstInsertionPt();
-
-      llvm::IRBuilder<> alloca_builder(alloca_insert);
-      auto *arr_ty = llvm::ArrayType::get(i8_ty, len);
-      auto *buf = alloca_builder.CreateAlloca(arr_ty, nullptr, "dec_buf");
+      llvm::IRBuilder<> alloca_builder(&*entry.getFirstInsertionPt());
+      auto *buf = alloca_builder.CreateAlloca(arr_ty, nullptr, "");
 
       // Find insertion point after all allocas.
-      llvm::Instruction *after_allocas = alloca_insert;
+      llvm::Instruction *after_allocas = &*entry.getFirstInsertionPt();
       while (after_allocas && llvm::isa<llvm::AllocaInst>(after_allocas))
         after_allocas = after_allocas->getNextNode();
       if (!after_allocas)
-        after_allocas = alloca_insert;
+        after_allocas = entry.getTerminator();
 
       llvm::IRBuilder<> builder(after_allocas);
 
-      // Load the key.
-      auto *key_load = builder.CreateLoad(i8_ty, key_gv, "enc_key");
+      // Load the i32 key and truncate to i8 for initial state.
+      auto *key_load = builder.CreateLoad(i32_ty, key_gv, "");
+      auto *state_init = builder.CreateTrunc(key_load, i8_ty, "");
 
-      // Unrolled decryption loop for small strings, loop for larger ones.
+      auto *c31 = llvm::ConstantInt::get(i8_ty, 31);
+      auto *c17 = llvm::ConstantInt::get(i8_ty, 17);
+
       if (len <= 32) {
-        // Unrolled.
+        // Unrolled decryption with feedback.
+        llvm::Value *cur_state = state_init;
         for (size_t i = 0; i < len; ++i) {
           auto *gep_enc = builder.CreateConstInBoundsGEP2_32(
-              enc_data->getType(), enc_gv, 0, static_cast<unsigned>(i));
-          auto *enc_byte = builder.CreateLoad(i8_ty, gep_enc);
-          auto *dec_byte = builder.CreateXor(enc_byte, key_load);
+              enc_data->getType(), enc_gv, 0, static_cast<unsigned>(i), "");
+          auto *enc_byte = builder.CreateLoad(i8_ty, gep_enc, "");
+          auto *dec_byte = builder.CreateXor(enc_byte, cur_state, "");
           auto *gep_buf = builder.CreateConstInBoundsGEP2_32(
-              arr_ty, buf, 0, static_cast<unsigned>(i));
+              arr_ty, buf, 0, static_cast<unsigned>(i), "");
           builder.CreateStore(dec_byte, gep_buf);
+          // state = (state * 31 + 17 + enc_byte) & 0xFF
+          // The & 0xFF is implicit since we're using i8.
+          auto *mul = builder.CreateMul(cur_state, c31, "");
+          auto *add1 = builder.CreateAdd(mul, c17, "");
+          cur_state = builder.CreateAdd(add1, enc_byte, "");
         }
       } else {
-        // Loop-based decryption.
-        auto *preheader = builder.GetInsertBlock();
-        auto *loop_bb = llvm::BasicBlock::Create(ctx, "dec_loop", F,
-                                                  after_allocas->getParent()
-                                                      ->getNextNode());
-        auto *exit_bb = llvm::BasicBlock::Create(ctx, "dec_done", F,
-                                                 loop_bb->getNextNode());
+        // Loop-based decryption for larger strings.
+        llvm::BasicBlock *preheader = builder.GetInsertBlock();
 
-        builder.CreateBr(loop_bb);
+        // Split the current block: everything after our insertion goes to exit.
+        // splitBasicBlock correctly updates PHI incoming blocks in successors.
+        llvm::BasicBlock *exit_bb =
+            preheader->splitBasicBlock(builder.GetInsertPoint(), "");
 
-        // Move all instructions after the branch to exit_bb.
-        // Actually we need to split the block.
-        // Let's just use the unrolled version for simplicity — test strings
-        // are small anyway.
-        // Fall through to unrolled for all sizes in the test context.
+        // Create loop block between preheader and exit.
+        llvm::BasicBlock *loop_bb =
+            llvm::BasicBlock::Create(ctx, "", F, exit_bb);
 
-        // Undo the branch — just unroll everything.
-        builder.GetInsertBlock()->getTerminator()->eraseFromParent();
-        loop_bb->eraseFromParent();
-        exit_bb->eraseFromParent();
+        // Fix preheader terminator: branch to loop instead of exit.
+        preheader->getTerminator()->eraseFromParent();
+        llvm::IRBuilder<> pre_builder(preheader);
+        pre_builder.CreateBr(loop_bb);
 
-        // Re-set builder.
-        llvm::IRBuilder<> builder2(after_allocas);
-        for (size_t i = 0; i < len; ++i) {
-          auto *gep_enc = builder2.CreateConstInBoundsGEP2_32(
-              enc_data->getType(), enc_gv, 0, static_cast<unsigned>(i));
-          auto *enc_byte = builder2.CreateLoad(i8_ty, gep_enc);
-          auto *dec_byte = builder2.CreateXor(enc_byte, key_load);
-          auto *gep_buf = builder2.CreateConstInBoundsGEP2_32(
-              arr_ty, buf, 0, static_cast<unsigned>(i));
-          builder2.CreateStore(dec_byte, gep_buf);
-        }
+        // Build the loop.
+        llvm::IRBuilder<> loop_builder(loop_bb);
+
+        // PHI for index (i64).
+        auto *phi_idx = loop_builder.CreatePHI(i64_ty, 2, "");
+        phi_idx->addIncoming(llvm::ConstantInt::get(i64_ty, 0), preheader);
+
+        // PHI for state (i8).
+        auto *phi_state = loop_builder.CreatePHI(i8_ty, 2, "");
+        phi_state->addIncoming(state_init, preheader);
+
+        // Load enc_gv[i].
+        llvm::Value *idx_vals[] = {
+            llvm::ConstantInt::get(i64_ty, 0), phi_idx};
+        auto *gep_enc = loop_builder.CreateInBoundsGEP(
+            enc_data->getType(), enc_gv, idx_vals, "");
+        auto *enc_byte = loop_builder.CreateLoad(i8_ty, gep_enc, "");
+
+        // dec = enc ^ state
+        auto *dec_byte = loop_builder.CreateXor(enc_byte, phi_state, "");
+
+        // Store to buf[i].
+        llvm::Value *buf_idx_vals[] = {
+            llvm::ConstantInt::get(i64_ty, 0), phi_idx};
+        auto *gep_buf = loop_builder.CreateInBoundsGEP(
+            arr_ty, buf, buf_idx_vals, "");
+        loop_builder.CreateStore(dec_byte, gep_buf);
+
+        // new_state = state * 31 + 17 + enc_byte
+        auto *mul = loop_builder.CreateMul(phi_state, c31, "");
+        auto *add1 = loop_builder.CreateAdd(mul, c17, "");
+        auto *new_state = loop_builder.CreateAdd(add1, enc_byte, "");
+
+        // i_next = i + 1
+        auto *i_next = loop_builder.CreateAdd(
+            phi_idx, llvm::ConstantInt::get(i64_ty, 1), "");
+
+        // Complete PHIs.
+        phi_idx->addIncoming(i_next, loop_bb);
+        phi_state->addIncoming(new_state, loop_bb);
+
+        // Branch: if i_next < len goto loop, else goto exit.
+        auto *cmp = loop_builder.CreateICmpULT(
+            i_next, llvm::ConstantInt::get(i64_ty, len), "");
+        loop_builder.CreateCondBr(cmp, loop_bb, exit_bb);
+
+        // Continue building in exit_bb.
+        builder.SetInsertPoint(&*exit_bb->getFirstInsertionPt());
       }
 
-      // Replace use with GEP to buf[0].
-      llvm::IRBuilder<> use_builder(insert_pt);
-      auto *buf_ptr = use_builder.CreateConstInBoundsGEP2_32(
-          arr_ty, buf, 0, 0);
+      // Create buf_ptr ONCE after decryption.  Since it's in the entry block
+      // (unrolled case) or exit_bb (loop case), it dominates all original code
+      // — including PHI predecessors.  This avoids the old bug of inserting a
+      // GEP at each use site, which could place a non-PHI instruction before
+      // a PHI node.
+      auto *buf_ptr = builder.CreateConstInBoundsGEP2_32(
+          arr_ty, buf, 0, 0, "");
 
-      // If the use was through a ConstantExpr GEP, we need to replace
-      // the ConstantExpr user, not the original global directly.
-      if (auto *ce = llvm::dyn_cast<llvm::ConstantExpr>(user)) {
-        // The constant expr is a GEP of the original global.
-        // Replace uses of the CE in this instruction with buf_ptr.
-        insert_pt->replaceUsesOfWith(ce, buf_ptr);
-      } else {
-        U->set(buf_ptr);
+      // Replace every use of the original global in this function.
+      for (auto &site : sites) {
+        if (site.via_ce) {
+          site.inst->replaceUsesOfWith(site.via_ce, buf_ptr);
+        } else {
+          site.string_use->set(buf_ptr);
+        }
       }
     }
+
+    // Clean up dead ConstantExpr users (CE → GV ref may linger after
+    // all instruction-level uses were rewritten above).
+    info.gv->removeDeadConstantUsers();
 
     // If original global has no more uses, remove it.
     if (info.gv->use_empty()) {
       info.gv->eraseFromParent();
     }
-
-    counter++;
   }
 }
 

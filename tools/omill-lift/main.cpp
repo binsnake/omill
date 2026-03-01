@@ -42,8 +42,17 @@ static cl::opt<std::string> InputFilename(cl::Positional,
                                            cl::Required);
 
 static cl::opt<std::string> FuncVA("va",
-                                    cl::desc("Function virtual address (hex)"),
-                                    cl::Required);
+                                    cl::desc("Function virtual address (hex)"));
+
+static cl::opt<bool> RawBinary(
+    "raw",
+    cl::desc("Treat input as a raw (headerless) code binary"),
+    cl::init(false));
+
+static cl::opt<uint64_t> BaseAddress(
+    "base",
+    cl::desc("Base address for raw binary loading (default: 0)"),
+    cl::init(0));
 
 static cl::opt<std::string> OutputFilename("o", cl::desc("Output .ll file"),
                                             cl::value_desc("filename"),
@@ -383,38 +392,63 @@ int main(int argc, char **argv) {
   cl::ParseCommandLineOptions(argc, argv,
       "omill-lift: Lift a function from a PE binary and optimize\n");
 
-  // Parse VA
+  // Parse VA — for raw binaries, default to base address if --va not given.
   uint64_t func_va = 0;
-  if (StringRef(FuncVA).starts_with("0x") ||
-      StringRef(FuncVA).starts_with("0X")) {
-    StringRef(FuncVA).drop_front(2).getAsInteger(16, func_va);
+  if (FuncVA.getNumOccurrences() > 0) {
+    if (StringRef(FuncVA).starts_with("0x") ||
+        StringRef(FuncVA).starts_with("0X")) {
+      StringRef(FuncVA).drop_front(2).getAsInteger(16, func_va);
+    } else {
+      StringRef(FuncVA).getAsInteger(16, func_va);
+    }
+  } else if (RawBinary) {
+    func_va = BaseAddress;
   } else {
-    StringRef(FuncVA).getAsInteger(16, func_va);
+    errs() << "--va is required for PE mode\n";
+    return 1;
   }
-  if (func_va == 0) {
+  if (func_va == 0 && !RawBinary) {
     errs() << "Invalid VA: " << FuncVA << "\n";
     return 1;
   }
   errs() << "Lifting function at VA 0x" << Twine::utohexstr(func_va) << "\n";
 
-  // Load PE
+  // --- Raw binary mode ---
   PEInfo pe;
-  if (!loadPE(InputFilename, pe)) return 1;
-  errs() << "Loaded PE: image_base=0x" << Twine::utohexstr(pe.image_base)
-         << " code_sections=" << pe.code_sections.size() << "\n";
-  for (const auto &cs : pe.code_sections) {
-    errs() << "  code: 0x" << Twine::utohexstr(cs.va)
-           << " (" << cs.size << " bytes)\n";
+  std::vector<uint8_t> raw_code;
+
+  if (RawBinary) {
+    auto buf_or_err = MemoryBuffer::getFile(InputFilename);
+    if (!buf_or_err) {
+      errs() << "Cannot open " << InputFilename << ": "
+             << buf_or_err.getError().message() << "\n";
+      return 1;
+    }
+    auto &buf = *buf_or_err;
+    raw_code.assign(
+        reinterpret_cast<const uint8_t *>(buf->getBufferStart()),
+        reinterpret_cast<const uint8_t *>(buf->getBufferEnd()));
+    errs() << "Loaded raw binary: " << raw_code.size()
+           << " bytes at base 0x" << Twine::utohexstr(BaseAddress) << "\n";
+  } else {
+    // Load PE
+    if (!loadPE(InputFilename, pe)) return 1;
+    errs() << "Loaded PE: image_base=0x" << Twine::utohexstr(pe.image_base)
+           << " code_sections=" << pe.code_sections.size() << "\n";
+    for (const auto &cs : pe.code_sections) {
+      errs() << "  code: 0x" << Twine::utohexstr(cs.va)
+             << " (" << cs.size << " bytes)\n";
+    }
+    if (pe.code_sections.empty()) {
+      errs() << "No executable sections found in PE\n";
+      return 1;
+    }
   }
 
-  if (pe.code_sections.empty()) {
-    errs() << "No executable sections found in PE\n";
-    return 1;
-  }
-
-  // Set up remill
+  // Set up remill — use Linux for raw binaries (no PE metadata).
   LLVMContext ctx;
-  auto arch = remill::Arch::Get(ctx, remill::kOSWindows, remill::kArchAMD64_AVX);
+  auto os_name = RawBinary ? remill::kOSLinux : remill::kOSWindows;
+  auto arch = remill::Arch::Get(ctx, os_name, remill::kArchAMD64_AVX);
   if (!arch) {
     errs() << "Failed to create AMD64 arch\n";
     return 1;
@@ -426,15 +460,19 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // Load all executable sections into the trace manager.
+  // Load code into the trace manager.
   BufferTraceManager manager;
-  for (const auto &cs : pe.code_sections) {
-    auto &stored = pe.section_storage[cs.storage_index];
-    manager.setCode(stored.data(), stored.size(), cs.va);
+  if (RawBinary) {
+    manager.setCode(raw_code.data(), raw_code.size(), BaseAddress);
+  } else {
+    for (const auto &cs : pe.code_sections) {
+      auto &stored = pe.section_storage[cs.storage_index];
+      manager.setCode(stored.data(), stored.size(), cs.va);
+    }
   }
   manager.setBaseAddr(func_va);
 
-  if (ResolveExceptions && !pe.exception_info.empty()) {
+  if (!RawBinary && ResolveExceptions && !pe.exception_info.empty()) {
     errs() << "Parsed .pdata: " << pe.exception_info.getHandlerVAs().size()
            << " unique handler(s)\n";
   }
@@ -445,7 +483,7 @@ int main(int argc, char **argv) {
   // If available, lift the handler first so Remill reuses a canonical
   // sub_<va> function instead of creating a late duplicate (sub_<va>.1).
   uint64_t auto_handler_va = 0;
-  if (ResolveExceptions) {
+  if (!RawBinary && ResolveExceptions) {
     if (auto *entry = pe.exception_info.lookup(func_va)) {
       auto_handler_va = entry->handler_va;
     }
@@ -483,13 +521,14 @@ int main(int argc, char **argv) {
 
   // Register custom module analyses first and keep backing storage stable.
   auto memory_map_holder =
-      std::make_shared<omill::BinaryMemoryMap>(pe.memory_map);
+      std::make_shared<omill::BinaryMemoryMap>(
+          RawBinary ? omill::BinaryMemoryMap() : pe.memory_map);
   MAM.registerPass([memory_map_holder] {
     return omill::BinaryMemoryAnalysis(*memory_map_holder);
   });
 
   std::shared_ptr<omill::ExceptionInfo> exception_info_holder;
-  if (ResolveExceptions) {
+  if (!RawBinary && ResolveExceptions) {
     exception_info_holder =
         std::make_shared<omill::ExceptionInfo>(std::move(pe.exception_info));
     MAM.registerPass([exception_info_holder] {
@@ -526,10 +565,14 @@ int main(int argc, char **argv) {
   std::unique_ptr<omill::BlockLifter> block_lifter;
   if (BlockLift) {
     block_manager = std::make_unique<BufferBlockManager>();
-    // Share code sections with the block manager.
-    for (auto &sec : pe.code_sections) {
-      auto &data = pe.section_storage[sec.storage_index];
-      block_manager->setCode(data.data(), data.size(), sec.va);
+    // Share code with the block manager.
+    if (RawBinary) {
+      block_manager->setCode(raw_code.data(), raw_code.size(), BaseAddress);
+    } else {
+      for (auto &sec : pe.code_sections) {
+        auto &data = pe.section_storage[sec.storage_index];
+        block_manager->setCode(data.data(), data.size(), sec.va);
+      }
     }
     block_lifter = std::make_unique<omill::BlockLifter>(
         arch.get(), *block_manager);

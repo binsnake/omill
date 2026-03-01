@@ -1,4 +1,6 @@
 #include "OpaquePredicates.h"
+#include "PassFilter.h"
+#include "OpaquePredicateLib.h"
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
@@ -27,83 +29,87 @@ static llvm::Value *getPredicateInput(llvm::Function &F,
     auto *i64Ty = llvm::Type::getInt64Ty(F.getContext());
     llvm::IRBuilder<> entryBuilder(&F.getEntryBlock(),
                                    F.getEntryBlock().begin());
-    fallbackAlloca = entryBuilder.CreateAlloca(i64Ty, nullptr, "opq_var");
+    fallbackAlloca = entryBuilder.CreateAlloca(i64Ty, nullptr);
     entryBuilder.CreateStore(llvm::ConstantInt::get(i64Ty, 0), fallbackAlloca);
   }
 
-  return builder.CreateLoad(fallbackAlloca->getAllocatedType(), fallbackAlloca,
-                            "opq_load");
+  return builder.CreateLoad(fallbackAlloca->getAllocatedType(), fallbackAlloca);
 }
 
 /// Build an always-true condition based on the selected variant.
-/// Returns an i1 value that is guaranteed to be true for all inputs.
+/// Delegates to the shared opaque predicate library.
+/// ~70% MBA-based, ~30% CRC32-based.
 static llvm::Value *buildOpaquePredicate(llvm::IRBuilder<> &builder,
-                                          llvm::Value *x, int variant,
+                                          llvm::Value *x,
+                                          llvm::Function &F,
                                           std::mt19937 &rng) {
-  auto *ty = x->getType();
-  auto *negOne = llvm::ConstantInt::getSigned(ty, -1);
-  auto *zero = llvm::ConstantInt::get(ty, 0);
-
-  switch (variant) {
-  case 0: {
-    // x | ~x == -1  (always true)
-    auto *notX = builder.CreateXor(x, negOne, "opq_not");
-    auto *orVal = builder.CreateOr(x, notX, "opq_or");
-    return builder.CreateICmpEQ(orVal, negOne, "opq_cmp");
+  std::uniform_int_distribution<int> dist(0, 99);
+  if (dist(rng) < 30) {
+    return ollvm::buildCRC32Predicate(builder, F, rng());
   }
-  case 1: {
-    // (x * (x + 1)) & 1 == 0  (product of consecutive ints is even)
-    auto *one = llvm::ConstantInt::get(ty, 1);
-    auto *xPlus1 = builder.CreateAdd(x, one, "opq_inc");
-    auto *prod = builder.CreateMul(x, xPlus1, "opq_prod");
-    auto *bit = builder.CreateAnd(prod, one, "opq_bit");
-    return builder.CreateICmpEQ(bit, zero, "opq_cmp");
-  }
-  case 2: {
-    // (x * x) >=u 0  (always true for unsigned comparison)
-    auto *sq = builder.CreateMul(x, x, "opq_sq");
-    return builder.CreateICmpUGE(sq, zero, "opq_cmp");
-  }
-  case 3: {
-    // x & (x - 1) != x when x is a known non-power-of-2 constant.
-    // We substitute x with a random odd constant >= 3 to guarantee truth.
-    std::uniform_int_distribution<uint64_t> dist(1, 0x7FFFFFFE);
-    uint64_t c = dist(rng) | 3;  // ensure at least bits 0 and 1 set
-    auto *constVal = llvm::ConstantInt::get(ty, c);
-    auto *one = llvm::ConstantInt::get(ty, 1);
-    auto *sub = builder.CreateSub(constVal, one, "opq_dec");
-    auto *andVal = builder.CreateAnd(constVal, sub, "opq_and");
-    return builder.CreateICmpNE(andVal, zero, "opq_cmp");
-  }
-  default:
-    llvm_unreachable("invalid opaque predicate variant");
-  }
+  return ollvm::generateOpaqueTrue(builder, x, rng());
 }
 
 /// Create a junk basic block that does a few harmless operations and then
-/// branches unconditionally to the given target.
+/// branches unconditionally to the given target.  Uses a function argument
+/// (or volatile alloca load) so the arithmetic survives constant folding.
 static llvm::BasicBlock *createJunkBlock(llvm::Function &F,
                                           llvm::BasicBlock *target,
                                           std::mt19937 &rng) {
   auto &ctx = F.getContext();
-  auto *junkBB = llvm::BasicBlock::Create(ctx, "opq_junk", &F);
+  auto *junkBB = llvm::BasicBlock::Create(ctx, "", &F);
   llvm::IRBuilder<> builder(junkBB);
 
-  // Insert a few dummy arithmetic operations so the block isn't empty.
   auto *i32Ty = llvm::Type::getInt32Ty(ctx);
   std::uniform_int_distribution<uint32_t> valDist(1, 0xFFFF);
-  auto *a = llvm::ConstantInt::get(i32Ty, valDist(rng));
-  auto *b = llvm::ConstantInt::get(i32Ty, valDist(rng));
-  auto *dummy = builder.CreateAdd(a, b, "junk_add");
-  builder.CreateMul(dummy, a, "junk_mul");
+
+  // Get a non-constant base value so IRBuilder can't fold everything away.
+  llvm::Value *base = nullptr;
+  for (auto &arg : F.args()) {
+    if (arg.getType()->isIntegerTy()) {
+      // Truncate or zext to i32 for uniform arithmetic.
+      if (arg.getType() == i32Ty) {
+        base = &arg;
+      } else if (arg.getType()->getIntegerBitWidth() > 32) {
+        base = builder.CreateTrunc(&arg, i32Ty);
+      } else {
+        base = builder.CreateZExt(&arg, i32Ty);
+      }
+      break;
+    }
+  }
+  if (!base) {
+    // No integer arg — create a volatile load from an alloca.
+    llvm::IRBuilder<> entryB(&F.getEntryBlock(), F.getEntryBlock().begin());
+    auto *alloca = entryB.CreateAlloca(i32Ty);
+    entryB.CreateStore(llvm::ConstantInt::get(i32Ty, 0), alloca);
+    base = builder.CreateLoad(i32Ty, alloca, /*isVolatile=*/true);
+  }
+
+  // 3-6 arithmetic ops using the live base value + random constants.
+  auto *acc = base;
+  unsigned numOps = std::uniform_int_distribution<unsigned>(3, 6)(rng);
+  for (unsigned i = 0; i < numOps; ++i) {
+    auto *k = llvm::ConstantInt::get(i32Ty, valDist(rng));
+    switch (std::uniform_int_distribution<int>(0, 3)(rng)) {
+    case 0: acc = builder.CreateAdd(acc, k); break;
+    case 1: acc = builder.CreateXor(acc, k); break;
+    case 2: acc = builder.CreateMul(acc, k); break;
+    default: acc = builder.CreateSub(acc, k); break;
+    }
+  }
+  // Sink the result into a volatile store so it isn't DCE'd.
+  auto *sinkAlloca = builder.CreateAlloca(i32Ty);
+  builder.CreateStore(acc, sinkAlloca, /*isVolatile=*/true);
 
   builder.CreateBr(target);
   return junkBB;
 }
 
 static void insertOpaquePredicatesFunction(llvm::Function &F,
-                                            std::mt19937 &rng) {
-  if (F.isDeclaration())
+                                            std::mt19937 &rng,
+                                            const FilterConfig &cfg) {
+  if (shouldSkipFunction(F, cfg))
     return;
 
   // Skip single-block functions.
@@ -128,10 +134,10 @@ static void insertOpaquePredicatesFunction(llvm::Function &F,
     return;
 
   std::uniform_int_distribution<int> coinFlip(0, 99);
-  std::uniform_int_distribution<int> variantDist(0, 3);
   llvm::AllocaInst *fallbackAlloca = nullptr;
 
   for (auto *BB : candidates) {
+    if (!shouldTransform(rng, cfg)) continue;
     // ~40% probability of insertion.
     if (coinFlip(rng) >= 40)
       continue;
@@ -142,8 +148,7 @@ static void insertOpaquePredicatesFunction(llvm::Function &F,
     // Build the opaque predicate just before the branch.
     llvm::IRBuilder<> builder(br);
     auto *x = getPredicateInput(F, builder, fallbackAlloca);
-    int variant = variantDist(rng);
-    auto *cond = buildOpaquePredicate(builder, x, variant, rng);
+    auto *cond = buildOpaquePredicate(builder, x, F, rng);
 
     // Create a junk block that also branches to the original target.
     auto *junkBB = createJunkBlock(F, originalTarget, rng);
@@ -164,10 +169,11 @@ static void insertOpaquePredicatesFunction(llvm::Function &F,
   }
 }
 
-void insertOpaquePredicatesModule(llvm::Module &M, uint32_t seed) {
+void insertOpaquePredicatesModule(llvm::Module &M, uint32_t seed,
+                                  const FilterConfig &cfg) {
   std::mt19937 rng(seed);
   for (auto &F : M) {
-    insertOpaquePredicatesFunction(F, rng);
+    insertOpaquePredicatesFunction(F, rng, cfg);
   }
 }
 

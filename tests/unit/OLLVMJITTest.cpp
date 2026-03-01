@@ -131,6 +131,23 @@ static uint32_t refRol32(uint32_t v, unsigned n) {
   return (v << n) | (v >> (32u - n));
 }
 
+
+static uint32_t refBitwise(uint32_t x, uint32_t y) {
+  uint32_t a = x ^ y;
+  uint32_t b = (x & y) | (~x & ~y);
+  uint32_t c = (a ^ b) & 0xFF00FF00u;
+  return c ^ (x | y);
+}
+
+static int refStackHeavy(int a, int b, int c, int d) {
+  int x = a + b;
+  int y = c - d;
+  int z = x * y;
+  int w = z ^ (a | d);
+  int v = w + (b & c);
+  int u = v - (x ^ z);
+  return u + (y | w);
+}
 static uint32_t refVecConstMix(const uint32_t *in) {
   const uint32_t x0 = in[0];
   const uint32_t x1 = in[1];
@@ -255,6 +272,45 @@ TEST_F(OLLVMJITTest, Clean_CopyGreeting) {
   EXPECT_STREQ(buf, "OLLVM Test String!");
 }
 
+
+TEST_F(OLLVMJITTest, Clean_Bitwise) {
+  auto *addr = jitFunction(OLLVM_CLEAN_BC_PATH, "ollvm_bitwise");
+  if (!addr) return;
+  auto fn = reinterpret_cast<uint32_t (*)(uint32_t, uint32_t)>(addr);
+  EXPECT_EQ(fn(0xA5A5A5A5u, 0x5A5A5A5Au), refBitwise(0xA5A5A5A5u, 0x5A5A5A5Au));
+  EXPECT_EQ(fn(0u, 0u), refBitwise(0u, 0u));
+  EXPECT_EQ(fn(123u, 456u), refBitwise(123u, 456u));
+}
+
+TEST_F(OLLVMJITTest, Clean_NestedLoops) {
+  auto *addr = jitFunction(OLLVM_CLEAN_BC_PATH, "ollvm_nested_loops");
+  if (!addr) return;
+  auto fn = reinterpret_cast<int (*)(int)>(addr);
+  EXPECT_EQ(fn(0), 0);
+  EXPECT_EQ(fn(1), 1);
+  EXPECT_EQ(fn(4), 22);
+  EXPECT_EQ(fn(5), 49);
+}
+
+TEST_F(OLLVMJITTest, Clean_Switch) {
+  auto *addr = jitFunction(OLLVM_CLEAN_BC_PATH, "ollvm_switch");
+  if (!addr) return;
+  auto fn = reinterpret_cast<int (*)(int)>(addr);
+  EXPECT_EQ(fn(10), 31);   // 10%5=0 -> 10*3=30 -> 31
+  EXPECT_EQ(fn(6), 14);    // 6%5=1  -> 6+7=13  -> 14
+  EXPECT_EQ(fn(7), 173);   // 7%5=2  -> 7^0xAB=172 -> 173
+  EXPECT_EQ(fn(8), -4);    // 8%5=3  -> 8-13=-5 -> -4
+  EXPECT_EQ(fn(9), 10);    // 9%5=4  -> 9       -> 10
+}
+
+TEST_F(OLLVMJITTest, Clean_StackHeavy) {
+  auto *addr = jitFunction(OLLVM_CLEAN_BC_PATH, "ollvm_stack_heavy");
+  if (!addr) return;
+  auto fn = reinterpret_cast<int (*)(int, int, int, int)>(addr);
+  EXPECT_EQ(fn(1, 2, 3, 4), refStackHeavy(1, 2, 3, 4));
+  EXPECT_EQ(fn(10, 20, 30, 40), refStackHeavy(10, 20, 30, 40));
+  EXPECT_EQ(fn(0, 0, 0, 0), refStackHeavy(0, 0, 0, 0));
+}
 // =============================================================================
 // Obfuscated JIT tests — same functions after ollvm-obf.
 // =============================================================================
@@ -333,6 +389,45 @@ TEST_F(OLLVMJITTest, Obfuscated_CopyGreeting) {
   EXPECT_STREQ(buf, "OLLVM Test String!");
 }
 
+
+TEST_F(OLLVMJITTest, Obfuscated_Bitwise) {
+  auto *addr = jitFunction(OLLVM_OBF_BC_PATH, "ollvm_bitwise");
+  if (!addr) return;
+  auto fn = reinterpret_cast<uint32_t (*)(uint32_t, uint32_t)>(addr);
+  EXPECT_EQ(fn(0xA5A5A5A5u, 0x5A5A5A5Au), refBitwise(0xA5A5A5A5u, 0x5A5A5A5Au));
+  EXPECT_EQ(fn(0u, 0u), refBitwise(0u, 0u));
+  EXPECT_EQ(fn(123u, 456u), refBitwise(123u, 456u));
+}
+
+TEST_F(OLLVMJITTest, Obfuscated_NestedLoops) {
+  auto *addr = jitFunction(OLLVM_OBF_BC_PATH, "ollvm_nested_loops");
+  if (!addr) return;
+  auto fn = reinterpret_cast<int (*)(int)>(addr);
+  EXPECT_EQ(fn(0), 0);
+  EXPECT_EQ(fn(1), 1);
+  EXPECT_EQ(fn(4), 22);
+  EXPECT_EQ(fn(5), 49);
+}
+
+TEST_F(OLLVMJITTest, Obfuscated_Switch) {
+  auto *addr = jitFunction(OLLVM_OBF_BC_PATH, "ollvm_switch");
+  if (!addr) return;
+  auto fn = reinterpret_cast<int (*)(int)>(addr);
+  EXPECT_EQ(fn(10), 31);
+  EXPECT_EQ(fn(6), 14);
+  EXPECT_EQ(fn(7), 173);
+  EXPECT_EQ(fn(8), -4);
+  EXPECT_EQ(fn(9), 10);
+}
+
+TEST_F(OLLVMJITTest, Obfuscated_StackHeavy) {
+  auto *addr = jitFunction(OLLVM_OBF_BC_PATH, "ollvm_stack_heavy");
+  if (!addr) return;
+  auto fn = reinterpret_cast<int (*)(int, int, int, int)>(addr);
+  EXPECT_EQ(fn(1, 2, 3, 4), refStackHeavy(1, 2, 3, 4));
+  EXPECT_EQ(fn(10, 20, 30, 40), refStackHeavy(10, 20, 30, 40));
+  EXPECT_EQ(fn(0, 0, 0, 0), refStackHeavy(0, 0, 0, 0));
+}
 TEST_F(OLLVMJITTest, Clean_VectorConstMix) {
   auto *addr = jitFunction(OLLVM_VEC_CONST_CLEAN_BC_PATH, "ollvm_vec_const_mix");
   if (!addr) return;

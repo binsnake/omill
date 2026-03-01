@@ -1,0 +1,119 @@
+# Standalone CMakeLists.txt for ollvm-obf + ollvm-plugin.
+#
+# Use this to build the obfuscation toolchain independently of omill.
+#
+# Copy these directories into your standalone project:
+#   ollvm-obf/        (all .cpp/.h, plus private/ if you have it)
+#   ollvm-plugin/     (OllvmPlugin.cpp, ollvm_attrs.h)
+#   tools/            (ollvm-cl.py, ollvm-cl.cmd, ollvm-lto.py, ollvm-msbuild.targets)
+#
+# Then:
+#   cmake -B build -G Ninja -DLLVM_DIR="C:/Program Files/LLVM21/lib/cmake/llvm"
+#   cmake --build build
+#
+cmake_minimum_required(VERSION 3.21)
+project(ollvm-obf LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# ── Find LLVM ─────────────────────────────────────────────────────────
+find_package(LLVM CONFIG REQUIRED)
+message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
+message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
+
+list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
+include(AddLLVM)
+
+# Components needed by ollvm-obf and the plugin.
+set(OLLVM_LLVM_COMPONENTS
+  Core IRReader IRPrinter BitReader BitWriter
+  Passes Analysis TransformUtils InstCombine ScalarOpts
+  Support AggressiveInstCombine
+  # For JIT tests (optional — remove if you don't build tests):
+  OrcJIT
+  # X86 backend (required for CRC32 intrinsic in opaque predicates):
+  X86CodeGen X86AsmParser X86Info
+)
+
+llvm_map_components_to_libnames(OLLVM_LLVM_LIBS ${OLLVM_LLVM_COMPONENTS})
+
+# ── ollvm-obf executable ─────────────────────────────────────────────
+add_executable(ollvm-obf
+  ollvm-obf/ArithmeticEncoding.cpp
+  ollvm-obf/BogusControlFlow.cpp
+  ollvm-obf/BMIMutation.cpp
+  ollvm-obf/CodeCloning.cpp
+  ollvm-obf/ConstantUnfolding.cpp
+  ollvm-obf/Flattening.cpp
+  ollvm-obf/FunctionOutlining.cpp
+  ollvm-obf/IfConversion.cpp
+  ollvm-obf/InstructionScheduling.cpp
+  ollvm-obf/LoopToRecursion.cpp
+  ollvm-obf/main.cpp
+  ollvm-obf/OpaquePredicates.cpp
+  ollvm-obf/RegisterPressure.cpp
+  ollvm-obf/StackRandomization.cpp
+  ollvm-obf/StringEncryption.cpp
+  ollvm-obf/Substitution.cpp
+  ollvm-obf/Vectorize.cpp
+)
+
+target_link_libraries(ollvm-obf PRIVATE ${OLLVM_LLVM_LIBS})
+
+# Private passes (optional — drop-in directory).
+if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/ollvm-obf/private")
+  file(GLOB _PRIVATE_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/ollvm-obf/private/*.cpp")
+  if(_PRIVATE_SRCS)
+    target_sources(ollvm-obf PRIVATE ${_PRIVATE_SRCS})
+    target_include_directories(ollvm-obf PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/ollvm-obf/private")
+    target_compile_definitions(ollvm-obf PRIVATE OLLVM_HAS_PRIVATE)
+    message(STATUS "ollvm-obf: private passes enabled")
+  endif()
+endif()
+
+if(NOT MSVC)
+  target_compile_options(ollvm-obf PRIVATE -fno-rtti)
+endif()
+
+# ── ollvm-plugin shared library ──────────────────────────────────────
+# Requires LLVM built with LLVM_EXPORT_SYMBOLS_FOR_PLUGINS=ON on Windows.
+add_library(ollvm-plugin MODULE
+  ollvm-plugin/OllvmPlugin.cpp
+  ollvm-obf/Flattening.cpp
+  ollvm-obf/Substitution.cpp
+  ollvm-obf/StringEncryption.cpp
+  ollvm-obf/ConstantUnfolding.cpp
+  ollvm-obf/Vectorize.cpp
+  ollvm-obf/OpaquePredicates.cpp
+  ollvm-obf/BogusControlFlow.cpp
+)
+
+target_include_directories(ollvm-plugin PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/ollvm-obf
+)
+
+if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/ollvm-obf/private")
+  file(GLOB _PLUGIN_PRIVATE_SRCS
+    "${CMAKE_CURRENT_SOURCE_DIR}/ollvm-obf/private/*.cpp")
+  if(_PLUGIN_PRIVATE_SRCS)
+    target_sources(ollvm-plugin PRIVATE ${_PLUGIN_PRIVATE_SRCS})
+    target_include_directories(ollvm-plugin PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/ollvm-obf/private")
+    target_compile_definitions(ollvm-plugin PRIVATE OLLVM_HAS_PRIVATE)
+    message(STATUS "ollvm-plugin: private passes enabled")
+  endif()
+endif()
+
+target_link_libraries(ollvm-plugin PRIVATE ${OLLVM_LLVM_LIBS})
+target_compile_features(ollvm-plugin PUBLIC cxx_std_17)
+
+if(NOT MSVC)
+  target_compile_options(ollvm-plugin PRIVATE -fno-rtti -fPIC)
+endif()
+
+set_target_properties(ollvm-plugin PROPERTIES
+  PREFIX ""
+  OUTPUT_NAME "OllvmPlugin"
+)

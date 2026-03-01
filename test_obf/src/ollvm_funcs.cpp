@@ -184,3 +184,44 @@ EXPORT void ollvm_sha256(const uint8_t *data, uint32_t len,
         digest[i * 4 + 3] = (uint8_t)(hs[i]);
     }
 }
+
+// Bitwise-heavy: exercises BMIMutation, Substitution (bitwise ops).
+EXPORT uint32_t ollvm_bitwise(uint32_t x, uint32_t y) {
+    uint32_t a = x ^ y;
+    uint32_t b = (x & y) | (~x & ~y);
+    uint32_t c = (a ^ b) & 0xFF00FF00;
+    return c ^ (x | y);
+}
+
+// Nested loop: stresses flattening + scheduling.
+EXPORT int ollvm_nested_loops(int n) {
+    int total = 0;
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j <= i; j++)
+            total += (i ^ j) + 1;
+    return total;
+}
+
+// Switch statement: tests flattening of switch terminators.
+EXPORT int ollvm_switch(int x) {
+    int r;
+    switch (x % 5) {
+    case 0: r = x * 3; break;
+    case 1: r = x + 7; break;
+    case 2: r = x ^ 0xAB; break;
+    case 3: r = x - 13; break;
+    default: r = x; break;
+    }
+    return r + 1;
+}
+
+// Many locals: exercises stack randomization + arithmetic encoding.
+EXPORT int ollvm_stack_heavy(int a, int b, int c, int d) {
+    int x = a + b;
+    int y = c - d;
+    int z = x * y;
+    int w = z ^ (a | d);
+    int v = w + (b & c);
+    int u = v - (x ^ z);
+    return u + (y | w);
+}
