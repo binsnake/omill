@@ -11,6 +11,7 @@
 
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
+#include "omill/BC/TraceLiftAnalysis.h"
 
 #include <gtest/gtest.h>
 
@@ -60,6 +61,7 @@ class IterativeTargetResolutionTest : public ::testing::Test {
     MAM.registerPass(
         [&]() { return omill::BinaryMemoryAnalysis(std::move(map)); });
     MAM.registerPass([] { return omill::LiftedFunctionAnalysis(); });
+    MAM.registerPass([] { return omill::TraceLiftAnalysis(); });
 
     PB.registerModuleAnalyses(MAM);
     PB.registerCGSCCAnalyses(CGAM);

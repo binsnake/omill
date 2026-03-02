@@ -215,12 +215,11 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
   llvm::DenseSet<uint64_t> already_lifted_pcs;  // Prevent re-lifting.
 
   // Get optional trace-lift callback for discovering new functions.
-  // Use getCachedResult — TraceLiftAnalysis is only registered when the
-  // consumer (e.g. omill-lift) provides a TraceLifter callback.  Tests and
-  // standalone pipelines may not register it.
   TraceLiftCallback lift_trace;
-  if (auto *lift_result = MAM.getCachedResult<TraceLiftAnalysis>(M))
-    lift_trace = lift_result->lift_trace;
+  {
+    auto &lift_result = MAM.getResult<TraceLiftAnalysis>(M);
+    lift_trace = lift_result.lift_trace;
+  }
 
   auto *lifted = MAM.getCachedResult<LiftedFunctionAnalysis>(M);
 

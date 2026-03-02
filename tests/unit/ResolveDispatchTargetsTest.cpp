@@ -13,6 +13,7 @@
 
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
+#include "omill/BC/TraceLiftAnalysis.h"
 #include "omill/Passes/ConstantMemoryFolding.h"
 #include "omill/Passes/IterativeTargetResolution.h"
 #include "omill/Passes/LowerRemillIntrinsics.h"
@@ -62,6 +63,7 @@ class ResolveDispatchTargetsTest : public ::testing::Test {
     MAM.registerPass(
         [&]() { return omill::BinaryMemoryAnalysis(std::move(map)); });
     MAM.registerPass([] { return omill::LiftedFunctionAnalysis(); });
+    MAM.registerPass([] { return omill::TraceLiftAnalysis(); });
 
     PB.registerModuleAnalyses(MAM);
     PB.registerCGSCCAnalyses(CGAM);
@@ -89,6 +91,7 @@ class ResolveDispatchTargetsTest : public ::testing::Test {
     MAM.registerPass(
         [&]() { return omill::BinaryMemoryAnalysis(std::move(map)); });
     MAM.registerPass([] { return omill::LiftedFunctionAnalysis(); });
+    MAM.registerPass([] { return omill::TraceLiftAnalysis(); });
 
     PB.registerModuleAnalyses(MAM);
     PB.registerCGSCCAnalyses(CGAM);
