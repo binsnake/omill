@@ -102,21 +102,27 @@ void VMHandlerGraph::scanDispatchPatterns(const BinaryMemoryMap &mem) {
         if (data[i + 8] != 0xFF || data[i + 9] != (0xE0 | reg_field))
           continue;
 
-        // The mov is exactly 5 bytes before the add — no backward scan.
-        // Any gap means intervening instructions that could clobber the
-        // register, and in practice EAC's dispatch has no gap.
+        // Check positions i-5 through i-8 for the mov opcode.
+        // i-5 is the exact position (no gap); i-6..i-8 allow 1-3 bytes
+        // of NOP/padding between mov and add.  Stops at first match.
         uint8_t mov_opcode = 0xB8 + reg_field;
-        if (i < 5)
-          continue;
-        auto rva = tryExtractMovRVA(data, i - 5, size, mov_opcode);
-        if (!rva || (image_size > 0 && *rva >= image_size))
-          continue;
+        bool found = false;
+        for (unsigned back = 5; back <= 8 && i >= back; ++back) {
+          auto rva = tryExtractMovRVA(data, i - back, size, mov_opcode);
+          if (!rva)
+            continue;
+          if (image_size > 0 && *rva >= image_size)
+            continue;
 
-        uint64_t target_va = image_base_ + *rva;
-        uint64_t dispatch_va = base + (i - 5);
-        dispatch_targets_[dispatch_va] = target_va;
-        dispatch_rvas_[dispatch_va] = *rva;
-        rva_to_target_[*rva] = target_va;
+          uint64_t target_va = image_base_ + *rva;
+          uint64_t dispatch_va = base + (i - back);
+          dispatch_targets_[dispatch_va] = target_va;
+          dispatch_rvas_[dispatch_va] = *rva;
+          rva_to_target_[*rva] = target_va;
+          found = true;
+          break;
+        }
+        (void)found;
 
       } else if (rex == 0x4D) {
         // Case 2: r8-r15 variant.
@@ -128,21 +134,28 @@ void VMHandlerGraph::scanDispatchPatterns(const BinaryMemoryMap &mem) {
             data[i + 10] != (0xE0 | reg_field))
           continue;
 
-        // mov is 6 bytes before add: 41 prefix + B8+reg + imm32.
+        // Check positions i-6 through i-9 for the 41+mov opcode.
         uint8_t mov_opcode = 0xB8 + reg_field;
-        if (i < 6)
-          continue;
-        if (data[i - 6] != 0x41)
-          continue;
-        auto rva = tryExtractMovRVA(data, i - 5, size, mov_opcode);
-        if (!rva || (image_size > 0 && *rva >= image_size))
-          continue;
+        bool found = false;
+        for (unsigned back = 6; back <= 9 && i >= back; ++back) {
+          if (data[i - back] != 0x41)
+            continue;
+          auto rva =
+              tryExtractMovRVA(data, i - back + 1, size, mov_opcode);
+          if (!rva)
+            continue;
+          if (image_size > 0 && *rva >= image_size)
+            continue;
 
-        uint64_t target_va = image_base_ + *rva;
-        uint64_t dispatch_va = base + (i - 6);  // Include 41 prefix.
-        dispatch_targets_[dispatch_va] = target_va;
-        dispatch_rvas_[dispatch_va] = *rva;
-        rva_to_target_[*rva] = target_va;
+          uint64_t target_va = image_base_ + *rva;
+          uint64_t dispatch_va = base + (i - back);  // Include 41 prefix.
+          dispatch_targets_[dispatch_va] = target_va;
+          dispatch_rvas_[dispatch_va] = *rva;
+          rva_to_target_[*rva] = target_va;
+          found = true;
+          break;
+        }
+        (void)found;
       }
     }
   });
