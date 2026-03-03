@@ -17,6 +17,7 @@
 #include <llvm/Support/raw_ostream.h>
 
 #include <remill/Arch/Arch.h>
+#include <remill/Arch/Instruction.h>
 #include <remill/Arch/Name.h>
 #include <remill/BC/IntrinsicTable.h>
 #include "omill/BC/TraceLifter.h"
@@ -885,6 +886,7 @@ int main(int argc, char **argv) {
     // Lift all discovered handler entry VAs.
     unsigned lifted_count = 0;
     unsigned failed_count = 0;
+    unsigned skipped_count = 0;
     for (uint64_t handler_va : vm_graph->handlerEntries()) {
       // Skip if already lifted (e.g. func_va or vmenter/vmexit).
       std::string name = "sub_" + Twine::utohexstr(handler_va).str();
@@ -892,6 +894,25 @@ int main(int argc, char **argv) {
         if (!existing->isDeclaration()) {
           // Tag existing function as a VM handler.
           existing->addFnAttr("omill.vm_handler");
+          continue;
+        }
+      }
+
+      // Probe decode: skip handler VAs where the first instruction can't
+      // be decoded.  These are typically decoy dispatch patterns in
+      // obfuscated code with garbage RVAs pointing mid-instruction.
+      {
+        uint8_t probe_buf[15];
+        if (!pe.memory_map.read(handler_va, probe_buf, sizeof(probe_buf))) {
+          ++skipped_count;
+          continue;
+        }
+        std::string_view probe_bytes(
+            reinterpret_cast<const char *>(probe_buf), sizeof(probe_buf));
+        remill::Instruction probe_inst;
+        if (!arch->DecodeInstruction(handler_va, probe_bytes, probe_inst,
+                                     arch->CreateInitialContext())) {
+          ++skipped_count;
           continue;
         }
       }
@@ -907,6 +928,8 @@ int main(int argc, char **argv) {
     }
 
     errs() << "VM bulk lift: " << lifted_count << " handlers lifted";
+    if (skipped_count > 0)
+      errs() << ", " << skipped_count << " skipped (bad VA)";
     if (failed_count > 0)
       errs() << ", " << failed_count << " failed";
     errs() << "\n";
