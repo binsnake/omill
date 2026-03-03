@@ -26,6 +26,40 @@ VMHandlerGraph::VMHandlerGraph(const BinaryMemoryMap &mem, uint64_t image_base,
   buildHandlerGraph();
 }
 
+/// Validate that a candidate handler VA looks like a plausible instruction
+/// boundary.  Returns false for obviously-invalid targets (mid-instruction
+/// positions, padding, etc.).
+static bool validateHandlerTarget(const BinaryMemoryMap &mem,
+                                  uint64_t target_va) {
+  uint8_t probe[2];
+  if (!mem.read(target_va, probe, 2))
+    return false;  // Not in any mapped region.
+
+  // Reject targets starting with undefined opcode extensions.
+  // 0xFE = group 4 (INC/DEC r/m8): only reg=0 (INC) and reg=1 (DEC) are
+  // defined.  Mid-instruction hits (e.g. landing in a call's displacement)
+  // often produce 0xFE 0xFF where reg=7 → GENERAL_ERROR from decoder.
+  if (probe[0] == 0xFE && ((probe[1] >> 3) & 0x07) > 1)
+    return false;
+
+  // Reject 00 00 (ADD [rax], al) — typically section padding, not code.
+  if (probe[0] == 0x00 && probe[1] == 0x00)
+    return false;
+
+  return true;
+}
+
+/// Check if a byte before a candidate `mov eXX, imm32` is a REX prefix.
+/// If so, the opcode is actually `mov rXX, imm64` (10-byte instruction)
+/// and the 4 bytes we'd extract as an RVA are only the low half of a
+/// 64-bit immediate — not a valid dispatch RVA.
+static bool precededByREX(const uint8_t *data, size_t mov_pos) {
+  if (mov_pos == 0)
+    return false;
+  uint8_t prev = data[mov_pos - 1];
+  return (prev & 0xF0) == 0x40;  // 0x40-0x4F are REX prefixes.
+}
+
 void VMHandlerGraph::scanDispatchPatterns(const BinaryMemoryMap &mem) {
   // Scan all regions for the dispatch epilogue pattern.
   //
@@ -43,6 +77,10 @@ void VMHandlerGraph::scanDispatchPatterns(const BinaryMemoryMap &mem) {
   //   41 (B8+(reg-8)) xx xx xx xx     mov e<reg>d, <RVA32>
   //   4D 03 (84|(reg-8)<<3) 24 E0 00 00 00  add r<reg>, [r12+0xE0]
   //   41 FF (E0|(reg-8))              jmp r<reg>
+
+  // Upper bound on valid RVAs — anything beyond image size is bogus.
+  uint64_t image_size = mem.imageSize();
+  unsigned rejected = 0;
 
   mem.forEachRegion([&](uint64_t base, const uint8_t *data, size_t size) {
     if (size < 15)
@@ -80,20 +118,42 @@ void VMHandlerGraph::scanDispatchPatterns(const BinaryMemoryMap &mem) {
           continue;
 
         // Walk backwards to find: (B8+reg_field) xx xx xx xx
+        // Window of 15 bytes: mov is typically 0-5 bytes before add.
+        // Wider windows risk matching B8 bytes inside other instructions'
+        // immediates, producing false-positive RVAs that land mid-instruction.
         uint8_t mov_opcode = 0xB8 + reg_field;
-        for (unsigned back = 1; back <= 30 && i >= back; ++back) {
+        for (unsigned back = 1; back <= 15 && i >= back; ++back) {
           size_t mov_pos = i - back;
-          if (data[mov_pos] == mov_opcode && mov_pos + 5 <= i) {
-            uint32_t rva;
-            std::memcpy(&rva, &data[mov_pos + 1], 4);
-            uint64_t target_va = image_base_ + rva;
-            uint64_t dispatch_va = base + mov_pos;
+          if (data[mov_pos] != mov_opcode || mov_pos + 5 > i)
+            continue;
 
-            dispatch_targets_[dispatch_va] = target_va;
-            dispatch_rvas_[dispatch_va] = rva;
-            rva_to_target_[rva] = target_va;
-            break;
+          // If preceded by a REX prefix, this is actually mov r64, imm64
+          // and the bytes we'd extract are only half the immediate.
+          if (precededByREX(data, mov_pos))
+            continue;
+
+          uint32_t rva;
+          std::memcpy(&rva, &data[mov_pos + 1], 4);
+
+          // RVA must be within the image.
+          if (image_size > 0 && rva >= image_size) {
+            ++rejected;
+            continue;
           }
+
+          uint64_t target_va = image_base_ + rva;
+
+          // Validate the target looks like a real instruction boundary.
+          if (!validateHandlerTarget(mem, target_va)) {
+            ++rejected;
+            continue;
+          }
+
+          uint64_t dispatch_va = base + mov_pos;
+          dispatch_targets_[dispatch_va] = target_va;
+          dispatch_rvas_[dispatch_va] = rva;
+          rva_to_target_[rva] = target_va;
+          break;
         }
       } else if (rex == 0x4D) {
         // Case 2: r8-r15 variant.
@@ -105,27 +165,42 @@ void VMHandlerGraph::scanDispatchPatterns(const BinaryMemoryMap &mem) {
 
         // Walk backwards to find: 41 (B8+reg_field) xx xx xx xx
         uint8_t mov_opcode = 0xB8 + reg_field;
-        for (unsigned back = 1; back <= 30 && i >= back; ++back) {
+        for (unsigned back = 1; back <= 15 && i >= back; ++back) {
           size_t mov_pos = i - back;
-          if (mov_pos >= 1 && data[mov_pos - 1] == 0x41 &&
-              data[mov_pos] == mov_opcode && mov_pos + 5 <= i) {
-            uint32_t rva;
-            std::memcpy(&rva, &data[mov_pos + 1], 4);
-            uint64_t target_va = image_base_ + rva;
-            uint64_t dispatch_va = base + mov_pos - 1;  // Include REX prefix.
+          if (mov_pos < 1 || data[mov_pos - 1] != 0x41 ||
+              data[mov_pos] != mov_opcode || mov_pos + 5 > i)
+            continue;
 
-            dispatch_targets_[dispatch_va] = target_va;
-            dispatch_rvas_[dispatch_va] = rva;
-            rva_to_target_[rva] = target_va;
-            break;
+          uint32_t rva;
+          std::memcpy(&rva, &data[mov_pos + 1], 4);
+
+          if (image_size > 0 && rva >= image_size) {
+            ++rejected;
+            continue;
           }
+
+          uint64_t target_va = image_base_ + rva;
+
+          if (!validateHandlerTarget(mem, target_va)) {
+            ++rejected;
+            continue;
+          }
+
+          uint64_t dispatch_va = base + mov_pos - 1;  // Include REX prefix.
+          dispatch_targets_[dispatch_va] = target_va;
+          dispatch_rvas_[dispatch_va] = rva;
+          rva_to_target_[rva] = target_va;
+          break;
         }
       }
     }
   });
 
   llvm::errs() << "VMHandlerGraph: found " << dispatch_targets_.size()
-               << " dispatch sites\n";
+               << " dispatch sites";
+  if (rejected > 0)
+    llvm::errs() << " (" << rejected << " rejected)";
+  llvm::errs() << "\n";
 }
 
 void VMHandlerGraph::scanVMEntrySites(const BinaryMemoryMap &mem) {
