@@ -952,8 +952,40 @@ int main(int argc, char **argv) {
   ModuleAnalysisManager MAM;
 
   StandardInstrumentations SI(ctx, /*DebugLogging=*/false,
-                              /*VerifyEach=*/VerifyEach);
+                              /*VerifyEach=*/false);
   SI.registerCallbacks(PIC, &MAM);
+
+  // Custom safe verify-each: uses nullptr stream to avoid crash in
+  // SlotTracker on corrupted modules, then aborts with pass name.
+  if (VerifyEach) {
+    PIC.registerAfterPassCallback(
+        [&](StringRef PassName, Any IR,
+            const PreservedAnalyses &) {
+          // Extract the module from whatever IR level we're at.
+          const Module *M = nullptr;
+          if (const auto **F = any_cast<const Function *>(&IR))
+            M = (*F)->getParent();
+          else if (const auto **MPtr = any_cast<const Module *>(&IR))
+            M = *MPtr;
+          else if (const auto **L = any_cast<const Loop *>(&IR))
+            M = (*L)->getHeader()->getParent()->getParent();
+          if (!M) return;
+
+          if (verifyModule(*M, nullptr)) {
+            errs() << "VERIFY-EACH: verification failed after pass: "
+                   << PassName << "\n";
+            // Don't try module->print() — SlotTracker may crash on
+            // corrupted modules with dangling Comdat/Value references.
+            // Per-function verification to narrow down:
+            for (const auto &F : *M) {
+              if (F.isDeclaration()) continue;
+              if (verifyFunction(F, nullptr))
+                errs() << "  broken function: " << F.getName() << "\n";
+            }
+            exit(1);
+          }
+        });
+  }
 
   PassBuilder PB(nullptr, PipelineTuningOptions(), std::nullopt, &PIC);
 
@@ -1077,6 +1109,14 @@ int main(int argc, char **argv) {
   }
   errs() << "Main pipeline complete\n";
 
+  if (VerifyEach && verifyModule(*module, nullptr)) {
+    errs() << "ERROR: module verification failed after main pipeline\n";
+    for (const auto &F : *module)
+      if (!F.isDeclaration() && verifyFunction(F, nullptr))
+        errs() << "  broken function: " << F.getName() << "\n";
+    return 1;
+  }
+
   if (DumpIR) {
     std::error_code ec;
     raw_fd_ostream os("after.ll", ec, sys::fs::OF_Text);
@@ -1183,6 +1223,14 @@ int main(int argc, char **argv) {
     omill::buildABIRecoveryPipeline(MPM);
     MPM.run(*module, MAM);
     errs() << "ABI recovery complete\n";
+
+    if (VerifyEach && verifyModule(*module, nullptr)) {
+      errs() << "ERROR: module verification failed after ABI recovery\n";
+      for (const auto &F : *module)
+        if (!F.isDeclaration() && verifyFunction(F, nullptr))
+          errs() << "  broken function: " << F.getName() << "\n";
+      return 1;
+    }
   }
 
   // Late target discovery: after ABI recovery folds MBA chains (via
@@ -1406,9 +1454,10 @@ int main(int argc, char **argv) {
   if (OmillTimePasses)
     TimingHandler.print();
 
-  // Verify
-  if (verifyModule(*module, &errs())) {
-    errs() << "WARNING: module verification failed\n";
+  // Verify (use nullptr to avoid crash in SlotTracker on corrupted modules)
+  if (verifyModule(*module, nullptr)) {
+    errs() << "WARNING: module verification failed (use --verify-each to "
+              "identify the culprit pass)\n";
   }
 
   // Write final output
