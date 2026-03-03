@@ -13,6 +13,7 @@
 #include <llvm/Support/InitLLVM.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/ToolOutputFile.h>
+#include <llvm/Support/JSON.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <remill/Arch/Arch.h>
@@ -36,6 +37,7 @@
 #include "omill/Analysis/VMHandlerGraph.h"
 #include "omill/Omill.h"
 
+#include <algorithm>
 #include <deque>
 #include <memory>
 #include <vector>
@@ -118,6 +120,33 @@ static cl::opt<bool> OmillTimePasses(
     "omill-time-passes",
     cl::desc("Time each omill pass, printing elapsed time on exit"),
     cl::init(false));
+
+static cl::opt<std::string> ScanSection(
+    "scan-section",
+    cl::desc("Scan a PE section and output function classification as JSON"));
+
+static cl::opt<std::string> ScanOutput(
+    "scan-output",
+    cl::desc("Output file for --scan-section (default: stdout)"),
+    cl::init("-"));
+
+static cl::opt<bool> ScanAll(
+    "scan-all",
+    cl::desc("Include all functions in scan output (default: >=64B only)"),
+    cl::init(false));
+
+static cl::opt<std::string> DeobfTargets(
+    "deobf-targets",
+    cl::desc("JSON file with function VAs to batch-deobfuscate"));
+
+static cl::opt<std::string> DeobfSection(
+    "deobf-section",
+    cl::desc("Scan section and deobfuscate all qualifying functions"));
+
+static cl::opt<unsigned> MinFuncSize(
+    "min-func-size",
+    cl::desc("Minimum function size in bytes for scan/deobf (default: 64)"),
+    cl::init(64));
 
 namespace {
 
@@ -432,6 +461,173 @@ bool loadPE(StringRef path, PEInfo &out) {
   return true;
 }
 
+struct ScanResult {
+  uint64_t va;
+  uint32_t size;
+  SmallVector<StringRef, 2> tags;
+};
+
+/// Scan a PE section, classifying each .pdata function by size and jmp density.
+std::vector<ScanResult> scanSection(StringRef section_name, const PEInfo &pe) {
+  // Find the named section's VA range by re-parsing the COFF headers.
+  // loadPE doesn't preserve section names, so we re-open briefly.
+  uint64_t sec_va = 0;
+  uint64_t sec_size = 0;
+  const uint8_t *sec_data = nullptr;
+  {
+    auto buf_or_err = MemoryBuffer::getFile(InputFilename);
+    if (!buf_or_err) return {};
+    auto obj_or_err = object::COFFObjectFile::create(
+        (*buf_or_err)->getMemBufferRef());
+    if (!obj_or_err) { consumeError(obj_or_err.takeError()); return {}; }
+    auto &coff = **obj_or_err;
+    for (const auto &sec : coff.sections()) {
+      Expected<StringRef> name_or = sec.getName();
+      if (!name_or) { consumeError(name_or.takeError()); continue; }
+      if (*name_or == section_name) {
+        sec_va = sec.getAddress();
+        sec_size = sec.getSize();
+        break;
+      }
+    }
+  }
+  if (sec_va == 0) {
+    errs() << "Section '" << section_name << "' not found\n";
+    return {};
+  }
+
+  // Find backing storage for byte-level analysis.
+  for (const auto &si : pe.code_sections) {
+    if (si.va == sec_va) {
+      sec_data = pe.section_storage[si.storage_index].data();
+      break;
+    }
+  }
+
+  uint64_t sec_end = sec_va + sec_size;
+  std::vector<ScanResult> results;
+
+  for (const auto &entry : pe.exception_info.entries()) {
+    if (entry.begin_va < sec_va || entry.begin_va >= sec_end)
+      continue;
+
+    uint32_t func_size = static_cast<uint32_t>(entry.end_va - entry.begin_va);
+    ScanResult sr;
+    sr.va = entry.begin_va;
+    sr.size = func_size;
+
+    // Compute jmp density from raw bytes if we have section data.
+    float jmp_density = 0.0f;
+    if (sec_data && func_size > 0) {
+      uint64_t offset = entry.begin_va - sec_va;
+      uint64_t end_offset = std::min(offset + func_size, sec_size);
+      unsigned jmp_count = 0;
+      for (uint64_t i = offset; i < end_offset; ++i) {
+        uint8_t b = sec_data[i];
+        if (b == 0xE9 || b == 0xEB)
+          ++jmp_count;
+      }
+      jmp_density = static_cast<float>(jmp_count) / func_size;
+    }
+
+    // Classify.
+    if (func_size < 64)
+      sr.tags.push_back("trivial");
+    else if (func_size <= 256)
+      sr.tags.push_back("stub");
+    else if (func_size > 256 && jmp_density > 0.08f)
+      sr.tags.push_back("cff");
+    else
+      sr.tags.push_back("normal");
+
+    if (func_size > 4096)
+      sr.tags.push_back("large");
+
+    results.push_back(std::move(sr));
+  }
+
+  return results;
+}
+
+/// Write scan results as JSON.
+void writeScanJSON(ArrayRef<ScanResult> results, StringRef binary_name,
+                   uint64_t image_base, StringRef section_name,
+                   raw_ostream &os) {
+  json::OStream J(os, /*IndentSize=*/2);
+  J.objectBegin();
+  J.attributeBegin("binary");
+  J.value(binary_name);
+  J.attributeEnd();
+  J.attributeBegin("image_base");
+  J.value(("0x" + Twine::utohexstr(image_base)).str());
+  J.attributeEnd();
+  J.attributeBegin("section");
+  J.value(section_name);
+  J.attributeEnd();
+  J.attributeBegin("functions");
+  J.arrayBegin();
+  for (const auto &r : results) {
+    J.objectBegin();
+    J.attributeBegin("va");
+    J.value(("0x" + Twine::utohexstr(r.va)).str());
+    J.attributeEnd();
+    J.attributeBegin("size");
+    J.value(static_cast<int64_t>(r.size));
+    J.attributeEnd();
+    J.attributeBegin("tags");
+    J.arrayBegin();
+    for (auto &tag : r.tags)
+      J.value(tag);
+    J.arrayEnd();
+    J.attributeEnd();
+    J.objectEnd();
+  }
+  J.arrayEnd();
+  J.attributeEnd();
+  J.objectEnd();
+  os << "\n";
+}
+
+/// Parse a deobf-targets JSON file, returning function VAs.
+std::vector<uint64_t> parseDeobfTargets(StringRef path) {
+  auto buf = MemoryBuffer::getFile(path);
+  if (!buf) {
+    errs() << "Cannot open " << path << ": "
+           << buf.getError().message() << "\n";
+    return {};
+  }
+  auto parsed = json::parse((*buf)->getBuffer());
+  if (!parsed) {
+    errs() << "JSON parse error: " << toString(parsed.takeError()) << "\n";
+    return {};
+  }
+  auto *root = parsed->getAsObject();
+  if (!root) {
+    errs() << "Expected JSON object at root\n";
+    return {};
+  }
+  auto *funcs = root->getArray("functions");
+  if (!funcs) {
+    errs() << "No 'functions' array in JSON\n";
+    return {};
+  }
+  std::vector<uint64_t> vas;
+  for (const auto &item : *funcs) {
+    auto *obj = item.getAsObject();
+    if (!obj) continue;
+    auto va_str = obj->getString("va");
+    if (!va_str) continue;
+    uint64_t va = 0;
+    StringRef sr = *va_str;
+    if (sr.starts_with("0x") || sr.starts_with("0X"))
+      sr = sr.drop_front(2);
+    sr.getAsInteger(16, va);
+    if (va != 0)
+      vas.push_back(va);
+  }
+  return vas;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -439,6 +635,11 @@ int main(int argc, char **argv) {
   InitLLVM X(argc, argv);
   cl::ParseCommandLineOptions(argc, argv,
       "omill-lift: Lift a function from a PE binary and optimize\n");
+
+  // Check for batch/scan modes that don't require --va.
+  bool batch_mode = (ScanSection.getNumOccurrences() > 0 ||
+                     DeobfTargets.getNumOccurrences() > 0 ||
+                     DeobfSection.getNumOccurrences() > 0);
 
   // Parse VA — for raw binaries, default to base address if --va not given.
   uint64_t func_va = 0;
@@ -451,15 +652,16 @@ int main(int argc, char **argv) {
     }
   } else if (RawBinary) {
     func_va = BaseAddress;
-  } else {
+  } else if (!batch_mode) {
     errs() << "--va is required for PE mode\n";
     return 1;
   }
-  if (func_va == 0 && !RawBinary) {
+  if (func_va == 0 && !RawBinary && !batch_mode) {
     errs() << "Invalid VA: " << FuncVA << "\n";
     return 1;
   }
-  errs() << "Lifting function at VA 0x" << Twine::utohexstr(func_va) << "\n";
+  if (func_va != 0)
+    errs() << "Lifting function at VA 0x" << Twine::utohexstr(func_va) << "\n";
 
   // Parse VM entry/exit VAs if provided.
   uint64_t vm_entry_va = 0, vm_exit_va = 0;
@@ -513,6 +715,65 @@ int main(int argc, char **argv) {
       errs() << "No executable sections found in PE\n";
       return 1;
     }
+
+    // --scan-section: classify functions and output JSON, then exit.
+    if (ScanSection.getNumOccurrences() > 0) {
+      auto results = scanSection(ScanSection, pe);
+      // Filter by minimum size unless --scan-all.
+      if (!ScanAll) {
+        results.erase(
+            std::remove_if(results.begin(), results.end(),
+                           [](const ScanResult &r) {
+                             return r.size < MinFuncSize;
+                           }),
+            results.end());
+      }
+      errs() << "Scanned " << results.size() << " functions in '"
+             << ScanSection << "'\n";
+
+      if (ScanOutput == "-") {
+        writeScanJSON(results, InputFilename, pe.image_base, ScanSection,
+                      outs());
+      } else {
+        std::error_code ec;
+        raw_fd_ostream out(ScanOutput, ec, sys::fs::OF_Text);
+        if (ec) {
+          errs() << "Error opening " << ScanOutput << ": "
+                 << ec.message() << "\n";
+          return 1;
+        }
+        writeScanJSON(results, InputFilename, pe.image_base, ScanSection, out);
+      }
+      return 0;
+    }
+  }
+
+  // Collect batch VAs from --deobf-targets or --deobf-section.
+  std::vector<uint64_t> batch_vas;
+  if (DeobfTargets.getNumOccurrences() > 0) {
+    batch_vas = parseDeobfTargets(DeobfTargets);
+    if (batch_vas.empty()) {
+      errs() << "No valid VAs in " << DeobfTargets << "\n";
+      return 1;
+    }
+    errs() << "Batch mode: " << batch_vas.size()
+           << " targets from " << DeobfTargets << "\n";
+  } else if (DeobfSection.getNumOccurrences() > 0) {
+    auto results = scanSection(DeobfSection, pe);
+    for (const auto &r : results) {
+      if (r.size >= MinFuncSize)
+        batch_vas.push_back(r.va);
+    }
+    if (batch_vas.empty()) {
+      errs() << "No functions >= " << MinFuncSize
+             << "B in section '" << DeobfSection << "'\n";
+      return 1;
+    }
+    errs() << "Section mode: " << batch_vas.size()
+           << " functions from '" << DeobfSection << "' (>= "
+           << MinFuncSize << "B)\n";
+    // Force deobfuscation on for --deobf-section.
+    Deobfuscate = true;
   }
 
   // Set up remill — use Linux for raw binaries (no PE metadata).
@@ -541,7 +802,10 @@ int main(int argc, char **argv) {
       manager.setCode(stored.data(), stored.size(), cs.va);
     }
   }
-  manager.setBaseAddr(func_va);
+  if (func_va != 0)
+    manager.setBaseAddr(func_va);
+  else if (!batch_vas.empty())
+    manager.setBaseAddr(batch_vas.front());
 
   if (!RawBinary && ResolveExceptions && !pe.exception_info.empty()) {
     errs() << "Parsed .pdata: " << pe.exception_info.getHandlerVAs().size()
@@ -551,26 +815,44 @@ int main(int argc, char **argv) {
   // Lift
   omill::TraceLifter lifter(arch.get(), manager);
 
-  // If available, lift the handler first so Remill reuses a canonical
-  // sub_<va> function instead of creating a late duplicate (sub_<va>.1).
-  uint64_t auto_handler_va = 0;
-  if (!RawBinary && ResolveExceptions) {
-    if (auto *entry = pe.exception_info.lookup(func_va)) {
-      auto_handler_va = entry->handler_va;
+  if (!batch_vas.empty()) {
+    // Batch lifting mode.
+    unsigned lifted = 0, failed = 0;
+    for (uint64_t va : batch_vas) {
+      if (lifter.Lift(va))
+        ++lifted;
+      else
+        ++failed;
     }
-  }
-  if (auto_handler_va != 0 && auto_handler_va != func_va) {
-    errs() << "Auto-lifting exception handler at 0x"
-           << Twine::utohexstr(auto_handler_va) << "\n";
-    if (!lifter.Lift(auto_handler_va)) {
-      errs() << "WARNING: failed to lift handler at 0x"
+    errs() << "Batch lift: " << lifted << " succeeded, "
+           << failed << " failed\n";
+    if (lifted == 0) {
+      errs() << "No functions lifted\n";
+      return 1;
+    }
+  } else {
+    // Single-function lifting mode.
+    // If available, lift the handler first so Remill reuses a canonical
+    // sub_<va> function instead of creating a late duplicate (sub_<va>.1).
+    uint64_t auto_handler_va = 0;
+    if (!RawBinary && ResolveExceptions) {
+      if (auto *entry = pe.exception_info.lookup(func_va)) {
+        auto_handler_va = entry->handler_va;
+      }
+    }
+    if (auto_handler_va != 0 && auto_handler_va != func_va) {
+      errs() << "Auto-lifting exception handler at 0x"
              << Twine::utohexstr(auto_handler_va) << "\n";
+      if (!lifter.Lift(auto_handler_va)) {
+        errs() << "WARNING: failed to lift handler at 0x"
+               << Twine::utohexstr(auto_handler_va) << "\n";
+      }
     }
-  }
 
-  if (!lifter.Lift(func_va)) {
-    errs() << "TraceLifter::Lift() failed\n";
-    return 1;
+    if (!lifter.Lift(func_va)) {
+      errs() << "TraceLifter::Lift() failed\n";
+      return 1;
+    }
   }
   errs() << "Lifting complete\n";
 

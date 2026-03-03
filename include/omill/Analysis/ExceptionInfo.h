@@ -72,6 +72,12 @@ class ExceptionInfo {
 
   bool empty() const { return entries_.empty(); }
 
+  /// Access all entries (sorted by begin_va).
+  const llvm::SmallVector<RuntimeFunctionEntry, 64> &entries() const {
+    ensureSorted();
+    return entries_;
+  }
+
   void setImageBase(uint64_t base) { image_base_ = base; }
   uint64_t imageBase() const { return image_base_; }
 
