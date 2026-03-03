@@ -26,38 +26,22 @@ VMHandlerGraph::VMHandlerGraph(const BinaryMemoryMap &mem, uint64_t image_base,
   buildHandlerGraph();
 }
 
-/// Validate that a candidate handler VA looks like a plausible instruction
-/// boundary.  Returns false for obviously-invalid targets (mid-instruction
-/// positions, padding, etc.).
-static bool validateHandlerTarget(const BinaryMemoryMap &mem,
-                                  uint64_t target_va) {
-  uint8_t probe[2];
-  if (!mem.read(target_va, probe, 2))
-    return false;  // Not in any mapped region.
-
-  // Reject targets starting with undefined opcode extensions.
-  // 0xFE = group 4 (INC/DEC r/m8): only reg=0 (INC) and reg=1 (DEC) are
-  // defined.  Mid-instruction hits (e.g. landing in a call's displacement)
-  // often produce 0xFE 0xFF where reg=7 → GENERAL_ERROR from decoder.
-  if (probe[0] == 0xFE && ((probe[1] >> 3) & 0x07) > 1)
-    return false;
-
-  // Reject 00 00 (ADD [rax], al) — typically section padding, not code.
-  if (probe[0] == 0x00 && probe[1] == 0x00)
-    return false;
-
-  return true;
-}
-
-/// Check if a byte before a candidate `mov eXX, imm32` is a REX prefix.
-/// If so, the opcode is actually `mov rXX, imm64` (10-byte instruction)
-/// and the 4 bytes we'd extract as an RVA are only the low half of a
-/// 64-bit immediate — not a valid dispatch RVA.
-static bool precededByREX(const uint8_t *data, size_t mov_pos) {
-  if (mov_pos == 0)
-    return false;
-  uint8_t prev = data[mov_pos - 1];
-  return (prev & 0xF0) == 0x40;  // 0x40-0x4F are REX prefixes.
+/// Try to extract an RVA from a `mov eXX, imm32` at an exact position.
+/// Returns the RVA if the opcode matches, std::nullopt otherwise.
+static std::optional<uint32_t> tryExtractMovRVA(const uint8_t *data, size_t pos,
+                                                 size_t region_size,
+                                                 uint8_t mov_opcode) {
+  if (pos + 5 > region_size)
+    return std::nullopt;
+  if (data[pos] != mov_opcode)
+    return std::nullopt;
+  // Reject if preceded by REX prefix — would be mov r64, imm64 (10 bytes),
+  // and the 4 bytes we'd extract are only the low half of a 64-bit immediate.
+  if (pos > 0 && (data[pos - 1] & 0xF0) == 0x40)
+    return std::nullopt;
+  uint32_t rva;
+  std::memcpy(&rva, &data[pos + 1], 4);
+  return rva;
 }
 
 void VMHandlerGraph::scanDispatchPatterns(const BinaryMemoryMap &mem) {
@@ -80,7 +64,6 @@ void VMHandlerGraph::scanDispatchPatterns(const BinaryMemoryMap &mem) {
 
   // Upper bound on valid RVAs — anything beyond image size is bogus.
   uint64_t image_size = mem.imageSize();
-  unsigned rejected = 0;
 
   mem.forEachRegion([&](uint64_t base, const uint8_t *data, size_t size) {
     if (size < 15)
@@ -112,95 +95,60 @@ void VMHandlerGraph::scanDispatchPatterns(const BinaryMemoryMap &mem) {
 
       if (rex == 0x49) {
         // Case 1: rax-rdi variant.
+        // Full pattern: (B8+reg) imm32 | 49 03 ModRM 24 E0000000 | FF (E0|reg)
+        //               5 bytes          8 bytes                    2 bytes
         if (i + 10 > size)
           continue;
         if (data[i + 8] != 0xFF || data[i + 9] != (0xE0 | reg_field))
           continue;
 
-        // Walk backwards to find: (B8+reg_field) xx xx xx xx
-        // Window of 15 bytes: mov is typically 0-5 bytes before add.
-        // Wider windows risk matching B8 bytes inside other instructions'
-        // immediates, producing false-positive RVAs that land mid-instruction.
+        // The mov is exactly 5 bytes before the add — no backward scan.
+        // Any gap means intervening instructions that could clobber the
+        // register, and in practice EAC's dispatch has no gap.
         uint8_t mov_opcode = 0xB8 + reg_field;
-        for (unsigned back = 1; back <= 15 && i >= back; ++back) {
-          size_t mov_pos = i - back;
-          if (data[mov_pos] != mov_opcode || mov_pos + 5 > i)
-            continue;
+        if (i < 5)
+          continue;
+        auto rva = tryExtractMovRVA(data, i - 5, size, mov_opcode);
+        if (!rva || (image_size > 0 && *rva >= image_size))
+          continue;
 
-          // If preceded by a REX prefix, this is actually mov r64, imm64
-          // and the bytes we'd extract are only half the immediate.
-          if (precededByREX(data, mov_pos))
-            continue;
+        uint64_t target_va = image_base_ + *rva;
+        uint64_t dispatch_va = base + (i - 5);
+        dispatch_targets_[dispatch_va] = target_va;
+        dispatch_rvas_[dispatch_va] = *rva;
+        rva_to_target_[*rva] = target_va;
 
-          uint32_t rva;
-          std::memcpy(&rva, &data[mov_pos + 1], 4);
-
-          // RVA must be within the image.
-          if (image_size > 0 && rva >= image_size) {
-            ++rejected;
-            continue;
-          }
-
-          uint64_t target_va = image_base_ + rva;
-
-          // Validate the target looks like a real instruction boundary.
-          if (!validateHandlerTarget(mem, target_va)) {
-            ++rejected;
-            continue;
-          }
-
-          uint64_t dispatch_va = base + mov_pos;
-          dispatch_targets_[dispatch_va] = target_va;
-          dispatch_rvas_[dispatch_va] = rva;
-          rva_to_target_[rva] = target_va;
-          break;
-        }
       } else if (rex == 0x4D) {
         // Case 2: r8-r15 variant.
+        // Full pattern: 41 (B8+reg) imm32 | 4D 03 ModRM 24 E0000000 | 41 FF (E0|reg)
+        //               6 bytes              8 bytes                    3 bytes
         if (i + 11 > size)
           continue;
         if (data[i + 8] != 0x41 || data[i + 9] != 0xFF ||
             data[i + 10] != (0xE0 | reg_field))
           continue;
 
-        // Walk backwards to find: 41 (B8+reg_field) xx xx xx xx
+        // mov is 6 bytes before add: 41 prefix + B8+reg + imm32.
         uint8_t mov_opcode = 0xB8 + reg_field;
-        for (unsigned back = 1; back <= 15 && i >= back; ++back) {
-          size_t mov_pos = i - back;
-          if (mov_pos < 1 || data[mov_pos - 1] != 0x41 ||
-              data[mov_pos] != mov_opcode || mov_pos + 5 > i)
-            continue;
+        if (i < 6)
+          continue;
+        if (data[i - 6] != 0x41)
+          continue;
+        auto rva = tryExtractMovRVA(data, i - 5, size, mov_opcode);
+        if (!rva || (image_size > 0 && *rva >= image_size))
+          continue;
 
-          uint32_t rva;
-          std::memcpy(&rva, &data[mov_pos + 1], 4);
-
-          if (image_size > 0 && rva >= image_size) {
-            ++rejected;
-            continue;
-          }
-
-          uint64_t target_va = image_base_ + rva;
-
-          if (!validateHandlerTarget(mem, target_va)) {
-            ++rejected;
-            continue;
-          }
-
-          uint64_t dispatch_va = base + mov_pos - 1;  // Include REX prefix.
-          dispatch_targets_[dispatch_va] = target_va;
-          dispatch_rvas_[dispatch_va] = rva;
-          rva_to_target_[rva] = target_va;
-          break;
-        }
+        uint64_t target_va = image_base_ + *rva;
+        uint64_t dispatch_va = base + (i - 6);  // Include 41 prefix.
+        dispatch_targets_[dispatch_va] = target_va;
+        dispatch_rvas_[dispatch_va] = *rva;
+        rva_to_target_[*rva] = target_va;
       }
     }
   });
 
   llvm::errs() << "VMHandlerGraph: found " << dispatch_targets_.size()
-               << " dispatch sites";
-  if (rejected > 0)
-    llvm::errs() << " (" << rejected << " rejected)";
-  llvm::errs() << "\n";
+               << " dispatch sites\n";
 }
 
 void VMHandlerGraph::scanVMEntrySites(const BinaryMemoryMap &mem) {
