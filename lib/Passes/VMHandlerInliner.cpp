@@ -158,10 +158,13 @@ llvm::PreservedAnalyses VMHandlerInlinerPass::run(
 
   bool inlined = false;
   for (auto *CB : inline_sites) {
+    auto *caller = CB->getFunction();
     llvm::InlineFunctionInfo IFI;
     auto result = llvm::InlineFunction(*CB, IFI);
-    if (result.isSuccess())
+    if (result.isSuccess()) {
       inlined = true;
+      caller->addFnAttr("omill.needs_cleanup");
+    }
   }
 
   // Clean up: remove handler functions that are now dead.

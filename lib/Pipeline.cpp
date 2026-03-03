@@ -184,6 +184,41 @@ struct SkipOnLiftedControlTransferPass
   }
 };
 
+/// Module pass that runs an FPM only on functions matching a predicate.
+/// Avoids iterating the entire module when only a few functions need work.
+template <typename Pred>
+struct ScopedFunctionPassAdaptor
+    : llvm::PassInfoMixin<ScopedFunctionPassAdaptor<Pred>> {
+  llvm::FunctionPassManager FPM;
+  Pred predicate;
+  ScopedFunctionPassAdaptor(llvm::FunctionPassManager FPM, Pred pred)
+      : FPM(std::move(FPM)), predicate(std::move(pred)) {}
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                               llvm::ModuleAnalysisManager &MAM) {
+    auto &FAM =
+        MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M).getManager();
+    bool changed = false;
+    for (auto &F : M) {
+      if (F.isDeclaration() || !predicate(F))
+        continue;
+      auto PA = FPM.run(F, FAM);
+      if (!PA.areAllPreserved()) {
+        changed = true;
+        FAM.invalidate(F, PA);
+      }
+    }
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+  static bool isRequired() { return true; }
+};
+
+template <typename Pred>
+ScopedFunctionPassAdaptor<Pred> createScopedFPM(llvm::FunctionPassManager FPM,
+                                                 Pred pred) {
+  return ScopedFunctionPassAdaptor<Pred>(std::move(FPM), std::move(pred));
+}
+
 }  // namespace
 
 static void addCleanupPasses(llvm::FunctionPassManager &FPM) {
@@ -522,29 +557,22 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     MPM.addPass(RewriteLiftedCallsToNativePass());
   }
 
-  // Eliminate dead stores to volatile State fields, then decompose the State
-  // alloca via SROA.  Running DSE first makes SROA more likely to succeed.
-  // Merged into a single module traversal to avoid adaptor overhead.
+  // Eliminate dead stores to volatile State fields, decompose the State
+  // alloca via SROA, and expand i128 div/rem — all in a single traversal.
   {
     llvm::FunctionPassManager FPM;
     if (!envDisabled("OMILL_SKIP_ABI_DEAD_STATE_STORE_DSE"))
       FPM.addPass(DeadStateStoreDSEPass());
     if (!envDisabled("OMILL_SKIP_ABI_SROA"))
       FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+    if (!envDisabled("OMILL_SKIP_EXPAND_I128_DIVREM"))
+      FPM.addPass(ExpandI128DivRemPass());
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
   addPhaseMarker(MPM, "ABI: GlobalDCE dead originals");
   if (!envDisabled("OMILL_SKIP_ABI_GLOBAL_DCE")) {
     MPM.addPass(llvm::GlobalDCEPass());
-  }
-
-  // Expand i128 sdiv/srem/udiv/urem into 64-bit operations so the x86
-  // backend doesn't lower them to __divti3/__modti3 library calls.
-  if (!envDisabled("OMILL_SKIP_EXPAND_I128_DIVREM")) {
-    llvm::FunctionPassManager FPM;
-    FPM.addPass(ExpandI128DivRemPass());
-    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
   addPhaseMarker(MPM, "ABI: final optimization");
   // Full optimization after inlining native wrappers.
@@ -576,21 +604,23 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
   // return. Fold direct calls to those helpers in their callers.
   if (!envDisabled("OMILL_SKIP_ABI_FOLD_CONST_RET_CALLS")) {
     MPM.addPass(FoldCallsToConstantReturnPass());
-    llvm::FunctionPassManager FPM;
-    FPM.addPass(llvm::InstCombinePass());
-    FPM.addPass(llvm::DCEPass());
-    FPM.addPass(llvm::SimplifyCFGPass());
-    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
-  // Eliminate obfuscation trace counters (NEXT_PC chains) and merge
-  // byte-level PHI nodes back into wider values.
-  if (!envDisabled("OMILL_SKIP_ABI_DEAD_TRACE_COUNTERS")) {
+  // Merged cleanup: post-FoldCallsToConstantReturn + dead trace counter
+  // elimination in a single module traversal.
+  {
     llvm::FunctionPassManager FPM;
-    FPM.addPass(EliminateDeadTraceCountersPass());
-    FPM.addPass(MergeBytePhisPass());
+    if (!envDisabled("OMILL_SKIP_ABI_FOLD_CONST_RET_CALLS")) {
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::DCEPass());
+      FPM.addPass(llvm::SimplifyCFGPass());
+    }
+    if (!envDisabled("OMILL_SKIP_ABI_DEAD_TRACE_COUNTERS")) {
+      FPM.addPass(EliminateDeadTraceCountersPass());
+      FPM.addPass(MergeBytePhisPass());
+    }
     FPM.addPass(llvm::InstCombinePass());
-    FPM.addPass(llvm::ADCEPass());  // ADCE kills cyclic dead phi chains (NEXT_PC)
+    FPM.addPass(llvm::ADCEPass());
     FPM.addPass(llvm::SimplifyCFGPass());
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
@@ -611,14 +641,20 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
         : llvm::PassInfoMixin<InlineVMHandlersAndCleanupPass> {
       llvm::PreservedAnalyses run(llvm::Module &M,
                                    llvm::ModuleAnalysisManager &MAM) {
-        // Mark VM handler _native functions for inlining.
+        // Mark VM handler _native functions for inlining and collect their
+        // callers so we only run expensive cleanup on affected functions.
         bool has_vm_handlers = false;
+        llvm::DenseSet<llvm::Function *> callers;
         for (auto &F : M) {
-          if (F.hasFnAttribute("omill.vm_handler") &&
-              F.getName().ends_with("_native")) {
-            F.removeFnAttr(llvm::Attribute::NoInline);
-            F.addFnAttr(llvm::Attribute::AlwaysInline);
-            has_vm_handlers = true;
+          if (!F.hasFnAttribute("omill.vm_handler") ||
+              !F.getName().ends_with("_native"))
+            continue;
+          F.removeFnAttr(llvm::Attribute::NoInline);
+          F.addFnAttr(llvm::Attribute::AlwaysInline);
+          has_vm_handlers = true;
+          for (auto *U : F.users()) {
+            if (auto *CB = llvm::dyn_cast<llvm::CallBase>(U))
+              callers.insert(CB->getFunction());
           }
         }
         if (!has_vm_handlers)
@@ -631,8 +667,11 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
           InlineMPM.run(M, MAM);
         }
 
-        // Cleanup: RecoverAllocaPointers + GVN + InstCombine + SROA etc.
+        // Cleanup only on functions that called VM handlers.
         {
+          auto &FAM =
+              MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M)
+                  .getManager();
           llvm::FunctionPassManager FPM;
           FPM.addPass(RecoverAllocaPointersPass());
           FPM.addPass(llvm::GVNPass());
@@ -644,9 +683,12 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
           FPM.addPass(llvm::ADCEPass());
           FPM.addPass(llvm::InstCombinePass());
           FPM.addPass(llvm::SimplifyCFGPass());
-          auto adaptor =
-              llvm::createModuleToFunctionPassAdaptor(std::move(FPM));
-          adaptor.run(M, MAM);
+          for (auto *F : callers) {
+            if (F->isDeclaration())
+              continue;
+            auto PA = FPM.run(*F, FAM);
+            FAM.invalidate(*F, PA);
+          }
         }
 
         {
@@ -1095,12 +1137,10 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     // separate AlwaysInlinerPass is needed.
     MPM.addPass(VMHandlerInlinerPass(/*max_handler_instrs=*/500,
                                      /*min_callsites=*/1));
-    // Remove remaining dead handler functions BEFORE the expensive cleanup
-    // passes to avoid running SROA/GVN/InstCombine on dead code.
-    MPM.addPass(llvm::GlobalDCEPass());
 
     addPhaseMarker(MPM, "Phase 3.56: post-handler cleanup");
-    // Clean up after handler inlining.
+    // Clean up after handler inlining — scoped to functions that
+    // VMHandlerInlinerPass tagged with "omill.needs_cleanup".
     {
       llvm::FunctionPassManager FPM;
       FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
@@ -1111,7 +1151,12 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
       FPM.addPass(llvm::GVNPass());
       FPM.addPass(llvm::ADCEPass());
       FPM.addPass(llvm::SimplifyCFGPass());
-      MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+      MPM.addPass(createScopedFPM(std::move(FPM), [](llvm::Function &F) {
+        if (!F.hasFnAttribute("omill.needs_cleanup"))
+          return false;
+        F.removeFnAttr("omill.needs_cleanup");
+        return true;
+      }));
     }
   }
 
@@ -1176,7 +1221,10 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     MPM.addPass(llvm::RequireAnalysisPass<BinaryMemoryAnalysis, llvm::Module>());
     llvm::FunctionPassManager FPM;
     buildDeobfuscationPipeline(FPM);
-    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    // Deobfuscation only applies to _native wrappers post-ABI.
+    MPM.addPass(createScopedFPM(std::move(FPM), [](llvm::Function &F) {
+      return F.getName().ends_with("_native");
+    }));
   }
 
   // Inline VM handler functions identified by callsite frequency analysis.
@@ -1185,13 +1233,18 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   // exposes their bodies to further optimization.
   if (opts.deobfuscate && !envDisabled("OMILL_SKIP_VM_HANDLER_INLINE")) {
     MPM.addPass(VMHandlerInlinerPass());
-    // Re-run function-level cleanup after inlining.
+    // Re-run cleanup only on functions that had handlers inlined.
     llvm::FunctionPassManager FPM;
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(llvm::GVNPass());
     FPM.addPass(llvm::ADCEPass());
     FPM.addPass(llvm::SimplifyCFGPass());
-    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    MPM.addPass(createScopedFPM(std::move(FPM), [](llvm::Function &F) {
+      if (!F.hasFnAttribute("omill.needs_cleanup"))
+        return false;
+      F.removeFnAttr("omill.needs_cleanup");
+      return true;
+    }));
   }
 
   // Late lowering: undefined values (after DCE removed most of them)
