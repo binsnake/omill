@@ -43,6 +43,13 @@ emitUDivRem128(llvm::IRBuilder<> &B, llvm::Value *a, llvm::Value *b) {
   done_bb->splice(done_bb->begin(), entry_bb, split_point->getIterator(),
                   entry_bb->end());
 
+  // The old terminator is now in done_bb but successors' PHI nodes still
+  // reference entry_bb.  Update them to reference done_bb instead.
+  if (auto *term = done_bb->getTerminator()) {
+    for (unsigned i = 0, e = term->getNumSuccessors(); i < e; ++i)
+      term->getSuccessor(i)->replacePhiUsesWith(entry_bb, done_bb);
+  }
+
   // Now entry_bb ends without a terminator — add the branch.
   B.SetInsertPoint(entry_bb);
   B.CreateCondBr(both_fit, fast_bb, loop_pre);
