@@ -529,7 +529,10 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     FPM.addPass(llvm::GVNPass());
     FPM.addPass(PointersHoistingPass());
     FPM.addPass(TypeRecoveryPass());
-    FPM.addPass(llvm::createFunctionToLoopPassAdaptor(llvm::LoopDeletionPass()));
+    // NOTE: LoopDeletionPass removed — SCEV's computeShiftCompareExitLimit
+    // crashes (SEH 0xC0000005) on lifted modular-exponentiation loops with
+    // 128-bit multiply-modulo operations.  ADCE + SimplifyCFG below handle
+    // dead code removal adequately without it.
     FPM.addPass(llvm::ADCEPass());
     FPM.addPass(llvm::SimplifyCFGPass());
     FPM.addPass(llvm::InstCombinePass());
