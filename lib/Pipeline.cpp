@@ -569,42 +569,63 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
   // (alloca)+C) to a GEP, so RecoverAllocaPointersPass does it first,
   // unblocking BasicAA / GVN store forwarding.
   if (!envDisabled("OMILL_SKIP_ABI_INLINE_VM_HANDLERS")) {
-    struct MarkVMHandlersInlinePass
-        : llvm::PassInfoMixin<MarkVMHandlersInlinePass> {
+    // Inline VM handler _native functions into their callers and run
+    // cleanup passes.  This entire block is skipped when no VM handler
+    // functions exist (e.g. non-VM block-lift mode) to avoid running
+    // expensive cleanup passes on the entire module for no benefit.
+    struct InlineVMHandlersAndCleanupPass
+        : llvm::PassInfoMixin<InlineVMHandlersAndCleanupPass> {
       llvm::PreservedAnalyses run(llvm::Module &M,
-                                   llvm::ModuleAnalysisManager &) {
-        bool changed = false;
+                                   llvm::ModuleAnalysisManager &MAM) {
+        // Mark VM handler _native functions for inlining.
+        bool has_vm_handlers = false;
         for (auto &F : M) {
           if (F.hasFnAttribute("omill.vm_handler") &&
               F.getName().ends_with("_native")) {
             F.removeFnAttr(llvm::Attribute::NoInline);
             F.addFnAttr(llvm::Attribute::AlwaysInline);
-            changed = true;
+            has_vm_handlers = true;
           }
         }
-        return changed ? llvm::PreservedAnalyses::none()
-                       : llvm::PreservedAnalyses::all();
+        if (!has_vm_handlers)
+          return llvm::PreservedAnalyses::all();
+
+        // Inline the marked functions.
+        {
+          llvm::ModulePassManager InlineMPM;
+          InlineMPM.addPass(llvm::AlwaysInlinerPass());
+          InlineMPM.run(M, MAM);
+        }
+
+        // Cleanup: RecoverAllocaPointers + GVN + InstCombine + SROA etc.
+        {
+          llvm::FunctionPassManager FPM;
+          FPM.addPass(RecoverAllocaPointersPass());
+          FPM.addPass(llvm::GVNPass());
+          FPM.addPass(llvm::InstCombinePass());
+          FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+          FPM.addPass(llvm::InstCombinePass());
+          FPM.addPass(llvm::SimplifyCFGPass());
+          FPM.addPass(llvm::GVNPass());
+          FPM.addPass(llvm::ADCEPass());
+          FPM.addPass(llvm::InstCombinePass());
+          FPM.addPass(llvm::SimplifyCFGPass());
+          auto adaptor =
+              llvm::createModuleToFunctionPassAdaptor(std::move(FPM));
+          adaptor.run(M, MAM);
+        }
+
+        {
+          llvm::ModulePassManager CleanMPM;
+          CleanMPM.addPass(llvm::GlobalDCEPass());
+          CleanMPM.run(M, MAM);
+        }
+
+        return llvm::PreservedAnalyses::none();
       }
+      static bool isRequired() { return true; }
     };
-    MPM.addPass(MarkVMHandlersInlinePass{});
-    MPM.addPass(llvm::AlwaysInlinerPass());
-    {
-      llvm::FunctionPassManager FPM;
-      // RecoverAllocaPointers resolves inttoptr(ptrtoint(alloca+C1)+C2) → GEP
-      // and follows loads through the store map, so a single round suffices.
-      FPM.addPass(RecoverAllocaPointersPass());
-      FPM.addPass(llvm::GVNPass());
-      FPM.addPass(llvm::InstCombinePass());
-      FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
-      FPM.addPass(llvm::InstCombinePass());
-      FPM.addPass(llvm::SimplifyCFGPass());
-      FPM.addPass(llvm::GVNPass());
-      FPM.addPass(llvm::ADCEPass());
-      FPM.addPass(llvm::InstCombinePass());
-      FPM.addPass(llvm::SimplifyCFGPass());
-      MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
-    }
-    MPM.addPass(llvm::GlobalDCEPass());
+    MPM.addPass(InlineVMHandlersAndCleanupPass{});
   }
   // Strip @llvm.compiler.used and run GlobalDCE to remove dead ISEL stubs.
   if (!envDisabled("OMILL_SKIP_STRIP_COMPILER_USED")) {
