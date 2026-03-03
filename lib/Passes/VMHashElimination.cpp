@@ -1,11 +1,14 @@
 #include "omill/Passes/VMHashElimination.h"
 
+#include <llvm/ADT/DenseSet.h>
 #include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
-#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/InstrTypes.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/IntrinsicInst.h>
+#include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/PatternMatch.h>
 #include <llvm/Support/raw_ostream.h>
 
@@ -15,216 +18,141 @@ namespace omill {
 
 namespace {
 
-/// Check if an instruction is a murmur-style hash round.
-///
-/// Pattern:
-///   %xor   = xor i64 %input, <K>
-///   %mul   = mul i64 %xor, <K>      (same K or different)
-///   %inner = lshr i64 %mul, 32
-///   %shift = lshr i64 %mul, 60
-///   %var   = lshr i64 %inner, %shift
-///   %fold  = xor i64 %var, %mul
-///   %result = mul i64 %fold, <K>
-///
-/// We detect this by looking for the signature: lshr(X, 60) where X is a mul.
-/// Then verify the full chain.
-struct MurmurRound {
-  llvm::Instruction *shift60 = nullptr;  // lshr %mul, 60
-  llvm::Instruction *mul_input = nullptr;  // the mul instruction
-  llvm::Instruction *result_mul = nullptr;  // final mul(fold, K)
-};
+// Threshold constants.
+constexpr uint64_t kIntegrityConstThreshold = 1ULL << 32;
+constexpr uint64_t kRangeConstThreshold = 1ULL << 48;
 
-/// Try to match a murmur hash round starting from an lshr by 60.
-static std::optional<MurmurRound> matchMurmurRound(llvm::Instruction *I) {
-  // Match: %shift = lshr i64 %mul, 60
-  llvm::Value *mul_val = nullptr;
-  if (!match(I, m_LShr(m_Value(mul_val), m_SpecificInt(60))))
-    return std::nullopt;
-
-  // %mul must be a mul instruction.
-  auto *mul_inst = llvm::dyn_cast<llvm::Instruction>(mul_val);
-  if (!mul_inst || mul_inst->getOpcode() != llvm::Instruction::Mul)
-    return std::nullopt;
-
-  // Look for lshr(%mul, 32) among mul's users.
-  llvm::Instruction *inner_shift = nullptr;
-  for (auto *user : mul_inst->users()) {
-    auto *u_inst = llvm::dyn_cast<llvm::Instruction>(user);
-    if (!u_inst)
-      continue;
-    if (match(u_inst, m_LShr(m_Specific(mul_inst), m_SpecificInt(32)))) {
-      inner_shift = u_inst;
-      break;
-    }
-  }
-  if (!inner_shift)
-    return std::nullopt;
-
-  // Look for the variable shift: lshr(%inner, %shift60) among inner's users.
-  llvm::Instruction *var_shift = nullptr;
-  for (auto *user : inner_shift->users()) {
-    auto *u_inst = llvm::dyn_cast<llvm::Instruction>(user);
-    if (!u_inst)
-      continue;
-    if (match(u_inst, m_LShr(m_Specific(inner_shift), m_Specific(I)))) {
-      var_shift = u_inst;
-      break;
-    }
-  }
-  if (!var_shift)
-    return std::nullopt;
-
-  // Look for xor(%var_shift, %mul) among var_shift's users.
-  llvm::Instruction *fold_xor = nullptr;
-  for (auto *user : var_shift->users()) {
-    auto *u_inst = llvm::dyn_cast<llvm::Instruction>(user);
-    if (!u_inst)
-      continue;
-    if (match(u_inst, m_Xor(m_Specific(var_shift), m_Specific(mul_inst))) ||
-        match(u_inst, m_Xor(m_Specific(mul_inst), m_Specific(var_shift)))) {
-      fold_xor = u_inst;
-      break;
-    }
-  }
-  if (!fold_xor)
-    return std::nullopt;
-
-  // Look for the final mul(%fold, <K>) among fold's users.
-  llvm::Instruction *result_mul = nullptr;
-  for (auto *user : fold_xor->users()) {
-    auto *u_inst = llvm::dyn_cast<llvm::Instruction>(user);
-    if (!u_inst)
-      continue;
-    if (u_inst->getOpcode() == llvm::Instruction::Mul) {
-      // One operand should be fold_xor, the other a constant.
-      if (u_inst->getOperand(0) == fold_xor ||
-          u_inst->getOperand(1) == fold_xor) {
-        result_mul = u_inst;
-        break;
-      }
-    }
-  }
-  if (!result_mul)
-    return std::nullopt;
-
-  return MurmurRound{I, mul_inst, result_mul};
-}
-
-/// Walk forward from hash round results to find the combined integrity flag.
-///
-/// The rounds are combined: or(or(round1_result, round2_result), ...)
-/// Then compared: icmp eq <combined>, <magic>
-/// Then: zext i1 to i64
-///
-/// We look for zext(icmp eq(or-chain, const)) patterns where the or-chain
-/// includes at least one murmur round result.
-static llvm::SmallVector<llvm::Instruction *, 4>
-findIntegrityFlags(llvm::Function &F,
-                   const llvm::SmallPtrSetImpl<llvm::Instruction *> &round_results) {
-  llvm::SmallVector<llvm::Instruction *, 4> flags;
-
-  // Track all values derived from round results through OR chains.
-  llvm::SmallPtrSet<llvm::Value *, 32> derived;
-  for (auto *result : round_results)
-    derived.insert(result);
-
-  // BFS through OR chains.
-  bool changed = true;
-  while (changed) {
-    changed = false;
-    for (auto *val : derived) {
-      for (auto *user : val->users()) {
-        auto *inst = llvm::dyn_cast<llvm::Instruction>(user);
-        if (!inst)
-          continue;
-        if (inst->getOpcode() == llvm::Instruction::Or ||
-            inst->getOpcode() == llvm::Instruction::Xor) {
-          if (derived.insert(inst).second)
-            changed = true;
-        }
-      }
-    }
-  }
-
-  // Look for icmp eq(derived_val, const) → zext patterns.
-  for (auto *val : derived) {
-    for (auto *user : val->users()) {
-      auto *cmp = llvm::dyn_cast<llvm::ICmpInst>(user);
-      if (!cmp || cmp->getPredicate() != llvm::ICmpInst::ICMP_EQ)
-        continue;
-      // One operand should be in the derived set, the other a constant.
-      if (!llvm::isa<llvm::ConstantInt>(cmp->getOperand(0)) &&
-          !llvm::isa<llvm::ConstantInt>(cmp->getOperand(1)))
-        continue;
-
-      // Look for zext of the comparison result.
-      for (auto *cmp_user : cmp->users()) {
-        auto *zext = llvm::dyn_cast<llvm::ZExtInst>(cmp_user);
-        if (zext && zext->getType()->isIntegerTy(64)) {
-          flags.push_back(zext);
-        }
-      }
-    }
-  }
-
-  return flags;
-}
-
-/// Find hash token range checks at handler entry.
-///
-/// Pattern:
-///   %cmp1 = icmp ugt i64 %token, <const>
-///   %cmp2 = icmp ult i64 %token, <const>
-///   %flag = or i1 %cmp1, %cmp2
-///   %r10  = zext i1 %flag to i64
-///
-/// These produce a 0-or-1 flag used as a branchless multiplier.
-static llvm::SmallVector<llvm::Instruction *, 4>
-findTokenRangeChecks(llvm::Function &F) {
-  llvm::SmallVector<llvm::Instruction *, 4> flags;
+/// Step 1: Find murmur anchors.
+/// A `mul` instruction M is a murmur mul if it has both lshr(M, 60) and
+/// lshr(M, 32) among its users.
+llvm::SmallVector<llvm::Instruction *, 16>
+findMurmurAnchors(llvm::Function &F) {
+  llvm::SmallVector<llvm::Instruction *, 16> anchors;
 
   for (auto &BB : F) {
     for (auto &I : BB) {
-      auto *zext = llvm::dyn_cast<llvm::ZExtInst>(&I);
-      if (!zext || !zext->getType()->isIntegerTy(64))
+      if (I.getOpcode() != llvm::Instruction::Mul)
         continue;
-      auto *src = zext->getOperand(0);
-      if (!src->getType()->isIntegerTy(1))
+      if (!I.getType()->isIntegerTy(64))
         continue;
 
-      // Check if src is an OR of two icmps.
-      auto *or_inst = llvm::dyn_cast<llvm::BinaryOperator>(src);
-      if (!or_inst || or_inst->getOpcode() != llvm::Instruction::Or)
-        continue;
+      bool has_shift32 = false;
+      bool has_shift60 = false;
 
-      auto *cmp1 = llvm::dyn_cast<llvm::ICmpInst>(or_inst->getOperand(0));
-      auto *cmp2 = llvm::dyn_cast<llvm::ICmpInst>(or_inst->getOperand(1));
-      if (!cmp1 || !cmp2)
-        continue;
-
-      // Check if one is ugt and the other is ult, comparing the same
-      // non-constant value against constants.
-      bool is_range_check = false;
-      auto pred1 = cmp1->getPredicate();
-      auto pred2 = cmp2->getPredicate();
-
-      if (((pred1 == llvm::ICmpInst::ICMP_UGT &&
-            pred2 == llvm::ICmpInst::ICMP_ULT) ||
-           (pred1 == llvm::ICmpInst::ICMP_ULT &&
-            pred2 == llvm::ICmpInst::ICMP_UGT)) &&
-          (llvm::isa<llvm::ConstantInt>(cmp1->getOperand(1)) ||
-           llvm::isa<llvm::ConstantInt>(cmp1->getOperand(0))) &&
-          (llvm::isa<llvm::ConstantInt>(cmp2->getOperand(1)) ||
-           llvm::isa<llvm::ConstantInt>(cmp2->getOperand(0)))) {
-        is_range_check = true;
+      for (auto *user : I.users()) {
+        auto *u_inst = llvm::dyn_cast<llvm::Instruction>(user);
+        if (!u_inst)
+          continue;
+        if (match(u_inst, m_LShr(m_Specific(&I), m_SpecificInt(32))))
+          has_shift32 = true;
+        if (match(u_inst, m_LShr(m_Specific(&I), m_SpecificInt(60))))
+          has_shift60 = true;
+        if (has_shift32 && has_shift60)
+          break;
       }
 
-      if (is_range_check)
-        flags.push_back(zext);
+      if (has_shift32 && has_shift60)
+        anchors.push_back(&I);
     }
   }
 
-  return flags;
+  return anchors;
+}
+
+/// Step 2: Forward taint BFS from murmur muls.
+/// Propagates through arithmetic, shifts, casts, phi, select (value only).
+/// Stops at load, store, call, icmp, br, switch, ret.
+void taintBFS(const llvm::SmallVectorImpl<llvm::Instruction *> &seeds,
+              llvm::DenseSet<llvm::Instruction *> &tainted) {
+  llvm::SmallVector<llvm::Instruction *, 64> worklist;
+
+  for (auto *seed : seeds) {
+    if (tainted.insert(seed).second)
+      worklist.push_back(seed);
+  }
+
+  while (!worklist.empty()) {
+    auto *inst = worklist.pop_back_val();
+
+    for (auto *user : inst->users()) {
+      auto *u_inst = llvm::dyn_cast<llvm::Instruction>(user);
+      if (!u_inst)
+        continue;
+
+      // Already tainted.
+      if (tainted.count(u_inst))
+        continue;
+
+      bool propagate = false;
+
+      switch (u_inst->getOpcode()) {
+        // Binary arithmetic — always propagate.
+        case llvm::Instruction::Xor:
+        case llvm::Instruction::Or:
+        case llvm::Instruction::And:
+        case llvm::Instruction::Add:
+        case llvm::Instruction::Sub:
+          propagate = true;
+          break;
+
+        // Mul — only if one operand is tainted or constant.
+        case llvm::Instruction::Mul: {
+          auto *op0 = u_inst->getOperand(0);
+          auto *op1 = u_inst->getOperand(1);
+          bool op0_tainted =
+              tainted.count(llvm::dyn_cast<llvm::Instruction>(op0));
+          bool op1_tainted =
+              tainted.count(llvm::dyn_cast<llvm::Instruction>(op1));
+          bool op0_const = llvm::isa<llvm::ConstantInt>(op0);
+          bool op1_const = llvm::isa<llvm::ConstantInt>(op1);
+          propagate = op0_tainted || op1_tainted || op0_const || op1_const;
+          break;
+        }
+
+        // Shifts.
+        case llvm::Instruction::LShr:
+        case llvm::Instruction::Shl:
+        case llvm::Instruction::AShr:
+          propagate = true;
+          break;
+
+        // Casts.
+        case llvm::Instruction::Trunc:
+        case llvm::Instruction::ZExt:
+        case llvm::Instruction::SExt:
+          propagate = true;
+          break;
+
+        // PHI — taint if any incoming is tainted.
+        case llvm::Instruction::PHI:
+          propagate = true;
+          break;
+
+        // Select — taint if a value operand (not condition) is tainted.
+        case llvm::Instruction::Select: {
+          auto *sel = llvm::cast<llvm::SelectInst>(u_inst);
+          auto *tv = sel->getTrueValue();
+          auto *fv = sel->getFalseValue();
+          auto *tv_inst = llvm::dyn_cast<llvm::Instruction>(tv);
+          auto *fv_inst = llvm::dyn_cast<llvm::Instruction>(fv);
+          propagate =
+              (tv_inst && tainted.count(tv_inst)) ||
+              (fv_inst && tainted.count(fv_inst));
+          break;
+        }
+
+        // Stop: load, store, call, icmp, br, switch, ret, etc.
+        default:
+          propagate = false;
+          break;
+      }
+
+      if (propagate) {
+        tainted.insert(u_inst);
+        worklist.push_back(u_inst);
+      }
+    }
+  }
 }
 
 }  // namespace
@@ -234,51 +162,131 @@ llvm::PreservedAnalyses VMHashEliminationPass::run(
   if (F.isDeclaration())
     return llvm::PreservedAnalyses::all();
 
-  // Only process VM handler functions.
-  if (!F.hasFnAttribute("omill.vm_handler"))
+  // Step 1: Find murmur anchors.
+  auto anchors = findMurmurAnchors(F);
+  if (anchors.empty())
     return llvm::PreservedAnalyses::all();
 
-  bool changed = false;
-  unsigned eliminated_count = 0;
+  // Step 2: Forward taint BFS.
+  llvm::DenseSet<llvm::Instruction *> tainted;
+  taintBFS(anchors, tainted);
 
-  // Phase 1: Find murmur hash rounds by scanning for lshr(X, 60).
-  llvm::SmallPtrSet<llvm::Instruction *, 16> round_results;
-  llvm::SmallVector<MurmurRound, 16> rounds;
+  bool changed = false;
+  unsigned integrity_count = 0;
+  unsigned range_count = 0;
+
+  // Step 3: Replace integrity checks.
+  // icmp eq i64 %tainted, <large_const> → i1 true
+  for (auto *inst : tainted) {
+    for (auto *user : inst->users()) {
+      auto *cmp = llvm::dyn_cast<llvm::ICmpInst>(user);
+      if (!cmp || cmp->getPredicate() != llvm::ICmpInst::ICMP_EQ)
+        continue;
+      if (!cmp->getType()->isIntegerTy(1))
+        continue;
+
+      // Find the constant operand.
+      llvm::ConstantInt *ci = nullptr;
+      if (auto *c = llvm::dyn_cast<llvm::ConstantInt>(cmp->getOperand(0)))
+        ci = c;
+      else if (auto *c = llvm::dyn_cast<llvm::ConstantInt>(cmp->getOperand(1)))
+        ci = c;
+      if (!ci)
+        continue;
+
+      // |const| > 2^32 threshold.
+      uint64_t abs_val = ci->getValue().isNegative()
+                             ? (uint64_t) (-ci->getSExtValue())
+                             : ci->getZExtValue();
+      if (abs_val <= kIntegrityConstThreshold)
+        continue;
+
+      cmp->replaceAllUsesWith(
+          llvm::ConstantInt::getTrue(cmp->getContext()));
+      changed = true;
+      ++integrity_count;
+    }
+  }
+
+  // Step 4: Replace range checks.
+  // Two sub-patterns in functions that have murmur rounds:
+  //
+  // 4a: icmp ugt/uge i64 %X, <const> where const > 2^48 → i1 true
+  // 4b: call @llvm.umax.i64(%X, <const>) where const > 2^48
+  //     → find downstream and(result, 1) → replace with i64 1
 
   for (auto &BB : F) {
     for (auto &I : BB) {
-      if (auto round = matchMurmurRound(&I)) {
-        rounds.push_back(*round);
-        round_results.insert(round->result_mul);
+      // 4a: icmp ugt/uge with large constant.
+      if (auto *cmp = llvm::dyn_cast<llvm::ICmpInst>(&I)) {
+        if (cmp->getPredicate() != llvm::ICmpInst::ICMP_UGT &&
+            cmp->getPredicate() != llvm::ICmpInst::ICMP_UGE)
+          continue;
+
+        llvm::ConstantInt *ci = nullptr;
+        if (auto *c = llvm::dyn_cast<llvm::ConstantInt>(cmp->getOperand(1)))
+          ci = c;
+        else if (auto *c =
+                     llvm::dyn_cast<llvm::ConstantInt>(cmp->getOperand(0)))
+          ci = c;
+        if (!ci || ci->getZExtValue() <= kRangeConstThreshold)
+          continue;
+
+        cmp->replaceAllUsesWith(
+            llvm::ConstantInt::getTrue(cmp->getContext()));
+        changed = true;
+        ++range_count;
+        continue;
+      }
+
+      // 4b: call @llvm.umax.i64 with large constant.
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!call)
+        continue;
+      auto *callee = call->getCalledFunction();
+      if (!callee || callee->getIntrinsicID() != llvm::Intrinsic::umax)
+        continue;
+      if (!call->getType()->isIntegerTy(64))
+        continue;
+
+      // Check if one argument is a large constant.
+      llvm::ConstantInt *ci = nullptr;
+      if (auto *c = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(0)))
+        ci = c;
+      else if (auto *c =
+                   llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1)))
+        ci = c;
+      if (!ci || ci->getZExtValue() <= kRangeConstThreshold)
+        continue;
+
+      // Find downstream and(result, 1) patterns.
+      for (auto *user : call->users()) {
+        auto *bin = llvm::dyn_cast<llvm::BinaryOperator>(user);
+        if (!bin || bin->getOpcode() != llvm::Instruction::And)
+          continue;
+        llvm::ConstantInt *and_const = nullptr;
+        if (auto *c = llvm::dyn_cast<llvm::ConstantInt>(bin->getOperand(0)))
+          and_const = c;
+        else if (auto *c =
+                     llvm::dyn_cast<llvm::ConstantInt>(bin->getOperand(1)))
+          and_const = c;
+        if (!and_const || !and_const->isOne())
+          continue;
+
+        bin->replaceAllUsesWith(
+            llvm::ConstantInt::get(bin->getType(), 1));
+        changed = true;
+        ++range_count;
       }
     }
   }
 
-  // Phase 2: Find combined integrity flags (zext(icmp eq(or-chain, magic))).
-  if (!round_results.empty()) {
-    auto integrity_flags = findIntegrityFlags(F, round_results);
-    for (auto *flag : integrity_flags) {
-      auto *one = llvm::ConstantInt::get(flag->getType(), 1);
-      flag->replaceAllUsesWith(one);
-      changed = true;
-      ++eliminated_count;
-    }
-  }
-
-  // Phase 3: Find and eliminate hash token range checks.
-  auto range_checks = findTokenRangeChecks(F);
-  for (auto *check : range_checks) {
-    auto *one = llvm::ConstantInt::get(check->getType(), 1);
-    check->replaceAllUsesWith(one);
-    changed = true;
-    ++eliminated_count;
-  }
-
-  if (eliminated_count > 0) {
+  if (integrity_count > 0 || range_count > 0) {
     llvm::errs() << "VMHashElimination[" << F.getName()
-                 << "]: eliminated " << eliminated_count
-                 << " integrity checks (" << rounds.size()
-                 << " hash rounds found)\n";
+                 << "]: eliminated " << integrity_count
+                 << " integrity checks, " << range_count
+                 << " range checks (" << anchors.size()
+                 << " murmur rounds found)\n";
   }
 
   if (!changed)

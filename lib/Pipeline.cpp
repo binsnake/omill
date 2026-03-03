@@ -1032,6 +1032,8 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
       llvm::FunctionPassManager FPM;
       FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
       FPM.addPass(RecoverAllocaPointersPass());
+      // Second hash elimination: inlined handlers may expose new murmur rounds.
+      FPM.addPass(VMHashEliminationPass());
       FPM.addPass(llvm::InstCombinePass());
       FPM.addPass(llvm::GVNPass());
       FPM.addPass(llvm::ADCEPass());
