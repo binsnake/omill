@@ -427,6 +427,7 @@ llvm::FunctionCallee getOrDeclareHelper(llvm::Module &M, llvm::StringRef name,
 
 enum SyncHyperCallID : uint32_t {
   kAssertPrivileged = 1,
+  kX86EmulateInstruction = 256,
   kAMD64EmulateInstruction = 257,
   kX86CPUID = 258,
   kX86ReadTSC = 259,
@@ -724,6 +725,7 @@ void lowerSyncHyperCall(llvm::CallInst *CI) {
 
   switch (ci->getZExtValue()) {
     case kAssertPrivileged:
+    case kX86EmulateInstruction:
     case kAMD64EmulateInstruction:
     // Segment register writes: value already written to State by semantics.
     // In x86-64 long mode, ES/DS/SS selectors are ignored.  FS/GS selector
@@ -878,6 +880,55 @@ void lowerAsyncHyperCall(llvm::CallInst *CI) {
       auto *IA = llvm::InlineAsm::get(void_fn_ty, "into", "",
                                       /*hasSideEffects=*/true);
       Builder.CreateCall(IA);
+      break;
+    }
+    case 5: {  // kX86Bound — invalid in 64-bit long mode
+      auto *IA = llvm::InlineAsm::get(void_fn_ty, "ud2", "",
+                                      /*hasSideEffects=*/true);
+      Builder.CreateCall(IA);
+      is_noreturn = true;
+      break;
+    }
+    case 6: {  // kX86IRet — interrupt return
+      auto *IA = llvm::InlineAsm::get(void_fn_ty, "iretq", "",
+                                      /*hasSideEffects=*/true);
+      Builder.CreateCall(IA);
+      is_noreturn = true;
+      break;
+    }
+    case 7: {  // kX86SysCall — transition to kernel
+      auto *IA = llvm::InlineAsm::get(void_fn_ty, "syscall", "",
+                                      /*hasSideEffects=*/true);
+      Builder.CreateCall(IA);
+      is_noreturn = true;
+      break;
+    }
+    case 8: {  // kX86SysRet — return from syscall to user mode
+      auto *IA = llvm::InlineAsm::get(void_fn_ty, "sysretq", "",
+                                      /*hasSideEffects=*/true);
+      Builder.CreateCall(IA);
+      is_noreturn = true;
+      break;
+    }
+    case 9: {  // kX86SysEnter — fast system call entry
+      auto *IA = llvm::InlineAsm::get(void_fn_ty, "sysenter", "",
+                                      /*hasSideEffects=*/true);
+      Builder.CreateCall(IA);
+      is_noreturn = true;
+      break;
+    }
+    case 10: {  // kX86SysExit — return from sysenter
+      auto *IA = llvm::InlineAsm::get(void_fn_ty, "sysexit", "",
+                                      /*hasSideEffects=*/true);
+      Builder.CreateCall(IA);
+      is_noreturn = true;
+      break;
+    }
+    case 11: {  // kX86JmpFar — far jump (can't lower without segment info)
+      auto *IA = llvm::InlineAsm::get(void_fn_ty, "ud2", "",
+                                      /*hasSideEffects=*/true);
+      Builder.CreateCall(IA);
+      is_noreturn = true;
       break;
     }
     default: {
