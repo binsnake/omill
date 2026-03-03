@@ -4,9 +4,12 @@
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Operator.h>
 #include <llvm/ADT/SmallPtrSet.h>
+
+#include <map>
 
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
@@ -469,7 +472,15 @@ mcConcreteEval(llvm::Value *V,
 
   std::optional<uint64_t> Result;
 
-  if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(V)) {
+  // Function argument: arg1 in lifted functions is the entry PC.
+  if (auto *Arg = llvm::dyn_cast<llvm::Argument>(V)) {
+    if (Arg->getArgNo() == 1) {
+      uint64_t va = extractEntryVA(Arg->getParent()->getName());
+      if (va != 0)
+        Result = va;
+    }
+    // Other arguments (State ptr, memory) stay unresolved → random below.
+  } else if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(V)) {
     Result = CI->getZExtValue();
   } else if (llvm::isa<llvm::UndefValue>(V) || llvm::isa<llvm::PoisonValue>(V)) {
     Result = uint64_t(0);
@@ -512,6 +523,49 @@ mcConcreteEval(llvm::Value *V,
           if (BestVal)
             Result =
                 mcConcreteEval(BestVal, Env, SSM, DL, BMM, InProgress, RNG);
+        }
+      }
+      // Phase 1.5: Same-BB inttoptr store forwarding.
+      // Walk backward in the same basic block looking for a store to
+      // an inttoptr address that concretely evaluates to the same
+      // address as the load.  This handles VM handlers where stores
+      // and loads go through inttoptr(RSP + offset) patterns that
+      // LLVM's AA can't prove NoAlias for intervening stores.
+      if (!Result) {
+        auto *Ptr = LI->getPointerOperand()->stripPointerCasts();
+        llvm::Value *LoadIntVal = nullptr;
+        if (auto *ITP = llvm::dyn_cast<llvm::IntToPtrInst>(Ptr))
+          LoadIntVal = ITP->getOperand(0);
+        if (LoadIntVal) {
+          auto LoadAddr =
+              mcConcreteEval(LoadIntVal, Env, SSM, DL, BMM, InProgress, RNG);
+          if (LoadAddr) {
+            auto *BB = LI->getParent();
+            for (auto It = LI->getIterator(); It != BB->begin();) {
+              --It;
+              if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&*It)) {
+                if (!SI->getValueOperand()->getType()->isIntegerTy())
+                  continue;
+                if (SI->getValueOperand()->getType()->getIntegerBitWidth() !=
+                    LoadBW)
+                  continue;
+                auto *SP = SI->getPointerOperand()->stripPointerCasts();
+                if (auto *SITP = llvm::dyn_cast<llvm::IntToPtrInst>(SP)) {
+                  auto StoreAddr = mcConcreteEval(
+                      SITP->getOperand(0), Env, SSM, DL, BMM, InProgress, RNG);
+                  if (StoreAddr && *StoreAddr == *LoadAddr) {
+                    Result = mcConcreteEval(SI->getValueOperand(), Env, SSM, DL,
+                                            BMM, InProgress, RNG);
+                    break;
+                  }
+                }
+              } else if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&*It)) {
+                // Stop at calls that may write memory.
+                if (!CI->doesNotAccessMemory())
+                  break;
+              }
+            }
+          }
         }
       }
       // Try binary memory read for inttoptr loads.
@@ -632,24 +686,74 @@ mcConcreteEval(llvm::Value *V,
     // For PHI nodes, try evaluating all incoming values.
     // If they all agree, use that.  Otherwise treat as free variable.
     if (PHI->getNumIncomingValues() > 0) {
-      std::optional<uint64_t> agreed;
-      bool all_agree = true;
-      for (unsigned i = 0, e = PHI->getNumIncomingValues(); i < e; ++i) {
-        auto val = mcConcreteEval(PHI->getIncomingValue(i), Env, SSM, DL, BMM,
-                                  InProgress, RNG);
-        if (!val) {
-          all_agree = false;
-          break;
-        }
-        if (!agreed)
-          agreed = val;
-        else if (*agreed != *val) {
-          all_agree = false;
-          break;
+      // Try control-flow-aware evaluation: for each predecessor with a
+      // conditional branch, evaluate the condition to determine which
+      // incoming value to use.  This handles SHR switch patterns where
+      // different paths produce different values but the final result
+      // is deterministic.
+      if (PHI->getNumIncomingValues() == 2) {
+        auto *BB0 = PHI->getIncomingBlock(0);
+        auto *BB1 = PHI->getIncomingBlock(1);
+        // Check if both predecessors share a common dominating conditional
+        // branch.  Common pattern: br i1 %cond, label %BB0, label %BB1
+        llvm::BranchInst *CondBr = nullptr;
+        if (auto *BI = llvm::dyn_cast<llvm::BranchInst>(BB0->getTerminator()))
+          if (BI->isConditional() &&
+              ((BI->getSuccessor(0) == PHI->getParent() &&
+                BI->getSuccessor(1) == PHI->getParent()) ||
+               BI->getSuccessor(0) == BB1 || BI->getSuccessor(1) == BB1))
+            CondBr = BI;
+        if (!CondBr)
+          if (auto *BI = llvm::dyn_cast<llvm::BranchInst>(BB1->getTerminator()))
+            if (BI->isConditional() &&
+                ((BI->getSuccessor(0) == PHI->getParent() &&
+                  BI->getSuccessor(1) == PHI->getParent()) ||
+                 BI->getSuccessor(0) == BB0 || BI->getSuccessor(1) == BB0))
+              CondBr = BI;
+        if (CondBr) {
+          auto cond = mcConcreteEval(CondBr->getCondition(), Env, SSM, DL, BMM,
+                                      InProgress, RNG);
+          if (cond) {
+            // Determine which successor is taken.
+            auto *taken_succ = (*cond & 1) ? CondBr->getSuccessor(0)
+                                            : CondBr->getSuccessor(1);
+            // Find the incoming value from the taken path.
+            for (unsigned i = 0; i < 2; ++i) {
+              auto *inc_bb = PHI->getIncomingBlock(i);
+              // The taken successor might be the incoming block itself,
+              // or the incoming block might be reachable from the taken
+              // successor (for multi-block diamond patterns).
+              if (inc_bb == taken_succ ||
+                  inc_bb == CondBr->getParent()) {
+                Result = mcConcreteEval(PHI->getIncomingValue(i), Env, SSM, DL,
+                                         BMM, InProgress, RNG);
+                break;
+              }
+            }
+          }
         }
       }
-      if (all_agree && agreed)
-        Result = *agreed;
+      // Fallback: check if all incoming values agree.
+      if (!Result) {
+        std::optional<uint64_t> agreed;
+        bool all_agree = true;
+        for (unsigned i = 0, e = PHI->getNumIncomingValues(); i < e; ++i) {
+          auto val = mcConcreteEval(PHI->getIncomingValue(i), Env, SSM, DL, BMM,
+                                    InProgress, RNG);
+          if (!val) {
+            all_agree = false;
+            break;
+          }
+          if (!agreed)
+            agreed = val;
+          else if (*agreed != *val) {
+            all_agree = false;
+            break;
+          }
+        }
+        if (all_agree && agreed)
+          Result = *agreed;
+      }
     }
   }
 
@@ -760,6 +864,505 @@ tryMonteCarloResolve(llvm::Value *V, llvm::Function &F,
   }
 
   // Validate: candidate should be a valid binary address (if BMM available).
+  if (BMM) {
+    uint8_t Byte = 0;
+    if (!BMM->read(Candidate, &Byte, 1))
+      return std::nullopt;
+  }
+
+  return Candidate;
+}
+
+// ============================================================
+// Forward Concrete Interpreter for Cross-BB Dispatch Resolution
+// ============================================================
+// When the backward MC evaluator fails (because stores and loads go through
+// inttoptr addresses in different basic blocks), we use a forward interpreter
+// that walks the function from entry, executing instructions in order.  This
+// naturally handles cross-BB store forwarding through a byte-addressable
+// virtual memory map, and resolves PHI nodes by tracking the execution path.
+
+/// Store bytes to virtual memory (little-endian).
+static void virtMemStore(std::map<uint64_t, uint8_t> &Mem,
+                          uint64_t Addr, uint64_t Val, unsigned Bytes) {
+  for (unsigned i = 0; i < Bytes; ++i)
+    Mem[Addr + i] = static_cast<uint8_t>((Val >> (i * 8)) & 0xFF);
+}
+
+/// Load bytes from virtual memory (little-endian).
+/// Returns nullopt if any byte is missing.
+static std::optional<uint64_t> virtMemLoad(
+    const std::map<uint64_t, uint8_t> &Mem,
+    uint64_t Addr, unsigned Bytes) {
+  uint64_t Result = 0;
+  for (unsigned i = 0; i < Bytes; ++i) {
+    auto It = Mem.find(Addr + i);
+    if (It == Mem.end())
+      return std::nullopt;
+    Result |= static_cast<uint64_t>(It->second) << (i * 8);
+  }
+  return Result;
+}
+
+/// Get a concrete value for an SSA value from the environment or constants.
+static uint64_t fwdGetVal(llvm::Value *V,
+                           llvm::DenseMap<llvm::Value *, uint64_t> &Env,
+                           uint64_t &RNG) {
+  auto It = Env.find(V);
+  if (It != Env.end())
+    return It->second;
+  if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(V)) {
+    if (CI->getBitWidth() <= 64)
+      return CI->getZExtValue();
+    return CI->getValue().trunc(64).getZExtValue();
+  }
+  if (llvm::isa<llvm::UndefValue>(V) || llvm::isa<llvm::PoisonValue>(V))
+    return 0;
+  if (auto *CFP = llvm::dyn_cast<llvm::ConstantFP>(V)) {
+    auto Bits = CFP->getValueAPF().bitcastToAPInt();
+    if (Bits.getBitWidth() <= 64)
+      return Bits.getZExtValue();
+    return Bits.trunc(64).getZExtValue();
+  }
+  if (llvm::isa<llvm::ConstantAggregateZero>(V) ||
+      llvm::isa<llvm::ConstantPointerNull>(V))
+    return 0;
+  if (auto *CE = llvm::dyn_cast<llvm::ConstantExpr>(V)) {
+    if (CE->getOpcode() == llvm::Instruction::IntToPtr ||
+        CE->getOpcode() == llvm::Instruction::PtrToInt ||
+        CE->getOpcode() == llvm::Instruction::BitCast)
+      return fwdGetVal(CE->getOperand(0), Env, RNG);
+  }
+  if (auto *CDV = llvm::dyn_cast<llvm::ConstantDataVector>(V)) {
+    unsigned NumElems = CDV->getNumElements();
+    unsigned ElemBits = CDV->getElementType()->getScalarSizeInBits();
+    if (NumElems * ElemBits <= 64) {
+      uint64_t Result = 0;
+      for (unsigned i = 0; i < NumElems; ++i) {
+        uint64_t Elem = 0;
+        if (CDV->getElementType()->isFloatTy()) {
+          float F = CDV->getElementAsFloat(i);
+          std::memcpy(&Elem, &F, 4);
+        } else if (CDV->getElementType()->isDoubleTy()) {
+          double D = CDV->getElementAsDouble(i);
+          std::memcpy(&Elem, &D, 8);
+        } else if (CDV->getElementType()->isIntegerTy()) {
+          Elem = CDV->getElementAsInteger(i);
+        }
+        uint64_t Mask = (ElemBits < 64) ? ((1ULL << ElemBits) - 1) : ~0ULL;
+        Result |= (Elem & Mask) << (i * ElemBits);
+      }
+      return Result;
+    }
+  }
+  return mcXorshift64(RNG);
+}
+
+/// Run one forward interpretation trial from function entry to a dispatch call.
+/// Returns the concrete dispatch target value, or nullopt.
+static std::optional<uint64_t>
+fwdInterpretTrial(llvm::Function &F, llvm::CallInst *DispatchCall,
+                   const BinaryMemoryMap *BMM, uint64_t &RNG,
+                   uint64_t AllocaBase) {
+  const auto &DL = F.getDataLayout();
+
+  llvm::DenseMap<llvm::Value *, uint64_t> Env;
+  std::map<uint64_t, uint8_t> VirtMem;
+
+  // Initialize arguments.
+  Env[F.getArg(0)] =
+      0x1000'0000'0000ULL | (mcXorshift64(RNG) & 0xFFFF'FFFFULL);
+  uint64_t EntryPC = extractEntryVA(F.getName());
+  Env[F.getArg(1)] = EntryPC ? EntryPC : mcXorshift64(RNG);
+  if (F.arg_size() > 2)
+    Env[F.getArg(2)] = mcXorshift64(RNG);
+
+  // Assign unique base addresses to allocas.
+  uint64_t AB = AllocaBase;
+  for (auto &BB : F)
+    for (auto &I : BB)
+      if (auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
+        Env[AI] = AB;
+        AB += 0x1'0000ULL;
+      }
+
+  llvm::BasicBlock *PrevBB = nullptr;
+  llvm::BasicBlock *CurBB = &F.getEntryBlock();
+  constexpr unsigned MaxSteps = 100000;
+  unsigned Steps = 0;
+
+  while (CurBB && Steps < MaxSteps) {
+    llvm::BasicBlock *NextBB = nullptr;
+
+    for (auto &I : *CurBB) {
+      if (++Steps > MaxSteps)
+        return std::nullopt;
+
+      // PHI: pick incoming value from PrevBB.
+      if (auto *PHI = llvm::dyn_cast<llvm::PHINode>(&I)) {
+        if (PrevBB) {
+          int Idx = PHI->getBasicBlockIndex(PrevBB);
+          Env[PHI] = (Idx >= 0)
+                         ? fwdGetVal(PHI->getIncomingValue(Idx), Env, RNG)
+                         : mcXorshift64(RNG);
+        } else {
+          Env[PHI] = mcXorshift64(RNG);
+        }
+        continue;
+      }
+
+      // Target dispatch call — return its target operand.
+      if (&I == DispatchCall)
+        return fwdGetVal(DispatchCall->getArgOperand(1), Env, RNG);
+
+      // Binary operators.
+      if (auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(&I)) {
+        uint64_t L = fwdGetVal(BO->getOperand(0), Env, RNG);
+        uint64_t R = fwdGetVal(BO->getOperand(1), Env, RNG);
+        uint64_t Res;
+        switch (BO->getOpcode()) {
+        case llvm::Instruction::Add:  Res = L + R; break;
+        case llvm::Instruction::Sub:  Res = L - R; break;
+        case llvm::Instruction::Mul:  Res = L * R; break;
+        case llvm::Instruction::Xor:  Res = L ^ R; break;
+        case llvm::Instruction::And:  Res = L & R; break;
+        case llvm::Instruction::Or:   Res = L | R; break;
+        case llvm::Instruction::Shl:  Res = L << (R & 63); break;
+        case llvm::Instruction::LShr: Res = L >> (R & 63); break;
+        case llvm::Instruction::AShr:
+          Res = uint64_t(int64_t(L) >> (R & 63)); break;
+        case llvm::Instruction::UDiv: Res = R ? L / R : 0; break;
+        case llvm::Instruction::URem: Res = R ? L % R : 0; break;
+        case llvm::Instruction::SDiv:
+          Res = R ? uint64_t(int64_t(L) / int64_t(R)) : 0; break;
+        case llvm::Instruction::SRem:
+          Res = R ? uint64_t(int64_t(L) % int64_t(R)) : 0; break;
+        default: Res = mcXorshift64(RNG); break;
+        }
+        Env[&I] = Res;
+        continue;
+      }
+
+      // Cast instructions.
+      if (auto *Cast = llvm::dyn_cast<llvm::CastInst>(&I)) {
+        uint64_t Op = fwdGetVal(Cast->getOperand(0), Env, RNG);
+        unsigned SrcBits = Cast->getSrcTy()->getScalarSizeInBits();
+        unsigned DstBits = Cast->getDestTy()->getScalarSizeInBits();
+        uint64_t Res;
+        switch (Cast->getOpcode()) {
+        case llvm::Instruction::ZExt:
+          Res = (SrcBits < 64) ? (Op & ((1ULL << SrcBits) - 1)) : Op; break;
+        case llvm::Instruction::SExt: {
+          uint64_t V = (SrcBits < 64) ? (Op & ((1ULL << SrcBits) - 1)) : Op;
+          if (SrcBits < 64 && (V & (1ULL << (SrcBits - 1))))
+            V |= ~((1ULL << SrcBits) - 1);
+          Res = V;
+          break;
+        }
+        case llvm::Instruction::Trunc:
+          Res = (DstBits < 64) ? (Op & ((1ULL << DstBits) - 1)) : Op; break;
+        case llvm::Instruction::IntToPtr:
+        case llvm::Instruction::PtrToInt:
+        case llvm::Instruction::BitCast:
+          Res = Op; break;
+        default: Res = mcXorshift64(RNG); break;
+        }
+        Env[&I] = Res;
+        continue;
+      }
+
+      // ICmp.
+      if (auto *IC = llvm::dyn_cast<llvm::ICmpInst>(&I)) {
+        uint64_t L = fwdGetVal(IC->getOperand(0), Env, RNG);
+        uint64_t R = fwdGetVal(IC->getOperand(1), Env, RNG);
+        bool Res = false;
+        switch (IC->getPredicate()) {
+        case llvm::ICmpInst::ICMP_EQ:  Res = L == R; break;
+        case llvm::ICmpInst::ICMP_NE:  Res = L != R; break;
+        case llvm::ICmpInst::ICMP_UGT: Res = L > R; break;
+        case llvm::ICmpInst::ICMP_UGE: Res = L >= R; break;
+        case llvm::ICmpInst::ICMP_ULT: Res = L < R; break;
+        case llvm::ICmpInst::ICMP_ULE: Res = L <= R; break;
+        case llvm::ICmpInst::ICMP_SGT:
+          Res = int64_t(L) > int64_t(R); break;
+        case llvm::ICmpInst::ICMP_SGE:
+          Res = int64_t(L) >= int64_t(R); break;
+        case llvm::ICmpInst::ICMP_SLT:
+          Res = int64_t(L) < int64_t(R); break;
+        case llvm::ICmpInst::ICMP_SLE:
+          Res = int64_t(L) <= int64_t(R); break;
+        default: break;
+        }
+        Env[&I] = Res ? 1ULL : 0ULL;
+        continue;
+      }
+
+      // Select.
+      if (auto *Sel = llvm::dyn_cast<llvm::SelectInst>(&I)) {
+        uint64_t Cond = fwdGetVal(Sel->getCondition(), Env, RNG);
+        Env[&I] = fwdGetVal(
+            (Cond & 1) ? Sel->getTrueValue() : Sel->getFalseValue(),
+            Env, RNG);
+        continue;
+      }
+
+      // GEP.
+      if (auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(&I)) {
+        uint64_t Base = fwdGetVal(GEP->getPointerOperand(), Env, RNG);
+        llvm::APInt Off(64, 0);
+        if (GEP->accumulateConstantOffset(DL, Off)) {
+          Env[&I] = Base + Off.getZExtValue();
+        } else if (GEP->getSourceElementType()->isIntegerTy(8) &&
+                   GEP->getNumIndices() == 1) {
+          Env[&I] = Base + fwdGetVal(GEP->getOperand(1), Env, RNG);
+        } else {
+          Env[&I] = mcXorshift64(RNG);
+        }
+        continue;
+      }
+
+      // Load.
+      if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I)) {
+        uint64_t Addr = fwdGetVal(LI->getPointerOperand(), Env, RNG);
+        unsigned Bytes = DL.getTypeStoreSize(LI->getType());
+        if (Bytes > 0 && Bytes <= 8) {
+          auto Val = virtMemLoad(VirtMem, Addr, Bytes);
+          if (!Val && BMM) {
+            uint8_t Buf[8] = {};
+            if (BMM->read(Addr, Buf, Bytes)) {
+              uint64_t V = 0;
+              for (unsigned i = 0; i < Bytes; ++i)
+                V |= uint64_t(Buf[i]) << (i * 8);
+              Val = V;
+            }
+          }
+          Env[&I] = Val.value_or(mcXorshift64(RNG));
+        } else {
+          Env[&I] = mcXorshift64(RNG);
+        }
+        continue;
+      }
+
+      // Store.
+      if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+        uint64_t Addr = fwdGetVal(SI->getPointerOperand(), Env, RNG);
+        uint64_t Val = fwdGetVal(SI->getValueOperand(), Env, RNG);
+        unsigned Bytes = DL.getTypeStoreSize(SI->getValueOperand()->getType());
+        if (Bytes > 0 && Bytes <= 8)
+          virtMemStore(VirtMem, Addr, Val, Bytes);
+        continue;
+      }
+
+      // Branch.
+      if (auto *BI = llvm::dyn_cast<llvm::BranchInst>(&I)) {
+        if (BI->isUnconditional()) {
+          NextBB = BI->getSuccessor(0);
+        } else {
+          uint64_t Cond = fwdGetVal(BI->getCondition(), Env, RNG);
+          NextBB = (Cond & 1) ? BI->getSuccessor(0) : BI->getSuccessor(1);
+        }
+        break;
+      }
+
+      // Switch.
+      if (auto *SW = llvm::dyn_cast<llvm::SwitchInst>(&I)) {
+        uint64_t Cond = fwdGetVal(SW->getCondition(), Env, RNG);
+        NextBB = SW->getDefaultDest();
+        for (auto &Case : SW->cases()) {
+          if (Case.getCaseValue()->getZExtValue() == Cond) {
+            NextBB = Case.getCaseSuccessor();
+            break;
+          }
+        }
+        break;
+      }
+
+      // Return / Unreachable: dispatch call not reached on this path.
+      if (llvm::isa<llvm::ReturnInst>(&I) ||
+          llvm::isa<llvm::UnreachableInst>(&I))
+        return std::nullopt;
+
+      // Call instructions.
+      if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I)) {
+        if (auto *Callee = CI->getCalledFunction()) {
+          auto IID = Callee->getIntrinsicID();
+          if (IID == llvm::Intrinsic::ctpop) {
+            uint64_t Op = fwdGetVal(CI->getArgOperand(0), Env, RNG);
+            unsigned Bits = CI->getType()->getIntegerBitWidth();
+            uint64_t Mask =
+                (Bits < 64) ? ((1ULL << Bits) - 1) : ~0ULL;
+            uint64_t V = Op & Mask;
+            unsigned Count = 0;
+            while (V) { V &= V - 1; ++Count; }
+            Env[&I] = Count;
+            continue;
+          }
+          if (IID == llvm::Intrinsic::umax) {
+            Env[&I] = std::max(fwdGetVal(CI->getArgOperand(0), Env, RNG),
+                               fwdGetVal(CI->getArgOperand(1), Env, RNG));
+            continue;
+          }
+          if (IID == llvm::Intrinsic::umin) {
+            Env[&I] = std::min(fwdGetVal(CI->getArgOperand(0), Env, RNG),
+                               fwdGetVal(CI->getArgOperand(1), Env, RNG));
+            continue;
+          }
+          if (IID == llvm::Intrinsic::bswap) {
+            uint64_t Op = fwdGetVal(CI->getArgOperand(0), Env, RNG);
+            unsigned Bits = CI->getType()->getIntegerBitWidth();
+            unsigned NBytes = Bits / 8;
+            uint64_t Res = 0;
+            for (unsigned i = 0; i < NBytes; ++i)
+              Res |= ((Op >> (i * 8)) & 0xFF) << ((NBytes - 1 - i) * 8);
+            Env[&I] = Res;
+            continue;
+          }
+          if (IID == llvm::Intrinsic::abs) {
+            int64_t Op = int64_t(fwdGetVal(CI->getArgOperand(0), Env, RNG));
+            Env[&I] = uint64_t(Op < 0 ? -Op : Op);
+            continue;
+          }
+          // doesNotAccessMemory intrinsics produce unknown values.
+          if (Callee->doesNotAccessMemory() ||
+              Callee->getName().starts_with("__remill_undefined_")) {
+            if (!CI->getType()->isVoidTy())
+              Env[&I] = mcXorshift64(RNG);
+            continue;
+          }
+        }
+        // Other calls: random result, but they may write memory.
+        // For safety, don't invalidate VirtMem (the dispatch chain
+        // typically has no aliasing calls).
+        if (!CI->getType()->isVoidTy())
+          Env[&I] = mcXorshift64(RNG);
+        continue;
+      }
+
+      // ExtractElement: handle <2 x float> → float extraction.
+      if (auto *EE = llvm::dyn_cast<llvm::ExtractElementInst>(&I)) {
+        uint64_t Vec = fwdGetVal(EE->getVectorOperand(), Env, RNG);
+        if (auto *IdxC =
+                llvm::dyn_cast<llvm::ConstantInt>(EE->getIndexOperand())) {
+          unsigned Idx = IdxC->getZExtValue();
+          if (auto *VTy = llvm::dyn_cast<llvm::FixedVectorType>(
+                  EE->getVectorOperand()->getType())) {
+            unsigned EBits = VTy->getElementType()->getScalarSizeInBits();
+            if (EBits <= 64 && Idx * EBits < 64) {
+              uint64_t Mask =
+                  (EBits < 64) ? ((1ULL << EBits) - 1) : ~0ULL;
+              Env[&I] = (Vec >> (Idx * EBits)) & Mask;
+              continue;
+            }
+          }
+        }
+        Env[&I] = mcXorshift64(RNG);
+        continue;
+      }
+
+      // InsertElement.
+      if (auto *IE = llvm::dyn_cast<llvm::InsertElementInst>(&I)) {
+        uint64_t Vec = fwdGetVal(IE->getOperand(0), Env, RNG);
+        uint64_t Elem = fwdGetVal(IE->getOperand(1), Env, RNG);
+        if (auto *IdxC =
+                llvm::dyn_cast<llvm::ConstantInt>(IE->getOperand(2))) {
+          unsigned Idx = IdxC->getZExtValue();
+          if (auto *VTy =
+                  llvm::dyn_cast<llvm::FixedVectorType>(IE->getType())) {
+            unsigned EBits = VTy->getElementType()->getScalarSizeInBits();
+            if (EBits <= 64 && Idx * EBits < 64) {
+              uint64_t Mask =
+                  (EBits < 64) ? ((1ULL << EBits) - 1) : ~0ULL;
+              Vec &= ~(Mask << (Idx * EBits));
+              Vec |= (Elem & Mask) << (Idx * EBits);
+              Env[&I] = Vec;
+              continue;
+            }
+          }
+        }
+        Env[&I] = mcXorshift64(RNG);
+        continue;
+      }
+
+      // Freeze: pass through.
+      if (auto *FI = llvm::dyn_cast<llvm::FreezeInst>(&I)) {
+        Env[&I] = fwdGetVal(FI->getOperand(0), Env, RNG);
+        continue;
+      }
+
+      // Any other instruction that produces a value: random.
+      if (!I.getType()->isVoidTy())
+        Env[&I] = mcXorshift64(RNG);
+    }
+
+    PrevBB = CurBB;
+    CurBB = NextBB;
+  }
+
+  return std::nullopt;
+}
+
+/// Try to resolve a dispatch target using forward Monte Carlo interpretation.
+/// Walks the function forward from entry, tracking stores/loads through
+/// virtual memory.  Handles cross-BB inttoptr store forwarding that the
+/// backward MC evaluator cannot.
+static std::optional<uint64_t>
+tryForwardMonteCarloResolve(llvm::CallInst *DispatchCall,
+                             llvm::Function &F,
+                             const BinaryMemoryMap *BMM) {
+  constexpr unsigned NumTrials = 32;
+  constexpr uint64_t AllocaBase1 = 0x7FFE'0000'0000ULL;
+
+  llvm::DenseMap<uint64_t, unsigned> Freq;
+  for (unsigned Trial = 0; Trial < NumTrials; ++Trial) {
+    uint64_t RNG = 0xCAFE'BABE'DEAD'BEEFULL ^
+                   (uint64_t(Trial) * 0x9E37'79B9'7F4A'7C15ULL);
+    auto Res = fwdInterpretTrial(F, DispatchCall, BMM, RNG, AllocaBase1);
+    if (!Res)
+      return std::nullopt;
+    Freq[*Res]++;
+  }
+
+  uint64_t Candidate = 0;
+  if (Freq.size() == 1) {
+    Candidate = Freq.begin()->first;
+  } else if (Freq.size() == 2 && BMM) {
+    // Two-value split: integrity check branch.  Pick the valid address.
+    auto It = Freq.begin();
+    uint64_t ValA = It->first;
+    unsigned CountA = It->second;
+    ++It;
+    uint64_t ValB = It->first;
+    unsigned CountB = It->second;
+
+    uint8_t ByteA = 0, ByteB = 0;
+    bool ValidA = BMM->read(ValA, &ByteA, 1);
+    bool ValidB = BMM->read(ValB, &ByteB, 1);
+    if (ValidA && !ValidB)
+      Candidate = ValA;
+    else if (ValidB && !ValidA)
+      Candidate = ValB;
+    else if (ValidA && ValidB)
+      Candidate = (CountA >= CountB) ? ValA : ValB;
+    else
+      return std::nullopt;
+  } else {
+    return std::nullopt;
+  }
+
+  // Cross-check: verify result is NOT alloca-dependent.
+  constexpr uint64_t AllocaBase2 = 0x7FFF'0000'0000ULL;
+  {
+    uint64_t RNG = 0xCAFE'BABE'DEAD'BEEFULL;  // Same seed as trial 0.
+    auto Res = fwdInterpretTrial(F, DispatchCall, BMM, RNG, AllocaBase2);
+    if (!Res)
+      return std::nullopt;
+    if (Freq.size() == 1 && *Res != Candidate)
+      return std::nullopt;
+    if (Freq.size() == 2 && Freq.find(*Res) == Freq.end())
+      return std::nullopt;
+  }
+
+  // Validate: candidate should be a valid binary address.
   if (BMM) {
     uint8_t Byte = 0;
     if (!BMM->read(Candidate, &Byte, 1))
@@ -965,9 +1568,13 @@ llvm::PreservedAnalyses IndirectCallResolverPass::run(
     // evaluation with random values for unknowns.
     if (!resolved)
       resolved = tryMonteCarloResolve(target, F, map);
-    if (!resolved) {
+    // Forward interpreter fallback: if backward MC fails (cross-BB
+    // inttoptr stores that the backward evaluator can't forward), walk
+    // the function forward, tracking stores/loads through virtual memory.
+    if (!resolved)
+      resolved = tryForwardMonteCarloResolve(cand.call, F, map);
+    if (!resolved)
       continue;
-    }
     if (cand.is_jump) {
       changed |= resolveDispatchJump(cand.call, *resolved, lifted);
     } else {

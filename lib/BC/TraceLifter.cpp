@@ -284,6 +284,15 @@ bool TraceLifter::Impl::Lift(
       continue;
     }
 
+    // Skip trace heads outside executable regions — avoids creating
+    // stub functions for .rdata or other non-code addresses.
+    {
+      uint8_t probe;
+      if (!manager.TryReadExecutableByte(trace_addr, &probe)) {
+        continue;
+      }
+    }
+
     func = get_trace_decl(trace_addr);
     blocks.clear();
     devirt_targets.clear();

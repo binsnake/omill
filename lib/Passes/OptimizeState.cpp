@@ -328,7 +328,8 @@ static bool promoteStateToSSA(llvm::Function &F, const llvm::DataLayout &DL) {
   // still contain remill dispatch/transfer intrinsics. Flushing/reloading
   // around these calls can over-constrain NEXT_PC/state flow and collapse
   // traces to incorrect self-loops.
-  if (F.getName().starts_with("sub_") && hasRemillControlTransfer(F))
+  if (F.getName().starts_with("sub_") && hasRemillControlTransfer(F) &&
+      !F.hasFnAttribute("omill.vm_handler"))
     return false;
 
   struct FieldInfo {

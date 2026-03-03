@@ -22,11 +22,14 @@ namespace omill {
 namespace {
 
 bool debugJumpSelector() {
-  const char *v = std::getenv("OMILL_DEBUG_JUMP_SELECTOR");
-  if (!v || v[0] == '\0')
-    return false;
-  return (v[0] == '1' && v[1] == '\0') || (v[0] == 't' && v[1] == '\0') ||
-         (v[0] == 'T' && v[1] == '\0');
+  static const bool enabled = [] {
+    const char *v = std::getenv("OMILL_DEBUG_JUMP_SELECTOR");
+    if (!v || v[0] == '\0')
+      return false;
+    return (v[0] == '1' && v[1] == '\0') || (v[0] == 't' && v[1] == '\0') ||
+           (v[0] == 'T' && v[1] == '\0');
+  }();
+  return enabled;
 }
 
 // ===----------------------------------------------------------------------===
@@ -758,20 +761,101 @@ void lowerSyncHyperCall(llvm::CallInst *CI) {
 
 void lowerAsyncHyperCall(llvm::CallInst *CI) {
   llvm::IRBuilder<> Builder(CI);
-  auto &M = *CI->getModule();
+  auto &Ctx = CI->getContext();
 
   llvm::Value *state = CI->getArgOperand(0);
-  llvm::Value *ret_addr = CI->getArgOperand(1);
   llvm::Value *mem = CI->getArgOperand(2);
 
-  auto *void_ty = llvm::Type::getVoidTy(CI->getContext());
-  auto *i64_ty = llvm::Type::getInt64Ty(CI->getContext());
-  auto *FT = llvm::FunctionType::get(void_ty, {state->getType(), i64_ty}, false);
-  auto callee = getOrDeclareHelper(M, "__omill_async_hyper_call", FT);
+  // Remill stores AsyncHyperCall::Name at State+0 (i32) and the interrupt
+  // vector at State+8 (i32) immediately before this call.  Walk backward to
+  // find the constant values so we can emit the right native instruction.
+  uint32_t hyper_call_code = 0;  // AsyncHyperCall::Name enum
+  uint32_t vector = 0;
 
-  Builder.CreateCall(callee, {state, ret_addr});
+  // Scan preceding stores into %state for the enum and vector.
+  for (auto It = CI->getReverseIterator(); It != CI->getParent()->rend(); ++It) {
+    auto *SI = llvm::dyn_cast<llvm::StoreInst>(&*It);
+    if (!SI) continue;
+
+    // State+0: hyper_call enum (store i32 N, ptr %state)
+    if (SI->getPointerOperand() == state) {
+      if (auto *C = llvm::dyn_cast<llvm::ConstantInt>(SI->getValueOperand()))
+        hyper_call_code = C->getZExtValue();
+    }
+
+    // State+8: vector (store i32 N, ptr (gep state, 8))
+    if (auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(
+            SI->getPointerOperand())) {
+      if (GEP->getPointerOperand() == state) {
+        llvm::APInt Off(64, 0);
+        if (GEP->accumulateConstantOffset(
+                CI->getModule()->getDataLayout(), Off) &&
+            Off.getZExtValue() == 8) {
+          if (auto *C = llvm::dyn_cast<llvm::ConstantInt>(
+                  SI->getValueOperand()))
+            vector = C->getZExtValue();
+        }
+      }
+    }
+
+    if (hyper_call_code && vector) break;
+  }
+
+  // Emit the appropriate native instruction via inline asm.
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+  auto *void_fn_ty = llvm::FunctionType::get(void_ty, false);
+
+  // AsyncHyperCall::Name values from remill/Arch/Runtime/HyperCall.h:
+  //   kInvalid=0, kX86Int1=1, kX86Int3=2, kX86IntO=3, kX86IntN=4,
+  //   kX86Bound=5, kX86IRet=6, kX86SysCall=7, ...
+  bool is_noreturn = false;
+  auto *call_bb = CI->getParent();
+  switch (hyper_call_code) {
+    case 2: {  // kX86Int3 — debug breakpoint, returns to next instruction
+      auto *IA = llvm::InlineAsm::get(void_fn_ty, "int3", "",
+                                      /*hasSideEffects=*/true);
+      Builder.CreateCall(IA);
+      break;
+    }
+    case 4: {  // kX86IntN — software interrupt (e.g. int 0x29 = __fastfail)
+      std::string asm_str = "int $$" + std::to_string(vector);
+      auto *IA = llvm::InlineAsm::get(void_fn_ty, asm_str, "",
+                                      /*hasSideEffects=*/true);
+      Builder.CreateCall(IA);
+      is_noreturn = (vector == 0x29);
+      break;
+    }
+    case 1: {  // kX86Int1 — single-step trap
+      auto *IA = llvm::InlineAsm::get(void_fn_ty, "int1", "",
+                                      /*hasSideEffects=*/true);
+      Builder.CreateCall(IA);
+      break;
+    }
+    case 3: {  // kX86IntO (into — overflow interrupt)
+      auto *IA = llvm::InlineAsm::get(void_fn_ty, "into", "",
+                                      /*hasSideEffects=*/true);
+      Builder.CreateCall(IA);
+      break;
+    }
+    default: {
+      // Unknown async hyper call — emit ud2.
+      auto *IA = llvm::InlineAsm::get(void_fn_ty, "ud2", "",
+                                      /*hasSideEffects=*/true);
+      Builder.CreateCall(IA);
+      break;
+    }
+  }
+
   CI->replaceAllUsesWith(mem);
   CI->eraseFromParent();
+
+  if (is_noreturn) {
+    // __fastfail is noreturn — kernel terminates the process.
+    if (auto *Term = call_bb->getTerminator())
+      Term->eraseFromParent();
+    llvm::IRBuilder<> B(call_bb);
+    B.CreateUnreachable();
+  }
 }
 
 void lowerIOPort(llvm::CallInst *CI, IntrinsicKind kind) {

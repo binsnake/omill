@@ -79,10 +79,12 @@
 #if OMILL_ENABLE_SIMPLIFIER
 #include "omill/Passes/SimplifyMBA.h"
 #endif
+#include "omill/Passes/CollapseRemillSHRSwitch.h"
 #include "omill/Passes/ExpandI128DivRem.h"
 #include "omill/Passes/StripCompilerUsed.h"
 #include "omill/Passes/EliminateDeadTraceCounters.h"
 #include "omill/Passes/MergeBytePhis.h"
+#include "omill/Passes/RecoverAllocaPointers.h"
 
 namespace omill {
 
@@ -516,6 +518,7 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(llvm::GVNPass());
     FPM.addPass(SimplifyVectorReassemblyPass());
+    FPM.addPass(CollapseRemillSHRSwitchPass());
 #if OMILL_ENABLE_SIMPLIFIER
     FPM.addPass(SimplifyMBAPass());
 #endif
@@ -554,6 +557,50 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
+  // Interprocedural inlining: inline VM handler _native functions into their
+  // callers.  This enables store-to-load forwarding across the call boundary
+  // (the caller stores constants to its native_stack, the VM handler reads
+  // them via inttoptr(R12 + offset)).  LLVM cannot fold inttoptr(ptrtoint
+  // (alloca)+C) to a GEP, so RecoverAllocaPointersPass does it first,
+  // unblocking BasicAA / GVN store forwarding.
+  if (!envDisabled("OMILL_SKIP_ABI_INLINE_VM_HANDLERS")) {
+    struct MarkVMHandlersInlinePass
+        : llvm::PassInfoMixin<MarkVMHandlersInlinePass> {
+      llvm::PreservedAnalyses run(llvm::Module &M,
+                                   llvm::ModuleAnalysisManager &) {
+        bool changed = false;
+        for (auto &F : M) {
+          if (F.hasFnAttribute("omill.vm_handler") &&
+              F.getName().ends_with("_native")) {
+            F.removeFnAttr(llvm::Attribute::NoInline);
+            F.addFnAttr(llvm::Attribute::AlwaysInline);
+            changed = true;
+          }
+        }
+        return changed ? llvm::PreservedAnalyses::none()
+                       : llvm::PreservedAnalyses::all();
+      }
+    };
+    MPM.addPass(MarkVMHandlersInlinePass{});
+    MPM.addPass(llvm::AlwaysInlinerPass());
+    {
+      llvm::FunctionPassManager FPM;
+      // RecoverAllocaPointers resolves inttoptr(ptrtoint(alloca+C1)+C2) → GEP
+      // and follows loads through the store map, so a single round suffices.
+      FPM.addPass(RecoverAllocaPointersPass());
+      FPM.addPass(llvm::GVNPass());
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::SimplifyCFGPass());
+      FPM.addPass(llvm::GVNPass());
+      FPM.addPass(llvm::ADCEPass());
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::SimplifyCFGPass());
+      MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    }
+    MPM.addPass(llvm::GlobalDCEPass());
+  }
   // Strip @llvm.compiler.used and run GlobalDCE to remove dead ISEL stubs.
   if (!envDisabled("OMILL_SKIP_STRIP_COMPILER_USED")) {
     MPM.addPass(StripCompilerUsedPass());
@@ -699,6 +746,68 @@ struct StripRemillIntrinsicBodiesPass
   static bool isRequired() { return true; }
 };
 
+/// Promote semantic function linkage from internal to external.
+/// Anonymous-namespace semantic functions have internal linkage by
+/// construction.  After Phase 0's AlwaysInlinerPass inlines them into
+/// lifted traces, they have no callers.  Without this promotion,
+/// SCCP/IPSCCP in later passes (Phase 2 ModuleInlinerWrapperPass)
+/// sees "internal, no callers" and replaces their bodies with
+/// unreachable.  External linkage makes them opaque to SCCP.
+struct ExternalizeRemillSemanticsPass
+    : llvm::PassInfoMixin<ExternalizeRemillSemanticsPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                               llvm::ModuleAnalysisManager &) {
+    bool changed = false;
+    for (auto &F : M) {
+      if (F.isDeclaration()) continue;
+      if (!F.hasLocalLinkage()) continue;
+      auto name = F.getName();
+      // Skip lifted code and remill intrinsics.
+      if (name.starts_with("sub_") || name.starts_with("block_") ||
+          name.starts_with("__remill_") || name.starts_with("__omill_"))
+        continue;
+      F.setLinkage(llvm::GlobalValue::ExternalLinkage);
+      changed = true;
+    }
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+  static bool isRequired() { return true; }
+};
+
+/// After Phase 0's AlwaysInlinerPass has inlined all semantic functions into
+/// existing lifted traces, protect the semantic function bodies from Phase 2's
+/// destructive optimizations (SROA, InstCombine, SimplifyCFG, GVN).  These
+/// passes run via createModuleToFunctionPassAdaptor on ALL functions and will
+/// collapse semantic function bodies to unreachable.  The `optnone` attribute
+/// makes LLVM skip optimization passes for these functions.
+///
+/// Phase 3.6's IterativeTargetResolution removes the protection before inlining
+/// semantics into newly-discovered VM handler functions.
+struct ProtectRemillSemanticsPass
+    : llvm::PassInfoMixin<ProtectRemillSemanticsPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                               llvm::ModuleAnalysisManager &) {
+    bool changed = false;
+    for (auto &F : M) {
+      if (F.isDeclaration()) continue;
+      auto name = F.getName();
+      if (name.starts_with("sub_") || name.starts_with("block_") ||
+          name.starts_with("__remill_") || name.starts_with("__omill_"))
+        continue;
+      // Skip if already protected.
+      if (F.hasFnAttribute(llvm::Attribute::OptimizeNone)) continue;
+      // optnone requires noinline and conflicts with alwaysinline.
+      F.removeFnAttr(llvm::Attribute::AlwaysInline);
+      F.addFnAttr(llvm::Attribute::NoInline);
+      F.addFnAttr(llvm::Attribute::OptimizeNone);
+      changed = true;
+    }
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+  static bool isRequired() { return true; }
+};
 /// Internalize all functions/globals that are not lifted code or remill
 /// intrinsics.  After AlwaysInlinerPass inlines the ~2000 semantic functions
 /// from the semantics module, their bodies are dead but retain external
@@ -753,15 +862,22 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   // switch/unreachable patterns that poison the entire function's control flow.
   MPM.addPass(StripRemillIntrinsicBodiesPass());
 
+  // Phase 0: Externalize semantic functions BEFORE AlwaysInliner.
+  // The ~2000 semantic functions live in anonymous C++ namespaces and have
+  // internal linkage by construction.  AlwaysInlinerPass inlines them into
+  // lifted traces, then replaces the original bodies with unreachable
+  // (internal + no callers = dead).  Promoting to external prevents this
+  // body destruction, keeping the bodies available for VM handler functions
+  // discovered later in Phase 3.6.
+  MPM.addPass(ExternalizeRemillSemanticsPass());
+
   // Phase 0: Inline remill's alwaysinline semantic functions so that
   // subsequent passes can see through them.
   MPM.addPass(llvm::AlwaysInlinerPass());
 
-  // Phase 0 cleanup: Internalize dead semantic functions/globals so GlobalDCE
-  // can remove them.  The semantics module has ~2000 instruction definitions
-  // with external linkage that GlobalDCE alone won't touch.
-  MPM.addPass(InternalizeRemillSemanticsPass());
-  MPM.addPass(llvm::GlobalDCEPass());
+  // Protect semantic function bodies from Phase 2 function-pass optimizations.
+  // Phase 3.6 Step 2b restores alwaysinline before inlining into VM handlers.
+  MPM.addPass(ProtectRemillSemanticsPass());
 
   // Phase 0.5: Resolve trace stubs and inline jump-exiting callees.
   // Must run BEFORE Phase 1 so that block_<hex> names (from jump table
@@ -890,6 +1006,12 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     MPM.addPass(
         IterativeTargetResolutionPass(opts.max_resolution_iterations));
   }
+
+  // Phase 0 deferred: now that IterativeTargetResolution has discovered all
+  // late functions and inlined semantic bodies into them, internalize and
+  // remove dead semantic functions that have no remaining callers.
+  MPM.addPass(InternalizeRemillSemanticsPass());
+  MPM.addPass(llvm::GlobalDCEPass());
 
   // Phase 3.7: Inter-procedural constant propagation.
   // After InterProceduralConstProp propagates R9 (DISPATCHER_CONTEXT* from

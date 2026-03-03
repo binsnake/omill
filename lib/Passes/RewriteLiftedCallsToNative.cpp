@@ -326,12 +326,32 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
               "extra_gpr_" + llvm::Twine(gpr_off)));
         }
 
-        auto *result = Builder.CreateCall(native_fn, args,
-                                          abi->ret.has_value()
-                                              ? native_fn->getName() + ".result"
-                                              : "");
+        auto *result = Builder.CreateCall(
+            native_fn, args,
+            (abi->ret.has_value() || abi->hasStructReturn())
+                ? native_fn->getName() + ".result"
+                : "");
 
-        if (abi->ret.has_value()) {
+        if (abi->hasStructReturn()) {
+          // Struct return: extract primary return + clobbered callee-saved.
+          unsigned idx = 0;
+          if (abi->ret.has_value()) {
+            auto *primary = Builder.CreateExtractValue(result, idx++,
+                                                       "ret.primary");
+            if (abi->ret->is_vector) {
+              buildStateStoreVec(Builder, cand.state_ptr,
+                                 abi->ret->state_offset, primary);
+            } else {
+              buildStateStore(Builder, cand.state_ptr,
+                              abi->ret->state_offset, primary);
+            }
+          }
+          for (unsigned off : abi->extra_gpr_live_outs) {
+            auto *val = Builder.CreateExtractValue(result, idx++,
+                "ret.clobbered." + llvm::Twine(off));
+            buildStateStore(Builder, cand.state_ptr, off, val);
+          }
+        } else if (abi->ret.has_value()) {
           if (abi->ret->is_vector) {
             buildStateStoreVec(Builder, cand.state_ptr,
                                abi->ret->state_offset, result);
@@ -348,6 +368,10 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
         auto *target_pc = cand.call->getArgOperand(1);
 
         if (cand.is_dispatch_jump) {
+          // Unresolved dispatch_jump: emit an indirect tail call through
+          // the computed target address, passing register state. Without this,
+          // all State stores feeding the dispatch become dead after inlining
+          // (State alloca no longer escapes), collapsing the function body.
           if (!target_pc->getType()->isIntegerTy(64)) {
             if (target_pc->getType()->isPointerTy()) {
               target_pc = Builder.CreatePtrToInt(target_pc, i64_ty, "jump.pc");
@@ -358,7 +382,29 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
             }
           }
           target_pc = normalizeJumpTargetPC(Builder, target_pc, &mem_map);
-          buildStateStore(Builder, cand.state_ptr, kRAXOffset, target_pc);
+
+          auto *ptr_ty = llvm::PointerType::get(Builder.getContext(), 0);
+          auto *fn_ptr = Builder.CreateIntToPtr(target_pc, ptr_ty, "jump.fn");
+
+          auto *rcx =
+              buildStateLoad(Builder, cand.state_ptr, kRCXOffset, "rcx");
+          auto *rdx =
+              buildStateLoad(Builder, cand.state_ptr, kRDXOffset, "rdx");
+          auto *r8 =
+              buildStateLoad(Builder, cand.state_ptr, kR8Offset, "r8");
+          auto *r9 =
+              buildStateLoad(Builder, cand.state_ptr, kR9Offset, "r9");
+
+          auto *fn_ty = llvm::FunctionType::get(
+              i64_ty, {i64_ty, i64_ty, i64_ty, i64_ty}, false);
+
+          auto *result = Builder.CreateCall(fn_ty, fn_ptr,
+                                            {rcx, rdx, r8, r9},
+                                            "jump.result");
+          llvm::cast<llvm::CallInst>(result)->setTailCallKind(
+              llvm::CallInst::TCK_Tail);
+
+          buildStateStore(Builder, cand.state_ptr, kRAXOffset, result);
         } else {
           auto *ptr_ty = llvm::PointerType::get(Builder.getContext(), 0);
           auto *fn_ptr = Builder.CreateIntToPtr(target_pc, ptr_ty, "fn.ptr");

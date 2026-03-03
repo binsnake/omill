@@ -63,11 +63,14 @@ add_library(omill STATIC
   Passes/StripCompilerUsed.cpp
   Passes/EliminateDeadTraceCounters.cpp
   Passes/MergeBytePhis.cpp
+  Passes/CollapseRemillSHRSwitch.cpp
+  Passes/RecoverAllocaPointers.cpp
   Passes/TypeRecovery.cpp
   Passes/VMHandlerInliner.cpp
   Passes/IterativeBlockDiscovery.cpp
   Passes/MergeBlockFunctions.cpp
   BC/BlockLifterAnalysis.cpp
+  BC/TraceLiftAnalysis.cpp
   # Pipeline
   Pipeline.cpp
   Passes/PassRegistry.cpp

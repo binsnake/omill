@@ -715,4 +715,148 @@ TEST_F(IndirectCallResolverTest, ResolvedButNoMatch_TargetBecomesConstant) {
   EXPECT_EQ(target_arg->getZExtValue(), 0xDEADBEEFULL);
 }
 
+// The forward Monte Carlo interpreter resolves dispatch targets where the
+// expression depends on inttoptr stores in a different basic block.
+// This simulates a post-SROA VM handler pattern: entry block stores a value
+// to a virtual stack slot (inttoptr(RSP + C)), then a later block loads it
+// and uses it to compute the dispatch target.  RSP is a single SSA value
+// (as produced by OptimizeState/SROA) used across all blocks.
+TEST_F(IndirectCallResolverTest, CrossBBIntToPtrForwarding_ForwardMC) {
+  auto M = createModule();
+  addI64(0x140020000, 0);  // Map target address so BMM validation passes.
+
+  // Target function at 0x140020000.
+  auto *target_fn = llvm::Function::Create(
+      getLiftedFnType(), llvm::GlobalValue::ExternalLinkage,
+      "sub_140020000", *M);
+  auto *target_entry = llvm::BasicBlock::Create(Ctx, "entry", target_fn);
+  llvm::IRBuilder<>(target_entry).CreateRet(target_fn->getArg(2));
+
+  // Caller function.
+  auto *fn = llvm::Function::Create(
+      getLiftedFnType(), llvm::GlobalValue::ExternalLinkage,
+      "sub_140001000", *M);
+  auto *i64Ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptrTy = llvm::PointerType::get(Ctx, 0);
+
+  // BB0: entry — load RSP once (simulating post-SROA single SSA value),
+  // then store constant to inttoptr(RSP - 100).
+  auto *BB0 = llvm::BasicBlock::Create(Ctx, "entry", fn);
+  llvm::IRBuilder<> B0(BB0);
+  auto *rsp = B0.CreateLoad(i64Ty,
+      B0.CreateGEP(llvm::Type::getInt8Ty(Ctx), fn->getArg(0),
+                   B0.getInt64(2312)),
+      "rsp");
+  auto *slot_addr = B0.CreateSub(rsp, B0.getInt64(100), "slot_addr");
+  auto *slot_ptr = B0.CreateIntToPtr(slot_addr, ptrTy);
+  B0.CreateStore(B0.getInt64(0x140020000), slot_ptr);
+  auto *BB1 = llvm::BasicBlock::Create(Ctx, "dispatch_bb", fn);
+  B0.CreateBr(BB1);
+
+  // BB1: dispatch — load from same slot using same RSP SSA value.
+  llvm::IRBuilder<> B1(BB1);
+  auto *slot_addr2 = B1.CreateSub(rsp, B1.getInt64(100), "slot_addr2");
+  auto *slot_ptr2 = B1.CreateIntToPtr(slot_addr2, ptrTy);
+  auto *loaded = B1.CreateLoad(i64Ty, slot_ptr2, "dispatch_target");
+  auto *dispatch = declareDispatchJump(*M);
+  auto *call = B1.CreateCall(dispatch,
+      {fn->getArg(0), loaded, fn->getArg(2)});
+  B1.CreateRet(call);
+
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+  runPass(fn);
+
+  // The forward MC interpreter should resolve the cross-BB store→load and
+  // turn the dispatch_jump into a musttail call to sub_140020000.
+  bool found_dispatch = false;
+  bool found_tail_call = false;
+  for (auto &BB : *fn) {
+    for (auto &I : BB) {
+      if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I)) {
+        if (auto *Callee = CI->getCalledFunction()) {
+          if (Callee->getName() == "__omill_dispatch_jump")
+            found_dispatch = true;
+          if (Callee == target_fn)
+            found_tail_call = true;
+        }
+      }
+    }
+  }
+  EXPECT_FALSE(found_dispatch) << "dispatch_jump should be resolved";
+  EXPECT_TRUE(found_tail_call) << "should have direct call to sub_140020000";
+  EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+}
+
+// Forward MC with MBA obfuscation across blocks: store obfuscated value
+// to slot, later load and deobfuscate → constant dispatch target.
+// Uses single RSP SSA value (post-SROA pattern).
+TEST_F(IndirectCallResolverTest, CrossBBWithMBA_ForwardMC) {
+  auto M = createModule();
+  addI64(0x140030000, 0);  // Map target address so BMM validation passes.
+
+  auto *target_fn = llvm::Function::Create(
+      getLiftedFnType(), llvm::GlobalValue::ExternalLinkage,
+      "sub_140030000", *M);
+  auto *target_entry = llvm::BasicBlock::Create(Ctx, "entry", target_fn);
+  llvm::IRBuilder<>(target_entry).CreateRet(target_fn->getArg(2));
+
+  auto *fn = llvm::Function::Create(
+      getLiftedFnType(), llvm::GlobalValue::ExternalLinkage,
+      "sub_140001000", *M);
+  auto *i64Ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptrTy = llvm::PointerType::get(Ctx, 0);
+
+  // BB0: load RSP once, store (RSP ^ 0xDEAD) to inttoptr(RSP - 200).
+  auto *BB0 = llvm::BasicBlock::Create(Ctx, "entry", fn);
+  llvm::IRBuilder<> B0(BB0);
+  auto *rsp = B0.CreateLoad(i64Ty,
+      B0.CreateGEP(llvm::Type::getInt8Ty(Ctx), fn->getArg(0),
+                   B0.getInt64(2312)),
+      "rsp");
+  auto *slot_addr = B0.CreateSub(rsp, B0.getInt64(200), "slot_addr");
+  auto *slot_ptr = B0.CreateIntToPtr(slot_addr, ptrTy);
+  auto *obfuscated = B0.CreateXor(rsp, B0.getInt64(0xDEAD), "obf_val");
+  B0.CreateStore(obfuscated, slot_ptr);
+  auto *BB1 = llvm::BasicBlock::Create(Ctx, "dispatch_bb", fn);
+  B0.CreateBr(BB1);
+
+  // BB1: load slot, XOR back to recover RSP, add offset → constant target.
+  // target = load(slot) ^ 0xDEAD + 0x140030000 - RSP
+  // = (RSP ^ 0xDEAD) ^ 0xDEAD + 0x140030000 - RSP
+  // = RSP + 0x140030000 - RSP = 0x140030000
+  llvm::IRBuilder<> B1(BB1);
+  auto *slot_addr2 = B1.CreateSub(rsp, B1.getInt64(200), "slot_addr2");
+  auto *slot_ptr2 = B1.CreateIntToPtr(slot_addr2, ptrTy);
+  auto *loaded = B1.CreateLoad(i64Ty, slot_ptr2, "loaded");
+  auto *deobf = B1.CreateXor(loaded, B1.getInt64(0xDEAD), "deobf");
+  auto *target = B1.CreateAdd(
+      B1.CreateSub(deobf, rsp, "cancel_rsp"),
+      B1.getInt64(0x140030000), "target");
+  auto *dispatch = declareDispatchJump(*M);
+  auto *call = B1.CreateCall(dispatch,
+      {fn->getArg(0), target, fn->getArg(2)});
+  B1.CreateRet(call);
+
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+  runPass(fn);
+
+  bool found_dispatch = false;
+  bool found_tail_call = false;
+  for (auto &BB : *fn) {
+    for (auto &I : BB) {
+      if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I)) {
+        if (auto *Callee = CI->getCalledFunction()) {
+          if (Callee->getName() == "__omill_dispatch_jump")
+            found_dispatch = true;
+          if (Callee == target_fn)
+            found_tail_call = true;
+        }
+      }
+    }
+  }
+  EXPECT_FALSE(found_dispatch) << "dispatch_jump should be resolved";
+  EXPECT_TRUE(found_tail_call) << "should resolve to sub_140030000";
+  EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+}
+
 }  // namespace

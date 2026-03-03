@@ -4,8 +4,6 @@
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Passes/PassBuilder.h>
-#include <llvm/Support/raw_ostream.h>
-#include <llvm/Support/FileSystem.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar/DCE.h>
 #include <llvm/Transforms/Scalar/EarlyCSE.h>
@@ -27,6 +25,7 @@
 #include "omill/Passes/IndirectCallResolver.h"
 #include "omill/Passes/LowerRemillIntrinsics.h"
 #include "omill/Passes/RecoverAllocaPointers.h"
+#include "omill/Passes/CollapseRemillSHRSwitch.h"
 #include "omill/Passes/ResolveAndLowerControlFlow.h"
 #include "omill/Passes/OptimizeState.h"
 #include "omill/Utils/LiftedNames.h"
@@ -199,6 +198,83 @@ bool inlineCalleesForDispatchResolution(llvm::Module &M) {
   return inlined_any;
 }
 
+/// Reverse inlining: inline functions that CONTAIN unresolved dispatches
+/// INTO their callers, enabling the caller's constant State stores to
+/// propagate into the handler's dynamic dispatch targets.
+///
+/// This handles VM dispatch table handlers where the handler computes its
+/// target from State fields (e.g., CX + DL) that the caller wrote as
+/// constants before tail-calling the handler.  By inlining the handler
+/// into the thunk, GVN forwards the constant values to the handler's
+/// dispatch computation, making it resolvable.
+bool inlineDispatchFunctionsIntoCallers(llvm::Module &M) {
+  // Find functions with unresolved dispatches.
+  llvm::SmallPtrSet<llvm::Function *, 4> dispatch_funcs;
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    bool has_dispatch = false;
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+        if (!CI)
+          continue;
+        auto *callee = CI->getCalledFunction();
+        if (!callee)
+          continue;
+        if (callee->getName() == "__omill_dispatch_call" ||
+            callee->getName() == "__omill_dispatch_jump") {
+          has_dispatch = true;
+          break;
+        }
+      }
+      if (has_dispatch)
+        break;
+    }
+    if (has_dispatch)
+      dispatch_funcs.insert(&F);
+  }
+
+  if (dispatch_funcs.empty())
+    return false;
+
+  bool inlined_any = false;
+  for (auto *DF : dispatch_funcs) {
+    // Skip very large functions to prevent code blowup.
+    unsigned inst_count = 0;
+    for (auto &BB : *DF)
+      inst_count += BB.size();
+    if (inst_count > 50000)
+      continue;
+
+    // Collect call sites of this function in other functions.
+    llvm::SmallVector<llvm::CallInst *, 4> call_sites;
+    for (auto *U : DF->users()) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(U);
+      if (!CI)
+        continue;
+      if (CI->getCalledFunction() != DF)
+        continue;
+      if (CI->getFunction() == DF)
+        continue;
+      call_sites.push_back(CI);
+    }
+
+    for (auto *CI : call_sites) {
+      // Strip musttail — InlineFunction can't handle it.
+      if (CI->isMustTailCall())
+        CI->setTailCallKind(llvm::CallInst::TCK_None);
+
+      llvm::InlineFunctionInfo IFI;
+      auto result = llvm::InlineFunction(*CI, IFI);
+      if (result.isSuccess())
+        inlined_any = true;
+    }
+  }
+
+  return inlined_any;
+}
+
 }  // namespace
 
 llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
@@ -211,6 +287,7 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
 
   bool ever_changed = false;
   bool tried_inlining = false;
+  bool tried_reverse_inlining = false;
   bool lifted_new_funcs = false;
   llvm::DenseSet<uint64_t> already_lifted_pcs;  // Prevent re-lifting.
 
@@ -239,13 +316,6 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
       FPM.addPass(llvm::InstCombinePass());
       auto adaptor = llvm::createModuleToFunctionPassAdaptor(std::move(FPM));
       adaptor.run(M, MAM);
-    }
-
-    // Debug: dump IR after Step 1 when we just inlined.
-    if (tried_inlining && iteration == 1) {
-      std::error_code ec;
-      llvm::raw_fd_ostream os("post_inline_opt.ll", ec, llvm::sys::fs::OF_Text);
-      if (!ec) M.print(os, nullptr);
     }
 
     // Step 2a: Resolve dispatch targets (but don't lower yet).
@@ -323,13 +393,6 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
             MAM.invalidate(M, llvm::PreservedAnalyses::none());
           }
 
-          // DEBUG: dump after AlwaysInliner, before lowering
-          if (auto *dbg = std::getenv("OMILL_DUMP_STEP2A")) {
-            std::string path(dbg);
-            std::error_code EC;
-            llvm::raw_fd_ostream OS(path, EC);
-            if (!EC) M.print(OS, nullptr);
-          }
           // Step B: Lower remill intrinsics now exposed by inlining.
           {
             llvm::FunctionPassManager FPM;
@@ -346,14 +409,6 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
             }
           }
 
-          // DEBUG: dump post-inline post-lowered handler IR
-          if (auto *dbg = std::getenv("OMILL_DUMP_STEP2B")) {
-            std::string path(dbg);
-            std::error_code EC;
-            llvm::raw_fd_ostream OS(path, EC);
-            if (!EC) M.print(OS, nullptr);
-          }
-
           // Step B2: State optimization — eliminate dead flag/PC stores.
           // After semantic inlining, the handler has ~3400 dead flag stores
           // and ~900 dead PC stores that LLVM DSE can't eliminate (inttoptr
@@ -361,6 +416,9 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
           // non-aliasing with State GEP offsets).
           {
             llvm::FunctionPassManager StateFPM;
+            StateFPM.addPass(CollapseRemillSHRSwitchPass());
+            StateFPM.addPass(llvm::SimplifyCFGPass());
+            StateFPM.addPass(llvm::InstCombinePass());
             StateFPM.addPass(OptimizeStatePass(OptimizePhases::All));
             StateFPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
             StateFPM.addPass(llvm::InstCombinePass());
@@ -402,6 +460,7 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
         // New functions can introduce new dispatches — reset inlining
         // state so the loop can make another attempt with new callees.
         tried_inlining = false;
+        tried_reverse_inlining = false;
         // Refresh the LiftedFunctionMap after lifting new functions.
         MAM.invalidate(M, llvm::PreservedAnalyses::none());
         lifted = MAM.getCachedResult<LiftedFunctionAnalysis>(M);
@@ -467,10 +526,94 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
           continue;  // Re-run optimization + resolution with inlined bodies.
         }
       }
+      // Step 4: Reverse inlining — inline dispatch-containing functions
+      // INTO their callers.  The caller may store constant context values
+      // into State (e.g. VM keys) before tail-calling the handler.  After
+      // inlining, GVN forwards those stores to the handler's State loads,
+      // making dynamic dispatch targets (e.g. CX + DL) constant.
+      if (!tried_reverse_inlining && curr_count > 0) {
+        if (inlineDispatchFunctionsIntoCallers(M)) {
+          tried_reverse_inlining = true;
+          ever_changed = true;
+
+          MAM.invalidate(M, llvm::PreservedAnalyses::none());
+
+          // Mark __remill_undefined_* as memory(none) so GVN can
+          // forward State stores past them.  These return undefined
+          // values and never touch memory.
+          for (auto &F : M) {
+            if (F.getName().starts_with("__remill_undefined_"))
+              F.setMemoryEffects(llvm::MemoryEffects::none());
+          }
+
+          // After reverse inlining, the caller now has dispatch
+          // intrinsics from the handler.  OptimizeStatePass skips
+          // sub_* functions with dispatches unless they have the
+          // vm_handler attribute.  Mark them so promotion proceeds.
+          for (auto &F : M) {
+            if (F.isDeclaration()) continue;
+            if (!F.getName().starts_with("sub_")) continue;
+            bool has_dispatch = false;
+            for (auto &BB : F)
+              for (auto &I : BB)
+                if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
+                  if (auto *C = CI->getCalledFunction())
+                    if (C->getName().starts_with("__omill_dispatch_")) {
+                      has_dispatch = true;
+                      goto mark_done;
+                    }
+            mark_done:
+            if (has_dispatch && !F.hasFnAttribute("omill.vm_handler"))
+              F.addFnAttr("omill.vm_handler");
+          }
+
+          // Phase A: Collapse SHR switches from the inlined handler,
+          // then promote State fields to allocas so stores are visible
+          // to SROA/GVN without inttoptr aliasing barriers.
+          {
+            llvm::FunctionPassManager FPM;
+            FPM.addPass(CollapseRemillSHRSwitchPass());
+            FPM.addPass(llvm::SimplifyCFGPass());
+            FPM.addPass(llvm::InstCombinePass());
+            FPM.addPass(OptimizeStatePass(OptimizePhases::All));
+            FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+            FPM.addPass(llvm::InstCombinePass());
+            auto adaptor =
+                llvm::createModuleToFunctionPassAdaptor(std::move(FPM));
+            adaptor.run(M, MAM);
+          }
+
+          // Phase B: Standard cleanup with constant folding.
+          {
+            llvm::FunctionPassManager FPM;
+            FPM.addPass(RecoverAllocaPointersPass());
+            FPM.addPass(llvm::GVNPass());
+            FPM.addPass(ConstantMemoryFoldingPass());
+            FPM.addPass(llvm::InstCombinePass());
+            FPM.addPass(llvm::SimplifyCFGPass());
+            FPM.addPass(llvm::ADCEPass());
+            FPM.addPass(llvm::SimplifyCFGPass());
+            FPM.addPass(llvm::InstCombinePass());
+            auto adaptor =
+                llvm::createModuleToFunctionPassAdaptor(std::move(FPM));
+            adaptor.run(M, MAM);
+          }
+
+          lifted = MAM.getCachedResult<LiftedFunctionAnalysis>(M);
+
+          // Recount after cleanup — reverse inlining may have increased
+          // the count (handler copy + inlined copy), but cleanup may
+          // have resolved some.  Use post-cleanup count as baseline.
+          prev_count = countUnresolvedDispatches(M);
+          ++iteration;
+          continue;
+        }
+      }
       break;
     }
 
     tried_inlining = false;  // Reset on progress — allow re-inlining.
+    tried_reverse_inlining = false;
     prev_count = curr_count;
     ++iteration;
   } while (iteration < max_iterations_);

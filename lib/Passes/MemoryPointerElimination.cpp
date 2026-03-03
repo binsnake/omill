@@ -8,6 +8,7 @@ namespace omill {
 
 llvm::PreservedAnalyses MemoryPointerEliminationPass::run(
     llvm::Function &F, llvm::FunctionAnalysisManager &AM) {
+  if (F.hasOptNone()) return llvm::PreservedAnalyses::all();
   // The Memory* pointer is the 3rd argument (index 2) of lifted functions.
   // After memory intrinsic lowering, it should have no meaningful uses.
   if (F.arg_size() < 3) {

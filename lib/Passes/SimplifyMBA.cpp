@@ -100,6 +100,12 @@ static bool isMBACandidate(llvm::Value *root) {
 
 llvm::PreservedAnalyses SimplifyMBAPass::run(llvm::Function &F,
                                               llvm::FunctionAnalysisManager &AM) {
+  // Skip remill semantic functions — they have mangled C++ names or __remill_ prefix.
+  // Lifted user code uses sub_*/  __lifted_*; everything else ("test", etc.) is allowed.
+  auto name = F.getName();
+  if (name.starts_with("_ZN") || name.starts_with("__remill_"))
+    return llvm::PreservedAnalyses::all();
+
   bool changed = false;
   LLVMTranslator translator;
   llvm::SmallVector<llvm::Instruction *, 16> dead;

@@ -20,13 +20,34 @@ llvm::FunctionType *buildNativeType(const FunctionABI &abi,
   auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
   auto *xmm_ty = llvm::FixedVectorType::get(i64_ty, 2);
 
-  llvm::Type *ret_ty;
+  // --- Return type ---
+  // If the function clobbers callee-saved GPRs, we pack the primary return
+  // value (RAX/XMM0/void) together with the clobbered register values into a
+  // struct return.  At call sites the caller extracts and stores each field
+  // back into its own State so that interprocedural register flow is kept.
+  llvm::Type *primary_ret_ty;
   if (abi.ret.has_value()) {
-    ret_ty = abi.ret->is_vector ? static_cast<llvm::Type *>(xmm_ty) : i64_ty;
+    primary_ret_ty =
+        abi.ret->is_vector ? static_cast<llvm::Type *>(xmm_ty) : i64_ty;
+  } else {
+    primary_ret_ty = nullptr;  // void
+  }
+
+  llvm::Type *ret_ty;
+  if (abi.hasStructReturn()) {
+    llvm::SmallVector<llvm::Type *, 10> fields;
+    if (primary_ret_ty)
+      fields.push_back(primary_ret_ty);
+    for (unsigned i = 0; i < abi.numExtraGPRReturns(); ++i)
+      fields.push_back(i64_ty);
+    ret_ty = llvm::StructType::get(Ctx, fields);
+  } else if (primary_ret_ty) {
+    ret_ty = primary_ret_ty;
   } else {
     ret_ty = llvm::Type::getVoidTy(Ctx);
   }
 
+  // --- Parameters ---
   llvm::SmallVector<llvm::Type *, 10> param_types;
 
   // GPR params (i64).
@@ -74,6 +95,9 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
       native_ty, llvm::Function::ExternalLinkage, native_name, M);
   native_fn->addFnAttr(llvm::Attribute::MustProgress);
   native_fn->addFnAttr(llvm::Attribute::NoUnwind);
+  // Propagate omill.vm_handler so post-ABI passes can identify VM handler wrappers.
+  if (lifted_fn->hasFnAttribute("omill.vm_handler"))
+    native_fn->addFnAttr("omill.vm_handler");
 
   auto *entry = llvm::BasicBlock::Create(Ctx, "entry", native_fn);
   llvm::IRBuilder<> Builder(entry);
@@ -188,8 +212,35 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
 
   Builder.CreateCall(lifted_fn, call_args);
 
-  // Load return value from State.
-  if (abi.ret.has_value()) {
+  // Load return value(s) from State.
+  if (abi.hasStructReturn()) {
+    // Build a struct containing the primary return + clobbered callee-saved.
+    auto *struct_ty = llvm::cast<llvm::StructType>(native_fn->getReturnType());
+    llvm::Value *agg = llvm::PoisonValue::get(struct_ty);
+    unsigned idx = 0;
+
+    // Primary return value (RAX or XMM0), if present.
+    if (abi.ret.has_value()) {
+      llvm::Type *load_ty = abi.ret->is_vector
+          ? static_cast<llvm::Type *>(
+                llvm::FixedVectorType::get(Builder.getInt64Ty(), 2))
+          : static_cast<llvm::Type *>(Builder.getInt64Ty());
+      auto *ret_ptr = buildStateGEP(Builder, state_alloca,
+                                     abi.ret->state_offset);
+      auto *primary = Builder.CreateLoad(load_ty, ret_ptr, "retval");
+      agg = Builder.CreateInsertValue(agg, primary, idx++);
+    }
+
+    // Extra clobbered callee-saved values (i64 each).
+    for (unsigned off : abi.extra_gpr_live_outs) {
+      auto *ptr = buildStateGEP(Builder, state_alloca, off);
+      auto *val = Builder.CreateLoad(Builder.getInt64Ty(), ptr,
+                                     "clobbered." + llvm::Twine(off));
+      agg = Builder.CreateInsertValue(agg, val, idx++);
+    }
+
+    Builder.CreateRet(agg);
+  } else if (abi.ret.has_value()) {
     auto *ret_ptr = buildStateGEP(Builder, state_alloca,
                                    abi.ret->state_offset);
     llvm::Type *load_ty;

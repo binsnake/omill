@@ -18,6 +18,7 @@
 #include "omill/BC/TraceLifter.h"
 #include "omill/BC/BlockLifter.h"
 #include "omill/BC/BlockLifterAnalysis.h"
+#include "omill/BC/TraceLiftAnalysis.h"
 #include <remill/BC/Util.h>
 #include <remill/OS/OS.h>
 
@@ -563,6 +564,20 @@ int main(int argc, char **argv) {
   MAM.registerPass([&] { return omill::LiftedFunctionAnalysis(); });
   if (!ResolveExceptions) {
     MAM.registerPass([&] { return omill::ExceptionInfoAnalysis(); });
+  }
+
+  // Register trace-lift callback so IterativeTargetResolutionPass can
+  // lift new functions from resolved dispatch targets.
+  {
+    omill::TraceLiftCallback trace_cb;
+    if (ResolveTargets) {
+      trace_cb = [&lifter](uint64_t pc) -> bool {
+        return lifter.Lift(pc);
+      };
+    }
+    MAM.registerPass([trace_cb] {
+      return omill::TraceLiftAnalysis(trace_cb);
+    });
   }
 
   // Block-lifting mode: set up BlockLifter and register the analysis

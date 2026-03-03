@@ -73,14 +73,25 @@ struct FunctionABI {
   /// passed as extra i64 parameters after XMM params.
   llvm::SmallVector<unsigned, 8> extra_gpr_live_ins;
 
+
+  /// Extra GPR live-outs: State offsets of callee-saved registers that the
+  /// function clobbers (writes without restoring).  These are returned as
+  /// additional i64 values packed into a struct return alongside the primary
+  /// return value.  At call sites the caller stores them back into State so
+  /// that interprocedural register flow is preserved.
+  llvm::SmallVector<unsigned, 4> extra_gpr_live_outs;
   bool isVoid() const { return !ret.has_value(); }
   unsigned numParams() const { return params.size(); }
   unsigned numXMMParams() const { return xmm_live_ins.size(); }
   unsigned numExtraGPRParams() const { return extra_gpr_live_ins.size(); }
+  unsigned numExtraGPRReturns() const { return extra_gpr_live_outs.size(); }
   unsigned numStackParams() const { return stack_params.size(); }
   unsigned totalNativeParams() const {
     return numParams() + numStackParams() + numXMMParams() +
            numExtraGPRParams();
+  }
+  bool hasStructReturn() const {
+    return !extra_gpr_live_outs.empty();
   }
 };
 

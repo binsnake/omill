@@ -3,7 +3,6 @@
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/IRBuilder.h>
-#include <llvm/Support/raw_ostream.h>
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/Transforms/Utils/Local.h>
 
@@ -86,9 +85,6 @@ llvm::PreservedAnalyses EliminateDeadTraceCountersPass::run(
     }
   }
 
-  llvm::errs() << "[EliminateDeadTraceCounters] Replaced "
-               << ErrorCalls.size() << " error_handler calls with unreachable, "
-               << "deleted " << TotalDeleted << " dead instructions\n";
   return llvm::PreservedAnalyses::none();
 }
 

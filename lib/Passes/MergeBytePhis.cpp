@@ -7,7 +7,6 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/PatternMatch.h>
-#include <llvm/Support/raw_ostream.h>
 
 using namespace llvm;
 using namespace llvm::PatternMatch;
@@ -242,8 +241,6 @@ PreservedAnalyses MergeBytePhisPass::run(Function &F,
     }
   }
 
-  llvm::errs() << "[MergeBytePhis] Merged " << Merged << " or-trees, "
-               << "deleted " << TotalDeleted << " dead instructions\n";
   return PreservedAnalyses::none();
 }
 

@@ -325,23 +325,23 @@ FunctionABI analyzeFunction(llvm::Function &F, const llvm::DataLayout &DL,
     for (auto &p : abi.params)
       standard_param_offsets.insert(p.state_offset);
 
-    // Build set of offsets to exclude: standard params + callee-saved +
+    // Build set of offsets to exclude: standard params +
     // RSP/RIP + volatile scratch (RAX=return, R10/R11=scratch).
     // In Win64, only RCX/RDX/R8/R9 can be params, and those are already
     // handled as standard params.  Exclude param-register offsets explicitly
     // too, since some modules use alias names (e.g. R8D) that can evade the
     // standard-param map and appear as false "extra" GPRs.
-    // All other GPRs are either callee-saved,
-    // return value, stack pointer, program counter, or scratch.
+    //
+    // NOTE: callee-saved registers (RBX, RBP, RDI, RSI, R12-R15) are NOT
+    // excluded.  If they appear in live_in, the function genuinely reads
+    // them before writing — which happens for VM handler stubs receiving
+    // context through non-standard registers (e.g. R12).  Including them as
+    // extra_gpr_live_ins ensures the _native wrapper passes the value, rather
+    // than zero-initializing State and constant-folding the function body.
     llvm::DenseSet<unsigned> excluded_offsets = standard_param_offsets;
     auto win64_param_offsets = collectWin64ParamRegisterOffsets(field_map);
     excluded_offsets.insert(win64_param_offsets.begin(),
                             win64_param_offsets.end());
-    for (unsigned i = 0; i < kWin64CalleeSavedCount; ++i) {
-      auto field = field_map.fieldByName(kWin64CalleeSaved[i]);
-      if (field)
-        excluded_offsets.insert(field->offset);
-    }
     static constexpr const char *kExcludedGPRs[] = {
         "RSP", "RIP", "RAX", "R10", "R11",
     };
@@ -349,7 +349,6 @@ FunctionABI analyzeFunction(llvm::Function &F, const llvm::DataLayout &DL,
       auto field = field_map.fieldByName(name);
       if (field) excluded_offsets.insert(field->offset);
     }
-
     for (auto off : live_in) {
       if (excluded_offsets.count(off))
         continue;
@@ -365,10 +364,14 @@ FunctionABI analyzeFunction(llvm::Function &F, const llvm::DataLayout &DL,
 
   // Identify clobbered callee-saved registers.
   // In Win64, RBX, RBP, RDI, RSI, R12-R15 are nonvolatile.
+  // A register is "clobbered" if it appears in live_out (ever_written).
+  // Additionally, populate extra_gpr_live_outs with their State offsets
+  // so that _native wrappers return them and callers can re-read them.
   for (unsigned i = 0; i < kWin64CalleeSavedCount; ++i) {
     auto field = field_map.fieldByName(kWin64CalleeSaved[i]);
     if (field && live_out.count(field->offset)) {
       abi.clobbered_callee_saved.push_back(kWin64CalleeSaved[i]);
+      abi.extra_gpr_live_outs.push_back(field->offset);
     }
   }
 

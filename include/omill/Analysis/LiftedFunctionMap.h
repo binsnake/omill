@@ -32,8 +32,15 @@ class LiftedFunctionMap {
   /// Number of lifted functions found.
   size_t size() const { return pc_to_func_.size(); }
 
-  /// LLVM analysis invalidation — the map is immutable after construction,
-  /// so it is never invalidated.
+  /// Insert a newly-lifted function into the map.
+  /// Used by IterativeTargetResolution after auto-lifting.
+  void insert(uint64_t pc, llvm::Function *F) {
+    pc_to_func_[pc] = F;
+    lifted_set_.insert(F);
+  }
+
+  /// LLVM analysis invalidation — the map is updated incrementally
+  /// via insert(), so it is never invalidated by the framework.
   bool invalidate(llvm::Module &, const llvm::PreservedAnalyses &,
                   llvm::ModuleAnalysisManager::Invalidator &) {
     return false;
