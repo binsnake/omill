@@ -587,11 +587,13 @@ void inlineAlwaysInlineCallees(llvm::ArrayRef<llvm::Function *> Funcs) {
 void processDeferredFunctions(llvm::ArrayRef<llvm::Function *> deferred,
                               llvm::Module &M,
                               llvm::ModuleAnalysisManager &MAM) {
-  // Unprotect semantic functions (strip optnone/noinline, add alwaysinline).
+  // Unprotect semantic functions: ensure alwaysinline is set so
+  // inlineAlwaysInlineCallees can inline them into deferred functions.
+  // Earlier ITR iterations may have already stripped optnone+alwaysinline
+  // from semantics, so we can't gate on optnone — instead, add
+  // alwaysinline to all non-lifted, non-intrinsic defined functions.
   for (auto &F : M) {
     if (F.isDeclaration())
-      continue;
-    if (!F.hasFnAttribute(llvm::Attribute::OptimizeNone))
       continue;
     auto name = F.getName();
     if (name.starts_with("sub_") || name.starts_with("block_") ||
