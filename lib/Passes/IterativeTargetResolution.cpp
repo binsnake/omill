@@ -2,6 +2,7 @@
 
 #include <llvm/ADT/DenseSet.h>
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/Support/Parallel.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/Verifier.h>
@@ -402,8 +403,22 @@ void inlineAlwaysInlineCallees(llvm::ArrayRef<llvm::Function *> Funcs) {
 
   // Phase 2: Inline pre-expanded semantics into target functions.
   // Callees are fully flattened, so this typically needs only 1 round.
+  // Each target function is independent (InlineFunction clones the callee
+  // body — the callee is read-only).  Remill semantics have no debug info
+  // or EH, so InlineFunction doesn't touch module-level metadata, making
+  // concurrent inlining into different callers safe.
+  llvm::SmallVector<llvm::Function *, 0> targets;
+  targets.reserve(Funcs.size());
   for (auto *F : Funcs)
-    inlineAlwaysInlineCalleesInFunc(F);
+    if (!F->isDeclaration())
+      targets.push_back(F);
+
+  llvm::errs() << "ITR: Step A Phase 2: inlining into " << targets.size()
+               << " targets (" << semantics.size() << " pre-expanded semantics)\n";
+
+  llvm::parallelFor(size_t{0}, targets.size(), [&](size_t I) {
+    inlineAlwaysInlineCalleesInFunc(targets[I]);
+  });
 }
 
 }  // namespace
