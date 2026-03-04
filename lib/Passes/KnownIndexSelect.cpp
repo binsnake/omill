@@ -108,15 +108,17 @@ bool tryTransformLoad(llvm::LoadInst *LI, const llvm::DataLayout &DL,
     auto *newGEP = Builder.CreateGEP(GEP->getSourceElementType(),
                                      GEP->getPointerOperand(), indices,
                                      GEP->getName() + ".resolved");
-    llvm::cast<llvm::GetElementPtrInst>(newGEP)->setIsInBounds(
-        GEP->isInBounds());
+    if (auto *gepInst = llvm::dyn_cast<llvm::GetElementPtrInst>(newGEP))
+      gepInst->setIsInBounds(GEP->isInBounds());
     auto *newLoad =
         Builder.CreateLoad(LI->getType(), newGEP, LI->getName() + ".sel");
     // Copy metadata.
     llvm::SmallVector<std::pair<unsigned, llvm::MDNode *>, 4> metadata;
     LI->getAllMetadata(metadata);
-    for (auto &[kind, md] : metadata)
-      llvm::cast<llvm::LoadInst>(newLoad)->setMetadata(kind, md);
+    for (auto &[kind, md] : metadata) {
+      if (auto *loadInst = llvm::dyn_cast<llvm::LoadInst>(newLoad))
+        loadInst->setMetadata(kind, md);
+    }
 
     LI->replaceAllUsesWith(newLoad);
     return true;
@@ -137,8 +139,8 @@ bool tryTransformLoad(llvm::LoadInst *LI, const llvm::DataLayout &DL,
     auto *concreteGEP = Builder.CreateGEP(GEP->getSourceElementType(),
                                           GEP->getPointerOperand(), indices,
                                           GEP->getName() + ".idx");
-    llvm::cast<llvm::GetElementPtrInst>(concreteGEP)
-        ->setIsInBounds(GEP->isInBounds());
+    if (auto *gepInst = llvm::dyn_cast<llvm::GetElementPtrInst>(concreteGEP))
+      gepInst->setIsInBounds(GEP->isInBounds());
     auto *concreteLoad =
         Builder.CreateLoad(LI->getType(), concreteGEP, "val");
     caseLoads.push_back({possVal, concreteLoad});

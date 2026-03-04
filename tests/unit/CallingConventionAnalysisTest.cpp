@@ -342,13 +342,14 @@ TEST_F(CallingConventionAnalysisTest, ExtraGPRLiveInsDetected) {
   auto result = MAM.getResult<omill::CallingConventionAnalysis>(*M);
   auto *abi = result.getABI(M->getFunction("sub_401000"));
   ASSERT_NE(abi, nullptr);
-  // New behavior: RBX is callee-saved in Win64 ABI, so it's excluded from
-  // extra_gpr_live_ins even if read before written.
+  // RBX is callee-saved but NOT excluded from extra_gpr_live_ins: VM handler
+  // stubs receive context through non-standard registers (e.g. R12, RBX).
+  // Including them ensures _native wrappers pass the value through.
   bool found_rbx = false;
   for (auto off : abi->extra_gpr_live_ins) {
     if (off == 8) found_rbx = true;
   }
-  EXPECT_FALSE(found_rbx);
+  EXPECT_TRUE(found_rbx);
 }
 
 TEST_F(CallingConventionAnalysisTest, RSPExcludedFromExtraGPR) {

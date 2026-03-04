@@ -211,7 +211,9 @@ TEST_F(PipelineTest, InternalizeFunctionsKeepsLiftedAndRemill) {
   createDefinedFunction(*M, "sub_140001000");
   createDefinedFunction(*M, "block_140001000");
   createDefinedFunction(*M, "__remill_read_memory_64");
-  auto *helper = createDefinedFunction(*M, "helper_func");
+  // Use __omill_ prefix so Phase 0 Protect/Unprotect passes skip it
+  // (they treat all non-prefixed functions as remill semantics).
+  auto *helper = createDefinedFunction(*M, "__omill_helper_func");
 
   // Give helper_func a caller so GlobalDCE doesn't remove it.
   auto *sub = M->getFunction("sub_140001000");
@@ -228,8 +230,8 @@ TEST_F(PipelineTest, InternalizeFunctionsKeepsLiftedAndRemill) {
   EXPECT_FALSE(M->getFunction("block_140001000")->hasLocalLinkage());
   EXPECT_FALSE(M->getFunction("__remill_read_memory_64")->hasLocalLinkage());
 
-  // helper_func with a body should be internalized.
-  auto *h = M->getFunction("helper_func");
+  // Non-lifted helper should be internalized.
+  auto *h = M->getFunction("__omill_helper_func");
   ASSERT_NE(h, nullptr);
   EXPECT_TRUE(h->hasLocalLinkage());
 }
@@ -241,8 +243,11 @@ TEST_F(PipelineTest, InternalizeSkipsDeclarations) {
   auto *decl = llvm::Function::Create(fnTy, llvm::GlobalValue::ExternalLinkage,
                                       "external_decl", *M);
 
-  // Defined helper — should be internalized.
-  auto *helper = createDefinedFunction(*M, "helper_with_body");
+  // Defined helper — use __omill_ prefix so Phase 0 Protect/Unprotect
+  // passes skip it (they treat all non-prefixed functions as remill
+  // semantics and add alwaysinline, causing AlwaysInlinerPass to
+  // inline and delete them before InternalizeRemillSemantics runs).
+  auto *helper = createDefinedFunction(*M, "__omill_helper_with_body");
 
   // Both need a caller to survive GlobalDCE.
   auto *sub = createDefinedFunction(*M, "sub_140001000");
@@ -260,7 +265,7 @@ TEST_F(PipelineTest, InternalizeSkipsDeclarations) {
   EXPECT_FALSE(declAfter->hasLocalLinkage())
       << "Declarations should not be internalized";
 
-  auto *defAfter = M->getFunction("helper_with_body");
+  auto *defAfter = M->getFunction("__omill_helper_with_body");
   ASSERT_NE(defAfter, nullptr);
   EXPECT_TRUE(defAfter->hasLocalLinkage())
       << "Defined non-lifted functions should be internalized";
@@ -268,7 +273,8 @@ TEST_F(PipelineTest, InternalizeSkipsDeclarations) {
 
 TEST_F(PipelineTest, InternalizeKeepsAlreadyInternal) {
   auto M = createModule();
-  auto *F = createDefinedFunction(*M, "already_internal",
+  // Use __omill_ prefix so Phase 0 Protect/Unprotect passes skip it.
+  auto *F = createDefinedFunction(*M, "__omill_already_internal",
                                   llvm::GlobalValue::InternalLinkage);
 
   // Give it a caller.
@@ -281,7 +287,7 @@ TEST_F(PipelineTest, InternalizeKeepsAlreadyInternal) {
 
   runPipeline(*M, minimalOpts());
 
-  auto *result = M->getFunction("already_internal");
+  auto *result = M->getFunction("__omill_already_internal");
   ASSERT_NE(result, nullptr);
   EXPECT_TRUE(result->hasLocalLinkage());
 }
@@ -300,17 +306,18 @@ TEST_F(PipelineTest, InternalizeGlobalsKeepsRemillMarkers) {
       llvm::ConstantInt::get(i64Ty, 0), "__remill_basic_block");
 
   // Non-remill global with initializer: internalize.
+  // Mark non-constant so the global can't be constant-folded away.
   auto *tableGV = new llvm::GlobalVariable(
       *M, i64Ty, false, llvm::GlobalValue::ExternalLinkage,
       llvm::ConstantInt::get(i64Ty, 42), "some_table");
 
-  // Give both globals a use so GlobalDCE doesn't remove them.
+  // Give both globals volatile uses so DCE/GlobalDCE can't remove them.
   auto *sub = createDefinedFunction(*M, "sub_140001000");
   sub->deleteBody();
   auto *entry = llvm::BasicBlock::Create(Ctx, "entry", sub);
   llvm::IRBuilder<> B(entry);
-  B.CreateLoad(i64Ty, remillGV);
-  B.CreateLoad(i64Ty, tableGV);
+  auto *ld1 = B.CreateLoad(i64Ty, remillGV, /*isVolatile=*/true);
+  auto *ld2 = B.CreateLoad(i64Ty, tableGV, /*isVolatile=*/true);
   B.CreateRetVoid();
 
   runPipeline(*M, minimalOpts());

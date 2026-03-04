@@ -1187,8 +1187,11 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   }
 
   // In staged test flows, stop here to avoid running later phases on
-  // partially-lowered IR.
+  // partially-lowered IR.  Internalize + DCE semantics since the late
+  // internalize (Phase 3.6→3.7 boundary) won't run.
   if (opts.stop_after_state_optimization) {
+    MPM.addPass(InternalizeRemillSemanticsPass());
+    MPM.addPass(llvm::GlobalDCEPass());
     return;
   }
   // Build the lifted function index before control flow passes need it.
