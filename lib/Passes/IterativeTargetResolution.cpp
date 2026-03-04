@@ -616,9 +616,35 @@ void processDeferredFunctions(llvm::ArrayRef<llvm::Function *> deferred,
   llvm::errs() << "ITR: deferred Step B...\n";
   runStepB(deferred, MAM, M);
 
-  // Step B2: Lightweight state optimization.
-  llvm::errs() << "ITR: deferred Step B2 (lightweight)...\n";
-  runStepB2(deferred, MAM, M, /*lightweight=*/true);
+  // Step B2: State optimization (full pipeline — deferred functions still need
+  // SROA/GVN to properly eliminate State struct usage).
+  llvm::errs() << "ITR: deferred Step B2...\n";
+  runStepB2(deferred, MAM, M);
+
+  // Step 1: CFG canonicalization + optimizations to prepare for resolution.
+  llvm::errs() << "ITR: deferred Step 1: optimizing...\n";
+  {
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(ConstantMemoryFoldingPass());
+    FPM.addPass(llvm::GVNPass());
+    FPM.addPass(llvm::SimplifyCFGPass());
+    FPM.addPass(llvm::InstCombinePass());
+    runFPMOnFunctions(FPM, deferred, MAM, M);
+  }
+
+  // Step 2: Resolve and lower dispatch targets.
+  llvm::errs() << "ITR: deferred Step 2: resolving dispatches...\n";
+  {
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(ResolveAndLowerControlFlowPass());
+    FPM.addPass(IndirectCallResolverPass());
+    FPM.addPass(LowerRemillIntrinsicsPass(LowerCategories::ResolvedDispatch));
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::SimplifyCFGPass());
+    FPM.addPass(llvm::ADCEPass());
+    runFPMOnFunctions(FPM, deferred, MAM, M);
+  }
 
   // Strip alwaysinline from callees.
   for (auto *F : deferred) {
@@ -646,6 +672,7 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
   bool lifted_new_funcs = false;
   llvm::DenseSet<uint64_t> already_lifted_pcs;  // Prevent re-lifting.
   llvm::DenseSet<llvm::Function *> already_optimized;  // Skip redundant Step 1.
+  llvm::DenseSet<llvm::Function *> already_resolved;   // Skip redundant Step 2a.
   llvm::SmallVector<llvm::Function *, 0> all_deferred;  // Deferred for post-loop.
 
   // Get optional trace-lift callback for discovering new functions.
@@ -700,20 +727,34 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
       FPM.addPass(EliminateDeadPathsPass());
       FPM.addPass(llvm::InstCombinePass());
       runFPMOnFunctions(FPM, needs_opt, MAM, M);
-      for (auto *F : needs_opt)
+      for (auto *F : needs_opt) {
         already_optimized.insert(F);
+        // Optimization changed IR — needs fresh resolution.
+        already_resolved.erase(F);
+      }
     }
 
     // Step 2a: Resolve dispatch targets (but don't lower yet).
-    // Only run on affected functions — resolvers early-exit on others anyway.
+    // Only run on functions whose IR changed since last resolution.
     {
-      llvm::FunctionPassManager FPM;
-      FPM.addPass(ResolveAndLowerControlFlowPass());
-      FPM.addPass(IndirectCallResolverPass());
+      llvm::SmallVector<llvm::Function *, 16> needs_resolve;
+      for (auto *F : affected)
+        if (!already_resolved.count(F))
+          needs_resolve.push_back(F);
+
+      if (!needs_resolve.empty()) {
+        llvm::errs() << "ITR: Step 2a: resolving " << needs_resolve.size()
+                     << "/" << affected.size() << " functions\n";
+        llvm::FunctionPassManager FPM;
+        FPM.addPass(ResolveAndLowerControlFlowPass());
+        FPM.addPass(IndirectCallResolverPass());
 #if OMILL_ENABLE_Z3
-      FPM.addPass(Z3DispatchSolverPass());
+        FPM.addPass(Z3DispatchSolverPass());
 #endif
-      runFPMOnFunctions(FPM, affected, MAM, M);
+        runFPMOnFunctions(FPM, needs_resolve, MAM, M);
+        for (auto *F : needs_resolve)
+          already_resolved.insert(F);
+      }
     }
 
     // Step 2b: If we have a lift callback, discover constant dispatch targets
@@ -876,8 +917,13 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
 
     unsigned curr_count = countUnresolvedDispatches(M);
     bool made_progress = curr_count < prev_count || lifted_new_funcs;
-    if (made_progress)
+    if (made_progress) {
       ever_changed = true;
+      // Lowering changed IR in some affected functions — they need
+      // re-resolution on the next iteration to discover further targets.
+      for (auto *F : affected)
+        already_resolved.erase(F);
+    }
 
     if (!made_progress) {
       // Step 3: Resolution stalled.  Try inlining lifted callees into
@@ -889,9 +935,12 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
           tried_inlining = true;
           ever_changed = true;
 
-          // Inlining dirtied these functions — they need re-optimization.
-          for (auto *F : inline_modified)
+          // Inlining dirtied these functions — they need re-optimization
+          // and re-resolution.
+          for (auto *F : inline_modified) {
             already_optimized.erase(F);
+            already_resolved.erase(F);
+          }
 
           llvm::errs() << "ITR: inlined callees into " << inline_modified.size()
                        << " functions\n";
@@ -950,9 +999,12 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
           tried_reverse_inlining = true;
           ever_changed = true;
 
-          // Reverse inlining dirtied callers — they need re-optimization.
-          for (auto *F : reverse_modified)
+          // Reverse inlining dirtied callers — they need re-optimization
+          // and re-resolution.
+          for (auto *F : reverse_modified) {
             already_optimized.erase(F);
+            already_resolved.erase(F);
+          }
 
           llvm::errs() << "ITR: reverse-inlined into "
                        << reverse_modified.size() << " functions\n";
