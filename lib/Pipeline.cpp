@@ -857,6 +857,36 @@ struct StripRemillIntrinsicBodiesPass
   static bool isRequired() { return true; }
 };
 
+/// Unprotect semantic functions so AlwaysInlinerPass can inline them.
+///
+/// During a pipeline re-run (e.g. VM discovery rounds), semantic functions
+/// are already protected with optnone+noinline from the first run's
+/// ProtectRemillSemanticsPass.  This pass reverses the protection so that
+/// AlwaysInlinerPass can inline semantics into newly lifted functions.
+/// On the first pipeline run this is a no-op (nothing is protected yet).
+struct UnprotectRemillSemanticsPass
+    : llvm::PassInfoMixin<UnprotectRemillSemanticsPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                               llvm::ModuleAnalysisManager &) {
+    bool changed = false;
+    for (auto &F : M) {
+      if (F.isDeclaration()) continue;
+      if (!F.hasFnAttribute(llvm::Attribute::OptimizeNone)) continue;
+      auto name = F.getName();
+      if (name.starts_with("sub_") || name.starts_with("block_") ||
+          name.starts_with("__remill_") || name.starts_with("__omill_"))
+        continue;
+      F.removeFnAttr(llvm::Attribute::OptimizeNone);
+      F.removeFnAttr(llvm::Attribute::NoInline);
+      F.addFnAttr(llvm::Attribute::AlwaysInline);
+      changed = true;
+    }
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+  static bool isRequired() { return true; }
+};
+
 /// Promote semantic function linkage from internal to external.
 /// Anonymous-namespace semantic functions have internal linkage by
 /// construction.  After Phase 0's AlwaysInlinerPass inlines them into
@@ -995,6 +1025,10 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   // body destruction, keeping the bodies available for VM handler functions
   // discovered later in Phase 3.6.
   MPM.addPass(ExternalizeRemillSemanticsPass());
+
+  // Phase 0: Unprotect semantics (no-op on first run; needed for re-runs
+  // where ProtectRemillSemanticsPass already added optnone+noinline).
+  MPM.addPass(UnprotectRemillSemanticsPass());
 
   // Phase 0: Inline remill's alwaysinline semantic functions so that
   // subsequent passes can see through them.
