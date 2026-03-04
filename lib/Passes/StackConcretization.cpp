@@ -454,7 +454,9 @@ llvm::PreservedAnalyses StackConcretizationPass::run(
           "omill.stack.base_offset",
           llvm::MDNode::get(Ctx, {md_offset}));
 
-      for (auto *itp : all_itp) {
+      for (auto *&itp : all_itp) {
+        if (!itp)
+          continue;
         int64_t const_off = 0;
         if (!traceToBase(itp->getOperand(0), base, const_off))
           continue;
@@ -468,6 +470,7 @@ llvm::PreservedAnalyses StackConcretizationPass::run(
                                       "stack_ptr");
         itp->replaceAllUsesWith(gep);
         itp->eraseFromParent();
+        itp = nullptr;
         changed = true;
       }
     }
