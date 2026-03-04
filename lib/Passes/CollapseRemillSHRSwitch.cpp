@@ -1,6 +1,7 @@
 #include "omill/Passes/CollapseRemillSHRSwitch.h"
 
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/Dominators.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/PatternMatch.h>
@@ -42,12 +43,33 @@ static bool verifyCaseStructure(SwitchInst *SW) {
 }
 
 /// Find `lshr i64 %V, 32` in the given basic block.
-static Value *findBaseShift(BasicBlock *BB, Value *V) {
+static Value *findBaseShiftInBlock(BasicBlock *BB, Value *V) {
   for (auto &I : *BB) {
     Value *op = nullptr;
     uint64_t c = 0;
     if (match(&I, m_LShr(m_Value(op), m_ConstantInt(c))) && op == V && c == 32)
       return &I;
+  }
+  return nullptr;
+}
+
+/// Find `lshr i64 %V, 32` by walking up the dominator tree from BB.
+static Value *findBaseShift(BasicBlock *BB, Value *V, DominatorTree *DT) {
+  // First check the local block (fast path).
+  if (Value *bs = findBaseShiftInBlock(BB, V))
+    return bs;
+
+  // If no dominator tree available, fall back to local-only.
+  if (!DT)
+    return nullptr;
+
+  // Walk dominator tree upward.
+  auto *node = DT->getNode(BB);
+  if (!node)
+    return nullptr;
+  for (auto *idom = node->getIDom(); idom; idom = idom->getIDom()) {
+    if (Value *bs = findBaseShiftInBlock(idom->getBlock(), V))
+      return bs;
   }
   return nullptr;
 }
@@ -152,6 +174,54 @@ static Instruction *findResultPhi(BasicBlock *MergeBB, BasicBlock *case0Pred) {
   return nullptr;
 }
 
+/// Pattern D (post-ABI): the phi feeds into a truncation sequence:
+///   %trunc = lshr i64 %phi, 1
+///   %result = and i64 %trunc, 4294967295
+/// or just:
+///   %result = and i64 %phi, 4294967295
+/// Returns the outermost instruction in the chain to RAUW.
+static Instruction *findPostABITruncation(BasicBlock *MergeBB,
+                                           BasicBlock *case0Pred) {
+  for (auto &I : *MergeBB) {
+    auto *phi = dyn_cast<PHINode>(&I);
+    if (!phi)
+      break;
+    if (!phi->getType()->isIntegerTy(64))
+      continue;
+    if (phi->getNumIncomingValues() != 2)
+      continue;
+    if (phi->getBasicBlockIndex(case0Pred) < 0)
+      continue;
+
+    // Check single use chain: phi → (optional lshr by 1) → and with 0xFFFFFFFF
+    for (auto *U : phi->users()) {
+      auto *user = dyn_cast<Instruction>(U);
+      if (!user)
+        continue;
+
+      // Direct: and(phi, 0xFFFFFFFF)
+      uint64_t and_c = 0;
+      if (match(user, m_And(m_Specific(phi), m_ConstantInt(and_c))) &&
+          and_c == 0xFFFFFFFFULL)
+        return user;
+
+      // Via shift: lshr(phi, 1) → and(..., 0xFFFFFFFF)
+      uint64_t shr_c = 0;
+      if (match(user, m_LShr(m_Specific(phi), m_ConstantInt(shr_c)))) {
+        for (auto *U2 : user->users()) {
+          auto *user2 = dyn_cast<Instruction>(U2);
+          if (!user2)
+            continue;
+          if (match(user2, m_And(m_Specific(user), m_ConstantInt(and_c))) &&
+              and_c == 0xFFFFFFFFULL)
+            return user2;
+        }
+      }
+    }
+  }
+  return nullptr;
+}
+
 /// Main analysis: find the instruction to replace with lshr(lshr(V,32), lshr(V,60)).
 ///
 /// Returns the instruction to RAUW, or nullptr.
@@ -198,6 +268,10 @@ static Instruction *analyzeSwitch(SwitchInst *SW, Value *V) {
   if (Instruction *phi = findResultPhi(merge, case0Pred))
     return phi;
 
+  // Try Pattern D: post-ABI truncation (phi → lshr/and → i32 range).
+  if (Instruction *trunc = findPostABITruncation(merge, case0Pred))
+    return trunc;
+
   return nullptr;
 }
 
@@ -206,6 +280,15 @@ llvm::PreservedAnalyses CollapseRemillSHRSwitchPass::run(
   auto name = F.getName();
   if (name.starts_with("_ZN") || name.starts_with("__remill_"))
     return PreservedAnalyses::all();
+
+  // Get dominator tree for cross-block lshr(V, 32) search.
+  auto *DT = AM.getCachedResult<DominatorTreeAnalysis>(F);
+  // Lazily compute if not cached — needed for dominator walk.
+  DominatorTree localDT;
+  if (!DT) {
+    localDT.recalculate(F);
+    DT = &localDT;
+  }
 
   bool changed = false;
 
@@ -227,7 +310,7 @@ llvm::PreservedAnalyses CollapseRemillSHRSwitchPass::run(
     if (!verifyCaseStructure(SW))
       continue;
 
-    Value *baseShift = findBaseShift(&BB, V);
+    Value *baseShift = findBaseShift(&BB, V, DT);
     if (!baseShift)
       continue;
 

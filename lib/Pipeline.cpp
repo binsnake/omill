@@ -2,6 +2,7 @@
 
 #include <llvm/IR/CFG.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Passes/PassBuilder.h>
@@ -189,6 +190,8 @@ struct SkipOnLiftedControlTransferPass
 
 /// Module pass that runs an FPM only on functions matching a predicate.
 /// Avoids iterating the entire module when only a few functions need work.
+/// Pre-collects matching functions to guard against iterator invalidation
+/// if the FPM creates new function declarations in the module.
 template <typename Pred>
 struct ScopedFunctionPassAdaptor
     : llvm::PassInfoMixin<ScopedFunctionPassAdaptor<Pred>> {
@@ -200,14 +203,25 @@ struct ScopedFunctionPassAdaptor
                                llvm::ModuleAnalysisManager &MAM) {
     auto &FAM =
         MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M).getManager();
-    bool changed = false;
+
+    // Pre-collect matching functions to avoid iterator invalidation when
+    // passes create new function declarations (e.g. __omill_dispatch_call).
+    llvm::SmallVector<llvm::Function *, 32> worklist;
     for (auto &F : M) {
       if (F.isDeclaration() || !predicate(F))
         continue;
-      auto PA = FPM.run(F, FAM);
+      worklist.push_back(&F);
+    }
+
+    bool changed = false;
+    for (auto *F : worklist) {
+      // Skip functions that became declarations during processing.
+      if (F->isDeclaration())
+        continue;
+      auto PA = FPM.run(*F, FAM);
       if (!PA.areAllPreserved()) {
         changed = true;
-        FAM.invalidate(F, PA);
+        FAM.invalidate(*F, PA);
       }
     }
     return changed ? llvm::PreservedAnalyses::none()
@@ -514,10 +528,90 @@ struct FoldCallsToConstantReturnPass
   static bool isRequired() { return true; }
 };
 
+/// Repair malformed PHI nodes and strip alwaysinline from broken functions.
+/// Must run before every AlwaysInlinerPass to prevent crashes in
+/// CloneAndPruneFunctionInto (SEH 0xC0000005).
+struct RepairBeforeInlinePass
+    : llvm::PassInfoMixin<RepairBeforeInlinePass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                               llvm::ModuleAnalysisManager &) {
+    bool changed = false;
+    for (auto &F : M) {
+      if (F.isDeclaration()) continue;
+      for (auto &BB : F) {
+        llvm::DenseMap<llvm::BasicBlock *, unsigned> pred_edge_count;
+        for (auto *P : llvm::predecessors(&BB))
+          ++pred_edge_count[P];
+        for (auto &I : llvm::make_early_inc_range(BB)) {
+          auto *phi = llvm::dyn_cast<llvm::PHINode>(&I);
+          if (!phi) break;
+          for (unsigned i = phi->getNumIncomingValues(); i-- > 0;) {
+            if (!pred_edge_count.count(phi->getIncomingBlock(i))) {
+              phi->removeIncomingValue(i, /*DeletePHIIfEmpty=*/false);
+              changed = true;
+            }
+          }
+          llvm::DenseMap<llvm::BasicBlock *, unsigned> phi_count;
+          for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i)
+            ++phi_count[phi->getIncomingBlock(i)];
+          for (auto &[pred, needed] : pred_edge_count) {
+            unsigned have = phi_count.lookup(pred);
+            if (have == 0) continue;
+            for (unsigned j = have; j < needed; ++j) {
+              phi->addIncoming(phi->getIncomingValueForBlock(pred), pred);
+              changed = true;
+            }
+          }
+          if (phi->getNumIncomingValues() == 0) {
+            phi->replaceAllUsesWith(
+                llvm::PoisonValue::get(phi->getType()));
+            phi->eraseFromParent();
+          }
+        }
+      }
+      if (F.hasFnAttribute(llvm::Attribute::AlwaysInline)) {
+        if (llvm::verifyFunction(F, &llvm::errs())) {
+          llvm::errs() << "[repair] stripping alwaysinline from broken: "
+                       << F.getName() << "\n";
+          F.removeFnAttr(llvm::Attribute::AlwaysInline);
+          changed = true;
+        }
+      }
+    }
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+  static bool isRequired() { return true; }
+};
+
 }  // namespace
 
 void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
   addPhaseMarker(MPM, "ABI: start");
+
+  // Set target-cpu on all functions so LLVM codegen emits inline CMPXCHG16B
+  // instead of library calls for i128 cmpxchg.  x86-64-v2 implies +cx16.
+  if (!envDisabled("OMILL_SKIP_ABI_TARGET_CPU")) {
+    struct SetTargetCPUPass : llvm::PassInfoMixin<SetTargetCPUPass> {
+      llvm::PreservedAnalyses run(llvm::Module &M,
+                                   llvm::ModuleAnalysisManager &) {
+        bool changed = false;
+        for (auto &F : M) {
+          if (F.isDeclaration())
+            continue;
+          if (!F.hasFnAttribute("target-cpu")) {
+            F.addFnAttr("target-cpu", "x86-64-v2");
+            changed = true;
+          }
+        }
+        return changed ? llvm::PreservedAnalyses::none()
+                       : llvm::PreservedAnalyses::all();
+      }
+      static bool isRequired() { return true; }
+    };
+    MPM.addPass(SetTargetCPUPass{});
+  }
+
   // Stack frame recovery runs per-function.
   if (!envDisabled("OMILL_SKIP_ABI_INITIAL_OPT")) {
     llvm::FunctionPassManager FPM;
@@ -542,75 +636,7 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
   }
 
   addPhaseMarker(MPM, "ABI: inline lifted → native");
-  // Repair malformed PHI nodes and strip alwaysinline from functions
-  // that fail verification.  Passes that replace terminators can leave
-  // PHI nodes with stale predecessor references.  Additionally,
-  // CloneAndPruneFunctionInto (used by AlwaysInliner) crashes on
-  // functions with various forms of IR corruption (SEH 0xC0000005).
-  {
-    struct RepairAndVerifyBeforeInlinePass
-        : llvm::PassInfoMixin<RepairAndVerifyBeforeInlinePass> {
-      llvm::PreservedAnalyses run(llvm::Module &M,
-                                   llvm::ModuleAnalysisManager &MAM) {
-        bool changed = false;
-        for (auto &F : M) {
-          if (F.isDeclaration()) continue;
-          // Repair malformed PHI nodes: remove stale entries and add
-          // missing duplicates for multi-edge predecessors (e.g. switch
-          // with two cases to the same block).
-          for (auto &BB : F) {
-            llvm::DenseMap<llvm::BasicBlock *, unsigned> pred_edge_count;
-            for (auto *P : llvm::predecessors(&BB))
-              ++pred_edge_count[P];
-
-            for (auto &I : llvm::make_early_inc_range(BB)) {
-              auto *phi = llvm::dyn_cast<llvm::PHINode>(&I);
-              if (!phi) break;
-              // Remove entries from non-predecessors.
-              for (unsigned i = phi->getNumIncomingValues(); i-- > 0;) {
-                if (!pred_edge_count.count(phi->getIncomingBlock(i))) {
-                  phi->removeIncomingValue(i, /*DeletePHIIfEmpty=*/false);
-                  changed = true;
-                }
-              }
-              // Add missing duplicate entries for multi-edge preds.
-              llvm::DenseMap<llvm::BasicBlock *, unsigned> phi_count;
-              for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i)
-                ++phi_count[phi->getIncomingBlock(i)];
-              for (auto &[pred, needed] : pred_edge_count) {
-                unsigned have = phi_count.lookup(pred);
-                if (have == 0) continue;
-                for (unsigned j = have; j < needed; ++j) {
-                  phi->addIncoming(
-                      phi->getIncomingValueForBlock(pred), pred);
-                  changed = true;
-                }
-              }
-              if (phi->getNumIncomingValues() == 0) {
-                phi->replaceAllUsesWith(
-                    llvm::PoisonValue::get(phi->getType()));
-                phi->eraseFromParent();
-              }
-            }
-          }
-          // Strip alwaysinline from functions that fail verification —
-          // AlwaysInlinerPass will crash trying to clone them.
-          if (F.hasFnAttribute(llvm::Attribute::AlwaysInline)) {
-            if (llvm::verifyFunction(F, &llvm::errs())) {
-              llvm::errs() << "[ABI] stripping alwaysinline from broken: "
-                           << F.getName() << "\n";
-              F.removeFnAttr(llvm::Attribute::AlwaysInline);
-              changed = true;
-            }
-          }
-        }
-        return changed ? llvm::PreservedAnalyses::none()
-                       : llvm::PreservedAnalyses::all();
-      }
-      static bool isRequired() { return true; }
-    };
-    MPM.addPass(RepairAndVerifyBeforeInlinePass{});
-  }
+  MPM.addPass(RepairBeforeInlinePass{});
   // Inline the lifted functions into their native wrappers.
   // IMPORTANT: defer ALL per-function optimization until after
   // interprocedural inlining.  SEH handlers and CFF resolvers read
@@ -655,6 +681,8 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     FPM.addPass(llvm::GVNPass());
     FPM.addPass(SimplifyVectorReassemblyPass());
     FPM.addPass(CollapseRemillSHRSwitchPass());
+    // Hash integrity checks become dead after SHR switch collapse.
+    FPM.addPass(VMHashEliminationPass());
 #if OMILL_ENABLE_SIMPLIFIER
     FPM.addPass(SimplifyMBAPass());
 #endif
@@ -1110,6 +1138,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
 
   // Phase 0: Inline remill's alwaysinline semantic functions so that
   // subsequent passes can see through them.
+  MPM.addPass(RepairBeforeInlinePass{});
   MPM.addPass(llvm::AlwaysInlinerPass());
 
   // Protect semantic function bodies from Phase 2 function-pass optimizations.
@@ -1194,6 +1223,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     // Inlining merges the handler body into the caller (which HAS XMM values),
     // preserving the full State across the call chain.
     if (!envDisabled("OMILL_SKIP_CF_HANDLER_INLINE")) {
+      MPM.addPass(RepairBeforeInlinePass{});
       MPM.addPass(llvm::AlwaysInlinerPass());
     }
     // Remove inlined handler functions so they don't appear as callers in
@@ -1375,6 +1405,231 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
       F.removeFnAttr("omill.needs_cleanup");
       return true;
     }));
+  }
+
+  // Eliminate memory accesses to sentinel addresses (0xCCCCCCCCCCCCCCCC)
+  // produced by stack fill.  These are dead cmpxchg/load/store ops that
+  // survived through ABI recovery.
+  if (!envDisabled("OMILL_SKIP_SENTINEL_MEMORY_ELIM")) {
+    struct SentinelMemoryEliminationPass
+        : llvm::PassInfoMixin<SentinelMemoryEliminationPass> {
+      llvm::PreservedAnalyses run(llvm::Function &F,
+                                   llvm::FunctionAnalysisManager &) {
+        if (F.isDeclaration())
+          return llvm::PreservedAnalyses::all();
+
+        // Known sentinel constants (stack fill patterns).
+        auto isSentinel = [](uint64_t v) -> bool {
+          return v == 0xCCCCCCCCCCCCCCCCULL ||
+                 v == 0xCDCDCDCDCDCDCDCDULL;
+        };
+
+        // Check if a pointer operand is inttoptr(sentinel_constant).
+        auto isSentinelPtr = [&](llvm::Value *ptr) -> bool {
+          auto *i2p = llvm::dyn_cast<llvm::IntToPtrInst>(ptr);
+          if (!i2p) {
+            // Check ConstantExpr inttoptr.
+            auto *ce = llvm::dyn_cast<llvm::ConstantExpr>(ptr);
+            if (!ce || ce->getOpcode() != llvm::Instruction::IntToPtr)
+              return false;
+            auto *ci = llvm::dyn_cast<llvm::ConstantInt>(ce->getOperand(0));
+            return ci && isSentinel(ci->getZExtValue());
+          }
+          auto *ci = llvm::dyn_cast<llvm::ConstantInt>(i2p->getOperand(0));
+          return ci && isSentinel(ci->getZExtValue());
+        };
+
+        bool changed = false;
+        llvm::SmallVector<llvm::Instruction *, 8> to_erase;
+
+        for (auto &BB : F) {
+          for (auto &I : BB) {
+            // cmpxchg to sentinel → replace with {undef, false}.
+            if (auto *cx = llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&I)) {
+              if (isSentinelPtr(cx->getPointerOperand())) {
+                auto *res_ty = cx->getType();  // {T, i1}
+                llvm::Value *res = llvm::PoisonValue::get(res_ty);
+                cx->replaceAllUsesWith(res);
+                to_erase.push_back(cx);
+                changed = true;
+              }
+              continue;
+            }
+            // load from sentinel → replace with poison.
+            if (auto *ld = llvm::dyn_cast<llvm::LoadInst>(&I)) {
+              if (isSentinelPtr(ld->getPointerOperand())) {
+                ld->replaceAllUsesWith(
+                    llvm::PoisonValue::get(ld->getType()));
+                to_erase.push_back(ld);
+                changed = true;
+              }
+              continue;
+            }
+            // store to sentinel → erase.
+            if (auto *st = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+              if (isSentinelPtr(st->getPointerOperand())) {
+                to_erase.push_back(st);
+                changed = true;
+              }
+              continue;
+            }
+          }
+        }
+        for (auto *I : to_erase)
+          I->eraseFromParent();
+
+        return changed ? llvm::PreservedAnalyses::none()
+                       : llvm::PreservedAnalyses::all();
+      }
+      static bool isRequired() { return true; }
+    };
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(SentinelMemoryEliminationPass{});
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+  }
+
+  // Inline tiny _native helper functions (e.g., VM context allocator called
+  // ~3000 times).  After ABI recovery these are ~5 instructions.  Inlining
+  // exposes their stack offset arithmetic to GVN/InstCombine in callers.
+  if (opts.recover_abi && !envDisabled("OMILL_SKIP_POST_ABI_INLINE")) {
+    llvm::InlineParams params = llvm::getInlineParams(50);
+    MPM.addPass(llvm::ModuleInlinerWrapperPass(params));
+    // Cleanup after inlining.
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::GVNPass());
+    FPM.addPass(llvm::ADCEPass());
+    FPM.addPass(llvm::SimplifyCFGPass());
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    MPM.addPass(llvm::GlobalDCEPass());
+  }
+
+  // Resolve call inttoptr(i64 CONST to ptr)(...) to direct calls when the
+  // constant address corresponds to a lifted function.
+  if (opts.recover_abi && !envDisabled("OMILL_SKIP_RESOLVE_INTTOPTR_CALLS")) {
+    struct ResolveIntToPtrCallsPass
+        : llvm::PassInfoMixin<ResolveIntToPtrCallsPass> {
+      llvm::PreservedAnalyses run(llvm::Module &M,
+                                   llvm::ModuleAnalysisManager &MAM) {
+        auto *lifted = MAM.getCachedResult<LiftedFunctionAnalysis>(M);
+        if (!lifted)
+          return llvm::PreservedAnalyses::all();
+
+        bool changed = false;
+        unsigned resolved_count = 0;
+
+        for (auto &F : M) {
+          for (auto &BB : F) {
+            for (auto &I : llvm::make_early_inc_range(BB)) {
+              auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+              if (!call)
+                continue;
+
+              // Match: call ... inttoptr(i64 CONST to ptr)(...)
+              auto *callee_val = call->getCalledOperand();
+              llvm::ConstantInt *addr_ci = nullptr;
+
+              // ConstantExpr inttoptr.
+              if (auto *ce = llvm::dyn_cast<llvm::ConstantExpr>(callee_val)) {
+                if (ce->getOpcode() == llvm::Instruction::IntToPtr)
+                  addr_ci = llvm::dyn_cast<llvm::ConstantInt>(ce->getOperand(0));
+              }
+              if (!addr_ci)
+                continue;
+
+              uint64_t addr = addr_ci->getZExtValue();
+
+              // Look up the native wrapper for this VA.
+              auto *target_fn = lifted->lookup(addr);
+              if (!target_fn)
+                continue;
+
+              // Find or create the _native version.
+              std::string native_name =
+                  (target_fn->getName() + "_native").str();
+              auto *native_fn = M.getFunction(native_name);
+              if (!native_fn)
+                continue;
+
+              // Build argument list, adapting types as needed.
+              auto *native_ty = native_fn->getFunctionType();
+              unsigned n_params = native_ty->getNumParams();
+              unsigned n_args = call->arg_size();
+              unsigned n = std::min(n_params, n_args);
+
+              llvm::SmallVector<llvm::Value *, 8> args;
+              llvm::IRBuilder<> B(call);
+              for (unsigned i = 0; i < n; ++i) {
+                auto *arg = call->getArgOperand(i);
+                auto *expected = native_ty->getParamType(i);
+                if (arg->getType() != expected) {
+                  if (arg->getType()->isIntegerTy() &&
+                      expected->isIntegerTy())
+                    arg = B.CreateIntCast(arg, expected, /*isSigned=*/false);
+                  else if (arg->getType()->isPointerTy() &&
+                           expected->isIntegerTy())
+                    arg = B.CreatePtrToInt(arg, expected);
+                  else if (arg->getType()->isIntegerTy() &&
+                           expected->isPointerTy())
+                    arg = B.CreateIntToPtr(arg, expected);
+                  else
+                    arg = B.CreateBitCast(arg, expected);
+                }
+                args.push_back(arg);
+              }
+              // Pad with poison if callee expects more args.
+              for (unsigned i = n; i < n_params; ++i)
+                args.push_back(
+                    llvm::PoisonValue::get(native_ty->getParamType(i)));
+
+              auto *new_call = B.CreateCall(native_fn, args);
+              new_call->setCallingConv(native_fn->getCallingConv());
+
+              // Adapt return type.
+              if (call->getType() != new_call->getType()) {
+                llvm::Value *result = new_call;
+                if (call->getType()->isVoidTy()) {
+                  // Original call returned void, nothing to replace.
+                } else if (new_call->getType()->isVoidTy()) {
+                  result = llvm::PoisonValue::get(call->getType());
+                } else if (call->getType()->isIntegerTy() &&
+                           new_call->getType()->isIntegerTy()) {
+                  result =
+                      B.CreateIntCast(new_call, call->getType(), false);
+                } else if (call->getType()->isPointerTy() &&
+                           new_call->getType()->isIntegerTy()) {
+                  result = B.CreateIntToPtr(new_call, call->getType());
+                } else if (call->getType()->isIntegerTy() &&
+                           new_call->getType()->isPointerTy()) {
+                  result = B.CreatePtrToInt(new_call, call->getType());
+                } else {
+                  result = B.CreateBitCast(new_call, call->getType());
+                }
+                call->replaceAllUsesWith(result);
+              } else {
+                call->replaceAllUsesWith(new_call);
+              }
+              call->eraseFromParent();
+              changed = true;
+              ++resolved_count;
+            }
+          }
+        }
+
+        if (resolved_count > 0) {
+          llvm::errs() << "ResolveIntToPtrCalls: resolved "
+                       << resolved_count
+                       << " inttoptr(const) calls to direct calls\n";
+        }
+
+        return changed ? llvm::PreservedAnalyses::none()
+                       : llvm::PreservedAnalyses::all();
+      }
+      static bool isRequired() { return true; }
+    };
+    MPM.addPass(llvm::RequireAnalysisPass<LiftedFunctionAnalysis,
+                                           llvm::Module>());
+    MPM.addPass(ResolveIntToPtrCallsPass{});
   }
 
   // Late lowering: undefined values (after DCE removed most of them)
