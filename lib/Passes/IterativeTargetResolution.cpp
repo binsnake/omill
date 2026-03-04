@@ -1,5 +1,6 @@
 #include "omill/Passes/IterativeTargetResolution.h"
 
+#include <llvm/ADT/DenseSet.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
@@ -10,7 +11,6 @@
 #include <llvm/Transforms/Scalar/EarlyCSE.h>
 #include <llvm/Transforms/Scalar/GVN.h>
 #include <llvm/Transforms/Scalar/ADCE.h>
-#include <llvm/Transforms/IPO/AlwaysInliner.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
 #include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Transforms/Utils/Cloning.h>
@@ -162,7 +162,12 @@ llvm::Function *resolveToDefinition(llvm::Function *decl, llvm::Module &M) {
 
 /// Inline lifted-function calls within functions that contain unresolved
 /// dispatch_jump or dispatch_call targets.
-bool inlineCalleesForDispatchResolution(llvm::Module &M) {
+/// If modified_out is provided, appends functions that were modified by
+/// inlining (i.e., the containing functions that had callees inlined into
+/// them).
+bool inlineCalleesForDispatchResolution(
+    llvm::Module &M,
+    llvm::SmallVectorImpl<llvm::Function *> *modified_out = nullptr) {
   llvm::SmallVector<llvm::Function *, 4> targets;
   for (auto &F : M) {
     if (F.isDeclaration())
@@ -232,6 +237,8 @@ bool inlineCalleesForDispatchResolution(llvm::Module &M) {
         if (result.isSuccess()) {
           progress = true;
           inlined_any = true;
+          if (modified_out)
+            modified_out->push_back(F);
         }
       }
     }
@@ -249,7 +256,9 @@ bool inlineCalleesForDispatchResolution(llvm::Module &M) {
 /// constants before tail-calling the handler.  By inlining the handler
 /// into the thunk, GVN forwards the constant values to the handler's
 /// dispatch computation, making it resolvable.
-bool inlineDispatchFunctionsIntoCallers(llvm::Module &M) {
+bool inlineDispatchFunctionsIntoCallers(
+    llvm::Module &M,
+    llvm::SmallVectorImpl<llvm::Function *> *modified_out = nullptr) {
   // Find functions with unresolved dispatches.
   llvm::SmallPtrSet<llvm::Function *, 4> dispatch_funcs;
   for (auto &F : M) {
@@ -307,14 +316,46 @@ bool inlineDispatchFunctionsIntoCallers(llvm::Module &M) {
       if (CI->isMustTailCall())
         CI->setTailCallKind(llvm::CallInst::TCK_None);
 
+      auto *caller = CI->getFunction();
       llvm::InlineFunctionInfo IFI;
       auto result = llvm::InlineFunction(*CI, IFI);
-      if (result.isSuccess())
+      if (result.isSuccess()) {
         inlined_any = true;
+        if (modified_out)
+          modified_out->push_back(caller);
+      }
     }
   }
 
   return inlined_any;
+}
+
+/// Inline alwaysinline callees within a specific set of functions, replacing
+/// the full-module AlwaysInlinerPass with a targeted version.
+void inlineAlwaysInlineCallees(llvm::ArrayRef<llvm::Function *> Funcs) {
+  for (auto *F : Funcs) {
+    if (F->isDeclaration())
+      continue;
+    bool progress = true;
+    while (progress) {
+      progress = false;
+      for (auto &BB : *F) {
+        for (auto &I : llvm::make_early_inc_range(BB)) {
+          auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+          if (!CI)
+            continue;
+          auto *Callee = CI->getCalledFunction();
+          if (!Callee || Callee->isDeclaration())
+            continue;
+          if (!Callee->hasFnAttribute(llvm::Attribute::AlwaysInline))
+            continue;
+          llvm::InlineFunctionInfo IFI;
+          if (llvm::InlineFunction(*CI, IFI).isSuccess())
+            progress = true;
+        }
+      }
+    }
+  }
 }
 
 }  // namespace
@@ -332,6 +373,7 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
   bool tried_reverse_inlining = false;
   bool lifted_new_funcs = false;
   llvm::DenseSet<uint64_t> already_lifted_pcs;  // Prevent re-lifting.
+  llvm::DenseSet<llvm::Function *> already_optimized;  // Skip redundant Step 1.
 
   // Get optional trace-lift callback for discovering new functions.
   TraceLiftCallback lift_trace;
@@ -349,9 +391,18 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
     // the expensive optimization passes in Step 1.
     auto affected = collectAffectedFunctions(M);
 
+    // Filter Step 1 to only functions not yet optimized in a prior iteration.
+    llvm::SmallVector<llvm::Function *, 16> needs_opt;
+    for (auto *F : affected)
+      if (!already_optimized.count(F))
+        needs_opt.push_back(F);
+
+    llvm::errs() << "ITR iter " << iteration << ": " << affected.size()
+                 << " affected, " << needs_opt.size() << " to optimize\n";
+
     // Step 1: CFG canonicalization + LLVM optimizations.
-    // Run only on functions with unresolved dispatches, not the entire module.
-    {
+    // Run only on functions that haven't been optimized yet.
+    if (!needs_opt.empty()) {
       llvm::FunctionPassManager FPM;
       FPM.addPass(llvm::FixIrreduciblePass());
       FPM.addPass(llvm::LoopSimplifyPass());
@@ -363,7 +414,9 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
       FPM.addPass(ConstantMemoryFoldingPass());
       FPM.addPass(EliminateDeadPathsPass());
       FPM.addPass(llvm::InstCombinePass());
-      runFPMOnFunctions(FPM, affected, MAM, M);
+      runFPMOnFunctions(FPM, needs_opt, MAM, M);
+      for (auto *F : needs_opt)
+        already_optimized.insert(F);
     }
 
     // Step 2a: Resolve dispatch targets (but don't lower yet).
@@ -415,6 +468,9 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
         // lifted functions.  These missed earlier pipeline phases that
         // inline semantic functions, lower remill intrinsics, and resolve
         // control flow.
+        llvm::errs() << "ITR: lifted " << new_funcs.size()
+                     << " new functions\n";
+
         if (!new_funcs.empty()) {
           // Step A: Inline alwaysinline semantic function bodies into the
           // VM handler.  This is the Phase 0 equivalent.  Semantic function
@@ -435,10 +491,12 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
               F.addFnAttr(llvm::Attribute::AlwaysInline);
             }
 
-            llvm::ModulePassManager InlineMPM;
-            InlineMPM.addPass(llvm::AlwaysInlinerPass());
-            InlineMPM.run(M, MAM);
-            MAM.invalidate(M, llvm::PreservedAnalyses::none());
+            inlineAlwaysInlineCallees(new_funcs);
+            auto &FAM =
+                MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M)
+                    .getManager();
+            for (auto *F : new_funcs)
+              FAM.invalidate(*F, llvm::PreservedAnalyses::none());
           }
 
           // Step B: Lower remill intrinsics now exposed by inlining.
@@ -483,6 +541,11 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
               StateFPM.run(*F, FAM);
             }
           }
+          // Mark new functions as already optimized — Phase B pipeline
+          // is equivalent to (and heavier than) Step 1.
+          for (auto *F : new_funcs)
+            already_optimized.insert(F);
+
           // Step C: Mark dynamically-discovered functions so:
           // (1) EliminateStateStruct does NOT add alwaysinline
           // (2) Phase 4 AlwaysInliner does NOT re-inline stubs into them
@@ -535,9 +598,17 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
       // functions with unresolved dispatches to expose interprocedural
       // data flow (e.g. VMenter → return-address patching).
       if (!tried_inlining && curr_count > 0) {
-        if (inlineCalleesForDispatchResolution(M)) {
+        llvm::SmallVector<llvm::Function *, 8> inline_modified;
+        if (inlineCalleesForDispatchResolution(M, &inline_modified)) {
           tried_inlining = true;
           ever_changed = true;
+
+          // Inlining dirtied these functions — they need re-optimization.
+          for (auto *F : inline_modified)
+            already_optimized.erase(F);
+
+          llvm::errs() << "ITR: inlined callees into " << inline_modified.size()
+                       << " functions\n";
 
           // Invalidate ALL cached analyses — inlining modified CFGs.
           MAM.invalidate(M, llvm::PreservedAnalyses::none());
@@ -564,6 +635,9 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
             FPM.addPass(llvm::ADCEPass());
             FPM.addPass(llvm::InstCombinePass());
             runFPMOnFunctions(FPM, post_inline, MAM, M);
+            // Post-inline optimization done — mark them optimized again.
+            for (auto *F : post_inline)
+              already_optimized.insert(F);
           }
 
           // Re-fetch the lifted map after invalidation.
@@ -580,9 +654,17 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
       // inlining, GVN forwards those stores to the handler's State loads,
       // making dynamic dispatch targets (e.g. CX + DL) constant.
       if (!tried_reverse_inlining && curr_count > 0) {
-        if (inlineDispatchFunctionsIntoCallers(M)) {
+        llvm::SmallVector<llvm::Function *, 8> reverse_modified;
+        if (inlineDispatchFunctionsIntoCallers(M, &reverse_modified)) {
           tried_reverse_inlining = true;
           ever_changed = true;
+
+          // Reverse inlining dirtied callers — they need re-optimization.
+          for (auto *F : reverse_modified)
+            already_optimized.erase(F);
+
+          llvm::errs() << "ITR: reverse-inlined into "
+                       << reverse_modified.size() << " functions\n";
 
           MAM.invalidate(M, llvm::PreservedAnalyses::none());
 
@@ -644,6 +726,9 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
             FPM.addPass(llvm::ADCEPass());
             FPM.addPass(llvm::InstCombinePass());
             runFPMOnFunctions(FPM, post_reverse, MAM, M);
+            // Post-reverse optimization done — mark them optimized again.
+            for (auto *F : post_reverse)
+              already_optimized.insert(F);
           }
 
           lifted = MAM.getCachedResult<LiftedFunctionAnalysis>(M);
@@ -664,6 +749,9 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
     prev_count = curr_count;
     ++iteration;
   } while (iteration < max_iterations_);
+
+  llvm::errs() << "ITR: " << iteration << " iterations, "
+               << countUnresolvedDispatches(M) << " dispatches remaining\n";
 
   return ever_changed ? llvm::PreservedAnalyses::none()
                       : llvm::PreservedAnalyses::all();
