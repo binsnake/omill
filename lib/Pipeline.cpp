@@ -587,7 +587,7 @@ struct RepairBeforeInlinePass
 }  // namespace
 
 void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
-  addPhaseMarker(MPM, "ABI: start");
+  addPhaseMarker(MPM, "ABI: start (target-cpu)");
 
   // Set target-cpu on all functions so LLVM codegen emits inline CMPXCHG16B
   // instead of library calls for i128 cmpxchg.  x86-64-v2 implies +cx16.
@@ -612,6 +612,7 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     MPM.addPass(SetTargetCPUPass{});
   }
 
+  addPhaseMarker(MPM, "ABI: initial SROA+InstCombine");
   // Stack frame recovery runs per-function.
   if (!envDisabled("OMILL_SKIP_ABI_INITIAL_OPT")) {
     llvm::FunctionPassManager FPM;
@@ -623,6 +624,7 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
+  addPhaseMarker(MPM, "ABI: recover signatures");
   // Ensure LiftedFunctionAnalysis is cached — RewriteLiftedCallsToNative needs
   // it to resolve forward-declaration calls (sub_X → sub_X.N definition).
   MPM.addPass(llvm::RequireAnalysisPass<LiftedFunctionAnalysis, llvm::Module>());
@@ -631,22 +633,18 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
   // internalizes the original lifted functions with alwaysinline.
   if (!envDisabled("OMILL_SKIP_ABI_RECOVER_SIGNATURES")) {
     MPM.addPass(RecoverFunctionSignaturesPass());
+    addPhaseMarker(MPM, "ABI: rewrite lifted calls");
     MPM.addPass(RewriteLiftedCallsToNativePass());
+    addPhaseMarker(MPM, "ABI: eliminate state struct");
     MPM.addPass(EliminateStateStructPass());
   }
 
-  addPhaseMarker(MPM, "ABI: inline lifted → native");
+  addPhaseMarker(MPM, "ABI: repair+inline lifted → native");
   MPM.addPass(RepairBeforeInlinePass{});
-  // Inline the lifted functions into their native wrappers.
-  // IMPORTANT: defer ALL per-function optimization until after
-  // interprocedural inlining.  SEH handlers and CFF resolvers read
-  // from parameter-based pointers (DISPATCHER_CONTEXT*, etc.) that
-  // can only fold once inlined into the caller where the allocas live.
-  // Any optimization here (even InstCombine+SimplifyCFG) would kill
-  // the handler/resolver bodies prematurely.
   if (!envDisabled("OMILL_SKIP_ABI_ALWAYS_INLINE")) {
     MPM.addPass(llvm::AlwaysInlinerPass());
   }
+  addPhaseMarker(MPM, "ABI: rewrite lifted calls (post-inline)");
 
   // Inlining lifted functions into _native wrappers can re-introduce
   // dispatch_call/dispatch_jump artifacts. Rewrite again so wrappers don't
@@ -655,6 +653,7 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     MPM.addPass(RewriteLiftedCallsToNativePass());
   }
 
+  addPhaseMarker(MPM, "ABI: DSE+SROA+i128");
   // Eliminate dead stores to volatile State fields, decompose the State
   // alloca via SROA, and expand i128 div/rem — all in a single traversal.
   {
@@ -676,30 +675,43 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
   // Full optimization after inlining native wrappers.
   // SROA already ran above; start with InstCombine on the decomposed SSA.
   if (!envDisabled("OMILL_SKIP_ABI_FINAL_OPT")) {
-    llvm::FunctionPassManager FPM;
-    FPM.addPass(llvm::InstCombinePass());
-    FPM.addPass(llvm::GVNPass());
-    FPM.addPass(SimplifyVectorReassemblyPass());
-    FPM.addPass(CollapseRemillSHRSwitchPass());
-    // Hash integrity checks become dead after SHR switch collapse.
-    FPM.addPass(VMHashEliminationPass());
+    {
+      llvm::FunctionPassManager FPM;
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::GVNPass());
+      MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    }
+    addPhaseMarker(MPM, "ABI: final-opt SHR+Hash+MBA");
+    {
+      llvm::FunctionPassManager FPM;
+      FPM.addPass(SimplifyVectorReassemblyPass());
+      FPM.addPass(CollapseRemillSHRSwitchPass());
+      // Hash integrity checks become dead after SHR switch collapse.
+      FPM.addPass(VMHashEliminationPass());
 #if OMILL_ENABLE_SIMPLIFIER
-    FPM.addPass(SimplifyMBAPass());
+      FPM.addPass(SimplifyMBAPass());
 #endif
-    FPM.addPass(llvm::InstCombinePass());
-    FPM.addPass(llvm::GVNPass());
-    FPM.addPass(PointersHoistingPass());
-    FPM.addPass(TypeRecoveryPass());
-    // NOTE: LoopDeletionPass removed — SCEV's computeShiftCompareExitLimit
-    // crashes (SEH 0xC0000005) on lifted modular-exponentiation loops with
-    // 128-bit multiply-modulo operations.  ADCE + SimplifyCFG below handle
-    // dead code removal adequately without it.
-    FPM.addPass(llvm::ADCEPass());
-    FPM.addPass(llvm::SimplifyCFGPass());
-    FPM.addPass(llvm::InstCombinePass());
-    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+      MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    }
+    addPhaseMarker(MPM, "ABI: final-opt GVN+Type+ADCE");
+    {
+      llvm::FunctionPassManager FPM;
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::GVNPass());
+      FPM.addPass(PointersHoistingPass());
+      FPM.addPass(TypeRecoveryPass());
+      // NOTE: LoopDeletionPass removed — SCEV's computeShiftCompareExitLimit
+      // crashes (SEH 0xC0000005) on lifted modular-exponentiation loops with
+      // 128-bit multiply-modulo operations.  ADCE + SimplifyCFG below handle
+      // dead code removal adequately without it.
+      FPM.addPass(llvm::ADCEPass());
+      FPM.addPass(llvm::SimplifyCFGPass());
+      FPM.addPass(llvm::InstCombinePass());
+      MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    }
   }
 
+  addPhaseMarker(MPM, "ABI: fold const-ret + trace counters");
   // After per-function cleanup, some native helpers collapse to a constant
   // return. Fold direct calls to those helpers in their callers.
   if (!envDisabled("OMILL_SKIP_ABI_FOLD_CONST_RET_CALLS")) {

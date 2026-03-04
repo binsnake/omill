@@ -83,7 +83,8 @@ llvm::Value *buildStateGEP(llvm::IRBuilder<> &Builder, llvm::Value *state_ptr,
 /// 4. Loads the return value from the appropriate State field
 llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
                                      const FunctionABI &abi,
-                                     const StateFieldMap &field_map) {
+                                     const StateFieldMap &field_map,
+                                     llvm::StructType *state_ty) {
   auto &M = *lifted_fn->getParent();
   auto &Ctx = M.getContext();
 
@@ -101,15 +102,6 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
 
   auto *entry = llvm::BasicBlock::Create(Ctx, "entry", native_fn);
   llvm::IRBuilder<> Builder(entry);
-
-  // Find the State struct type.
-  llvm::StructType *state_ty = nullptr;
-  for (auto *ST : M.getIdentifiedStructTypes()) {
-    if (ST->getName() == "struct.State") {
-      state_ty = ST;
-      break;
-    }
-  }
 
   // If we can't find the State type, create a raw byte allocation.
   llvm::Value *state_alloca;
@@ -283,15 +275,12 @@ llvm::PreservedAnalyses RecoverFunctionSignaturesPass::run(
   llvm::SmallVector<llvm::Function *, 16> functions;
   for (auto &F : M) {
     if (!isLiftedFunction(F)) continue;
-    // Skip VM handler functions that have callers — they'll be inlined
-    // directly into their caller's _native wrapper by
-    // InlineVMHandlersAndCleanupPass.  Uncalled handlers (discovered
-    // targets without direct call sites) need their own _native wrapper
-    // so they survive as proper native entry points in the output.
-    if (F.hasFnAttribute("omill.vm_handler") && !F.use_empty())
-      continue;
     functions.push_back(&F);
   }
+
+  // Look up the State struct type once (getIdentifiedStructTypes is expensive).
+  llvm::StructType *state_ty = llvm::StructType::getTypeByName(
+      M.getContext(), "struct.State");
 
   for (auto *F : functions) {
     auto *abi = cc_info.getABI(F);
@@ -304,7 +293,7 @@ llvm::PreservedAnalyses RecoverFunctionSignaturesPass::run(
       llvm::errs() << "[Sigs] Creating wrapper for " << F->getName()
                     << " params=" << abi->numParams()
                     << " ret=" << abi->ret.has_value() << "\n";
-    createNativeWrapper(F, *abi, field_map);
+    createNativeWrapper(F, *abi, field_map, state_ty);
     changed = true;
   }
 

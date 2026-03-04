@@ -1619,6 +1619,9 @@ int main(int argc, char **argv) {
           itp_ce->replaceAllUsesWith(target_fn);
         }
         // IntToPtrInst with constant operand.
+        // ConstantInt is a ConstantData — it may not have a use list in LLVM 21.
+        if (!pc_ci->hasUseList())
+          continue;
         for (auto *user : llvm::make_early_inc_range(pc_ci->users())) {
           auto *inst = llvm::dyn_cast<llvm::IntToPtrInst>(user);
           if (!inst)
@@ -1814,6 +1817,9 @@ int main(int argc, char **argv) {
         late_MAM.registerPass([] {
           return omill::TraceLiftAnalysis(omill::TraceLiftCallback{});
         });
+        late_MAM.registerPass([&] {
+          return omill::VMHandlerGraphAnalysis();
+        });
 
         omill::PipelineOptions late_opts = opts;
         late_opts.resolve_indirect_targets = false;
@@ -1882,6 +1888,9 @@ int main(int argc, char **argv) {
 
         // Case 2: IntToPtrInst instructions with this constant operand.
         // Each instruction is a separate Value, so scan and replace each.
+        // ConstantInt (ConstantData) may not have a use list in LLVM 21.
+        if (!pc_ci->hasUseList())
+          continue;
         for (auto *user : llvm::make_early_inc_range(pc_ci->users())) {
           auto *inst = llvm::dyn_cast<llvm::IntToPtrInst>(user);
           if (!inst)

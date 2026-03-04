@@ -155,8 +155,27 @@ int main(int argc, char **argv) {
     opts.interprocedural_const_prop = IPCP;
   }
 
+  // When running --recover-abi on a checkpoint file, scope phases 0-3
+  // to only process functions that still have the remill signature
+  // (ptr, i64, ptr) -> ptr.  Already-processed functions crash if
+  // re-run through the lowering passes.
+  if (RecoverABI && !OnlyRecoverABI) {
+    opts.scope_predicate = [](Function &F) -> bool {
+      if (F.isDeclaration()) return false;
+      auto *FT = F.getFunctionType();
+      if (FT->getNumParams() != 3) return false;
+      if (!FT->getReturnType()->isPointerTy()) return false;
+      if (!FT->getParamType(0)->isPointerTy()) return false;
+      if (!FT->getParamType(1)->isIntegerTy(64)) return false;
+      if (!FT->getParamType(2)->isPointerTy()) return false;
+      return true;
+    };
+  }
+
   // Set up pass timing instrumentation.
   PassInstrumentationCallbacks PIC;
+  StandardInstrumentations SI(Context, /*DebugLogging=*/false);
+  SI.registerCallbacks(PIC);
   TimePassesHandler TimingHandler(OmillTimePasses);
   TimingHandler.registerCallbacks(PIC);
 
