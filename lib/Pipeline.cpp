@@ -3,6 +3,7 @@
 #include <llvm/IR/CFG.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/PassManager.h>
+#include <llvm/IR/Verifier.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/SmallVector.h>
@@ -541,32 +542,47 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
   }
 
   addPhaseMarker(MPM, "ABI: inline lifted → native");
-  // Repair malformed PHI nodes before inlining.  Passes that replace
-  // terminators (LowerFunctionReturn, LowerJump, etc.) can leave PHI
-  // nodes with incoming values from blocks that are no longer
-  // predecessors.  CloneAndPruneFunctionInto (used by AlwaysInliner)
-  // crashes on these with SEH 0xC0000005 in removeIncomingValue.
+  // Repair malformed PHI nodes and strip alwaysinline from functions
+  // that fail verification.  Passes that replace terminators can leave
+  // PHI nodes with stale predecessor references.  Additionally,
+  // CloneAndPruneFunctionInto (used by AlwaysInliner) crashes on
+  // functions with various forms of IR corruption (SEH 0xC0000005).
   {
-    struct RepairMalformedPHIsPass
-        : llvm::PassInfoMixin<RepairMalformedPHIsPass> {
-      llvm::PreservedAnalyses run(llvm::Function &F,
-                                   llvm::FunctionAnalysisManager &FAM) {
+    struct RepairAndVerifyBeforeInlinePass
+        : llvm::PassInfoMixin<RepairAndVerifyBeforeInlinePass> {
+      llvm::PreservedAnalyses run(llvm::Module &M,
+                                   llvm::ModuleAnalysisManager &MAM) {
         bool changed = false;
-        for (auto &BB : F) {
-          llvm::SmallPtrSet<llvm::BasicBlock *, 8> preds(
-              llvm::pred_begin(&BB), llvm::pred_end(&BB));
-          for (auto &I : llvm::make_early_inc_range(BB)) {
-            auto *phi = llvm::dyn_cast<llvm::PHINode>(&I);
-            if (!phi) break;
-            for (unsigned i = phi->getNumIncomingValues(); i-- > 0;) {
-              if (!preds.count(phi->getIncomingBlock(i))) {
-                phi->removeIncomingValue(i, /*DeletePHIIfEmpty=*/false);
-                changed = true;
+        for (auto &F : M) {
+          if (F.isDeclaration()) continue;
+          // Repair malformed PHI nodes.
+          for (auto &BB : F) {
+            llvm::SmallPtrSet<llvm::BasicBlock *, 8> preds(
+                llvm::pred_begin(&BB), llvm::pred_end(&BB));
+            for (auto &I : llvm::make_early_inc_range(BB)) {
+              auto *phi = llvm::dyn_cast<llvm::PHINode>(&I);
+              if (!phi) break;
+              for (unsigned i = phi->getNumIncomingValues(); i-- > 0;) {
+                if (!preds.count(phi->getIncomingBlock(i))) {
+                  phi->removeIncomingValue(i, /*DeletePHIIfEmpty=*/false);
+                  changed = true;
+                }
+              }
+              if (phi->getNumIncomingValues() == 0) {
+                phi->replaceAllUsesWith(
+                    llvm::PoisonValue::get(phi->getType()));
+                phi->eraseFromParent();
               }
             }
-            if (phi->getNumIncomingValues() == 0) {
-              phi->replaceAllUsesWith(llvm::PoisonValue::get(phi->getType()));
-              phi->eraseFromParent();
+          }
+          // Strip alwaysinline from functions that fail verification —
+          // AlwaysInlinerPass will crash trying to clone them.
+          if (F.hasFnAttribute(llvm::Attribute::AlwaysInline)) {
+            if (llvm::verifyFunction(F, &llvm::errs())) {
+              llvm::errs() << "[ABI] stripping alwaysinline from broken: "
+                           << F.getName() << "\n";
+              F.removeFnAttr(llvm::Attribute::AlwaysInline);
+              changed = true;
             }
           }
         }
@@ -575,8 +591,7 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
       }
       static bool isRequired() { return true; }
     };
-    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(
-        RepairMalformedPHIsPass{}));
+    MPM.addPass(RepairAndVerifyBeforeInlinePass{});
   }
   // Inline the lifted functions into their native wrappers.
   // IMPORTANT: defer ALL per-function optimization until after
