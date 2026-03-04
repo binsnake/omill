@@ -330,32 +330,80 @@ bool inlineDispatchFunctionsIntoCallers(
   return inlined_any;
 }
 
-/// Inline alwaysinline callees within a specific set of functions, replacing
-/// the full-module AlwaysInlinerPass with a targeted version.
-void inlineAlwaysInlineCallees(llvm::ArrayRef<llvm::Function *> Funcs) {
-  for (auto *F : Funcs) {
-    if (F->isDeclaration())
-      continue;
-    bool progress = true;
-    while (progress) {
-      progress = false;
-      for (auto &BB : *F) {
-        for (auto &I : llvm::make_early_inc_range(BB)) {
-          auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
-          if (!CI)
-            continue;
-          auto *Callee = CI->getCalledFunction();
-          if (!Callee || Callee->isDeclaration())
-            continue;
-          if (!Callee->hasFnAttribute(llvm::Attribute::AlwaysInline))
-            continue;
-          llvm::InlineFunctionInfo IFI;
-          if (llvm::InlineFunction(*CI, IFI).isSuccess())
-            progress = true;
-        }
+/// Inline all alwaysinline callees within a single function until fixpoint.
+void inlineAlwaysInlineCalleesInFunc(llvm::Function *F) {
+  if (F->isDeclaration())
+    return;
+  bool progress = true;
+  while (progress) {
+    progress = false;
+    for (auto &BB : *F) {
+      for (auto &I : llvm::make_early_inc_range(BB)) {
+        auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+        if (!CI)
+          continue;
+        auto *Callee = CI->getCalledFunction();
+        if (!Callee || Callee->isDeclaration())
+          continue;
+        if (!Callee->hasFnAttribute(llvm::Attribute::AlwaysInline))
+          continue;
+        llvm::InlineFunctionInfo IFI;
+        if (llvm::InlineFunction(*CI, IFI).isSuccess())
+          progress = true;
       }
     }
   }
+}
+
+/// Inline alwaysinline callees within a specific set of functions, replacing
+/// the full-module AlwaysInlinerPass with a targeted version.
+///
+/// Phase 1 pre-expands the shared semantic functions by inlining their own
+/// alwaysinline callees.  This is done once (~200 small functions) so that
+/// Phase 2 copies fully-flattened bodies into each of the N target functions,
+/// needing only a single inlining round instead of D rounds (D = call depth).
+void inlineAlwaysInlineCallees(llvm::ArrayRef<llvm::Function *> Funcs) {
+  // Phase 1: Collect alwaysinline functions called (directly or transitively)
+  // by the target functions, and pre-expand them.
+  llvm::DenseSet<llvm::Function *> semantics;
+  llvm::SmallVector<llvm::Function *, 64> worklist;
+
+  // Seed with direct callees of target functions.
+  for (auto *F : Funcs) {
+    if (F->isDeclaration())
+      continue;
+    for (auto &BB : *F)
+      for (auto &I : BB)
+        if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
+          if (auto *Callee = CI->getCalledFunction())
+            if (!Callee->isDeclaration() &&
+                Callee->hasFnAttribute(llvm::Attribute::AlwaysInline) &&
+                semantics.insert(Callee).second)
+              worklist.push_back(Callee);
+  }
+
+  // Transitively collect callees of callees.
+  while (!worklist.empty()) {
+    auto *SF = worklist.pop_back_val();
+    for (auto &BB : *SF)
+      for (auto &I : BB)
+        if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
+          if (auto *Callee = CI->getCalledFunction())
+            if (!Callee->isDeclaration() &&
+                Callee->hasFnAttribute(llvm::Attribute::AlwaysInline) &&
+                semantics.insert(Callee).second)
+              worklist.push_back(Callee);
+  }
+
+  // Pre-expand: inline alwaysinline callees within each semantic function.
+  // Semantic functions are small (~30-200 insns) so this converges fast.
+  for (auto *SF : semantics)
+    inlineAlwaysInlineCalleesInFunc(SF);
+
+  // Phase 2: Inline pre-expanded semantics into target functions.
+  // Callees are fully flattened, so this typically needs only 1 round.
+  for (auto *F : Funcs)
+    inlineAlwaysInlineCalleesInFunc(F);
 }
 
 }  // namespace
@@ -491,6 +539,8 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
               F.addFnAttr(llvm::Attribute::AlwaysInline);
             }
 
+            llvm::errs() << "ITR: Step A: inlining semantics into "
+                         << new_funcs.size() << " functions...\n";
             inlineAlwaysInlineCallees(new_funcs);
             auto &FAM =
                 MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M)
@@ -501,6 +551,7 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
 
           // Step B: Lower remill intrinsics now exposed by inlining.
           {
+            llvm::errs() << "ITR: Step B: lowering remill intrinsics...\n";
             llvm::FunctionPassManager FPM;
             FPM.addPass(LowerRemillIntrinsicsPass(
                 LowerCategories::Phase1 | LowerCategories::Phase3));
@@ -521,6 +572,8 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
           // memory ops between them prevent alias analysis from proving
           // non-aliasing with State GEP offsets).
           {
+            llvm::errs() << "ITR: Step B2: state optimization on "
+                         << new_funcs.size() << " functions...\n";
             llvm::FunctionPassManager StateFPM;
             StateFPM.addPass(CollapseRemillSHRSwitchPass());
             StateFPM.addPass(llvm::SimplifyCFGPass());
@@ -540,6 +593,7 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
                       .getManager();
               StateFPM.run(*F, FAM);
             }
+            llvm::errs() << "ITR: Step B2 complete\n";
           }
           // Mark new functions as already optimized — Phase B pipeline
           // is equivalent to (and heavier than) Step 1.
