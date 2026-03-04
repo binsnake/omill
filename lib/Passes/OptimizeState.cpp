@@ -462,6 +462,10 @@ static bool promoteStateToSSA(llvm::Function &F, const llvm::DataLayout &DL) {
       {
         llvm::IRBuilder<> Builder(CI->getNextNode());
         for (auto &[offset, info] : fields) {
+          // Only reload fields that have loads — fields with no loads
+          // anywhere in the function can't be observed, so skipping
+          // their reload is safe and avoids dead alloca churn in SROA.
+          if (info.loads.empty()) continue;
           auto *alloca = field_allocas[offset];
           auto *gep = buildStateFieldGEP(Builder, state_ptr, offset,
                                           info.type, DL);

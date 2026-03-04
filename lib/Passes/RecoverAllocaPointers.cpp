@@ -659,6 +659,16 @@ RecoverAllocaPointersPass::run(Function &F, FunctionAnalysisManager &AM) {
   const DataLayout &DL = F.getDataLayout();
   bool Changed = false;
 
+  // Collect inttoptr instructions first — skip everything if none exist.
+  SmallVector<IntToPtrInst *, 32> WorkList;
+  for (auto &BB : F)
+    for (auto &I : BB)
+      if (auto *I2P = dyn_cast<IntToPtrInst>(&I))
+        WorkList.push_back(I2P);
+
+  if (WorkList.empty())
+    return PreservedAnalyses::all();
+
   // Try to get BinaryMemoryMap for dispatch target validation.
   const omill::BinaryMemoryMap *BMM = nullptr;
   auto &MAMProxy = AM.getResult<ModuleAnalysisManagerFunctionProxy>(F);
@@ -668,12 +678,6 @@ RecoverAllocaPointersPass::run(Function &F, FunctionAnalysisManager &AM) {
 
   // Build i64-only store map for the linear resolution phase.
   StoreMap Stores = buildStoreMap(F, DL);
-
-  SmallVector<IntToPtrInst *, 32> WorkList;
-  for (auto &BB : F)
-    for (auto &I : BB)
-      if (auto *I2P = dyn_cast<IntToPtrInst>(&I))
-        WorkList.push_back(I2P);
 
   if (debugRecover())
     llvm::errs() << "[RecoverAllocaPointers] " << F.getName()
@@ -707,7 +711,14 @@ RecoverAllocaPointersPass::run(Function &F, FunctionAnalysisManager &AM) {
   }
 
   // Phase 2: Speculative concrete evaluation for remaining inttoptr.
-  if (!Unresolved.empty()) {
+  // Cap at 200 — beyond this, Monte Carlo cost is prohibitive and remaining
+  // inttoptr are unlikely to be dispatch-critical.
+  if (Unresolved.size() > 200) {
+    if (debugRecover())
+      llvm::errs() << "[RecoverAllocaPointers] " << F.getName()
+                   << ": skipping Phase 2 — " << Unresolved.size()
+                   << " unresolved inttoptr exceeds cap of 200\n";
+  } else if (!Unresolved.empty()) {
     SpecStoreMap SSM = buildSpecStoreMap(F, DL);
 
     // Collect all allocas in the function for multi-alloca resolution.

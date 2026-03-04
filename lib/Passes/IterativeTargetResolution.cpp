@@ -962,6 +962,17 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
           llvm::errs() << "ITR: post-reverse optimizing "
                        << post_reverse.size() << " modified functions\n";
 
+          // Phase 0: Trim dead code from inlined handler body.
+          // After reverse inlining, functions contain full handler bodies
+          // with dead error paths and unreachable continuations. Trimming
+          // first shrinks functions before the expensive Phase A passes.
+          {
+            llvm::FunctionPassManager FPM;
+            FPM.addPass(llvm::ADCEPass());
+            FPM.addPass(llvm::SimplifyCFGPass());
+            runFPMOnFunctions(FPM, post_reverse, MAM, M);
+          }
+
           // Phase A: Collapse SHR switches from the inlined handler,
           // then promote State fields to allocas so stores are visible
           // to SROA/GVN without inttoptr aliasing barriers.
