@@ -13,16 +13,10 @@
 #include <llvm/Transforms/Scalar/ADCE.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
 #include <llvm/Transforms/Scalar/SROA.h>
-#include <llvm/Bitcode/BitcodeReader.h>
-#include <llvm/Bitcode/BitcodeWriter.h>
-#include <llvm/Linker/Linker.h>
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/FixIrreducible.h>
 #include <llvm/Transforms/Utils/LCSSA.h>
 #include <llvm/Transforms/Utils/LoopSimplify.h>
-
-#include <future>
-#include <thread>
 
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
@@ -554,81 +548,45 @@ void inlineAlwaysInlineCallees(llvm::ArrayRef<llvm::Function *> Funcs) {
   llvm::errs() << "ITR: Step A Phase 2 complete\n";
 }
 
-/// Result from a parallel deferred-processing worker.
-struct WorkerResult {
-  llvm::SmallVector<char, 0> bitcode;
-  std::string error;  // empty on success
-};
-
-/// Process a chunk of deferred functions in an isolated LLVMContext.
-/// Parses the full module bitcode, finds chunk functions by name, runs
-/// Step A (semantic inlining) + Step B + Step B2 lightweight, then serializes
-/// the processed chunk functions back to bitcode.
-WorkerResult processDeferredChunk(llvm::StringRef module_bitcode,
-                                  const std::vector<std::string> &func_names) {
-  WorkerResult result;
-
-  // 1. Fresh LLVMContext + parse module.
-  llvm::LLVMContext ctx;
-  auto buf = llvm::MemoryBuffer::getMemBuffer(module_bitcode, "", false);
-  auto mod_or_err = llvm::parseBitcodeFile(buf->getMemBufferRef(), ctx);
-  if (!mod_or_err) {
-    result.error = llvm::toString(mod_or_err.takeError());
-    return result;
-  }
-  auto mod = std::move(*mod_or_err);
-
-  // 2. Find chunk functions by name.
-  llvm::SmallVector<llvm::Function *, 64> chunk_funcs;
-  llvm::DenseSet<llvm::Function *> chunk_set;
-  for (const auto &name : func_names) {
-    if (auto *F = mod->getFunction(name)) {
-      if (!F->isDeclaration()) {
-        chunk_funcs.push_back(F);
-        chunk_set.insert(F);
-      }
-    }
-  }
-  if (chunk_funcs.empty()) {
-    result.error = "no chunk functions found";
-    return result;
-  }
-
-  // 3. Delete bodies of non-chunk sub_*/block_* functions to reduce noise.
-  //    Keep semantic functions intact for inlining.
-  for (auto &F : *mod) {
-    if (F.isDeclaration() || chunk_set.count(&F))
+/// Process deferred functions: unprotect semantics, inline, lower, optimize.
+void processDeferredFunctions(llvm::ArrayRef<llvm::Function *> deferred,
+                              llvm::Module &M,
+                              llvm::ModuleAnalysisManager &MAM) {
+  // Unprotect semantic functions (strip optnone/noinline, add alwaysinline).
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    if (!F.hasFnAttribute(llvm::Attribute::OptimizeNone))
       continue;
     auto name = F.getName();
-    if (name.starts_with("sub_") || name.starts_with("block_"))
-      F.deleteBody();
+    if (name.starts_with("sub_") || name.starts_with("block_") ||
+        name.starts_with("__remill_") || name.starts_with("__omill_"))
+      continue;
+    F.removeFnAttr(llvm::Attribute::OptimizeNone);
+    F.removeFnAttr(llvm::Attribute::NoInline);
+    F.addFnAttr(llvm::Attribute::AlwaysInline);
   }
 
-  // 4. Setup independent analysis managers.
-  llvm::LoopAnalysisManager LAM;
-  llvm::FunctionAnalysisManager FAM;
-  llvm::CGSCCAnalysisManager CGAM;
-  llvm::ModuleAnalysisManager MAM;
-  llvm::PassBuilder PB;
-  PB.registerModuleAnalyses(MAM);
-  PB.registerCGSCCAnalyses(CGAM);
-  PB.registerFunctionAnalyses(FAM);
-  PB.registerLoopAnalyses(LAM);
-  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  // Step A: Inline semantics.
+  llvm::errs() << "ITR: deferred Step A: inlining semantics...\n";
+  inlineAlwaysInlineCallees(deferred);
+  {
+    auto &FAM =
+        MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M).getManager();
+    for (auto *F : deferred)
+      FAM.invalidate(*F, llvm::PreservedAnalyses::none());
+  }
 
-  // 5. Step A: Inline alwaysinline semantic callees.
-  inlineAlwaysInlineCallees(chunk_funcs);
-  for (auto *F : chunk_funcs)
-    FAM.invalidate(*F, llvm::PreservedAnalyses::none());
+  // Step B: Lower remill intrinsics.
+  llvm::errs() << "ITR: deferred Step B...\n";
+  runStepB(deferred, MAM, M);
 
-  // 6. Step B: Lower remill intrinsics.
-  runStepB(chunk_funcs, MAM, *mod);
+  // Step B2: Lightweight state optimization.
+  llvm::errs() << "ITR: deferred Step B2 (lightweight)...\n";
+  runStepB2(deferred, MAM, M, /*lightweight=*/true);
 
-  // 7. Step B2: Lightweight state optimization.
-  runStepB2(chunk_funcs, MAM, *mod, /*lightweight=*/true);
-
-  // 8. Strip alwaysinline from callees of chunk functions.
-  for (auto *F : chunk_funcs) {
+  // Strip alwaysinline from callees.
+  for (auto *F : deferred) {
     if (F->isDeclaration())
       continue;
     for (auto &BB : *F)
@@ -638,209 +596,6 @@ WorkerResult processDeferredChunk(llvm::StringRef module_bitcode,
             if (Callee->hasFnAttribute(llvm::Attribute::AlwaysInline))
               Callee->removeFnAttr(llvm::Attribute::AlwaysInline);
   }
-
-  // 9. Delete all non-chunk function bodies to minimize bitcode size.
-  for (auto &F : *mod) {
-    if (F.isDeclaration() || chunk_set.count(&F))
-      continue;
-    F.deleteBody();
-    F.setLinkage(llvm::GlobalValue::ExternalLinkage);
-  }
-
-  // 10. Serialize to bitcode.
-  llvm::raw_svector_ostream OS(result.bitcode);
-  llvm::WriteBitcodeToFile(*mod, OS);
-  return result;
-}
-
-/// Process deferred functions using module-splitting parallelism.
-/// Falls back to sequential processing for small workloads or errors.
-void parallelDeferredProcessing(llvm::ArrayRef<llvm::Function *> deferred,
-                                llvm::Module &M,
-                                llvm::ModuleAnalysisManager &MAM) {
-  // Helper: unprotect semantic functions (strip optnone/noinline, add
-  // alwaysinline).  Idempotent.
-  auto unprotectSemantics = [&M]() {
-    for (auto &F : M) {
-      if (F.isDeclaration())
-        continue;
-      if (!F.hasFnAttribute(llvm::Attribute::OptimizeNone))
-        continue;
-      auto name = F.getName();
-      if (name.starts_with("sub_") || name.starts_with("block_") ||
-          name.starts_with("__remill_") || name.starts_with("__omill_"))
-        continue;
-      F.removeFnAttr(llvm::Attribute::OptimizeNone);
-      F.removeFnAttr(llvm::Attribute::NoInline);
-      F.addFnAttr(llvm::Attribute::AlwaysInline);
-    }
-  };
-
-  // Helper: strip alwaysinline from callees of processed functions.
-  auto stripAlwaysInline = [](llvm::ArrayRef<llvm::Function *> funcs) {
-    for (auto *F : funcs) {
-      if (F->isDeclaration())
-        continue;
-      for (auto &BB : *F)
-        for (auto &I : BB)
-          if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
-            if (auto *Callee = CI->getCalledFunction())
-              if (Callee->hasFnAttribute(llvm::Attribute::AlwaysInline))
-                Callee->removeFnAttr(llvm::Attribute::AlwaysInline);
-    }
-  };
-
-  // Helper: run the full sequential processing path.
-  auto runSequential = [&](llvm::ArrayRef<llvm::Function *> funcs) {
-    unprotectSemantics();
-    llvm::errs() << "ITR: deferred Step A (sequential): inlining semantics...\n";
-    inlineAlwaysInlineCallees(funcs);
-    {
-      auto &FAM =
-          MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M)
-              .getManager();
-      for (auto *F : funcs)
-        FAM.invalidate(*F, llvm::PreservedAnalyses::none());
-    }
-    llvm::errs() << "ITR: deferred Step B...\n";
-    runStepB(funcs, MAM, M);
-    llvm::errs() << "ITR: deferred Step B2 (lightweight)...\n";
-    runStepB2(funcs, MAM, M, /*lightweight=*/true);
-    stripAlwaysInline(funcs);
-  };
-
-  // Determine thread count.
-  unsigned hw = std::thread::hardware_concurrency();
-  unsigned num_threads = std::min({hw, 6u, (unsigned)deferred.size()});
-
-  // Fall back to sequential for small workloads or single core.
-  if (num_threads < 2 || deferred.size() < 20) {
-    runSequential(deferred);
-    return;
-  }
-
-  llvm::errs() << "ITR: parallel deferred processing with " << num_threads
-               << " threads for " << deferred.size() << " functions\n";
-
-  // 1. Unprotect semantic functions before serialization so workers see
-  //    alwaysinline attributes.
-  unprotectSemantics();
-
-  // 2. Serialize main module to bitcode.
-  llvm::SmallVector<char, 0> module_bitcode;
-  {
-    llvm::raw_svector_ostream OS(module_bitcode);
-    llvm::WriteBitcodeToFile(M, OS);
-  }
-  llvm::errs() << "ITR: serialized module (" << module_bitcode.size()
-               << " bytes)\n";
-
-  // 3. Partition deferred function names into N chunks (round-robin).
-  std::vector<std::vector<std::string>> chunks(num_threads);
-  for (size_t i = 0; i < deferred.size(); ++i)
-    chunks[i % num_threads].push_back(deferred[i]->getName().str());
-
-  // 4. Launch workers via std::async.
-  llvm::StringRef bitcode_ref(module_bitcode.data(), module_bitcode.size());
-  std::vector<std::future<WorkerResult>> futures;
-  for (unsigned i = 0; i < num_threads; ++i) {
-    auto chunk_names = std::move(chunks[i]);
-    futures.push_back(std::async(std::launch::async,
-        [bitcode_ref, names = std::move(chunk_names)]() {
-          return processDeferredChunk(bitcode_ref, names);
-        }));
-  }
-
-  // 5. Join all workers.
-  std::vector<WorkerResult> results;
-  bool any_error = false;
-  for (auto &f : futures) {
-    results.push_back(f.get());
-    if (!results.back().error.empty()) {
-      llvm::errs() << "ITR: worker error: " << results.back().error << "\n";
-      any_error = true;
-    }
-  }
-
-  // 6. If any worker failed, fall back to sequential.
-  //    Main module bodies are still intact at this point.
-  if (any_error) {
-    llvm::errs() << "ITR: parallel failed, falling back to sequential\n";
-    runSequential(deferred);
-    return;
-  }
-
-  // 7. Delete deferred function bodies from main module.
-  for (auto *F : deferred) {
-    if (!F->isDeclaration())
-      F->deleteBody();
-  }
-
-  // 8. Link each worker's processed output back into the main module.
-  for (size_t i = 0; i < results.size(); ++i) {
-    auto &wr = results[i];
-    auto link_buf = llvm::MemoryBuffer::getMemBuffer(
-        llvm::StringRef(wr.bitcode.data(), wr.bitcode.size()), "", false);
-    auto sub_or_err =
-        llvm::parseBitcodeFile(link_buf->getMemBufferRef(), M.getContext());
-    if (!sub_or_err) {
-      llvm::errs() << "ITR: failed to parse worker " << i
-                   << " output: " << llvm::toString(sub_or_err.takeError())
-                   << "\n";
-      continue;
-    }
-    auto sub_module = std::move(*sub_or_err);
-
-    // Delete conflicting definitions from sub-module — keep only chunk funcs.
-    for (auto &F : llvm::make_early_inc_range(*sub_module)) {
-      if (F.isDeclaration())
-        continue;
-      if (auto *existing = M.getFunction(F.getName())) {
-        if (!existing->isDeclaration()) {
-          F.deleteBody();
-          F.setLinkage(llvm::GlobalValue::ExternalLinkage);
-        }
-      }
-    }
-    // Delete conflicting global variable definitions.
-    for (auto &GV : llvm::make_early_inc_range(sub_module->globals())) {
-      if (GV.isDeclaration())
-        continue;
-      if (auto *existing =
-              M.getGlobalVariable(GV.getName(), /*AllowInternal=*/true)) {
-        if (!existing->isDeclaration()) {
-          GV.setInitializer(nullptr);
-          GV.setLinkage(llvm::GlobalValue::ExternalLinkage);
-        }
-      }
-    }
-
-    if (llvm::Linker::linkModules(M, std::move(sub_module)))
-      llvm::errs() << "ITR: linking worker " << i << " output failed\n";
-  }
-
-  // 9. Invalidate analyses for re-linked deferred functions.
-  {
-    auto &FAM =
-        MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M).getManager();
-    for (auto *F : deferred)
-      if (!F->isDeclaration())
-        FAM.invalidate(*F, llvm::PreservedAnalyses::none());
-  }
-
-  // 10. Strip alwaysinline from semantic functions (cleanup).
-  for (auto &F : M) {
-    if (F.isDeclaration())
-      continue;
-    if (!F.hasFnAttribute(llvm::Attribute::AlwaysInline))
-      continue;
-    auto name = F.getName();
-    if (!name.starts_with("sub_") && !name.starts_with("block_") &&
-        !name.starts_with("__remill_") && !name.starts_with("__omill_"))
-      F.removeFnAttr(llvm::Attribute::AlwaysInline);
-  }
-
-  llvm::errs() << "ITR: parallel deferred processing complete\n";
 }
 
 }  // namespace
@@ -1266,7 +1021,7 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
     llvm::errs() << "ITR: processing " << all_deferred.size()
                  << " deferred functions...\n";
     ever_changed = true;
-    parallelDeferredProcessing(all_deferred, M, MAM);
+    processDeferredFunctions(all_deferred, M, MAM);
     llvm::errs() << "ITR: deferred processing complete\n";
   }
 
