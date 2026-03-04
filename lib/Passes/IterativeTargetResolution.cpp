@@ -2,7 +2,6 @@
 
 #include <llvm/ADT/DenseSet.h>
 #include <llvm/ADT/SmallVector.h>
-#include <llvm/Support/Parallel.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/Verifier.h>
@@ -331,6 +330,66 @@ bool inlineDispatchFunctionsIntoCallers(
   return inlined_any;
 }
 
+/// Build the set of semantic functions that transitively produce dispatch
+/// intrinsics (__remill_function_call, __remill_jump, __remill_async_hyper_call).
+/// A newly-lifted function has "dispatch potential" only if it calls one of
+/// these semantics — otherwise it won't produce __omill_dispatch_* after
+/// lowering, and its Step A/B/B2 work can be deferred.
+llvm::DenseSet<llvm::Function *>
+buildDispatchSemanticSet(llvm::Module &M) {
+  llvm::DenseSet<llvm::Function *> result;
+
+  // Seed: functions that directly call dispatch-producing intrinsics.
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+        if (!CI)
+          continue;
+        auto *C = CI->getCalledFunction();
+        if (!C)
+          continue;
+        auto name = C->getName();
+        if (name == "__remill_function_call" || name == "__remill_jump" ||
+            name == "__remill_async_hyper_call") {
+          result.insert(&F);
+          goto next_seed;
+        }
+      }
+    }
+    next_seed:;
+  }
+
+  // Transitively: if function A calls B (alwaysinline) and B is in result,
+  // then A is also dispatch-producing.  Iterate to fixpoint.
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (auto &F : M) {
+      if (F.isDeclaration() || result.count(&F))
+        continue;
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+          if (!CI)
+            continue;
+          auto *Callee = CI->getCalledFunction();
+          if (!Callee || !result.count(Callee))
+            continue;
+          result.insert(&F);
+          changed = true;
+          goto next_trans;
+        }
+      }
+      next_trans:;
+    }
+  }
+
+  return result;
+}
+
 /// Inline all alwaysinline callees within a single function until fixpoint.
 void inlineAlwaysInlineCalleesInFunc(llvm::Function *F) {
   if (F->isDeclaration())
@@ -401,24 +460,20 @@ void inlineAlwaysInlineCallees(llvm::ArrayRef<llvm::Function *> Funcs) {
   for (auto *SF : semantics)
     inlineAlwaysInlineCalleesInFunc(SF);
 
+  llvm::errs() << "ITR: Step A Phase 1: pre-expanded " << semantics.size()
+               << " semantics\n";
+
   // Phase 2: Inline pre-expanded semantics into target functions.
   // Callees are fully flattened, so this typically needs only 1 round.
-  // Each target function is independent (InlineFunction clones the callee
-  // body — the callee is read-only).  Remill semantics have no debug info
-  // or EH, so InlineFunction doesn't touch module-level metadata, making
-  // concurrent inlining into different callers safe.
-  llvm::SmallVector<llvm::Function *, 0> targets;
-  targets.reserve(Funcs.size());
-  for (auto *F : Funcs)
-    if (!F->isDeclaration())
-      targets.push_back(F);
-
-  llvm::errs() << "ITR: Step A Phase 2: inlining into " << targets.size()
-               << " targets (" << semantics.size() << " pre-expanded semantics)\n";
-
-  llvm::parallelFor(size_t{0}, targets.size(), [&](size_t I) {
-    inlineAlwaysInlineCalleesInFunc(targets[I]);
-  });
+  for (size_t I = 0; I < Funcs.size(); ++I) {
+    if (Funcs[I]->isDeclaration())
+      continue;
+    if (I % 50 == 0)
+      llvm::errs() << "ITR: Step A Phase 2: " << I << "/" << Funcs.size()
+                   << "\n";
+    inlineAlwaysInlineCalleesInFunc(Funcs[I]);
+  }
+  llvm::errs() << "ITR: Step A Phase 2 complete\n";
 }
 
 }  // namespace
@@ -437,6 +492,7 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
   bool lifted_new_funcs = false;
   llvm::DenseSet<uint64_t> already_lifted_pcs;  // Prevent re-lifting.
   llvm::DenseSet<llvm::Function *> already_optimized;  // Skip redundant Step 1.
+  llvm::SmallVector<llvm::Function *, 0> all_deferred;  // Deferred for post-loop.
 
   // Get optional trace-lift callback for discovering new functions.
   TraceLiftCallback lift_trace;
@@ -527,14 +583,58 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
           }
         }
 
-        // Run the equivalent of Phase 0 + Phase 1 + Phase 3 on newly
-        // lifted functions.  These missed earlier pipeline phases that
-        // inline semantic functions, lower remill intrinsics, and resolve
-        // control flow.
+        // Split new functions: only those with dispatch potential (call
+        // semantics that produce __remill_function_call / __remill_jump)
+        // need expensive Step A/B/B2 during ITR.  The rest are deferred
+        // to after the loop — they just need to exist for dispatch lowering.
         llvm::errs() << "ITR: lifted " << new_funcs.size()
                      << " new functions\n";
 
-        if (!new_funcs.empty()) {
+        llvm::SmallVector<llvm::Function *, 4> dispatch_new, deferred_new;
+        {
+          auto dispatch_set = buildDispatchSemanticSet(M);
+          for (auto *F : new_funcs) {
+            if (F->isDeclaration()) {
+              continue;
+            }
+            bool has_potential = false;
+            for (auto &BB : *F) {
+              for (auto &I : BB) {
+                auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+                if (!CI)
+                  continue;
+                auto *Callee = CI->getCalledFunction();
+                if (Callee && dispatch_set.count(Callee)) {
+                  has_potential = true;
+                  goto classified;
+                }
+              }
+            }
+            classified:
+            if (has_potential)
+              dispatch_new.push_back(F);
+            else
+              deferred_new.push_back(F);
+          }
+        }
+        llvm::errs() << "ITR: " << dispatch_new.size()
+                     << " with dispatch potential, " << deferred_new.size()
+                     << " deferred\n";
+
+        // Accumulate deferred functions for post-loop processing.
+        all_deferred.append(deferred_new.begin(), deferred_new.end());
+
+        // Step C: Mark ALL new functions (including deferred) so they
+        // survive the pipeline as callable functions.
+        for (auto *F : new_funcs) {
+          if (F->isDeclaration()) continue;
+          F->addFnAttr("omill.vm_handler");
+          F->addFnAttr(llvm::Attribute::NoInline);
+        }
+
+        // Run the equivalent of Phase 0 + Phase 1 + Phase 3 only on
+        // dispatch-potential functions.
+        if (!dispatch_new.empty()) {
           // Step A: Inline alwaysinline semantic function bodies into the
           // VM handler.  This is the Phase 0 equivalent.  Semantic function
           // bodies are preserved because GlobalDCE was deferred to after
@@ -555,12 +655,12 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
             }
 
             llvm::errs() << "ITR: Step A: inlining semantics into "
-                         << new_funcs.size() << " functions...\n";
-            inlineAlwaysInlineCallees(new_funcs);
+                         << dispatch_new.size() << " functions...\n";
+            inlineAlwaysInlineCallees(dispatch_new);
             auto &FAM =
                 MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M)
                     .getManager();
-            for (auto *F : new_funcs)
+            for (auto *F : dispatch_new)
               FAM.invalidate(*F, llvm::PreservedAnalyses::none());
           }
 
@@ -572,7 +672,7 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
                 LowerCategories::Phase1 | LowerCategories::Phase3));
             FPM.addPass(llvm::InstCombinePass());
             FPM.addPass(llvm::SimplifyCFGPass());
-            for (auto *F : new_funcs) {
+            for (auto *F : dispatch_new) {
               if (F->isDeclaration()) continue;
               llvm::FunctionAnalysisManager &FAM =
                   MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M)
@@ -582,13 +682,9 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
           }
 
           // Step B2: State optimization — eliminate dead flag/PC stores.
-          // After semantic inlining, the handler has ~3400 dead flag stores
-          // and ~900 dead PC stores that LLVM DSE can't eliminate (inttoptr
-          // memory ops between them prevent alias analysis from proving
-          // non-aliasing with State GEP offsets).
           {
             llvm::errs() << "ITR: Step B2: state optimization on "
-                         << new_funcs.size() << " functions...\n";
+                         << dispatch_new.size() << " functions...\n";
             llvm::FunctionPassManager StateFPM;
             StateFPM.addPass(CollapseRemillSHRSwitchPass());
             StateFPM.addPass(llvm::SimplifyCFGPass());
@@ -601,7 +697,7 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
             StateFPM.addPass(llvm::GVNPass());
             StateFPM.addPass(llvm::InstCombinePass());
             StateFPM.addPass(llvm::SimplifyCFGPass());
-            for (auto *F : new_funcs) {
+            for (auto *F : dispatch_new) {
               if (F->isDeclaration()) continue;
               llvm::FunctionAnalysisManager &FAM =
                   MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M)
@@ -610,22 +706,14 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
             }
             llvm::errs() << "ITR: Step B2 complete\n";
           }
-          // Mark new functions as already optimized — Phase B pipeline
-          // is equivalent to (and heavier than) Step 1.
-          for (auto *F : new_funcs)
+          // Mark dispatch functions as already optimized.
+          for (auto *F : dispatch_new)
             already_optimized.insert(F);
 
-          // Step C: Mark dynamically-discovered functions so:
-          // (1) EliminateStateStruct does NOT add alwaysinline
-          // (2) Phase 4 AlwaysInliner does NOT re-inline stubs into them
-          // (3) They survive the full ABI recovery pipeline as callable
-          //     functions with the remill calling convention.
-          for (auto *F : new_funcs) {
+          // Strip alwaysinline from callees of processed functions so
+          // Phase 4's AlwaysInliner doesn't re-inline them.
+          for (auto *F : dispatch_new) {
             if (F->isDeclaration()) continue;
-            F->addFnAttr("omill.vm_handler");
-            F->addFnAttr(llvm::Attribute::NoInline);
-            // Strip alwaysinline from any remaining callees so Phase 4's
-            // AlwaysInliner doesn't re-inline them.
             for (auto &BB : *F)
               for (auto &I : BB)
                 if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
@@ -633,7 +721,6 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
                     if (Callee->hasFnAttribute(llvm::Attribute::AlwaysInline))
                       Callee->removeFnAttr(llvm::Attribute::AlwaysInline);
           }
-
         }
         ever_changed = true;
         lifted_new_funcs = true;
@@ -821,6 +908,93 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
 
   llvm::errs() << "ITR: " << iteration << " iterations, "
                << countUnresolvedDispatches(M) << " dispatches remaining\n";
+
+  // Process deferred functions that were skipped during the ITR loop.
+  // These have no dispatch potential so they don't affect resolution,
+  // but they need Step A/B/B2 before the downstream ABI recovery pipeline.
+  if (!all_deferred.empty()) {
+    llvm::errs() << "ITR: processing " << all_deferred.size()
+                 << " deferred functions...\n";
+    ever_changed = true;
+
+    // Unprotect semantic functions (may already be done, but idempotent).
+    for (auto &F : M) {
+      if (F.isDeclaration()) continue;
+      if (!F.hasFnAttribute(llvm::Attribute::OptimizeNone)) continue;
+      auto name = F.getName();
+      if (name.starts_with("sub_") || name.starts_with("block_") ||
+          name.starts_with("__remill_") || name.starts_with("__omill_"))
+        continue;
+      F.removeFnAttr(llvm::Attribute::OptimizeNone);
+      F.removeFnAttr(llvm::Attribute::NoInline);
+      F.addFnAttr(llvm::Attribute::AlwaysInline);
+    }
+
+    // Step A: Inline semantics.
+    llvm::errs() << "ITR: deferred Step A: inlining semantics...\n";
+    inlineAlwaysInlineCallees(all_deferred);
+    {
+      auto &FAM =
+          MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M)
+              .getManager();
+      for (auto *F : all_deferred)
+        FAM.invalidate(*F, llvm::PreservedAnalyses::none());
+    }
+
+    // Step B: Lower remill intrinsics.
+    {
+      llvm::errs() << "ITR: deferred Step B...\n";
+      llvm::FunctionPassManager FPM;
+      FPM.addPass(LowerRemillIntrinsicsPass(
+          LowerCategories::Phase1 | LowerCategories::Phase3));
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::SimplifyCFGPass());
+      for (auto *F : all_deferred) {
+        if (F->isDeclaration()) continue;
+        llvm::FunctionAnalysisManager &FAM =
+            MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M)
+                .getManager();
+        FPM.run(*F, FAM);
+      }
+    }
+
+    // Step B2: State optimization.
+    {
+      llvm::errs() << "ITR: deferred Step B2...\n";
+      llvm::FunctionPassManager StateFPM;
+      StateFPM.addPass(CollapseRemillSHRSwitchPass());
+      StateFPM.addPass(llvm::SimplifyCFGPass());
+      StateFPM.addPass(llvm::InstCombinePass());
+      StateFPM.addPass(OptimizeStatePass(OptimizePhases::All));
+      StateFPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+      StateFPM.addPass(llvm::InstCombinePass());
+      StateFPM.addPass(llvm::DCEPass());
+      StateFPM.addPass(llvm::SimplifyCFGPass());
+      StateFPM.addPass(llvm::GVNPass());
+      StateFPM.addPass(llvm::InstCombinePass());
+      StateFPM.addPass(llvm::SimplifyCFGPass());
+      for (auto *F : all_deferred) {
+        if (F->isDeclaration()) continue;
+        llvm::FunctionAnalysisManager &FAM =
+            MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M)
+                .getManager();
+        StateFPM.run(*F, FAM);
+      }
+    }
+
+    // Strip alwaysinline from callees.
+    for (auto *F : all_deferred) {
+      if (F->isDeclaration()) continue;
+      for (auto &BB : *F)
+        for (auto &I : BB)
+          if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
+            if (auto *Callee = CI->getCalledFunction())
+              if (Callee->hasFnAttribute(llvm::Attribute::AlwaysInline))
+                Callee->removeFnAttr(llvm::Attribute::AlwaysInline);
+    }
+
+    llvm::errs() << "ITR: deferred processing complete\n";
+  }
 
   return ever_changed ? llvm::PreservedAnalyses::none()
                       : llvm::PreservedAnalyses::all();
