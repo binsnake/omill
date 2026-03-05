@@ -1,14 +1,23 @@
 #pragma once
 
 #include <functional>
+#include <string>
 
 #include <llvm/Analysis/AliasAnalysis.h>
 #include <llvm/IR/PassManager.h>
+
+#include "omill/Arch/ArchABI.h"
 
 namespace omill {
 
 /// Configuration for the omill optimization pipeline.
 struct PipelineOptions {
+  /// Target architecture (default: x86_64).
+  TargetArch target_arch = TargetArch::kX86_64;
+
+  /// Target OS name (default: "windows").
+  std::string target_os = "windows";
+
   /// Stage 2: Lower remill intrinsics to native LLVM operations.
   bool lower_intrinsics = true;
 

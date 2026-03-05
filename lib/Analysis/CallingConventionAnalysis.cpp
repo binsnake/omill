@@ -10,6 +10,8 @@
 
 #include <algorithm>
 
+#include "omill/Analysis/TargetArchAnalysis.h"
+#include "omill/Arch/ArchABI.h"
 #include "omill/Utils/LiftedNames.h"
 #include "omill/Utils/StateFieldMap.h"
 
@@ -382,6 +384,125 @@ FunctionABI analyzeFunction(llvm::Function &F, const llvm::DataLayout &DL,
   return abi;
 }
 
+/// Analyze a lifted function assuming AAPCS64 calling convention.
+/// Uses the ArchABI descriptor for register names and conventions.
+FunctionABI analyzeFunctionAAPCS64(llvm::Function &F,
+                                    const llvm::DataLayout &DL,
+                                    const StateFieldMap &field_map,
+                                    const ArchABI &arch_abi) {
+  FunctionABI abi;
+
+  if (F.isDeclaration() || F.empty()) return abi;
+  if (F.arg_size() == 0) return abi;
+
+  llvm::DenseSet<unsigned> live_in, live_out, entry_live_in;
+  computeLiveness(F, DL, live_in, live_out, entry_live_in);
+
+  // Score: count consecutive AAPCS64 parameter registers that are live-in.
+  unsigned matched = 0;
+  for (unsigned i = 0; i < arch_abi.param_regs.size(); ++i) {
+    auto field = field_map.fieldByName(arch_abi.param_regs[i]);
+    if (!field) break;
+    if (entry_live_in.count(field->offset)) {
+      matched++;
+    } else {
+      break;
+    }
+  }
+
+  abi.cc = DetectedCC::kAAPCS64;
+
+  // Build parameter list.  If no params detected, default to all 8.
+  unsigned param_count = matched > 0
+      ? matched
+      : static_cast<unsigned>(arch_abi.param_regs.size());
+  for (unsigned i = 0; i < param_count; ++i) {
+    auto field = field_map.fieldByName(arch_abi.param_regs[i]);
+    if (!field) break;
+    RecoveredParam param;
+    param.reg_name = arch_abi.param_regs[i];
+    param.state_offset = field->offset;
+    param.size = field->size;
+    param.index = i;
+    abi.params.push_back(param);
+  }
+
+  // Return value: X0 for integer.
+  auto ret_field = field_map.fieldByName(arch_abi.return_reg);
+  if (ret_field && live_out.count(ret_field->offset)) {
+    RecoveredReturn ret;
+    ret.reg_name = arch_abi.return_reg;
+    ret.state_offset = ret_field->offset;
+    ret.size = ret_field->size;
+    ret.is_vector = false;
+    abi.ret = ret;
+  } else {
+    // V0 return for FP.
+    auto vec_ret = field_map.fieldByName(arch_abi.vec_return_reg);
+    if (vec_ret && live_out.count(vec_ret->offset)) {
+      RecoveredReturn ret;
+      ret.reg_name = arch_abi.vec_return_reg;
+      ret.state_offset = vec_ret->offset;
+      ret.size = 16;
+      ret.is_vector = true;
+      abi.ret = ret;
+    }
+  }
+
+  // Detect vector live-ins (D0-D7 / V0-V7).
+  // AAPCS64 uses independent counters for GPR and FP params (not positional).
+  for (unsigned i = 0; i < arch_abi.max_vec_params; ++i) {
+    if (i >= arch_abi.fp_param_regs.size()) break;
+    auto field = field_map.fieldByName(arch_abi.fp_param_regs[i]);
+    if (!field) continue;
+    if (live_in.count(field->offset)) {
+      abi.xmm_live_ins.push_back(field->offset);
+      abi.has_non_standard_regs = true;
+    }
+  }
+  llvm::sort(abi.xmm_live_ins);
+
+  // Extra GPR live-ins: volatile scratch beyond param regs.
+  {
+    llvm::DenseSet<unsigned> excluded_offsets;
+    for (auto &p : abi.params)
+      excluded_offsets.insert(p.state_offset);
+    // Exclude SP, PC, and volatile scratch.
+    for (const auto &name : arch_abi.volatile_scratch) {
+      auto field = field_map.fieldByName(name);
+      if (field) excluded_offsets.insert(field->offset);
+    }
+    auto sp = field_map.fieldByName(arch_abi.stack_pointer);
+    if (sp) excluded_offsets.insert(sp->offset);
+    auto pc = field_map.fieldByName(arch_abi.program_counter);
+    if (pc) excluded_offsets.insert(pc->offset);
+
+    for (auto off : live_in) {
+      if (excluded_offsets.count(off)) continue;
+      auto field = field_map.fieldAtOffset(off);
+      if (field && field->category == StateFieldCategory::kGPR &&
+          field->size == 8) {
+        abi.extra_gpr_live_ins.push_back(off);
+        abi.has_non_standard_regs = true;
+      }
+    }
+    llvm::sort(abi.extra_gpr_live_ins);
+  }
+
+  // Callee-saved clobber detection.
+  for (const auto &name : arch_abi.callee_saved) {
+    auto field = field_map.fieldByName(name);
+    if (field && live_out.count(field->offset)) {
+      abi.clobbered_callee_saved.push_back(name);
+      abi.extra_gpr_live_outs.push_back(field->offset);
+    }
+  }
+
+  abi.shadow_space_size = arch_abi.shadow_space;
+
+  return abi;
+}
+
 }  // namespace
 
 /// Propagate callee XMM live-ins to callers.
@@ -726,11 +847,17 @@ CallingConventionInfo CallingConventionAnalysis::run(
   CallingConventionInfo result;
   auto &DL = M.getDataLayout();
   StateFieldMap field_map(M);
+  auto &arch_abi = MAM.getResult<TargetArchAnalysis>(M);
 
   for (auto &F : M) {
     if (!isLiftedFunction(F)) continue;
 
-    result.function_abis[&F] = analyzeFunction(F, DL, field_map);
+    if (arch_abi.arch == TargetArch::kAArch64) {
+      result.function_abis[&F] =
+          analyzeFunctionAAPCS64(F, DL, field_map, arch_abi);
+    } else {
+      result.function_abis[&F] = analyzeFunction(F, DL, field_map);
+    }
   }
 
   // Propagate callee XMM live-ins to callers (transitive closure).

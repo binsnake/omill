@@ -119,12 +119,12 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
                           llvm::MaybeAlign(16));
   }
 
-  // Seed a synthetic native stack so lifted prologues don't run with RSP=0.
-  // Keeping RSP as a dynamic pointer avoids constant-folding stack math into
+  // Seed a synthetic native stack so lifted prologues don't run with SP=0.
+  // Keeping SP as a dynamic pointer avoids constant-folding stack math into
   // degenerate infinite loops in flattened dispatchers.
   constexpr uint64_t kSyntheticStackSize = 1ull << 16;  // 64 KiB
-  // Extra room above RSP for caller-frame reads (e.g. RSP+456 in
-  // sub_1402d4b7e).  Without this, positive RSP-relative loads fall
+  // Extra room above SP for caller-frame reads (e.g. RSP+456 in
+  // sub_1402d4b7e).  Without this, positive SP-relative loads fall
   // outside the alloca → OOB UB → optimizer folds body to unreachable.
   constexpr uint64_t kCallerFrameRoom = 0x1000;  // 4 KiB
   constexpr uint64_t kTotalStackSize = kSyntheticStackSize + kCallerFrameRoom;
@@ -139,13 +139,21 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
   auto *stack_top = Builder.CreateConstGEP1_64(
       Builder.getInt8Ty(), stack_alloca, kSyntheticStackSize - 0x20);
   auto *stack_top_i64 = Builder.CreatePtrToInt(stack_top, Builder.getInt64Ty());
-  if (auto rsp = field_map.fieldByName("RSP"); rsp.has_value()) {
-    auto *rsp_ptr = buildStateGEP(Builder, state_alloca, rsp->offset);
-    Builder.CreateStore(stack_top_i64, rsp_ptr);
+  // Seed the stack pointer register (RSP for x86-64, SP for AArch64).
+  for (const char *sp_name : {"RSP", "SP"}) {
+    if (auto sp = field_map.fieldByName(sp_name); sp.has_value()) {
+      auto *sp_ptr = buildStateGEP(Builder, state_alloca, sp->offset);
+      Builder.CreateStore(stack_top_i64, sp_ptr);
+      break;
+    }
   }
-  if (auto rbp = field_map.fieldByName("RBP"); rbp.has_value()) {
-    auto *rbp_ptr = buildStateGEP(Builder, state_alloca, rbp->offset);
-    Builder.CreateStore(stack_top_i64, rbp_ptr);
+  // Seed the frame pointer register (RBP for x86-64, FP/X29 for AArch64).
+  for (const char *fp_name : {"RBP", "FP", "X29"}) {
+    if (auto fp = field_map.fieldByName(fp_name); fp.has_value()) {
+      auto *fp_ptr = buildStateGEP(Builder, state_alloca, fp->offset);
+      Builder.CreateStore(stack_top_i64, fp_ptr);
+      break;
+    }
   }
 
   // Store GPR parameters into State fields.
@@ -158,8 +166,11 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
 
   // Store stack-passed parameters to the caller's stack area.
   // In the native wrapper, we need to store them at the appropriate
-  // RSP-relative offsets so the lifted function can read them.
-  if (auto rsp = field_map.fieldByName("RSP"); rsp.has_value()) {
+  // SP-relative offsets so the lifted function can read them.
+  auto sp_field = field_map.fieldByName("RSP");
+  if (!sp_field) sp_field = field_map.fieldByName("SP");
+  if (sp_field.has_value()) {
+    auto rsp = sp_field;
     for (unsigned i = 0; i < abi.numStackParams(); ++i) {
       unsigned arg_idx = abi.numParams() + i;
       auto *param = native_fn->getArg(arg_idx);

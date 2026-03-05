@@ -458,6 +458,10 @@ enum SyncHyperCallID : uint32_t {
   kX86SysCall = 284,
   kX86SysEnter = 285,
   kX86SysExit = 286,
+
+  // AArch64 sync hypercalls.
+  kAArch64EmulateInstruction = 0x200,
+  kAArch64Breakpoint = 0x201,
 };
 
 enum StateFieldOffset : uint64_t {
@@ -798,6 +802,11 @@ void lowerSyncHyperCall(llvm::CallInst *CI) {
     case kX86SysExit:
       emitBarePrivilegedInsn(CI, "sysexit");
       break;
+    // AArch64: emulate instruction and breakpoint are NOP for recompilation.
+    case kAArch64EmulateInstruction:
+    case kAArch64Breakpoint:
+      emitNopHyperCall(CI);
+      break;
     default:
       emitGenericSyncStub(CI);
       break;
@@ -931,8 +940,16 @@ void lowerAsyncHyperCall(llvm::CallInst *CI) {
       is_noreturn = true;
       break;
     }
+    case 12: {  // kAArch64SupervisorCall — SVC #imm
+      std::string asm_str = "svc #" + std::to_string(vector);
+      auto *IA = llvm::InlineAsm::get(void_fn_ty, asm_str, "",
+                                      /*hasSideEffects=*/true);
+      Builder.CreateCall(IA);
+      is_noreturn = true;
+      break;
+    }
     default: {
-      // Unknown async hyper call — emit ud2.
+      // Unknown async hyper call — emit ud2 (x86) or brk (AArch64).
       auto *IA = llvm::InlineAsm::get(void_fn_ty, "ud2", "",
                                       /*hasSideEffects=*/true);
       Builder.CreateCall(IA);

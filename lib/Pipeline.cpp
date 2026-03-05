@@ -94,6 +94,7 @@
 #include "omill/Passes/EliminateDeadTraceCounters.h"
 #include "omill/Passes/MergeBytePhis.h"
 #include "omill/Passes/RecoverAllocaPointers.h"
+#include "omill/Analysis/TargetArchAnalysis.h"
 
 namespace omill {
 
@@ -1274,6 +1275,25 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   PhaseMarkerPass::origin() = PhaseMarkerPass::Clock::now();
   addPhaseMarker(MPM, "Phase 0: start");
 
+  // Stamp target architecture metadata so downstream analyses can query it.
+  {
+    auto arch = opts.target_arch;
+    auto os = opts.target_os;
+    struct StampTargetArchPass : llvm::PassInfoMixin<StampTargetArchPass> {
+      TargetArch arch;
+      std::string os;
+      StampTargetArchPass(TargetArch a, std::string o)
+          : arch(a), os(std::move(o)) {}
+      llvm::PreservedAnalyses run(llvm::Module &M,
+                                  llvm::ModuleAnalysisManager &) {
+        setTargetArchMetadata(M, arch, os);
+        return llvm::PreservedAnalyses::all();
+      }
+      static llvm::StringRef name() { return "StampTargetArchPass"; }
+    };
+    MPM.addPass(StampTargetArchPass(arch, os));
+  }
+
   // Phase 0: Strip remill intrinsic bodies to prevent AlwaysInlinerPass from
   // inlining them via call-site alwaysinline attributes.  Their bodies contain
   // switch/unreachable patterns that poison the entire function's control flow.
@@ -2272,6 +2292,7 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
 }
 
 void registerModuleAnalyses(llvm::ModuleAnalysisManager &MAM) {
+  MAM.registerPass([&] { return TargetArchAnalysis(); });
   MAM.registerPass([&] { return CallGraphAnalysis(); });
   MAM.registerPass([&] { return CallingConventionAnalysis(); });
   MAM.registerPass([&] { return BinaryMemoryAnalysis(); });

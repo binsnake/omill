@@ -13,7 +13,7 @@ namespace {
 
 // Map common State sub-struct/field names to categories.
 StateFieldCategory categorizeFieldName(llvm::StringRef name) {
-  // GPRs
+  // --- x86-64 GPRs ---
   if (name == "RAX" || name == "RBX" || name == "RCX" || name == "RDX" ||
       name == "RSI" || name == "RDI" || name == "RSP" || name == "RBP" ||
       name == "R8" || name == "R9" || name == "R10" || name == "R11" ||
@@ -22,16 +22,47 @@ StateFieldCategory categorizeFieldName(llvm::StringRef name) {
     return StateFieldCategory::kGPR;
   }
 
-  // Flags
+  // --- AArch64 GPRs ---
+  // X0-X30, SP, PC, FP (X29), LR (X30)
+  if (name == "SP" || name == "PC" || name == "FP" || name == "LR") {
+    return StateFieldCategory::kGPR;
+  }
+  if (name.size() >= 2 && name.size() <= 3 && name[0] == 'X') {
+    unsigned reg_num = 0;
+    if (!name.drop_front(1).getAsInteger(10, reg_num) && reg_num <= 30)
+      return StateFieldCategory::kGPR;
+  }
+  // W0-W30 (32-bit sub-registers)
+  if (name.size() >= 2 && name.size() <= 3 && name[0] == 'W') {
+    unsigned reg_num = 0;
+    if (!name.drop_front(1).getAsInteger(10, reg_num) && reg_num <= 30)
+      return StateFieldCategory::kGPR;
+  }
+
+  // --- x86-64 Flags ---
   if (name == "CF" || name == "PF" || name == "AF" || name == "ZF" ||
       name == "SF" || name == "DF" || name == "OF") {
     return StateFieldCategory::kFlag;
   }
 
-  // Vector registers
+  // --- AArch64 Flags (NZCV) ---
+  if (name == "N" || name == "Z" || name == "C" || name == "V") {
+    return StateFieldCategory::kFlag;
+  }
+
+  // --- x86-64 Vector registers ---
   if (name.starts_with("XMM") || name.starts_with("YMM") ||
       name.starts_with("ZMM")) {
     return StateFieldCategory::kVector;
+  }
+
+  // --- AArch64 Vector registers (V0-V31 / Q0-Q31 / D0-D31 / S0-S31) ---
+  if (name.size() >= 2 && name.size() <= 3 &&
+      (name[0] == 'V' || name[0] == 'Q' || name[0] == 'D' ||
+       name[0] == 'S')) {
+    unsigned reg_num = 0;
+    if (!name.drop_front(1).getAsInteger(10, reg_num) && reg_num <= 31)
+      return StateFieldCategory::kVector;
   }
 
   // MMX
@@ -39,15 +70,20 @@ StateFieldCategory categorizeFieldName(llvm::StringRef name) {
     return StateFieldCategory::kMMX;
   }
 
-  // Segment selectors
+  // Segment selectors (x86-64)
   if (name == "CS" || name == "DS" || name == "ES" || name == "FS" ||
       name == "GS" || name == "SS") {
     return StateFieldCategory::kSegment;
   }
 
-  // FPU
+  // FPU (x86-64)
   if (name.starts_with("ST") || name.starts_with("FPU") ||
       name.starts_with("FXSAVE")) {
+    return StateFieldCategory::kFPU;
+  }
+
+  // AArch64 FPU control/status
+  if (name == "FPCR" || name == "FPSR") {
     return StateFieldCategory::kFPU;
   }
 

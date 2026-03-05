@@ -1,10 +1,15 @@
 add_library(omill STATIC
+  # Arch
+  Arch/ArchABI.cpp
+
   # Utils
   Utils/IntrinsicTable.cpp
   Utils/LiftedNames.cpp
   Utils/StateFieldMap.cpp
+  Tools/LiftRunContract.cpp
 
   # Analysis
+  Analysis/TargetArchAnalysis.cpp
   Analysis/CallGraphAnalysis.cpp
   Analysis/LiftedFunctionMap.cpp
   Analysis/RemillIntrinsicAnalysis.cpp

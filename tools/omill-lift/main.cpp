@@ -4,14 +4,20 @@
 #include <llvm/IR/PassTimingInfo.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/BinaryFormat/COFF.h>
+#include <llvm/BinaryFormat/Magic.h>
+#include <llvm/BinaryFormat/MachO.h>
 #include <llvm/Linker/Linker.h>
 #include <llvm/Object/COFF.h>
+#include <llvm/Object/MachO.h>
+#include <llvm/Object/MachOUniversal.h>
+#include <llvm/Object/ObjectFile.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Passes/StandardInstrumentations.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/InitLLVM.h>
 #include <llvm/Support/MemoryBuffer.h>
+#include <llvm/Support/Process.h>
 #include <llvm/Support/ToolOutputFile.h>
 #include <llvm/Support/JSON.h>
 #include <llvm/Support/raw_ostream.h>
@@ -30,6 +36,7 @@
 #include <llvm/Support/Win64EH.h>
 
 #include "omill/Support/MemoryLimit.h"
+#include "omill/Arch/ArchABI.h"
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/CallingConventionAnalysis.h"
 #include "omill/Analysis/CallGraphAnalysis.h"
@@ -37,10 +44,13 @@
 #include "omill/Analysis/LiftedFunctionMap.h"
 #include "omill/Analysis/VMHandlerGraph.h"
 #include "omill/Omill.h"
+#include "omill/Tools/LiftRunContract.h"
 
 #include <algorithm>
+#include <chrono>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <vector>
 
 using namespace llvm;
@@ -96,7 +106,7 @@ static void repairMalformedPHIs(Module &M) {
 }
 
 static cl::opt<std::string> InputFilename(cl::Positional,
-                                           cl::desc("<input PE file>"),
+                                           cl::desc("<input binary (PE/Mach-O)>"),
                                            cl::Required);
 
 static cl::opt<std::string> FuncVA("va",
@@ -215,7 +225,143 @@ static cl::opt<unsigned> MinFuncSize(
     cl::desc("Minimum function size in bytes for scan/deobf (default: 64)"),
     cl::init(64));
 
+static cl::opt<std::string> EventJSONL(
+    "event-jsonl",
+    cl::desc("Emit structured run events as JSONL to file path or '-'"),
+    cl::init(""));
+
+static cl::opt<std::string> EventDetail(
+    "event-detail",
+    cl::desc("Event granularity: basic|detailed"),
+    cl::init("basic"));
+
 namespace {
+
+class LiftEventLogger {
+ public:
+  using EventKV = llvm::json::Object::KV;
+
+  LiftEventLogger() = default;
+
+  bool init(llvm::StringRef sink_path, llvm::StringRef detail_text,
+            llvm::StringRef input_file) {
+    if (sink_path.empty()) {
+      enabled_ = false;
+      return true;
+    }
+    auto parsed = omill::tools::parseEventDetailLevel(detail_text);
+    if (!parsed) {
+      errs() << "Invalid --event-detail: " << detail_text
+             << " (expected basic|detailed)\n";
+      return false;
+    }
+    detail_ = *parsed;
+    enabled_ = true;
+    run_id_ = buildRunId(input_file);
+
+    if (sink_path == "-") {
+      os_ = &outs();
+      return true;
+    }
+
+    std::error_code ec;
+    file_ = std::make_unique<raw_fd_ostream>(sink_path, ec, sys::fs::OF_Text);
+    if (ec) {
+      errs() << "Error opening --event-jsonl output '" << sink_path
+             << "': " << ec.message() << "\n";
+      return false;
+    }
+    os_ = file_.get();
+    return true;
+  }
+
+  bool enabled() const { return enabled_; }
+  bool detailed() const { return detail_ == omill::tools::EventDetailLevel::kDetailed; }
+  llvm::StringRef runId() const { return run_id_; }
+
+  void emit(llvm::StringRef kind, llvm::StringRef severity,
+            llvm::StringRef message = "",
+            llvm::json::Object payload = {}) {
+    if (!enabled_ || !os_)
+      return;
+    omill::tools::LiftRunEvent event;
+    event.run_id = run_id_;
+    event.seq = ++seq_;
+    event.timestamp_ms = nowMs();
+    event.kind = kind.str();
+    event.severity = severity.str();
+    event.message = message.str();
+    event.payload = std::move(payload);
+    *os_ << llvm::json::Value(omill::tools::toJSON(event)) << "\n";
+    os_->flush();
+  }
+
+  void emitInfo(llvm::StringRef kind, llvm::StringRef message = "",
+                llvm::json::Object payload = {}) {
+    emit(kind, "info", message, std::move(payload));
+  }
+  void emitInfo(llvm::StringRef kind, llvm::StringRef message,
+                std::initializer_list<EventKV> payload) {
+    emit(kind, "info", message, llvm::json::Object(payload));
+  }
+
+  void emitWarn(llvm::StringRef kind, llvm::StringRef message = "",
+                llvm::json::Object payload = {}) {
+    emit(kind, "warning", message, std::move(payload));
+  }
+  void emitWarn(llvm::StringRef kind, llvm::StringRef message,
+                std::initializer_list<EventKV> payload) {
+    emit(kind, "warning", message, llvm::json::Object(payload));
+  }
+
+  void emitError(llvm::StringRef kind, llvm::StringRef message = "",
+                 llvm::json::Object payload = {}) {
+    emit(kind, "error", message, std::move(payload));
+  }
+  void emitError(llvm::StringRef kind, llvm::StringRef message,
+                 std::initializer_list<EventKV> payload) {
+    emit(kind, "error", message, llvm::json::Object(payload));
+  }
+
+  void emitTerminalSuccess(llvm::StringRef output_file) {
+    llvm::json::Object payload;
+    payload["status"] = "success";
+    payload["output_file"] = output_file;
+    emitInfo("run_done", "completed", std::move(payload));
+  }
+
+  void emitTerminalFailure(int exit_code, llvm::StringRef reason) {
+    llvm::json::Object payload;
+    payload["status"] = "failed";
+    payload["exit_code"] = exit_code;
+    payload["reason"] = reason;
+    emitError("run_done", "failed", std::move(payload));
+  }
+
+ private:
+  static int64_t nowMs() {
+    auto now = std::chrono::system_clock::now().time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+  }
+
+  static std::string buildRunId(llvm::StringRef input_file) {
+    auto ms = nowMs();
+    uint64_t pid = static_cast<uint64_t>(llvm::sys::Process::getProcessId());
+    std::string basename = input_file.str();
+    size_t slash = basename.find_last_of("/\\");
+    if (slash != std::string::npos)
+      basename = basename.substr(slash + 1);
+    return ("run_" + std::to_string(ms) + "_" + std::to_string(pid) +
+            "_" + basename);
+  }
+
+  bool enabled_ = false;
+  omill::tools::EventDetailLevel detail_ = omill::tools::EventDetailLevel::kBasic;
+  std::string run_id_;
+  uint64_t seq_ = 0;
+  raw_ostream *os_ = nullptr;
+  std::unique_ptr<raw_fd_ostream> file_;
+};
 
 /// In-memory trace manager for remill lifting.
 class BufferTraceManager : public omill::TraceManager {
@@ -528,6 +674,170 @@ bool loadPE(StringRef path, PEInfo &out) {
   return true;
 }
 
+/// Helper: parse sections, imports, and relocations from a MachOObjectFile.
+static void parseMachOContents(object::MachOObjectFile &macho,
+                                PEInfo &out) {
+  // Use __TEXT segment vmaddr as image base.
+  uint64_t text_vmaddr = 0;
+  uint64_t max_addr = 0;
+  for (const auto &cmd : macho.load_commands()) {
+    if (cmd.C.cmd == MachO::LC_SEGMENT_64) {
+      auto seg = macho.getSegment64LoadCommand(cmd);
+      StringRef seg_name(seg.segname, strnlen(seg.segname, 16));
+      uint64_t end = seg.vmaddr + seg.vmsize;
+      if (end > max_addr) max_addr = end;
+      if (seg_name == "__TEXT" && text_vmaddr == 0)
+        text_vmaddr = seg.vmaddr;
+    }
+  }
+  out.image_base = text_vmaddr;
+  out.memory_map.setImageBase(text_vmaddr);
+  out.memory_map.setImageSize(
+      max_addr > text_vmaddr ? max_addr - text_vmaddr : 0);
+
+  // Parse sections.
+  for (const auto &sec : macho.sections()) {
+    auto contents_or = sec.getContents();
+    if (!contents_or) { consumeError(contents_or.takeError()); continue; }
+    StringRef contents = *contents_or;
+    uint64_t va = sec.getAddress();
+    size_t idx = out.section_storage.size();
+    out.section_storage.emplace_back(
+        reinterpret_cast<const uint8_t *>(contents.data()),
+        reinterpret_cast<const uint8_t *>(contents.data()) + contents.size());
+    auto &stored = out.section_storage.back();
+    out.memory_map.addRegion(va, stored.data(), stored.size());
+
+    auto name_or = sec.getName();
+    auto seg_name =
+        macho.getSectionFinalSegmentName(sec.getRawDataRefImpl());
+    if (name_or && seg_name == "__TEXT" &&
+        (*name_or == "__text" || *name_or == "__stubs")) {
+      out.code_sections.push_back({va, stored.size(), idx});
+    }
+  }
+
+  // Parse imports from bind opcodes.
+  // The ordinal maps to a library index via getLibraryShortNameByIndex().
+  {
+    Error err = Error::success();
+    for (const auto &entry : macho.bindTable(err)) {
+      uint64_t addr = entry.address();
+      StringRef sym = entry.symbolName();
+      if (sym.starts_with("_")) sym = sym.drop_front(1);
+      StringRef lib_name;
+      int ord = entry.ordinal();
+      if (ord > 0)
+        macho.getLibraryShortNameByIndex(ord - 1, lib_name);
+      out.memory_map.addImport(addr, lib_name.str(), sym.str());
+    }
+    if (err) consumeError(std::move(err));
+  }
+  {
+    Error err = Error::success();
+    for (const auto &entry : macho.lazyBindTable(err)) {
+      uint64_t addr = entry.address();
+      StringRef sym = entry.symbolName();
+      if (sym.starts_with("_")) sym = sym.drop_front(1);
+      StringRef lib_name;
+      int ord = entry.ordinal();
+      if (ord > 0)
+        macho.getLibraryShortNameByIndex(ord - 1, lib_name);
+      out.memory_map.addImport(addr, lib_name.str(), sym.str());
+    }
+    if (err) consumeError(std::move(err));
+  }
+
+  // Parse relocations from rebase opcodes.
+  {
+    Error err = Error::success();
+    for (const auto &entry : macho.rebaseTable(err)) {
+      out.memory_map.addRelocation(entry.address(), 8);
+    }
+    if (err) consumeError(std::move(err));
+  }
+  out.memory_map.finalizeRelocations();
+}
+
+/// Load a Mach-O binary (or extract arm64/x86_64 slice from a fat binary).
+/// Populates the PEInfo struct with code sections, imports, and relocations.
+/// Returns the detected remill arch name.
+bool loadMachO(StringRef path, PEInfo &out,
+               remill::ArchName &out_arch, remill::OSName &out_os) {
+  auto buf_or_err = MemoryBuffer::getFile(path);
+  if (!buf_or_err) {
+    errs() << "Cannot open " << path << ": "
+           << buf_or_err.getError().message() << "\n";
+    return false;
+  }
+
+  MemoryBufferRef mbr = (*buf_or_err)->getMemBufferRef();
+  auto magic = identify_magic(mbr.getBuffer());
+
+  // Handle fat/universal binaries — prefer arm64, fall back to x86_64.
+  if (magic == file_magic::macho_universal_binary) {
+    auto uni_or = object::MachOUniversalBinary::create(mbr);
+    if (!uni_or) {
+      errs() << "Invalid fat binary: " << toString(uni_or.takeError()) << "\n";
+      return false;
+    }
+    auto &uni = **uni_or;
+
+    const object::MachOUniversalBinary::ObjectForArch *arm64_slice = nullptr;
+    const object::MachOUniversalBinary::ObjectForArch *x64_slice = nullptr;
+    for (const auto &obj : uni.objects()) {
+      if (obj.getCPUType() == MachO::CPU_TYPE_ARM64)
+        arm64_slice = &obj;
+      else if (obj.getCPUType() == MachO::CPU_TYPE_X86_64)
+        x64_slice = &obj;
+    }
+    auto *chosen = arm64_slice ? arm64_slice : x64_slice;
+    if (!chosen) {
+      errs() << "Fat binary has no arm64 or x86_64 slice\n";
+      return false;
+    }
+    auto obj_or = chosen->getAsObjectFile();
+    if (!obj_or) {
+      errs() << "Cannot extract slice: " << toString(obj_or.takeError()) << "\n";
+      return false;
+    }
+    auto &macho = **obj_or;
+
+    if (chosen == arm64_slice) {
+      out_arch = remill::kArchAArch64LittleEndian;
+    } else {
+      out_arch = remill::kArchAMD64_AVX;
+    }
+    out_os = remill::kOSmacOS;
+
+    parseMachOContents(macho, out);
+    return true;
+  }
+
+  // Non-fat Mach-O: use ObjectFile factory for automatic parsing.
+  auto obj_or = object::ObjectFile::createMachOObjectFile(mbr);
+  if (!obj_or) {
+    errs() << "Not a valid Mach-O: " << toString(obj_or.takeError()) << "\n";
+    return false;
+  }
+  auto &macho = *llvm::cast<object::MachOObjectFile>(obj_or->get());
+
+  // Detect architecture from header.
+  auto header = macho.getHeader();
+  if (header.cputype == MachO::CPU_TYPE_ARM64) {
+    out_arch = remill::kArchAArch64LittleEndian;
+  } else if (header.cputype == MachO::CPU_TYPE_X86_64) {
+    out_arch = remill::kArchAMD64_AVX;
+  } else {
+    errs() << "Unsupported Mach-O CPU type: " << header.cputype << "\n";
+    return false;
+  }
+  out_os = remill::kOSmacOS;
+
+  parseMachOContents(macho, out);
+  return true;
+}
+
 struct ScanResult {
   uint64_t va;
   uint32_t size;
@@ -701,7 +1011,19 @@ int main(int argc, char **argv) {
   omill::setProcessMemoryLimit(32ULL * 1024 * 1024 * 1024);  // 32 GB
   InitLLVM X(argc, argv);
   cl::ParseCommandLineOptions(argc, argv,
-      "omill-lift: Lift a function from a PE binary and optimize\n");
+      "omill-lift: Lift a function from a PE/Mach-O binary and optimize\n");
+
+  LiftEventLogger events;
+  if (!events.init(EventJSONL, EventDetail, InputFilename))
+    return 1;
+  events.emitInfo("run_started", "omill-lift started",
+                  {{"input", InputFilename}});
+
+  auto fail = [&](int code, StringRef reason) -> int {
+    events.emitError("run_error", reason);
+    events.emitTerminalFailure(code, reason);
+    return code;
+  };
 
   // Check for batch/scan modes that don't require --va.
   bool batch_mode = (ScanSection.getNumOccurrences() > 0 ||
@@ -721,11 +1043,11 @@ int main(int argc, char **argv) {
     func_va = BaseAddress;
   } else if (!batch_mode) {
     errs() << "--va is required for PE mode\n";
-    return 1;
+    return fail(1, "--va is required for PE mode");
   }
   if (func_va == 0 && !RawBinary && !batch_mode) {
     errs() << "Invalid VA: " << FuncVA << "\n";
-    return 1;
+    return fail(1, "invalid --va value");
   }
   if (func_va != 0)
     errs() << "Lifting function at VA 0x" << Twine::utohexstr(func_va) << "\n";
@@ -750,18 +1072,27 @@ int main(int argc, char **argv) {
   if (vm_mode) {
     errs() << "VM mode: vmenter=0x" << Twine::utohexstr(vm_entry_va)
            << " vmexit=0x" << Twine::utohexstr(vm_exit_va) << "\n";
+    events.emitInfo("vm_mode",
+                    "vm devirtualization mode enabled",
+                    {{"vm_entry", ("0x" + Twine::utohexstr(vm_entry_va)).str()},
+                     {"vm_exit", ("0x" + Twine::utohexstr(vm_exit_va)).str()}});
   }
 
-  // --- Raw binary mode ---
+  // --- Binary loading with format auto-detection ---
   PEInfo pe;
   std::vector<uint8_t> raw_code;
+  remill::ArchName detected_arch = remill::kArchAMD64_AVX;
+  remill::OSName detected_os = remill::kOSWindows;
+  omill::TargetArch target_arch = omill::TargetArch::kX86_64;
+  std::string target_os_str = "windows";
+  events.emitInfo("input_load_started", "loading input");
 
   if (RawBinary) {
     auto buf_or_err = MemoryBuffer::getFile(InputFilename);
     if (!buf_or_err) {
       errs() << "Cannot open " << InputFilename << ": "
              << buf_or_err.getError().message() << "\n";
-      return 1;
+      return fail(1, "cannot open raw input file");
     }
     auto &buf = *buf_or_err;
     raw_code.assign(
@@ -769,22 +1100,68 @@ int main(int argc, char **argv) {
         reinterpret_cast<const uint8_t *>(buf->getBufferEnd()));
     errs() << "Loaded raw binary: " << raw_code.size()
            << " bytes at base 0x" << Twine::utohexstr(BaseAddress) << "\n";
+    detected_os = remill::kOSLinux;
+    target_os_str = "linux";
+    events.emitInfo("input_load_completed", "raw input loaded",
+                    {{"mode", "raw"},
+                     {"bytes", static_cast<int64_t>(raw_code.size())},
+                     {"base", ("0x" + Twine::utohexstr(BaseAddress)).str()}});
   } else {
-    // Load PE
-    if (!loadPE(InputFilename, pe)) return 1;
-    errs() << "Loaded PE: image_base=0x" << Twine::utohexstr(pe.image_base)
-           << " code_sections=" << pe.code_sections.size() << "\n";
+    // Auto-detect binary format by peeking at the magic bytes.
+    bool is_macho = false;
+    {
+      auto probe_buf = MemoryBuffer::getFile(InputFilename);
+      if (!probe_buf) {
+        errs() << "Cannot open " << InputFilename << "\n";
+        return fail(1, "cannot open input file");
+      }
+      auto magic = identify_magic((*probe_buf)->getBuffer());
+      is_macho = (magic == file_magic::macho_object ||
+                  magic == file_magic::macho_executable ||
+                  magic == file_magic::macho_dynamically_linked_shared_lib ||
+                  magic == file_magic::macho_bundle ||
+                  magic == file_magic::macho_universal_binary);
+    }
+
+    if (is_macho) {
+      if (!loadMachO(InputFilename, pe, detected_arch, detected_os))
+        return fail(1, "failed to load Mach-O input");
+      if (detected_arch == remill::kArchAArch64LittleEndian) {
+        target_arch = omill::TargetArch::kAArch64;
+        target_os_str = "darwin";
+      } else {
+        target_arch = omill::TargetArch::kX86_64;
+        target_os_str = "darwin";
+      }
+      errs() << "Loaded Mach-O: image_base=0x"
+             << Twine::utohexstr(pe.image_base)
+             << " code_sections=" << pe.code_sections.size()
+             << " arch=" << (target_arch == omill::TargetArch::kAArch64
+                                 ? "aarch64" : "x86_64") << "\n";
+    } else {
+      // Default: PE/COFF
+      if (!loadPE(InputFilename, pe))
+        return fail(1, "failed to load PE input");
+      errs() << "Loaded PE: image_base=0x" << Twine::utohexstr(pe.image_base)
+             << " code_sections=" << pe.code_sections.size() << "\n";
+    }
     for (const auto &cs : pe.code_sections) {
       errs() << "  code: 0x" << Twine::utohexstr(cs.va)
              << " (" << cs.size << " bytes)\n";
     }
     if (pe.code_sections.empty()) {
       errs() << "No executable sections found in PE\n";
-      return 1;
+      return fail(1, "no executable sections found");
     }
+    events.emitInfo("input_load_completed", "pe input loaded",
+                    {{"mode", "pe"},
+                     {"image_base", ("0x" + Twine::utohexstr(pe.image_base)).str()},
+                     {"code_sections", static_cast<int64_t>(pe.code_sections.size())}});
 
     // --scan-section: classify functions and output JSON, then exit.
     if (ScanSection.getNumOccurrences() > 0) {
+      events.emitInfo("scan_started", "scan-section started",
+                      {{"section", ScanSection}});
       auto results = scanSection(ScanSection, pe);
       // Filter by minimum size unless --scan-all.
       if (!ScanAll) {
@@ -807,10 +1184,16 @@ int main(int argc, char **argv) {
         if (ec) {
           errs() << "Error opening " << ScanOutput << ": "
                  << ec.message() << "\n";
-          return 1;
+          return fail(1, "scan-output open failed");
         }
         writeScanJSON(results, InputFilename, pe.image_base, ScanSection, out);
       }
+      events.emitInfo("scan_completed", "scan-section completed",
+                      {{"section", ScanSection},
+                       {"function_count", static_cast<int64_t>(results.size())}});
+      events.emitTerminalSuccess(ScanOutput == "-"
+                                     ? StringRef("<stdout>")
+                                     : StringRef(ScanOutput));
       return 0;
     }
   }
@@ -821,11 +1204,14 @@ int main(int argc, char **argv) {
     batch_vas = parseDeobfTargets(DeobfTargets);
     if (batch_vas.empty()) {
       errs() << "No valid VAs in " << DeobfTargets << "\n";
-      return 1;
+      return fail(1, "no valid VAs in --deobf-targets");
     }
     errs() << "Batch mode: " << batch_vas.size()
            << " targets from " << DeobfTargets << "\n";
   } else if (DeobfSection.getNumOccurrences() > 0) {
+    events.emitInfo("batch_discovery_started",
+                    "discovering targets from section",
+                    {{"section", DeobfSection}});
     auto results = scanSection(DeobfSection, pe);
     for (const auto &r : results) {
       if (r.size >= MinFuncSize)
@@ -834,7 +1220,7 @@ int main(int argc, char **argv) {
     if (batch_vas.empty()) {
       errs() << "No functions >= " << MinFuncSize
              << "B in section '" << DeobfSection << "'\n";
-      return 1;
+      return fail(1, "no qualifying functions found in --deobf-section");
     }
     errs() << "Section mode: " << batch_vas.size()
            << " functions from '" << DeobfSection << "' (>= "
@@ -842,20 +1228,25 @@ int main(int argc, char **argv) {
     // Force deobfuscation on for --deobf-section.
     Deobfuscate = true;
   }
+  if (!batch_vas.empty()) {
+    events.emitInfo("batch_targets_ready", "batch target set created",
+                    {{"count", static_cast<int64_t>(batch_vas.size())}});
+  }
 
-  // Set up remill — use Linux for raw binaries (no PE metadata).
+  // Set up remill with the detected architecture.
   LLVMContext ctx;
-  auto os_name = RawBinary ? remill::kOSLinux : remill::kOSWindows;
-  auto arch = remill::Arch::Get(ctx, os_name, remill::kArchAMD64_AVX);
+  auto arch = remill::Arch::Get(ctx, detected_os, detected_arch);
   if (!arch) {
-    errs() << "Failed to create AMD64 arch\n";
-    return 1;
+    errs() << "Failed to create arch (arch="
+           << static_cast<int>(detected_arch)
+           << " os=" << static_cast<int>(detected_os) << ")\n";
+    return fail(1, "failed to create arch");
   }
 
   auto module = remill::LoadArchSemantics(arch.get());
   if (!module) {
     errs() << "Failed to load arch semantics\n";
-    return 1;
+    return fail(1, "failed to load arch semantics");
   }
 
   // Load code into the trace manager.
@@ -881,11 +1272,16 @@ int main(int argc, char **argv) {
 
   // Lift
   omill::TraceLifter lifter(arch.get(), manager);
+  events.emitInfo("lifting_started", "lifting started");
 
   if (!batch_vas.empty()) {
     // Batch lifting mode.
     unsigned lifted = 0, failed = 0;
     for (uint64_t va : batch_vas) {
+      if (events.detailed()) {
+        events.emitInfo("lift_target_started", "lifting target",
+                        {{"va", ("0x" + Twine::utohexstr(va)).str()}});
+      }
       if (lifter.Lift(va))
         ++lifted;
       else
@@ -893,9 +1289,12 @@ int main(int argc, char **argv) {
     }
     errs() << "Batch lift: " << lifted << " succeeded, "
            << failed << " failed\n";
+    events.emitInfo("lifting_batch_completed", "batch lift finished",
+                    {{"lifted", static_cast<int64_t>(lifted)},
+                     {"failed", static_cast<int64_t>(failed)}});
     if (lifted == 0) {
       errs() << "No functions lifted\n";
-      return 1;
+      return fail(1, "no functions lifted");
     }
   } else {
     // Single-function lifting mode.
@@ -910,24 +1309,34 @@ int main(int argc, char **argv) {
     if (auto_handler_va != 0 && auto_handler_va != func_va) {
       errs() << "Auto-lifting exception handler at 0x"
              << Twine::utohexstr(auto_handler_va) << "\n";
+      if (events.detailed()) {
+        events.emitInfo("lift_handler_started", "auto-lifting exception handler",
+                        {{"va", ("0x" + Twine::utohexstr(auto_handler_va)).str()}});
+      }
       if (!lifter.Lift(auto_handler_va)) {
         errs() << "WARNING: failed to lift handler at 0x"
                << Twine::utohexstr(auto_handler_va) << "\n";
+        events.emitWarn("lift_handler_failed", "failed to lift exception handler",
+                        {{"va", ("0x" + Twine::utohexstr(auto_handler_va)).str()}});
       }
     }
 
     if (!lifter.Lift(func_va)) {
       errs() << "TraceLifter::Lift() failed\n";
-      return 1;
+      return fail(1, "trace lifter failed");
     }
   }
   errs() << "Lifting complete\n";
+  events.emitInfo("lifting_completed", "lifting complete");
 
   // VM mode: build handler graph and bulk-lift all discovered handlers.
   std::shared_ptr<omill::VMHandlerGraph> vm_graph;
   if (vm_mode && !RawBinary) {
     vm_graph = std::make_shared<omill::VMHandlerGraph>(
         pe.memory_map, pe.image_base, vm_entry_va, vm_exit_va);
+    events.emitInfo("vm_graph_built", "vm handler graph created",
+                    {{"handlers", static_cast<int64_t>(vm_graph->handlerEntries().size())},
+                     {"dispatch_sites", static_cast<int64_t>(vm_graph->numDispatchSites())}});
 
     errs() << "VM handler graph: " << vm_graph->handlerEntries().size()
            << " handlers, " << vm_graph->numDispatchSites()
@@ -983,6 +1392,10 @@ int main(int argc, char **argv) {
     if (failed_count > 0)
       errs() << ", " << failed_count << " failed";
     errs() << "\n";
+    events.emitInfo("vm_bulk_lift_completed", "vm handler bulk lift complete",
+                    {{"lifted", static_cast<int64_t>(lifted_count)},
+                     {"skipped", static_cast<int64_t>(skipped_count)},
+                     {"failed", static_cast<int64_t>(failed_count)}});
 
     // Also tag vmenter/vmexit.
     if (auto *fn = module->getFunction(
@@ -1028,6 +1441,19 @@ int main(int argc, char **argv) {
   PassInstrumentationCallbacks PIC;
   TimePassesHandler TimingHandler(OmillTimePasses);
   TimingHandler.registerCallbacks(PIC);
+
+  if (events.enabled()) {
+    PIC.registerAfterPassCallback([&events](StringRef PassName, Any,
+                                            const PreservedAnalyses &) {
+      if (PassName.contains("PhaseMarkerPass")) {
+        events.emitInfo("pipeline_phase_boundary", "phase boundary",
+                        {{"pass", PassName.str()}});
+      } else if (events.detailed() && PassName.contains("omill")) {
+        events.emitInfo("pipeline_pass", "pass completed",
+                        {{"pass", PassName.str()}});
+      }
+    });
+  }
 
   // Set up pass infrastructure
   LoopAnalysisManager LAM;
@@ -1113,6 +1539,10 @@ int main(int argc, char **argv) {
           if (verifyModule(*M, nullptr)) {
             errs() << "VERIFY-EACH: verification failed after pass: "
                    << PassName << "\n";
+            events.emitError("verify_each_failed",
+                             "module verification failed after pass",
+                             {{"pass", PassName.str()}});
+            events.emitTerminalFailure(1, "verify-each failure");
             // Don't try module->print() — SlotTracker may crash on
             // corrupted modules with dangling Comdat/Value references.
             // Per-function verification to narrow down:
@@ -1324,6 +1754,8 @@ int main(int argc, char **argv) {
 
   // Run the main pipeline (without ABI first)
   omill::PipelineOptions opts;
+  opts.target_arch = target_arch;
+  opts.target_os = target_os_str;
   opts.recover_abi = false;
   opts.deobfuscate = Deobfuscate;
   opts.resolve_indirect_targets = ResolveTargets;
@@ -1332,19 +1764,21 @@ int main(int argc, char **argv) {
   opts.interprocedural_const_prop = IPCP;
   opts.use_block_lifting = BlockLift;
   opts.vm_devirtualize = vm_mode;
+  events.emitInfo("pipeline_started", "main pipeline started");
   {
     ModulePassManager MPM;
     omill::buildPipeline(MPM, opts);
     MPM.run(*module, MAM);
   }
   errs() << "Main pipeline complete\n";
+  events.emitInfo("pipeline_completed", "main pipeline completed");
 
   if (VerifyEach && verifyModule(*module, nullptr)) {
     errs() << "ERROR: module verification failed after main pipeline\n";
     for (const auto &F : *module)
       if (!F.isDeclaration() && verifyFunction(F, nullptr))
         errs() << "  broken function: " << F.getName() << "\n";
-    return 1;
+    return fail(1, "module verification failed after main pipeline");
   }
 
   if (DumpIR) {
@@ -1361,6 +1795,10 @@ int main(int argc, char **argv) {
   // original binary scan).  Lift these new targets and re-run the pipeline.
   if (vm_mode) {
     for (unsigned vm_round = 0; vm_round < 4; ++vm_round) {
+      if (events.detailed()) {
+        events.emitInfo("vm_discovery_round_started", "vm discovery round started",
+                        {{"round", static_cast<int64_t>(vm_round + 1)}});
+      }
       // Extract discovered dispatch targets from named metadata.
       llvm::DenseSet<uint64_t> dispatch_targets;
       if (auto *named_md =
@@ -1442,6 +1880,10 @@ int main(int argc, char **argv) {
       errs() << "VM discovery round " << (vm_round + 1) << ": "
              << dispatch_targets.size() << " dispatch + "
              << call_targets.size() << " call target(s)\n";
+      events.emitInfo("vm_discovery_targets", "vm discovery targets found",
+                      {{"round", static_cast<int64_t>(vm_round + 1)},
+                       {"dispatch_targets", static_cast<int64_t>(dispatch_targets.size())},
+                       {"call_targets", static_cast<int64_t>(call_targets.size())}});
 
       // Snapshot existing functions before lifting so we can tag ALL new ones
       // (not just the top-level targets) with omill.vm_newly_lifted.
@@ -1533,6 +1975,10 @@ int main(int argc, char **argv) {
       }
 
       errs() << "  pipeline re-run complete\n";
+      events.emitInfo("vm_discovery_round_completed", "vm discovery round completed",
+                      {{"round", static_cast<int64_t>(vm_round + 1)},
+                       {"lifted", static_cast<int64_t>(lift_ok)},
+                       {"failed", static_cast<int64_t>(lift_fail)}});
 
       // Checkpoint: save LL after each VM discovery round.
       repairMalformedPHIs(*module);
@@ -1551,6 +1997,7 @@ int main(int argc, char **argv) {
 
   // ABI recovery
   if (!NoABI) {
+    events.emitInfo("abi_recovery_started", "abi recovery started");
     // Repair broken PHIs before saving checkpoint (otherwise LLVM parser
     // rejects the LL on reload).
     repairMalformedPHIs(*module);
@@ -1567,13 +2014,14 @@ int main(int argc, char **argv) {
     omill::buildABIRecoveryPipeline(MPM);
     MPM.run(*module, MAM);
     errs() << "ABI recovery complete\n";
+    events.emitInfo("abi_recovery_completed", "abi recovery completed");
 
     if (VerifyEach && verifyModule(*module, nullptr)) {
       errs() << "ERROR: module verification failed after ABI recovery\n";
       for (const auto &F : *module)
         if (!F.isDeclaration() && verifyFunction(F, nullptr))
           errs() << "  broken function: " << F.getName() << "\n";
-      return 1;
+      return fail(1, "module verification failed after ABI recovery");
     }
 
     // Patch B3 call sites: after ABI recovery created _native wrappers,
@@ -1643,6 +2091,10 @@ int main(int argc, char **argv) {
       if (patched > 0)
         errs() << "Patched " << patched
                << " inttoptr call sites to direct calls\n";
+      if (patched > 0 && events.detailed()) {
+        events.emitInfo("abi_patch_callsites", "patched inttoptr callsites",
+                        {{"patched_uses", static_cast<int64_t>(patched)}});
+      }
     }
 
     // Post-ABI deobfuscation on _native functions.  When recover_abi is
@@ -1662,6 +2114,7 @@ int main(int argc, char **argv) {
           FAM.invalidate(F, PA);
       }
       errs() << "Post-ABI deobfuscation complete\n";
+      events.emitInfo("post_abi_deobf_completed", "post-ABI deobfuscation completed");
     }
   }
 
@@ -1673,6 +2126,11 @@ int main(int argc, char **argv) {
   // then link the resulting _native functions back into the main module.
   if (ResolveTargets && !NoABI) {
     for (unsigned round = 0; round < 3; ++round) {
+      if (events.detailed()) {
+        events.emitInfo("late_discovery_round_started",
+                        "late target discovery round started",
+                        {{"round", static_cast<int64_t>(round + 1)}});
+      }
       // Collect constant inttoptr call targets.
       // Match both ConstantExpr::IntToPtr and IntToPtrInst with constant
       // operands — LLVM 21 no longer folds inttoptr(const) instructions
@@ -1730,11 +2188,14 @@ int main(int argc, char **argv) {
 
       errs() << "Late discovery round " << (round + 1) << ": "
              << late_targets.size() << " new target(s)\n";
+      events.emitInfo("late_discovery_targets", "late discovery targets found",
+                      {{"round", static_cast<int64_t>(round + 1)},
+                       {"targets", static_cast<int64_t>(late_targets.size())}});
 
       // Load fresh arch + semantics for lifting (the main module's
       // remill ISEL stubs and intrinsics were deleted by the pipeline).
       auto late_arch =
-          remill::Arch::Get(ctx, os_name, remill::kArchAMD64_AVX);
+          remill::Arch::Get(ctx, detected_os, detected_arch);
       auto late_module = remill::LoadArchSemantics(late_arch.get());
 
       BufferTraceManager late_manager;
@@ -1874,6 +2335,8 @@ int main(int argc, char **argv) {
       // declarations with definitions and handles type merging.
       if (llvm::Linker::linkModules(*module, std::move(late_module))) {
         errs() << "WARNING: linking late module failed\n";
+        events.emitWarn("late_discovery_link_failed", "late module link failed",
+                        {{"round", static_cast<int64_t>(round + 1)}});
         break;
       }
 
@@ -1910,6 +2373,9 @@ int main(int argc, char **argv) {
       }
 
       errs() << "Late discovery round " << (round + 1) << " complete\n";
+      events.emitInfo("late_discovery_round_completed",
+                      "late discovery round completed",
+                      {{"round", static_cast<int64_t>(round + 1)}});
     }
   }
 
@@ -1920,6 +2386,8 @@ int main(int argc, char **argv) {
   if (verifyModule(*module, nullptr)) {
     errs() << "WARNING: module verification failed (use --verify-each to "
               "identify the culprit pass)\n";
+    events.emitWarn("module_verify_warning",
+                    "module verification failed after full run");
   }
 
   // Late cleanup: replace sentinel data constants with poison, DCE.
@@ -1931,13 +2399,17 @@ int main(int argc, char **argv) {
 
   // Write final output
   std::error_code EC;
+  events.emitInfo("output_write_started", "writing final output",
+                  {{"path", OutputFilename}});
   ToolOutputFile Out(OutputFilename, EC, sys::fs::OF_Text);
   if (EC) {
     errs() << "Error opening output: " << EC.message() << "\n";
-    return 1;
+    return fail(1, "failed to open output file");
   }
   module->print(Out.os(), nullptr);
   Out.keep();
+  events.emitInfo("output_write_completed", "output write complete",
+                  {{"path", OutputFilename}});
 
   if (DumpIR) {
     std::error_code ec;
@@ -1949,5 +2421,6 @@ int main(int argc, char **argv) {
   }
 
   errs() << "Done.\n";
+  events.emitTerminalSuccess(OutputFilename);
   return 0;
 }

@@ -14,7 +14,8 @@ namespace omill {
 /// Detected calling convention for a lifted function.
 enum class DetectedCC {
   kUnknown,
-  kWin64,          // RCX, RDX, R8, R9; RAX return; 32-byte shadow space
+  kWin64,            // RCX, RDX, R8, R9; RAX return; 32-byte shadow space
+  kAAPCS64,          // X0-X7; X0 return; no shadow space; 16-byte SP align
 };
 
 /// Describes a recovered function parameter.
