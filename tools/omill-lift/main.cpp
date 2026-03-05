@@ -38,6 +38,7 @@
 #include "omill/Support/MemoryLimit.h"
 #include "omill/Arch/ArchABI.h"
 #include "omill/Analysis/BinaryMemoryMap.h"
+#include "omill/Analysis/TargetArchAnalysis.h"
 #include "omill/Analysis/CallingConventionAnalysis.h"
 #include "omill/Analysis/CallGraphAnalysis.h"
 #include "omill/Analysis/ExceptionInfo.h"
@@ -1688,6 +1689,7 @@ int main(int argc, char **argv) {
 
   omill::registerAnalyses(FAM);
   // Register remaining module analyses without overriding custom ones above.
+  MAM.registerPass([&] { return omill::TargetArchAnalysis(); });
   MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
   MAM.registerPass([&] { return omill::CallGraphAnalysis(); });
   MAM.registerPass([&] { return omill::LiftedFunctionAnalysis(); });
@@ -2270,6 +2272,9 @@ int main(int argc, char **argv) {
 
         late_MAM.registerPass([memory_map_holder] {
           return omill::BinaryMemoryAnalysis(*memory_map_holder);
+        });
+        late_MAM.registerPass([&] {
+          return omill::TargetArchAnalysis();
         });
         late_MAM.registerPass([&] {
           return omill::CallingConventionAnalysis();
