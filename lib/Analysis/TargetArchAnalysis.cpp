@@ -30,10 +30,15 @@ TargetArchAnalysis::Result TargetArchAnalysis::run(
 void setTargetArchMetadata(llvm::Module &M, TargetArch arch,
                            llvm::StringRef os) {
   auto &ctx = M.getContext();
-  M.addModuleFlag(llvm::Module::Error, "omill.target_arch",
-                  static_cast<uint32_t>(arch));
-  M.addModuleFlag(llvm::Module::Error, "omill.target_os",
-                  llvm::MDString::get(ctx, os));
+  // Use Override so that Linker::linkModules silently keeps the first value
+  // when merging the late-discovery module (which carries the same flags)
+  // into the main module.  Error behavior would abort on duplicate keys.
+  if (!M.getModuleFlag("omill.target_arch"))
+    M.addModuleFlag(llvm::Module::Override, "omill.target_arch",
+                    static_cast<uint32_t>(arch));
+  if (!M.getModuleFlag("omill.target_os"))
+    M.addModuleFlag(llvm::Module::Override, "omill.target_os",
+                    llvm::MDString::get(ctx, os));
 }
 
 }  // namespace omill
