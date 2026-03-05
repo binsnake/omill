@@ -318,6 +318,22 @@ llvm::SmallVector<llvm::Value *, 4> findStackBaseValues(llvm::Function &F) {
     }
   }
 
+  // Pass 3: detect parameter-derived bases (VM context pattern).
+  // In _native functions, non-State integer params may flow into
+  // add(param, const) → inttoptr patterns (e.g., R12 = VM context ptr).
+  // No negative-offset requirement — VM context uses positive offsets.
+  bool is_native = F.getName().ends_with("_native") ||
+                   F.hasFnAttribute("omill.vm_handler");
+  if (is_native) {
+    for (unsigned i = 1; i < F.arg_size(); ++i) {
+      auto *arg = F.getArg(i);
+      if (!arg->getType()->isIntegerTy(64)) continue;
+      if (!hasIntToPtrUser(arg)) continue;
+      if (seen.insert(arg).second)
+        result.push_back(arg);
+    }
+  }
+
   return result;
 }
 
@@ -402,9 +418,16 @@ llvm::PreservedAnalyses RecoverStackFramePass::run(
     return llvm::PreservedAnalyses::all();
   }
 
-  if (debugStackFrame())
+  if (debugStackFrame()) {
+    unsigned n_param = 0;
+    for (auto *v : base_values)
+      if (llvm::isa<llvm::Argument>(v)) ++n_param;
     llvm::errs() << "[RSF] " << F.getName() << ": found "
-                 << base_values.size() << " base value(s)\n";
+                 << base_values.size() << " base value(s)"
+                 << (n_param ? " (" + std::to_string(n_param) + " param-derived)"
+                             : "")
+                 << "\n";
+  }
 
   llvm::IRBuilder<> EntryBuilder(&F.getEntryBlock().front());
   auto *i8_ty = EntryBuilder.getInt8Ty();
