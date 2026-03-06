@@ -26,6 +26,7 @@
 #include <llvm/Transforms/IPO/Inliner.h>
 #include <llvm/Transforms/IPO/SCCP.h>
 #include <llvm/Transforms/Scalar/ADCE.h>
+#include <llvm/Transforms/Scalar/DeadStoreElimination.h>
 #include <llvm/Transforms/Scalar/LoopDeletion.h>
 #include <llvm/Transforms/Scalar/LoopRotation.h>
 #include <llvm/Transforms/Scalar/LoopUnrollPass.h>
@@ -1353,6 +1354,280 @@ struct InternalizeRemillSemanticsPass
   static bool isRequired() { return true; }
 };
 
+/// Resolve inttoptr(ptrtoint(alloca) ± δ) → GEP alloca, δ.
+/// After VM handler inlining, the vmcontext alloca has a self-referencing
+/// pointer: ptrtoint(alloca+off) is stored to a field, handlers reload it
+/// and do `add delta / inttoptr / load|store`.  This pass forward-propagates
+/// the ptrtoint-derived value through store→load pairs within the same alloca
+/// and replaces each inttoptr with a direct GEP, enabling alias analysis and
+/// downstream DSE/GVN.
+struct ConcretizeAllocaPtrsPass
+    : llvm::PassInfoMixin<ConcretizeAllocaPtrsPass> {
+
+  /// Get the alloca and constant byte offset behind a pointer value.
+  static std::pair<llvm::AllocaInst *, int64_t>
+  getAllocaAndOffset(llvm::Value *ptr) {
+    auto *base = ptr->stripInBoundsConstantOffsets();
+    auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(base);
+    if (!alloca)
+      return {nullptr, 0};
+    auto &DL = alloca->getDataLayout();
+    llvm::APInt offset(DL.getPointerSizeInBits(), 0);
+    if (ptr->stripAndAccumulateConstantOffsets(DL, offset,
+                                               /*AllowNonInbounds=*/true))
+      return {alloca, offset.getSExtValue()};
+    return {nullptr, 0};
+  }
+
+  /// Get the total byte size of an alloca.
+  static uint64_t getAllocaSize(llvm::AllocaInst *A) {
+    auto &DL = A->getDataLayout();
+    auto ty_size = DL.getTypeAllocSize(A->getAllocatedType());
+    if (A->isArrayAllocation())
+      if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(A->getArraySize()))
+        return ty_size * CI->getZExtValue();
+    return ty_size;
+  }
+
+  llvm::PreservedAnalyses run(llvm::Function &F,
+                               llvm::FunctionAnalysisManager &) {
+    if (F.isDeclaration() || F.empty())
+      return llvm::PreservedAnalyses::all();
+
+    auto &entry = F.getEntryBlock();
+
+    // Phase 1: collect ptrtoint seeds from entry-block allocas.
+    struct Seed {
+      llvm::PtrToIntInst *pti;
+      llvm::AllocaInst *alloca;
+      int64_t base_offset;
+    };
+    llvm::SmallVector<Seed, 4> seeds;
+
+    for (auto &I : entry) {
+      auto *pti = llvm::dyn_cast<llvm::PtrToIntInst>(&I);
+      if (!pti)
+        continue;
+      auto [alloca, off] = getAllocaAndOffset(pti->getPointerOperand());
+      if (!alloca)
+        continue;
+      seeds.push_back({pti, alloca, off});
+    }
+
+    if (seeds.empty())
+      return llvm::PreservedAnalyses::all();
+
+    // Phase 2: BFS from each seed — track (Value, offset) pairs.
+    struct StoreRec {
+      llvm::AllocaInst *alloca;
+      int64_t field_offset;
+      int64_t ptr_offset;
+    };
+    struct ReplaceRec {
+      llvm::IntToPtrInst *itp;
+      llvm::AllocaInst *alloca;
+      int64_t offset;
+    };
+
+    llvm::SmallVector<StoreRec, 8> stores;
+    llvm::SmallVector<ReplaceRec, 64> replacements;
+    // Map from ptrtoint-derived Value → (alloca, accumulated byte offset).
+    struct ValInfo {
+      llvm::AllocaInst *alloca;
+      int64_t offset;
+    };
+    llvm::DenseMap<llvm::Value *, ValInfo> val_info;
+    llvm::DenseSet<llvm::Value *> visited;
+
+    struct WorkItem {
+      llvm::Value *val;
+      int64_t offset;
+      llvm::AllocaInst *alloca;
+    };
+    llvm::SmallVector<WorkItem, 64> worklist;
+
+    auto traceArithmetic = [&](llvm::Value *val, int64_t offset,
+                                llvm::AllocaInst *alloca,
+                                llvm::User *U) -> bool {
+      auto *bin = llvm::dyn_cast<llvm::BinaryOperator>(U);
+      if (!bin)
+        return false;
+      if (bin->getOpcode() != llvm::Instruction::Add &&
+          bin->getOpcode() != llvm::Instruction::Sub)
+        return false;
+      auto *lhs_ci =
+          llvm::dyn_cast<llvm::ConstantInt>(bin->getOperand(0));
+      auto *rhs_ci =
+          llvm::dyn_cast<llvm::ConstantInt>(bin->getOperand(1));
+      llvm::ConstantInt *ci = nullptr;
+      bool val_is_lhs = (bin->getOperand(0) == val);
+      if (val_is_lhs)
+        ci = rhs_ci;
+      else
+        ci = lhs_ci;
+      if (!ci)
+        return false;
+      int64_t delta = ci->getSExtValue();
+      int64_t new_off;
+      if (bin->getOpcode() == llvm::Instruction::Add) {
+        new_off = offset + delta;
+      } else {
+        if (val_is_lhs)
+          new_off = offset - delta;
+        else
+          return false;
+      }
+      worklist.push_back({bin, new_off, alloca});
+      return true;
+    };
+
+    for (auto &s : seeds)
+      worklist.push_back({s.pti, s.base_offset, s.alloca});
+
+    while (!worklist.empty()) {
+      auto [val, offset, alloca] = worklist.pop_back_val();
+      if (!visited.insert(val).second)
+        continue;
+      val_info[val] = {alloca, offset};
+
+      for (auto *U : val->users()) {
+        if (auto *bin = llvm::dyn_cast<llvm::BinaryOperator>(U)) {
+          traceArithmetic(val, offset, alloca, bin);
+          continue;
+        }
+        if (auto *si = llvm::dyn_cast<llvm::StoreInst>(U)) {
+          if (si->getValueOperand() != val)
+            continue;
+          auto [st_alloca, st_off] =
+              getAllocaAndOffset(si->getPointerOperand());
+          if (st_alloca == alloca)
+            stores.push_back({alloca, st_off, offset});
+          continue;
+        }
+        if (auto *itp = llvm::dyn_cast<llvm::IntToPtrInst>(U)) {
+          replacements.push_back({itp, alloca, offset});
+          continue;
+        }
+      }
+    }
+
+    // Phase 3: iterative store-load forwarding with reaching-definitions.
+    // The vmcontext self-reference pointer can be stored to field A, loaded
+    // from A, then re-stored to field B, loaded from B, etc.  We iterate
+    // until no new forwarded values are discovered.
+    using FieldKey = std::pair<llvm::AllocaInst *, int64_t>;
+
+    for (int iter = 0; iter < 8; ++iter) {
+      size_t prev_val_info_size = val_info.size();
+
+      // Build a set of tracked fields for reaching-definitions kill.
+      llvm::DenseSet<FieldKey> tracked_fields;
+      for (auto &sr : stores)
+        tracked_fields.insert({sr.alloca, sr.field_offset});
+      // Also track any field whose stored value is in val_info.
+      for (auto &[val, info] : val_info) {
+        for (auto *U : val->users()) {
+          auto *si = llvm::dyn_cast<llvm::StoreInst>(U);
+          if (!si || si->getValueOperand() != val)
+            continue;
+          auto [st_alloca, st_off] =
+              getAllocaAndOffset(si->getPointerOperand());
+          if (st_alloca)
+            tracked_fields.insert({st_alloca, st_off});
+        }
+      }
+
+      // Forward scan each basic block.
+      for (auto &BB : F) {
+        llvm::DenseMap<FieldKey, int64_t> current;
+
+        for (auto &I : BB) {
+          if (auto *si = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+            auto [st_alloca, st_off] =
+                getAllocaAndOffset(si->getPointerOperand());
+            if (!st_alloca)
+              continue;
+            FieldKey key{st_alloca, st_off};
+            auto vi = val_info.find(si->getValueOperand());
+            if (vi != val_info.end() && vi->second.alloca == st_alloca) {
+              current[key] = vi->second.offset;
+            } else if (tracked_fields.count(key)) {
+              current.erase(key);
+            }
+            continue;
+          }
+
+          auto *ld = llvm::dyn_cast<llvm::LoadInst>(&I);
+          if (!ld || !ld->getType()->isIntegerTy())
+            continue;
+          auto [ld_alloca, ld_off] =
+              getAllocaAndOffset(ld->getPointerOperand());
+          if (!ld_alloca)
+            continue;
+          FieldKey key{ld_alloca, ld_off};
+          auto it = current.find(key);
+          if (it != current.end())
+            worklist.push_back({ld, it->second, ld_alloca});
+        }
+      }
+
+      // BFS: trace forwarded values through arithmetic, stores, and inttoptr.
+      while (!worklist.empty()) {
+        auto [val, offset, alloca] = worklist.pop_back_val();
+        if (!visited.insert(val).second)
+          continue;
+        val_info[val] = {alloca, offset};
+
+        for (auto *U : val->users()) {
+          if (auto *bin = llvm::dyn_cast<llvm::BinaryOperator>(U)) {
+            traceArithmetic(val, offset, alloca, bin);
+            continue;
+          }
+          if (auto *si = llvm::dyn_cast<llvm::StoreInst>(U)) {
+            if (si->getValueOperand() != val)
+              continue;
+            auto [st_alloca, st_off] =
+                getAllocaAndOffset(si->getPointerOperand());
+            if (st_alloca == alloca)
+              stores.push_back({alloca, st_off, offset});
+            continue;
+          }
+          if (auto *itp = llvm::dyn_cast<llvm::IntToPtrInst>(U)) {
+            replacements.push_back({itp, alloca, offset});
+            continue;
+          }
+        }
+      }
+
+      // Fixed point: stop if no new val_info entries were discovered.
+      if (val_info.size() == prev_val_info_size)
+        break;
+    }
+
+    if (replacements.empty())
+      return llvm::PreservedAnalyses::all();
+
+    // Phase 4: replace inttoptr with GEP.
+    bool changed = false;
+    for (auto &r : replacements) {
+      uint64_t alloca_size = getAllocaSize(r.alloca);
+      if (r.offset < 0 || static_cast<uint64_t>(r.offset) >= alloca_size)
+        continue;
+      llvm::IRBuilder<> builder(r.itp);
+      auto *gep = builder.CreateInBoundsGEP(
+          builder.getInt8Ty(), r.alloca,
+          builder.getInt64(r.offset));
+      r.itp->replaceAllUsesWith(gep);
+      r.itp->eraseFromParent();
+      changed = true;
+    }
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+  static bool isRequired() { return true; }
+};
+
 }  // namespace
 
 void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
@@ -1782,6 +2057,15 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     };
     llvm::FunctionPassManager FPM;
     FPM.addPass(SentinelMemoryEliminationPass{});
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+  }
+
+  if (!envDisabled("OMILL_SKIP_CONCRETIZE_ALLOCA_PTRS")) {
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(ConcretizeAllocaPtrsPass{});
+    FPM.addPass(llvm::DSEPass());
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::GVNPass());
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
@@ -2395,6 +2679,60 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
+  // Convert sentinel memsets (0xCC/0xCD) to zero-fill.
+  // RecoverFunctionSignatures fills the synthetic stack with 0xCC to prevent
+  // undef→UB during optimization.  Now that optimization is complete, convert
+  // to zero-fill for cleaner output.
+  if (!envDisabled("OMILL_SKIP_SENTINEL_MEMORY_ELIM")) {
+    struct LateSentinelMemsetPass
+        : llvm::PassInfoMixin<LateSentinelMemsetPass> {
+      llvm::PreservedAnalyses run(llvm::Function &F,
+                                   llvm::FunctionAnalysisManager &) {
+        if (F.isDeclaration())
+          return llvm::PreservedAnalyses::all();
+        bool changed = false;
+        for (auto &BB : F) {
+          for (auto &I : BB) {
+            auto *ms = llvm::dyn_cast<llvm::MemSetInst>(&I);
+            if (!ms)
+              continue;
+            auto *fill =
+                llvm::dyn_cast<llvm::ConstantInt>(ms->getValue());
+            if (!fill)
+              continue;
+            uint8_t v = static_cast<uint8_t>(fill->getZExtValue());
+            if (v == 0xCC || v == 0xCD) {
+              ms->setValue(llvm::ConstantInt::get(fill->getType(), 0));
+              changed = true;
+            }
+          }
+        }
+        return changed ? llvm::PreservedAnalyses::none()
+                       : llvm::PreservedAnalyses::all();
+      }
+      static bool isRequired() { return true; }
+    };
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(LateSentinelMemsetPass{});
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+  }
+
+  // Resolve inttoptr(ptrtoint(alloca) ± δ) → GEP in post-ABI output.
+  // After ABI recovery, the vmcontext alloca has self-referencing pointer
+  // patterns that the main-pipeline ConcretizeAllocaPtrsPass couldn't see
+  // (they're created by RecoverStackFrame).  Re-run here.
+  if (!envDisabled("OMILL_SKIP_CONCRETIZE_ALLOCA_PTRS")) {
+    // Reuse the file-scope ConcretizeAllocaPtrsPass.  Find ptrtoint-of-alloca
+    // seeds, BFS through add/sub chains, forward through store→load pairs,
+    // replace inttoptr with GEP.
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(ConcretizeAllocaPtrsPass{});
+    FPM.addPass(llvm::DSEPass());
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::GVNPass());
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+  }
+
   // Cleanup after sentinel elimination.
   {
     llvm::FunctionPassManager FPM;
@@ -2402,6 +2740,52 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
     FPM.addPass(llvm::ADCEPass());
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
+  // Strip inline diagnostic markers emitted by emitInlineDiagMarker().
+  // These volatile stores to @__omill_inline_diag_sink.* are only needed
+  // during pipeline development; remove them from the final output.
+  if (!envDisabled("OMILL_SKIP_STRIP_INLINE_DIAG")) {
+    struct StripInlineDiagMarkersPass
+        : llvm::PassInfoMixin<StripInlineDiagMarkersPass> {
+      llvm::PreservedAnalyses run(llvm::Module &M,
+                                   llvm::ModuleAnalysisManager &) {
+        bool changed = false;
+        llvm::SmallVector<llvm::GlobalVariable *, 16> to_erase;
+
+        for (auto &GV : M.globals()) {
+          if (!GV.getName().starts_with("__omill_inline_diag"))
+            continue;
+          to_erase.push_back(&GV);
+        }
+
+        if (to_erase.empty())
+          return llvm::PreservedAnalyses::all();
+
+        // Remove from @llvm.used / @llvm.compiler.used first.
+        llvm::removeFromUsedLists(M, [&](llvm::Constant *C) {
+          if (auto *GV = llvm::dyn_cast<llvm::GlobalVariable>(C))
+            return GV->getName().starts_with("__omill_inline_diag");
+          return false;
+        });
+
+        // Erase all users (store volatile → sink), then the globals.
+        for (auto *GV : to_erase) {
+          llvm::SmallVector<llvm::User *, 8> users(GV->users());
+          for (auto *U : users) {
+            if (auto *I = llvm::dyn_cast<llvm::Instruction>(U))
+              I->eraseFromParent();
+          }
+          GV->eraseFromParent();
+          changed = true;
+        }
+
+        return changed ? llvm::PreservedAnalyses::none()
+                       : llvm::PreservedAnalyses::all();
+      }
+      static bool isRequired() { return true; }
+    };
+    MPM.addPass(StripInlineDiagMarkersPass{});
+  }
+
   MPM.addPass(llvm::GlobalDCEPass());
 }
 
