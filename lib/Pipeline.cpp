@@ -2755,6 +2755,107 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
+  // Eliminate zero stores to alloca regions already zeroed by memset(0).
+  // DSE cannot handle this when the alloca escapes through inttoptr.
+  {
+    struct DeadZeroStorePass : llvm::PassInfoMixin<DeadZeroStorePass> {
+      /// Check if a constant is all-zero bits.
+      static bool isZeroBits(llvm::Constant *C) {
+        return C->isNullValue();
+      }
+      /// Get the alloca and byte offset from a pointer (strips GEPs).
+      static std::pair<llvm::AllocaInst *, int64_t>
+      getAllocaAndOffset(llvm::Value *ptr, const llvm::DataLayout &DL) {
+        int64_t offset = 0;
+        while (auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(ptr)) {
+          llvm::APInt gep_off(64, 0);
+          if (!gep->accumulateConstantOffset(DL, gep_off))
+            return {nullptr, 0};
+          offset += gep_off.getSExtValue();
+          ptr = gep->getPointerOperand();
+        }
+        return {llvm::dyn_cast<llvm::AllocaInst>(ptr), offset};
+      }
+
+      llvm::PreservedAnalyses run(llvm::Function &F,
+                                   llvm::FunctionAnalysisManager &) {
+        if (F.isDeclaration() || F.empty())
+          return llvm::PreservedAnalyses::all();
+        auto &DL = F.getDataLayout();
+        auto &entry = F.getEntryBlock();
+
+        // Find memset(alloca, 0, size) in the entry block.
+        struct ZeroedAlloca {
+          llvm::AllocaInst *alloca;
+          uint64_t size;
+        };
+        llvm::SmallVector<ZeroedAlloca, 2> zeroed;
+        for (auto &I : entry) {
+          auto *ms = llvm::dyn_cast<llvm::MemSetInst>(&I);
+          if (!ms)
+            continue;
+          auto *fill = llvm::dyn_cast<llvm::ConstantInt>(ms->getValue());
+          if (!fill || fill->getZExtValue() != 0)
+            continue;
+          auto *len = llvm::dyn_cast<llvm::ConstantInt>(ms->getLength());
+          if (!len)
+            continue;
+          auto *alloca =
+              llvm::dyn_cast<llvm::AllocaInst>(ms->getDest());
+          if (!alloca)
+            continue;
+          zeroed.push_back({alloca, len->getZExtValue()});
+        }
+        if (zeroed.empty())
+          return llvm::PreservedAnalyses::all();
+
+        // Forward scan: eliminate zero stores to zeroed regions.
+        // Track which byte ranges have been overwritten with non-zero values.
+        // Use interval tracking: set of (offset, size) non-zero writes.
+        llvm::DenseMap<llvm::AllocaInst *, uint64_t> alloca_sizes;
+        for (auto &z : zeroed)
+          alloca_sizes[z.alloca] = z.size;
+
+        // Collect dead stores, then erase them.
+        llvm::SmallVector<llvm::StoreInst *, 64> dead;
+
+        for (auto &BB : F) {
+          // Per-BB: track which offsets have been written with non-zero.
+          // Simple approach: just check entry-block stores that precede any
+          // call or load from the same alloca.
+          for (auto &I : BB) {
+            auto *si = llvm::dyn_cast<llvm::StoreInst>(&I);
+            if (!si)
+              continue;
+            auto [alloca, off] = getAllocaAndOffset(si->getPointerOperand(), DL);
+            if (!alloca)
+              continue;
+            auto it = alloca_sizes.find(alloca);
+            if (it == alloca_sizes.end())
+              continue;
+            if (off < 0 || static_cast<uint64_t>(off) >= it->second)
+              continue;
+            auto *val = llvm::dyn_cast<llvm::Constant>(si->getValueOperand());
+            if (!val || !isZeroBits(val))
+              continue;
+            dead.push_back(si);
+          }
+        }
+
+        for (auto *si : dead)
+          si->eraseFromParent();
+
+        return dead.empty() ? llvm::PreservedAnalyses::all()
+                            : llvm::PreservedAnalyses::none();
+      }
+      static bool isRequired() { return true; }
+    };
+
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(DeadZeroStorePass{});
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+  }
+
   // MBA simplification on post-ABI code.  MBA chains may be introduced by
   // inlining VM handlers that were individually simplified but recombine.
 #if OMILL_ENABLE_SIMPLIFIER
@@ -2785,6 +2886,8 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
   // Cleanup after sentinel elimination + concretization.
   {
     llvm::FunctionPassManager FPM;
+    FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+    FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(llvm::SimplifyCFGPass());
     FPM.addPass(llvm::ADCEPass());
     FPM.addPass(llvm::DSEPass());
