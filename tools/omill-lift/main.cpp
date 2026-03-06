@@ -1430,17 +1430,10 @@ int main(int argc, char **argv) {
                      {"skipped", static_cast<int64_t>(skipped_count)},
                      {"failed", static_cast<int64_t>(failed_count)}});
 
-    // Also tag vmenter/vmexit.
-    if (auto *fn = module->getFunction(
-            "sub_" + Twine::utohexstr(vm_entry_va).str()))
-      fn->addFnAttr("omill.vm_handler");
-    if (vm_exit_va != 0) {
-      if (auto *fn = module->getFunction(
-              "sub_" + Twine::utohexstr(vm_exit_va).str()))
-        fn->addFnAttr("omill.vm_handler");
-    }
-
     // Fix DeclareLiftedFunction naming collisions (sub_X.N → sub_X).
+    // Must happen BEFORE setting attributes on vmentry/vmexit, because
+    // the fix erases declarations (which may hold attributes from the
+    // chain handler loop above) and renames definitions (which don't).
     for (auto &F : llvm::make_early_inc_range(*module)) {
       if (!F.isDeclaration())
         continue;
@@ -1457,6 +1450,35 @@ int main(int argc, char **argv) {
             break;
           }
         }
+      }
+    }
+
+    // After naming collisions are fixed, tag vmentry/vmexit as vm_handler
+    // and set internal linkage.  Must happen AFTER the naming fix because
+    // DeclareLiftedFunction creates sub_X.1 definitions for existing sub_X
+    // declarations; the fix erases the declaration (losing any attributes
+    // we set) and renames the definition.
+    //
+    // vmentry must NOT get AlwaysInline.  If inlined at Phase 0, its
+    // __remill_function_return ends up inside DriverEntry; LowerFunctionReturn
+    // (Phase 3b) converts it to `ret`, creating an early return that kills
+    // DriverEntry's continuation code (hash computation + dispatch to the
+    // first handler).  Instead, vmentry is tagged omill.vm_handler so
+    // VMHandlerInlinerPass inlines it at Phase 3.56 — by that point
+    // LowerFunctionReturn has already converted vmentry's return to a plain
+    // `ret`, and LLVM's InlineFunction replaces it with a branch to the
+    // continuation block.  The vmcontext alloca then lands on DriverEntry's
+    // stack (fixing the dangling-pointer / 0xCC sentinel issue).
+    if (auto *fn = module->getFunction(
+            "sub_" + Twine::utohexstr(vm_entry_va).str())) {
+      fn->addFnAttr("omill.vm_handler");
+      fn->setLinkage(llvm::GlobalValue::InternalLinkage);
+    }
+    if (vm_exit_va != 0) {
+      if (auto *fn = module->getFunction(
+              "sub_" + Twine::utohexstr(vm_exit_va).str())) {
+        fn->addFnAttr("omill.vm_handler");
+        fn->setLinkage(llvm::GlobalValue::InternalLinkage);
       }
     }
   }

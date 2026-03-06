@@ -1725,6 +1725,22 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
 
         for (auto &BB : F) {
           for (auto &I : BB) {
+            // memset with sentinel fill byte → zero-fill.
+            // Converts vmcontext / stack init from 0xCC/0xCD debug
+            // patterns to zero-initialization for cleaner output.
+            if (auto *ms = llvm::dyn_cast<llvm::MemSetInst>(&I)) {
+              auto *fill =
+                  llvm::dyn_cast<llvm::ConstantInt>(ms->getValue());
+              if (fill) {
+                uint8_t v = static_cast<uint8_t>(fill->getZExtValue());
+                if (v == 0xCC || v == 0xCD) {
+                  ms->setValue(
+                      llvm::ConstantInt::get(fill->getType(), 0));
+                  changed = true;
+                }
+              }
+              continue;
+            }
             // cmpxchg to sentinel → replace with {undef, false}.
             if (auto *cx = llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&I)) {
               if (isSentinelPtr(cx->getPointerOperand())) {

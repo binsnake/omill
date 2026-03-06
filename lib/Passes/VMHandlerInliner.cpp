@@ -181,9 +181,11 @@ llvm::SmallVector<llvm::Function *, 16> identifyHandlers(
     if (has_tagged_handlers && func->use_empty())
       continue;
 
-    // Skip if function is too large to be a handler.
+    // Skip if function is too large to be a handler, UNLESS it's
+    // explicitly tagged by the chain solver — those are known VM handlers
+    // that must be inlined regardless of size.
     unsigned size = countMeaningfulInstructions(*func);
-    if (size > max_instrs)
+    if (size > max_instrs && !func->hasFnAttribute("omill.vm_handler"))
       continue;
 
     // Skip functions that are lifted (sub_*) — those are real functions,
@@ -226,49 +228,74 @@ llvm::PreservedAnalyses VMHandlerInlinerPass::run(
     }
   }
 
-  // Inline the marked functions.
-  // We perform the inlining ourselves for direct calls to avoid depending
-  // on a separate AlwaysInliner pass invocation.
-  llvm::SmallVector<llvm::CallBase *, 32> inline_sites;
+  // Inline the marked functions iteratively.
+  // After inlining function A into B, B may now contain calls to other
+  // handlers (from A's body).  Re-scanning after each round catches these
+  // transitive callsites.  musttail calls are stripped before inlining
+  // because LLVM may refuse to inline them; after inlining the callee's
+  // code is directly in the caller, so the tail-call property is moot.
   llvm::DenseSet<llvm::Function *> handler_set(handlers.begin(),
                                                 handlers.end());
 
-  for (auto &F : M) {
-    if (F.isDeclaration())
-      continue;
-
-    for (auto it = llvm::inst_begin(F), end = llvm::inst_end(F);
-         it != end; ++it) {
-      auto *CB = llvm::dyn_cast<llvm::CallBase>(&*it);
-      if (!CB)
-        continue;
-
-      auto *callee = CB->getCalledFunction();
-      if (!callee || !handler_set.contains(callee))
-        continue;
-
-      inline_sites.push_back(CB);
-    }
-  }
-
   bool inlined = false;
-  for (auto *CB : inline_sites) {
-    auto *callee = CB->getCalledFunction();
-    if (callee && emitInlineDiagMarkers())
-      emitInlineDiagMarker(*CB, *callee, "vm_handler_inline");
+  bool round_changed;
+  do {
+    round_changed = false;
+    llvm::SmallVector<llvm::CallBase *, 32> inline_sites;
 
-    auto *caller = CB->getFunction();
-    llvm::InlineFunctionInfo IFI;
-    auto result = llvm::InlineFunction(*CB, IFI);
-    if (result.isSuccess()) {
-      inlined = true;
-      caller->addFnAttr("omill.needs_cleanup");
+    for (auto &F : M) {
+      if (F.isDeclaration())
+        continue;
+
+      for (auto it = llvm::inst_begin(F), end = llvm::inst_end(F);
+           it != end; ++it) {
+        auto *CB = llvm::dyn_cast<llvm::CallBase>(&*it);
+        if (!CB)
+          continue;
+
+        auto *callee = CB->getCalledFunction();
+        if (!callee || !handler_set.contains(callee))
+          continue;
+
+        inline_sites.push_back(CB);
+      }
     }
-  }
+
+    for (auto *CB : inline_sites) {
+      auto *callee = CB->getCalledFunction();
+      if (!callee)
+        continue;
+      if (emitInlineDiagMarkers())
+        emitInlineDiagMarker(*CB, *callee, "vm_handler_inline");
+
+      // Strip musttail — LLVM cannot inline musttail calls, but after
+      // inlining the callee body is directly in the caller so the
+      // tail-call guarantee is no longer needed.
+      if (auto *CI = llvm::dyn_cast<llvm::CallInst>(CB)) {
+        if (CI->isMustTailCall())
+          CI->setTailCallKind(llvm::CallInst::TCK_None);
+      }
+
+      auto *caller = CB->getFunction();
+      llvm::InlineFunctionInfo IFI;
+      auto result = llvm::InlineFunction(*CB, IFI);
+      if (result.isSuccess()) {
+        round_changed = true;
+        inlined = true;
+        caller->addFnAttr("omill.needs_cleanup");
+      }
+    }
+  } while (round_changed);
 
   // Clean up: remove handler functions that are now dead.
   for (auto *F : handlers) {
-    if (F->use_empty() && !F->hasExternalLinkage()) {
+    if (!F->use_empty())
+      continue;
+
+    // VM handlers tagged by the chain solver are implementation details
+    // that should always be cleaned up after inlining, regardless of
+    // linkage.  Non-tagged handlers respect the original linkage guard.
+    if (F->hasFnAttribute("omill.vm_handler") || !F->hasExternalLinkage()) {
       F->eraseFromParent();
     }
   }

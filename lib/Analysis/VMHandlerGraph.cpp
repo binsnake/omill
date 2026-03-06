@@ -297,6 +297,12 @@ void VMHandlerGraph::mergeChainResults(
     if (!entry.successors.empty()) {
       chain_targets_[entry.handler_va] = entry.successors;
       ++chain_count;
+    } else if (entry.is_vmexit) {
+      // Terminal vmexit: handler chain ends here.  Store vmexit_va as the
+      // sole successor so VMDispatchResolution can detect this and convert
+      // the dispatch to a function return.
+      chain_targets_[entry.handler_va] = {vmexit_va_};
+      ++chain_count;
     }
   }
 
