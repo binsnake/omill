@@ -2686,6 +2686,23 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
   if (!envDisabled("OMILL_SKIP_SENTINEL_MEMORY_ELIM")) {
     struct LateSentinelMemsetPass
         : llvm::PassInfoMixin<LateSentinelMemsetPass> {
+      /// Check if an APInt's raw bytes are all the same sentinel byte
+      /// (0xCC or 0xCD).
+      static bool isSentinelBits(const llvm::APInt &bits) {
+        unsigned bytes = bits.getBitWidth() / 8;
+        if (bytes == 0 || bits.getBitWidth() % 8 != 0)
+          return false;
+        uint8_t first = static_cast<uint8_t>(bits.extractBitsAsZExtValue(8, 0));
+        if (first != 0xCC && first != 0xCD)
+          return false;
+        for (unsigned i = 1; i < bytes; ++i) {
+          if (static_cast<uint8_t>(
+                  bits.extractBitsAsZExtValue(8, i * 8)) != first)
+            return false;
+        }
+        return true;
+      }
+
       llvm::PreservedAnalyses run(llvm::Function &F,
                                    llvm::FunctionAnalysisManager &) {
         if (F.isDeclaration())
@@ -2693,17 +2710,38 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
         bool changed = false;
         for (auto &BB : F) {
           for (auto &I : BB) {
-            auto *ms = llvm::dyn_cast<llvm::MemSetInst>(&I);
-            if (!ms)
+            // Handle memset(0xCC) / memset(0xCD).
+            if (auto *ms = llvm::dyn_cast<llvm::MemSetInst>(&I)) {
+              auto *fill =
+                  llvm::dyn_cast<llvm::ConstantInt>(ms->getValue());
+              if (!fill)
+                continue;
+              uint8_t v = static_cast<uint8_t>(fill->getZExtValue());
+              if (v == 0xCC || v == 0xCD) {
+                ms->setValue(llvm::ConstantInt::get(fill->getType(), 0));
+                changed = true;
+              }
               continue;
-            auto *fill =
-                llvm::dyn_cast<llvm::ConstantInt>(ms->getValue());
-            if (!fill)
+            }
+            // Handle store of sentinel float/double/integer constants.
+            // Example: store float 0xC199999980000000 (= 0xCCCCCCCC as float)
+            auto *si = llvm::dyn_cast<llvm::StoreInst>(&I);
+            if (!si)
               continue;
-            uint8_t v = static_cast<uint8_t>(fill->getZExtValue());
-            if (v == 0xCC || v == 0xCD) {
-              ms->setValue(llvm::ConstantInt::get(fill->getType(), 0));
-              changed = true;
+            llvm::Value *val = si->getValueOperand();
+            if (auto *cfp = llvm::dyn_cast<llvm::ConstantFP>(val)) {
+              llvm::APInt bits = cfp->getValueAPF().bitcastToAPInt();
+              if (isSentinelBits(bits)) {
+                auto *zero = llvm::ConstantFP::getZero(cfp->getType());
+                si->setOperand(0, zero);
+                changed = true;
+              }
+            } else if (auto *ci = llvm::dyn_cast<llvm::ConstantInt>(val)) {
+              if (ci->getBitWidth() >= 16 && isSentinelBits(ci->getValue())) {
+                si->setOperand(0,
+                    llvm::ConstantInt::get(ci->getType(), 0));
+                changed = true;
+              }
             }
           }
         }
@@ -2716,6 +2754,17 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
     FPM.addPass(LateSentinelMemsetPass{});
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
+
+  // MBA simplification on post-ABI code.  MBA chains may be introduced by
+  // inlining VM handlers that were individually simplified but recombine.
+#if OMILL_ENABLE_SIMPLIFIER
+  if (!envDisabled("OMILL_SKIP_DEOBF_SIMPLIFY_MBA")) {
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(SimplifyMBAPass());
+    FPM.addPass(llvm::InstCombinePass());
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+  }
+#endif
 
   // Resolve inttoptr(ptrtoint(alloca) ± δ) → GEP in post-ABI output.
   // After ABI recovery, the vmcontext alloca has self-referencing pointer
@@ -2733,11 +2782,12 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
-  // Cleanup after sentinel elimination.
+  // Cleanup after sentinel elimination + concretization.
   {
     llvm::FunctionPassManager FPM;
     FPM.addPass(llvm::SimplifyCFGPass());
     FPM.addPass(llvm::ADCEPass());
+    FPM.addPass(llvm::DSEPass());
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
   // Strip inline diagnostic markers emitted by emitInlineDiagMarker().
