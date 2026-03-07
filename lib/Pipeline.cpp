@@ -3429,6 +3429,47 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
     MPM.addPass(StripInlineDiagMarkersPass{});
   }
 
+  // After late target patching and post-ABI cleanup, unreferenced _native
+  // helpers that are not user-requested output roots are implementation-detail
+  // debris. Keep them alive only while unresolved dispatch shims remain;
+  // otherwise internalize them so the final GlobalDCE can drop the wrapper
+  // plus any remill helper baggage it alone references.
+  if (!envDisabled("OMILL_SKIP_INTERNALIZE_DEAD_NATIVE_HELPERS")) {
+    struct InternalizeDeadNativeHelpersPass
+        : llvm::PassInfoMixin<InternalizeDeadNativeHelpersPass> {
+      llvm::PreservedAnalyses run(llvm::Module &M,
+                                   llvm::ModuleAnalysisManager &) {
+        auto has_live_dispatch = [&](llvm::StringRef name) {
+          auto *F = M.getFunction(name);
+          return F && !F->use_empty();
+        };
+        if (has_live_dispatch("__omill_dispatch_call") ||
+            has_live_dispatch("__omill_dispatch_jump")) {
+          return llvm::PreservedAnalyses::all();
+        }
+
+        bool changed = false;
+        for (auto &F : M) {
+          if (F.isDeclaration() || !F.getName().ends_with("_native"))
+            continue;
+          if (F.hasFnAttribute("omill.output_root"))
+            continue;
+          if (!F.use_empty())
+            continue;
+          if (!F.hasExternalLinkage())
+            continue;
+          F.setLinkage(llvm::GlobalValue::InternalLinkage);
+          changed = true;
+        }
+
+        return changed ? llvm::PreservedAnalyses::none()
+                       : llvm::PreservedAnalyses::all();
+      }
+      static bool isRequired() { return true; }
+    };
+    MPM.addPass(InternalizeDeadNativeHelpersPass{});
+  }
+
   MPM.addPass(llvm::GlobalDCEPass());
 }
 

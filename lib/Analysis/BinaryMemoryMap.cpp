@@ -8,12 +8,12 @@ namespace omill {
 llvm::AnalysisKey BinaryMemoryAnalysis::Key;
 
 void BinaryMemoryMap::addRegion(uint64_t base, const uint8_t *data,
-                                size_t size) {
-	Region r{base, data, size};
-	auto it = std::lower_bound(
-			regions_.begin(), regions_.end(), r,
-			[](const Region &a, const Region &b) { return a.base < b.base; });
-	regions_.insert(it, r);	// Maintain sorted order for binary search.
+                                size_t size, bool read_only) {
+  Region r{base, data, size, read_only};
+  auto it = std::lower_bound(
+      regions_.begin(), regions_.end(), r,
+      [](const Region &a, const Region &b) { return a.base < b.base; });
+  regions_.insert(it, r);  // Maintain sorted order for binary search.
 }
 
 bool BinaryMemoryMap::read(uint64_t addr, uint8_t *out, unsigned size) const {
@@ -56,6 +56,22 @@ std::optional<uint64_t> BinaryMemoryMap::readInt(uint64_t addr,
   for (unsigned i = 0; i < byte_size; ++i)
     val |= static_cast<uint64_t>(buf[i]) << (i * 8);
   return val;
+}
+
+bool BinaryMemoryMap::isReadOnly(uint64_t addr, unsigned size) const {
+  auto it = std::upper_bound(
+      regions_.begin(), regions_.end(), addr,
+      [](uint64_t a, const Region &r) { return a < r.base; });
+
+  if (it == regions_.begin())
+    return false;
+  --it;
+
+  uint64_t offset = addr - it->base;
+  if (offset + size > it->size)
+    return false;
+
+  return it->read_only;
 }
 
 void BinaryMemoryMap::addRelocation(uint64_t va, uint8_t size) {

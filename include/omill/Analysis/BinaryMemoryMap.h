@@ -44,7 +44,10 @@ class BinaryMemoryMap {
   };
 
   /// Add a memory region from the original binary.
-  void addRegion(uint64_t base, const uint8_t *data, size_t size);
+  /// `read_only` marks regions whose bytes are immutable at runtime and are
+  /// therefore safe sources for absolute-address constant folding.
+  void addRegion(uint64_t base, const uint8_t *data, size_t size,
+                 bool read_only);
 
   /// Register an IAT entry mapping an IAT slot VA to an import name.
   void addImport(uint64_t iat_va, std::string module, std::string function);
@@ -58,6 +61,10 @@ class BinaryMemoryMap {
 
   /// Read a little-endian integer of the given byte size (1/2/4/8).
   std::optional<uint64_t> readInt(uint64_t addr, unsigned byte_size) const;
+
+  /// Return true when the byte range [addr, addr+size) lies within a region
+  /// that is immutable at runtime.
+  bool isReadOnly(uint64_t addr, unsigned size) const;
 
   /// Register a base relocation entry from the PE .reloc section.
   void addRelocation(uint64_t va, uint8_t size);
@@ -109,6 +116,7 @@ class BinaryMemoryMap {
     uint64_t base;
     const uint8_t *data;
     size_t size;
+    bool read_only;
   };
 
   llvm::SmallVector<Region, 4> regions_;

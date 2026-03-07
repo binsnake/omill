@@ -2,6 +2,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/PassTimingInfo.h>
+#include <llvm/IR/ValueHandle.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/BinaryFormat/COFF.h>
 #include <llvm/BinaryFormat/Magic.h>
@@ -408,7 +409,12 @@ class BufferTraceManager : public omill::TraceManager {
 
   llvm::Function *GetLiftedTraceDeclaration(uint64_t addr) override {
     auto it = lifted_.find(addr);
-    return (it != lifted_.end()) ? it->second : nullptr;
+    if (it == lifted_.end())
+      return nullptr;
+    auto *func = llvm::dyn_cast_or_null<llvm::Function>(it->second);
+    if (!func)
+      lifted_.erase(it);
+    return func;
   }
 
   llvm::Function *GetLiftedTraceDefinition(uint64_t addr) override {
@@ -418,8 +424,13 @@ class BufferTraceManager : public omill::TraceManager {
     // only need the target function, not its callees.
     if (max_lift_count_ > 0 && lift_count_ >= max_lift_count_) {
       auto it = lifted_.find(addr);
-      if (it != lifted_.end())
-        return it->second;
+      if (it != lifted_.end()) {
+        auto *func = llvm::dyn_cast_or_null<llvm::Function>(it->second);
+        if (!func)
+          lifted_.erase(it);
+        else
+          return func;
+      }
       // Create a real declaration so the TraceLifter can safely
       // dereference the returned pointer (it checks getParent()).
       auto *decl = arch_->DeclareLiftedFunction(TraceName(addr), module_);
@@ -445,7 +456,7 @@ class BufferTraceManager : public omill::TraceManager {
 
  private:
   std::map<uint64_t, std::vector<uint8_t>> code_;
-  std::map<uint64_t, llvm::Function *> lifted_;
+  std::map<uint64_t, llvm::WeakTrackingVH> lifted_;
   uint64_t base_addr_ = 0;
   unsigned max_lift_count_ = 0;
   unsigned lift_count_ = 0;
@@ -723,10 +734,13 @@ bool loadPE(StringRef path, PEInfo &out) {
         reinterpret_cast<const uint8_t *>(contents.data()),
         reinterpret_cast<const uint8_t *>(contents.data()) + contents.size());
     auto &stored = out.section_storage.back();
-    out.memory_map.addRegion(va, stored.data(), stored.size());
+    const auto *coff_sec = coff.getCOFFSection(sec);
+    bool read_only = true;
+    if (coff_sec && (coff_sec->Characteristics & COFF::IMAGE_SCN_MEM_WRITE))
+      read_only = false;
+    out.memory_map.addRegion(va, stored.data(), stored.size(), read_only);
 
     // Track all executable sections for the trace manager.
-    const auto *coff_sec = coff.getCOFFSection(sec);
     Expected<StringRef> name_or = sec.getName();
     std::string section_name;
     if (name_or)
@@ -826,8 +840,6 @@ static void parseMachOContents(object::MachOObjectFile &macho,
         reinterpret_cast<const uint8_t *>(contents.data()),
         reinterpret_cast<const uint8_t *>(contents.data()) + contents.size());
     auto &stored = out.section_storage.back();
-    out.memory_map.addRegion(va, stored.data(), stored.size());
-
     auto name_or = sec.getName();
     std::string section_name;
     if (name_or)
@@ -836,6 +848,8 @@ static void parseMachOContents(object::MachOObjectFile &macho,
       consumeError(name_or.takeError());
     std::string seg_name =
         macho.getSectionFinalSegmentName(sec.getRawDataRefImpl()).str();
+    bool read_only = !llvm::StringRef(seg_name).starts_with("__DATA");
+    out.memory_map.addRegion(va, stored.data(), stored.size(), read_only);
     if (sec.isText() || section_name == "__stubs") {
       out.code_sections.push_back(
           {va, stored.size(), idx, seg_name, section_name});
@@ -1446,6 +1460,23 @@ int main(int argc, char **argv) {
   omill::TraceLifter lifter(arch.get(), manager);
   events.emitInfo("lifting_started", "lifting started");
 
+  auto tagOutputRoot = [&](uint64_t va) {
+    std::string base = "sub_" + llvm::Twine::utohexstr(va).str();
+    if (auto *fn = module->getFunction(base)) {
+      if (!fn->isDeclaration())
+        fn->addFnAttr("omill.output_root");
+      return;
+    }
+    for (int i = 1; i <= 20; ++i) {
+      if (auto *fn = module->getFunction((base + "." + std::to_string(i)).c_str())) {
+        if (!fn->isDeclaration()) {
+          fn->addFnAttr("omill.output_root");
+          return;
+        }
+      }
+    }
+  };
+
   if (!batch_vas.empty()) {
     // Batch lifting mode.
     unsigned lifted = 0, failed = 0;
@@ -1468,6 +1499,8 @@ int main(int argc, char **argv) {
       errs() << "No functions lifted\n";
       return fail(1, "no functions lifted");
     }
+    for (uint64_t va : batch_vas)
+      tagOutputRoot(va);
   } else {
     // Single-function lifting mode.
     // If available, lift the handler first so Remill reuses a canonical
@@ -1497,6 +1530,7 @@ int main(int argc, char **argv) {
       errs() << "TraceLifter::Lift() failed\n";
       return fail(1, "trace lifter failed");
     }
+    tagOutputRoot(func_va);
 
     // When --vm-wrapper differs from --va, fold jmp-thunks between
     // func_va and the VM wrapper so that the entry function calls the
@@ -1986,7 +2020,8 @@ int main(int argc, char **argv) {
   // Register custom module analyses first and keep backing storage stable.
   omill::BinaryMemoryMap raw_memory_map;
   if (RawBinary) {
-    raw_memory_map.addRegion(BaseAddress, raw_code.data(), raw_code.size());
+    raw_memory_map.addRegion(BaseAddress, raw_code.data(), raw_code.size(),
+                             true);
     raw_memory_map.setImageBase(BaseAddress);
     raw_memory_map.setImageSize(raw_code.size());
   }
@@ -2105,6 +2140,29 @@ int main(int argc, char **argv) {
       events.emitInfo("post_patch_cleanup_completed",
                       "post patch cleanup completed",
                       {{"reason", reason.str()}});
+    }
+  };
+
+  auto restoreVMHandlerAttrs = [&]() {
+    if (!vm_graph)
+      return;
+
+    for (uint64_t va : vm_graph->handlerEntries()) {
+      std::string name = "sub_" + Twine::utohexstr(va).str();
+      if (auto *fn = module->getFunction(name)) {
+        if (!fn->isDeclaration())
+          fn->addFnAttr("omill.vm_handler");
+      }
+    }
+
+    for (uint64_t va : {vm_entry_va, vm_exit_va}) {
+      if (!va)
+        continue;
+      std::string name = "sub_" + Twine::utohexstr(va).str();
+      if (auto *fn = module->getFunction(name)) {
+        if (!fn->isDeclaration())
+          fn->addFnAttr("omill.vm_handler");
+      }
     }
   };
 
@@ -2353,6 +2411,7 @@ int main(int argc, char **argv) {
 
   // ABI recovery
   if (!NoABI) {
+    restoreVMHandlerAttrs();
     events.emitInfo("abi_recovery_started", "abi recovery started");
     // Repair broken PHIs before saving checkpoint (otherwise LLVM parser
     // rejects the LL on reload).

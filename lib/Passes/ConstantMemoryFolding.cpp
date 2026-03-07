@@ -270,6 +270,9 @@ llvm::PreservedAnalyses ConstantMemoryFoldingPass::run(
       continue;
     }
 
+    if (!map->isReadOnly(*addr, bytes))
+      continue;
+
     auto val = map->readInt(*addr, bytes);
     if (!val)
       continue;

@@ -101,6 +101,8 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
     native_fn->addFnAttr("omill.vm_handler");
   if (lifted_fn->hasFnAttribute("omill.vm_entry_seed"))
     native_fn->addFnAttr("omill.vm_entry_seed");
+  if (lifted_fn->hasFnAttribute("omill.output_root"))
+    native_fn->addFnAttr("omill.output_root");
 
   auto *entry = llvm::BasicBlock::Create(Ctx, "entry", native_fn);
   llvm::IRBuilder<> Builder(entry);

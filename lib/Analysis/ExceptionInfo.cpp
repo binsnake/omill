@@ -44,7 +44,7 @@ void ExceptionInfo::buildSyntheticDCs(
     // [+0x08] = ImageBase
     std::memcpy(buf.data() + kDCImageBaseOffset, &image_base, sizeof(uint64_t));
 
-    mem_map.addRegion(dc_va, buf.data(), buf.size());
+    mem_map.addRegion(dc_va, buf.data(), buf.size(), true);
     entry.dc_synthetic_va = dc_va;
 
     // Build synthetic CONTEXT with Rip = begin_va (exception address).
@@ -53,7 +53,7 @@ void ExceptionInfo::buildSyntheticDCs(
     auto &ctx_buf = storage.back();
     std::memcpy(ctx_buf.data() + kCtxRipOffset, &entry.begin_va,
                 sizeof(uint64_t));
-    mem_map.addRegion(ctx_va, ctx_buf.data(), ctx_buf.size());
+    mem_map.addRegion(ctx_va, ctx_buf.data(), ctx_buf.size(), true);
     entry.ctx_synthetic_va = ctx_va;
 
     ++idx;
