@@ -165,11 +165,13 @@ bool addressBasesEqual(llvm::Value *A, llvm::Value *B) {
 /// walks the entire expression tree in one shot, resolving multi-hop chains
 /// like load(load(0x140008000) + 0x10) without requiring multiple pass
 /// iterations.
-std::optional<uint64_t> evaluateToConstant(llvm::Value *V,
-                                           const BinaryMemoryMap &map,
-                                           unsigned depth = 0) {
+std::optional<uint64_t> evaluateToConstantImpl(
+    llvm::Value *V, const BinaryMemoryMap &map,
+    llvm::SmallPtrSetImpl<llvm::Value *> &Visited, unsigned depth = 0) {
   if (depth > kMaxEvalDepth)
     return std::nullopt;
+  if (!Visited.insert(V).second)
+    return std::nullopt;  // Cycle through PHIs.
 
   // Function argument: arg1 in lifted functions is the entry PC.
   // The function name encodes it as sub_<hex_va>.
@@ -193,9 +195,9 @@ std::optional<uint64_t> evaluateToConstant(llvm::Value *V,
 
   // ZExt / SExt: evaluate the inner value.
   if (auto *zext = llvm::dyn_cast<llvm::ZExtInst>(V))
-    return evaluateToConstant(zext->getOperand(0), map, depth + 1);
+    return evaluateToConstantImpl(zext->getOperand(0), map, Visited, depth + 1);
   if (auto *sext = llvm::dyn_cast<llvm::SExtInst>(V)) {
-    auto inner = evaluateToConstant(sext->getOperand(0), map, depth + 1);
+    auto inner = evaluateToConstantImpl(sext->getOperand(0), map, Visited, depth + 1);
     if (!inner)
       return std::nullopt;
     unsigned src_bits = sext->getOperand(0)->getType()->getIntegerBitWidth();
@@ -208,7 +210,7 @@ std::optional<uint64_t> evaluateToConstant(llvm::Value *V,
 
   // Trunc: evaluate inner and mask.
   if (auto *trunc = llvm::dyn_cast<llvm::TruncInst>(V)) {
-    auto inner = evaluateToConstant(trunc->getOperand(0), map, depth + 1);
+    auto inner = evaluateToConstantImpl(trunc->getOperand(0), map, Visited, depth + 1);
     if (!inner)
       return std::nullopt;
     unsigned dst_bits = trunc->getType()->getIntegerBitWidth();
@@ -219,8 +221,8 @@ std::optional<uint64_t> evaluateToConstant(llvm::Value *V,
 
   // Binary operators: add, sub, xor, or, and, shl, lshr, ashr, mul.
   if (auto *bin = llvm::dyn_cast<llvm::BinaryOperator>(V)) {
-    auto lhs = evaluateToConstant(bin->getOperand(0), map, depth + 1);
-    auto rhs = evaluateToConstant(bin->getOperand(1), map, depth + 1);
+    auto lhs = evaluateToConstantImpl(bin->getOperand(0), map, Visited, depth + 1);
+    auto rhs = evaluateToConstantImpl(bin->getOperand(1), map, Visited, depth + 1);
     if (!lhs || !rhs)
       return std::nullopt;
 
@@ -258,7 +260,7 @@ std::optional<uint64_t> evaluateToConstant(llvm::Value *V,
 
     // Path 1: inttoptr(X) where X evaluates to a constant → binary memory read.
     if (int_val) {
-      auto addr = evaluateToConstant(int_val, map, depth + 1);
+      auto addr = evaluateToConstantImpl(int_val, map, Visited, depth + 1);
       if (addr) {
         unsigned load_size = load->getType()->getIntegerBitWidth() / 8;
         if (load_size <= 8) {
@@ -294,7 +296,7 @@ std::optional<uint64_t> evaluateToConstant(llvm::Value *V,
 
         // Case (a): exact pointer match (same GEP/alloca/SSA value).
         if (store_ptr == load_ptr) {
-          return evaluateToConstant(SI->getValueOperand(), map, depth + 1);
+          return evaluateToConstantImpl(SI->getValueOperand(), map, Visited, depth + 1);
         }
 
         // Classify the store pointer.
@@ -312,7 +314,7 @@ std::optional<uint64_t> evaluateToConstant(llvm::Value *V,
             if (store_int_val) {
               // Fast path: same SSA address.
               if (store_int_val == int_val) {
-                return evaluateToConstant(SI->getValueOperand(), map, depth + 1);
+                return evaluateToConstantImpl(SI->getValueOperand(), map, Visited, depth + 1);
               }
 
               // Normalize both address expressions and compare.
@@ -320,8 +322,8 @@ std::optional<uint64_t> evaluateToConstant(llvm::Value *V,
               auto [storeBase, storeOff] = normalizeAddrExpr(store_int_val);
               if (loadOff == storeOff &&
                   addressBasesEqual(loadBase, storeBase)) {
-                return evaluateToConstant(SI->getValueOperand(), map,
-                                         depth + 1);
+                return evaluateToConstantImpl(SI->getValueOperand(), map,
+                                             Visited, depth + 1);
               }
             }
             // Non-matching inttoptr store — skip (different runtime addr).
@@ -358,15 +360,15 @@ std::optional<uint64_t> evaluateToConstant(llvm::Value *V,
 
   // Select with one evaluable arm (or both).
   if (auto *sel = llvm::dyn_cast<llvm::SelectInst>(V)) {
-    auto cond = evaluateToConstant(sel->getCondition(), map, depth + 1);
+    auto cond = evaluateToConstantImpl(sel->getCondition(), map, Visited, depth + 1);
     if (cond) {
       // Condition is known — evaluate only the selected arm.
       auto *arm = (*cond != 0) ? sel->getTrueValue() : sel->getFalseValue();
-      return evaluateToConstant(arm, map, depth + 1);
+      return evaluateToConstantImpl(arm, map, Visited, depth + 1);
     }
     // If both arms evaluate to the same value, use that.
-    auto true_val = evaluateToConstant(sel->getTrueValue(), map, depth + 1);
-    auto false_val = evaluateToConstant(sel->getFalseValue(), map, depth + 1);
+    auto true_val = evaluateToConstantImpl(sel->getTrueValue(), map, Visited, depth + 1);
+    auto false_val = evaluateToConstantImpl(sel->getFalseValue(), map, Visited, depth + 1);
     if (true_val && false_val && *true_val == *false_val)
       return *true_val;
     return std::nullopt;
@@ -378,7 +380,7 @@ std::optional<uint64_t> evaluateToConstant(llvm::Value *V,
       return std::nullopt;
     std::optional<uint64_t> agreed;
     for (unsigned i = 0, e = phi->getNumIncomingValues(); i < e; ++i) {
-      auto val = evaluateToConstant(phi->getIncomingValue(i), map, depth + 1);
+      auto val = evaluateToConstantImpl(phi->getIncomingValue(i), map, Visited, depth + 1);
       if (!val)
         return std::nullopt;
       if (!agreed)
@@ -390,6 +392,13 @@ std::optional<uint64_t> evaluateToConstant(llvm::Value *V,
   }
 
   return std::nullopt;
+}
+
+/// Public wrapper — creates a per-call visited set for cycle detection.
+std::optional<uint64_t> evaluateToConstant(llvm::Value *V,
+                                           const BinaryMemoryMap &map) {
+  llvm::SmallPtrSet<llvm::Value *, 32> Visited;
+  return evaluateToConstantImpl(V, map, Visited);
 }
 
 // ============================================================
