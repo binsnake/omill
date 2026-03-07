@@ -1703,6 +1703,13 @@ int main(int argc, char **argv) {
         if (!existing->isDeclaration()) {
           // Tag existing function as a VM handler.
           existing->addFnAttr("omill.vm_handler");
+          // The VM wrapper is a boundary function: handlers get inlined
+          // INTO it, but it must NOT be inlined into callers like
+          // DriverEntry.  Tag it so VMHandlerInlinerPass excludes it
+          // from the handler_set while keeping it in
+          // VMDispatchResolution's scope (which requires vm_handler).
+          if (handler_va == vm_wrapper_va)
+            existing->addFnAttr("omill.vm_wrapper");
           continue;
         }
       }
@@ -2187,8 +2194,11 @@ int main(int argc, char **argv) {
     for (uint64_t va : vm_graph->handlerEntries()) {
       std::string name = "sub_" + Twine::utohexstr(va).str();
       if (auto *fn = module->getFunction(name)) {
-        if (!fn->isDeclaration())
+        if (!fn->isDeclaration()) {
           fn->addFnAttr("omill.vm_handler");
+          if (va == vm_wrapper_va)
+            fn->addFnAttr("omill.vm_wrapper");
+        }
       }
     }
 

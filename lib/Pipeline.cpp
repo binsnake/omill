@@ -1023,6 +1023,11 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
           if (!F.getName().ends_with("_native") &&
               M.getFunction((F.getName() + "_native").str()))
             continue;  // Has a _native wrapper — skip the original.
+          // The VM wrapper is a boundary function — handlers are inlined
+          // INTO it, but it must NOT be inlined into its callers (e.g.
+          // DriverEntry).  Skip it to preserve the call boundary.
+          if (F.hasFnAttribute("omill.vm_wrapper"))
+            continue;
           // Only inline VM handlers that have callers.  Uncalled handlers
           // (deferred functions whose addresses weren't resolved to direct
           // calls) must be kept — they're still reachable via indirect
@@ -2486,7 +2491,8 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
         // Internalize dead _native functions.
         for (auto *F : dead_fns) {
           if (F->getName().ends_with("_native") &&
-              !F->hasLocalLinkage()) {
+              !F->hasLocalLinkage() &&
+              !F->hasFnAttribute("omill.vm_wrapper")) {
             F->setLinkage(llvm::GlobalValue::InternalLinkage);
             changed = true;
           }
@@ -2537,6 +2543,10 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
             }
           }
           if (!has_internal_caller) continue;
+          // VM wrapper boundary functions must stay external — their call
+          // boundary is semantically meaningful and must not be inlined by
+          // the ModuleInliner in subsequent cleanup passes.
+          if (F.hasFnAttribute("omill.vm_wrapper")) continue;
           F.setLinkage(llvm::GlobalValue::InternalLinkage);
           changed = true;
         }

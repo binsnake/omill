@@ -247,9 +247,17 @@ void collectCandidates(llvm::Function &F, const LiftedFunctionMap &lifted,
           // Leaf functions: don't rewrite — let AlwaysInlinerPass inline them
           // directly, preserving flag/State field semantics.  Just fix the
           // call target if it's a forward declaration.
+          // EXCEPTION: if the callee has a _native wrapper (ABI recovered),
+          // always rewrite to native form to preserve the call boundary.
+          // Without this, AlwaysInlinerPass inlines the original into ALL
+          // callers (e.g. VM wrapper into DriverEntry), merging everything
+          // into one mega-function.
           if (!non_leaf_set.count(def)) {
-            fixupForwardDeclarationCall(call, def);
-            continue;
+            std::string callee_native = def->getName().str() + "_native";
+            if (!F.getParent()->getFunction(callee_native)) {
+              fixupForwardDeclarationCall(call, def);
+              continue;
+            }
           }
           candidates.push_back({call, def, call->getArgOperand(0), false});
           continue;
@@ -341,18 +349,6 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
     llvm::SmallVector<RewriteCandidate, 8> candidates;
     collectCandidates(F, lifted, non_leaf_set, candidates);
     if (candidates.empty()) continue;
-
-    if (getenv("OMILL_DEBUG_REWRITE")) {
-      llvm::errs() << "[Rewrite] " << F.getName()
-                    << ": " << candidates.size() << " candidates\n";
-      for (auto &c : candidates) {
-        llvm::errs() << "  call to "
-                      << (c.lifted_definition
-                              ? c.lifted_definition->getName()
-                              : llvm::StringRef("(dynamic)"))
-                      << " dispatch_jump=" << c.is_dispatch_jump << "\n";
-      }
-    }
 
     for (auto &cand : candidates) {
       if (cand.lifted_definition) {

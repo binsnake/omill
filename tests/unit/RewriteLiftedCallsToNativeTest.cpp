@@ -219,7 +219,7 @@ TEST_F(RewriteLiftedCallsToNativeTest, DynamicDispatchEmitsIndirectCall) {
   EXPECT_TRUE(has_indirect_call);
 }
 
-TEST_F(RewriteLiftedCallsToNativeTest, LeafFunctionNotRewritten) {
+TEST_F(RewriteLiftedCallsToNativeTest, LeafWithNativeRewrittenToNative) {
   auto M = createBaseModule();
   auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
 
@@ -236,7 +236,7 @@ TEST_F(RewriteLiftedCallsToNativeTest, LeafFunctionNotRewritten) {
     B.CreateRet(leaf->getArg(2));
   }
 
-  // Create native wrapper (won't be used since it's a leaf).
+  // Create native wrapper — WILL be used since leaf+native → rewrite to native.
   auto *native_ty = llvm::FunctionType::get(i64_ty, {i64_ty}, false);
   auto *native_fn = llvm::Function::Create(
       native_ty, llvm::Function::ExternalLinkage, "sub_402000_native", *M);
@@ -259,7 +259,8 @@ TEST_F(RewriteLiftedCallsToNativeTest, LeafFunctionNotRewritten) {
 
   runPass(*M);
 
-  // After: caller should still call sub_402000 (the leaf), not sub_402000_native.
+  // After: caller should call sub_402000_native (preserving call boundary),
+  // not the original leaf (which would be inlined by AlwaysInlinerPass).
   bool calls_leaf = false;
   bool calls_native = false;
   for (auto &BB : *caller)
@@ -271,8 +272,51 @@ TEST_F(RewriteLiftedCallsToNativeTest, LeafFunctionNotRewritten) {
           calls_native = true;
       }
 
+  EXPECT_FALSE(calls_leaf);
+  EXPECT_TRUE(calls_native);
+}
+
+TEST_F(RewriteLiftedCallsToNativeTest, LeafWithoutNativeNotRewritten) {
+  auto M = createBaseModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+
+  // Create a leaf function WITHOUT a _native wrapper.
+  auto *leaf = llvm::Function::Create(
+      liftedFnTy(), llvm::Function::ExternalLinkage, "sub_402000", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", leaf);
+    llvm::IRBuilder<> B(entry);
+    auto *rcx_gep = B.CreateConstGEP1_64(B.getInt8Ty(), leaf->getArg(0), 2248);
+    auto *val = B.CreateLoad(i64_ty, rcx_gep, "rcx_val");
+    auto *rax_gep = B.CreateConstGEP1_64(B.getInt8Ty(), leaf->getArg(0), 2216);
+    B.CreateStore(val, rax_gep);
+    B.CreateRet(leaf->getArg(2));
+  }
+
+  // No sub_402000_native — leaf stays as leaf.
+
+  // Caller calls the leaf directly.
+  auto *caller = llvm::Function::Create(
+      liftedFnTy(), llvm::Function::ExternalLinkage, "sub_401000", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", caller);
+    llvm::IRBuilder<> B(entry);
+    auto *result = B.CreateCall(leaf,
+        {caller->getArg(0), caller->getArg(1), caller->getArg(2)});
+    B.CreateRet(result);
+  }
+
+  runPass(*M);
+
+  // After: caller should still call sub_402000 (no native wrapper, keep leaf).
+  bool calls_leaf = false;
+  for (auto &BB : *caller)
+    for (auto &I : BB)
+      if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
+        if (CI->getCalledFunction() == leaf)
+          calls_leaf = true;
+
   EXPECT_TRUE(calls_leaf);
-  EXPECT_FALSE(calls_native);
 }
 
 TEST_F(RewriteLiftedCallsToNativeTest, NativeDispatchJumpMaterializesRAX) {

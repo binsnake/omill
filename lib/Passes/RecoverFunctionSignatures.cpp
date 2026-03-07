@@ -99,6 +99,9 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
   // Propagate omill.vm_handler so post-ABI passes can identify VM handler wrappers.
   if (lifted_fn->hasFnAttribute("omill.vm_handler"))
     native_fn->addFnAttr("omill.vm_handler");
+  // Propagate omill.vm_wrapper so InlineVMHandlersAndCleanupPass skips it.
+  if (lifted_fn->hasFnAttribute("omill.vm_wrapper"))
+    native_fn->addFnAttr("omill.vm_wrapper");
   if (lifted_fn->hasFnAttribute("omill.vm_entry_seed"))
     native_fn->addFnAttr("omill.vm_entry_seed");
   if (lifted_fn->hasFnAttribute("omill.output_root"))

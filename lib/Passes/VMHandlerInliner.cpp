@@ -195,6 +195,14 @@ llvm::SmallVector<llvm::Function *, 16> identifyHandlers(
         !func->hasFnAttribute("omill.vm_handler"))
       continue;
 
+    // The VM wrapper is a boundary function: handlers get inlined INTO it,
+    // but it must NOT be inlined into its callers (e.g. DriverEntry).
+    // Excluding it from handler_set means VMHandlerInlinerPass won't
+    // collect inline sites targeting it, while still allowing handler_set
+    // members called FROM the wrapper to be inlined into it.
+    if (func->hasFnAttribute("omill.vm_wrapper"))
+      continue;
+
     handlers.push_back(func);
   }
 
