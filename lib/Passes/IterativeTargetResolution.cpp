@@ -281,6 +281,37 @@ bool inlineCalleesForDispatchResolution(
           if (def == F)
             continue;
 
+          // Only inline callees that can contribute to dispatch resolution:
+          // they must contain dispatch intrinsics or calls to other sub_*
+          // functions.  Leaf functions without dispatch calls (e.g. security
+          // cookie init) provide no benefit and their inlined code may be
+          // misfolded by ConstantMemoryFolding (reading uninitialized globals
+          // as zero from the static binary kills continuation paths).
+          {
+            bool has_dispatch_or_subcalls = false;
+            for (auto &DefBB : *def) {
+              for (auto &DefI : DefBB) {
+                auto *DefCI = llvm::dyn_cast<llvm::CallInst>(&DefI);
+                if (!DefCI)
+                  continue;
+                auto *DefCallee = DefCI->getCalledFunction();
+                if (!DefCallee)
+                  continue;
+                auto name = DefCallee->getName();
+                if (name == "__omill_dispatch_call" ||
+                    name == "__omill_dispatch_jump" ||
+                    name.starts_with("sub_")) {
+                  has_dispatch_or_subcalls = true;
+                  break;
+                }
+              }
+              if (has_dispatch_or_subcalls)
+                break;
+            }
+            if (!has_dispatch_or_subcalls)
+              continue;
+          }
+
           if (callee != def)
             CI->setCalledFunction(def->getFunctionType(), def);
 

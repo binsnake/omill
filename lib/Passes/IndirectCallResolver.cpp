@@ -1570,15 +1570,17 @@ llvm::PreservedAnalyses IndirectCallResolverPass::run(
       MAMProxy.getCachedResult<LiftedFunctionAnalysis>(*F.getParent());
 
   // Collect candidates: dispatch_call and dispatch_jump with non-constant,
-  // non-resolved targets.
+  // non-resolved targets.  Count instructions for forward MC budget.
   struct Candidate {
     llvm::WeakTrackingVH call;
     bool is_jump;
   };
   llvm::SmallVector<Candidate, 8> candidates;
+  unsigned inst_count = 0;
 
   for (auto &BB : F) {
     for (auto &I : BB) {
+      ++inst_count;
       auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
       if (!call)
         continue;
@@ -1623,14 +1625,16 @@ llvm::PreservedAnalyses IndirectCallResolverPass::run(
     // evaluation with random values for unknowns.
     if (!resolved)
       resolved = tryMonteCarloResolve(target, F, map, &SSM);
-    // Forward interpreter fallback: if backward MC fails (cross-BB
-    // inttoptr stores that the backward evaluator can't forward), walk
-    // the function forward, tracking stores/loads through virtual memory.
     // Forward MC fallback: if backward MC fails (cross-BB inttoptr stores
     // that the backward evaluator can't forward), walk the function
     // forward, tracking stores/loads through virtual memory.
+    // Skip for very large functions (>5000 instructions) — forward MC
+    // walks the entire function per trial (32+1 trials per candidate),
+    // which is O(candidates * 33 * MaxSteps) and prohibitively slow
+    // on inlined VM handler chains.
+    constexpr unsigned kForwardMCInstLimit = 5000;
     bool from_fwd_mc = false;
-    if (!resolved) {
+    if (!resolved && inst_count <= kForwardMCInstLimit) {
       resolved = tryForwardMonteCarloResolve(call, F, map);
       from_fwd_mc = resolved.has_value();
     }

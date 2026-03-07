@@ -1951,7 +1951,22 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
 #endif
     FPM.addPass(ResolveAndLowerControlFlowPass(ResolvePhases::ResolveTargets));
     FPM.addPass(LowerRemillIntrinsicsPass(LowerCategories::ResolvedDispatch));
-    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    // Scope to functions that have unresolved dispatch calls/jumps.
+    // Running ConstantMemoryFolding on all functions is unsound: it folds
+    // loads from writable .data globals (e.g. __security_cookie) whose
+    // static values differ from runtime, destroying control flow.
+    MPM.addPass(createScopedFPM(std::move(FPM), [](llvm::Function &F) {
+      for (auto &BB : F)
+        for (auto &I : BB)
+          if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
+            if (auto *Callee = CI->getCalledFunction()) {
+              auto name = Callee->getName();
+              if (name == "__omill_dispatch_call" ||
+                  name == "__omill_dispatch_jump")
+                return true;
+            }
+      return false;
+    }));
   }
 
   addPhaseMarker(MPM, "Phase 4: ABI recovery");
