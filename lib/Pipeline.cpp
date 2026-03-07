@@ -1404,9 +1404,10 @@ struct ConcretizeAllocaPtrsPass
     if (F.isDeclaration() || F.empty())
       return llvm::PreservedAnalyses::all();
 
-    auto &entry = F.getEntryBlock();
-
-    // Phase 1: collect ptrtoint seeds from entry-block allocas.
+    // Phase 1: collect ptrtoint seeds from allocas in all blocks.
+    // We scan beyond the entry block because SimplifyCFG / switch lowering
+    // can move ptrtoint instructions into successor blocks (e.g., after an
+    // early-exit switch on KUSER_SHARED_DATA).
     struct Seed {
       llvm::PtrToIntInst *pti;
       llvm::AllocaInst *alloca;
@@ -1414,14 +1415,16 @@ struct ConcretizeAllocaPtrsPass
     };
     llvm::SmallVector<Seed, 4> seeds;
 
-    for (auto &I : entry) {
-      auto *pti = llvm::dyn_cast<llvm::PtrToIntInst>(&I);
-      if (!pti)
-        continue;
-      auto [alloca, off] = getAllocaAndOffset(pti->getPointerOperand());
-      if (!alloca)
-        continue;
-      seeds.push_back({pti, alloca, off});
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *pti = llvm::dyn_cast<llvm::PtrToIntInst>(&I);
+        if (!pti)
+          continue;
+        auto [alloca, off] = getAllocaAndOffset(pti->getPointerOperand());
+        if (!alloca)
+          continue;
+        seeds.push_back({pti, alloca, off});
+      }
     }
 
     if (seeds.empty())
@@ -2932,7 +2935,9 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
           uint64_t sz = arrTy->getNumElements() *
                         F.getDataLayout().getTypeAllocSize(
                             arrTy->getElementType());
-          if (sz < 256)
+          // After SplitLargeAllocaPass, the vmcontext may be split into
+          // smaller regions.  Accept any array alloca with a ptrtoint user.
+          if (sz < 16)
             continue;
           bool has_pti = false;
           for (auto *U : AI->users()) {
@@ -3173,7 +3178,9 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
           uint64_t sz = arrTy->getNumElements() *
                         F.getDataLayout().getTypeAllocSize(
                             arrTy->getElementType());
-          if (sz < 256)
+          // After SplitLargeAllocaPass, the vmcontext may be split into
+          // smaller regions.  Accept any array alloca with a ptrtoint user.
+          if (sz < 16)
             continue;
           // Must have at least one ptrtoint user (the escape).
           bool has_pti = false;

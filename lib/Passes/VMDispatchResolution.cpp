@@ -523,10 +523,13 @@ llvm::PreservedAnalyses VMDispatchResolutionPass::run(
     };
 
     // Two passes: second pass may benefit from earlier resolutions.
+    // Only resolve dispatch_jumps with chain targets — these are the
+    // handler-to-handler dispatch mechanism (jmp trampoline → next handler).
+    // dispatch_calls within VM handlers are native function calls
+    // (vmexit → call [rsp+8] → vmentry) whose targets are unrelated to
+    // the handler chain succession.
     resolve_calls(dispatch_jumps);
-    resolve_calls(dispatch_calls);
     resolve_calls(dispatch_jumps);
-    resolve_calls(dispatch_calls);
   }
 
   // Store discovered targets as named metadata so the tool can re-lift them.
