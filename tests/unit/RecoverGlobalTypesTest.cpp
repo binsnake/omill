@@ -76,7 +76,7 @@ TEST_F(RecoverGlobalTypesTest, AsciiStringRecovered) {
   const char *str = "Hello, World!";
   mem.addRegion(0x140010000,
                 reinterpret_cast<const uint8_t *>(str),
-                strlen(str) + 1);
+                strlen(str) + 1, /*read_only=*/true);
 
   runPass(*M, std::move(mem));
   EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
@@ -100,7 +100,7 @@ TEST_F(RecoverGlobalTypesTest, ShortStringSkipped) {
   const char *str = "abc";
   mem.addRegion(0x140010000,
                 reinterpret_cast<const uint8_t *>(str),
-                strlen(str) + 1);
+                strlen(str) + 1, /*read_only=*/true);
 
   runPass(*M, std::move(mem));
 
@@ -115,7 +115,7 @@ TEST_F(RecoverGlobalTypesTest, NonStringBinaryDataUnchanged) {
   // Binary data with non-printable bytes.
   omill::BinaryMemoryMap mem;
   uint8_t data[] = {0xFF, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06};
-  mem.addRegion(0x140010000, data, sizeof(data));
+  mem.addRegion(0x140010000, data, sizeof(data), /*read_only=*/true);
 
   runPass(*M, std::move(mem));
 

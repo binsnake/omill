@@ -165,7 +165,7 @@ TEST_F(JumpTableConcretizerTest, AbsoluteTable8ByteStride) {
   // Entries: 0x2000, 0x3000, 0x4000.
   uint64_t entries[] = {0x2000, 0x3000, 0x4000};
   mem_map.addRegion(0x1000, reinterpret_cast<const uint8_t *>(entries),
-                    sizeof(entries));
+                    sizeof(entries), /*read_only=*/true);
   mem_map.setImageBase(0x1000);
   mem_map.setImageSize(0x10000);
 
@@ -280,7 +280,7 @@ TEST_F(JumpTableConcretizerTest, RVATable4ByteStride) {
   // Entries (as int32 RVAs): 0x100, 0x200, 0x300 → VAs: 0x5100, 0x5200, 0x5300
   int32_t rva_entries[] = {0x100, 0x200, 0x300};
   mem_map.addRegion(0x5000, reinterpret_cast<const uint8_t *>(rva_entries),
-                    sizeof(rva_entries));
+                    sizeof(rva_entries), /*read_only=*/true);
   mem_map.setImageBase(0x5000);
   mem_map.setImageSize(0x10000);
 

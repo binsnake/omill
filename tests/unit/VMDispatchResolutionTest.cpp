@@ -83,7 +83,7 @@ class VMDispatchResolutionTest : public ::testing::Test {
       buffer[i] = static_cast<uint8_t>((value >> (i * 8)) & 0xFF);
     auto *data = buffer.get();
     Buffers.push_back(std::move(buffer));
-    MemMap.addRegion(addr, data, 4);
+    MemMap.addRegion(addr, data, 4, /*read_only=*/true);
   }
 
   void runPass(llvm::Module &M, omill::VMHandlerGraph graph = {}) {

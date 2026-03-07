@@ -525,7 +525,7 @@ TEST_F(LLVMZ3TranslatorTest, MemoryAwareLoadResolvesConstantAddress) {
   // Set up binary memory with a known value.
   omill::BinaryMemoryMap map;
   uint8_t data[] = {0x00, 0x11, 0x00, 0x40, 0x01, 0x00, 0x00, 0x00};
-  map.addRegion(0x140020000, data, sizeof(data));
+  map.addRegion(0x140020000, data, sizeof(data), /*read_only=*/true);
   translator.setBinaryMemory(&map);
 
   auto *F = createFunc();
@@ -561,7 +561,7 @@ TEST_F(LLVMZ3TranslatorTest, MemoryAwareLoadFallsBackForUnknownAddr) {
   // Binary memory with no mapping at the load address.
   omill::BinaryMemoryMap map;
   uint8_t data[] = {0xAA};
-  map.addRegion(0x140010000, data, 1);
+  map.addRegion(0x140010000, data, 1, /*read_only=*/true);
   translator.setBinaryMemory(&map);
 
   auto *F = createFunc();

@@ -84,7 +84,7 @@ TEST_F(ConstantMemoryFoldingTest, LoadFromConstantAddressFolded) {
   // Set up memory: 8 bytes at address 0x1000 = 0xDEADBEEF12345678
   uint8_t data[8] = {0x78, 0x56, 0x34, 0x12, 0xEF, 0xBE, 0xAD, 0xDE};
   omill::BinaryMemoryMap map;
-  map.addRegion(0x1000, data, 8);
+  map.addRegion(0x1000, data, 8, /*read_only=*/true);
 
   runPass(*M, std::move(map));
 
@@ -107,7 +107,7 @@ TEST_F(ConstantMemoryFoldingTest, LoadFromUnmappedAddressUnchanged) {
   // Map only 0x1000-0x1008, load is at 0x2000 = unmapped.
   uint8_t data[8] = {0};
   omill::BinaryMemoryMap map;
-  map.addRegion(0x1000, data, 8);
+  map.addRegion(0x1000, data, 8, /*read_only=*/true);
 
   runPass(*M, std::move(map));
 
@@ -146,7 +146,7 @@ TEST_F(ConstantMemoryFoldingTest, GEPChainResolved) {
   data[11] = 0x42;
 
   omill::BinaryMemoryMap map;
-  map.addRegion(0x1000, data, 16);
+  map.addRegion(0x1000, data, 16, /*read_only=*/true);
 
   runPass(*M, std::move(map));
 
@@ -173,7 +173,7 @@ TEST_F(ConstantMemoryFoldingTest, MultipleTypesFolded) {
   createLoadFunction(*M, "load_i32", llvm::Type::getInt32Ty(Ctx), 0x1004);
 
   omill::BinaryMemoryMap map;
-  map.addRegion(0x1000, data, 16);
+  map.addRegion(0x1000, data, 16, /*read_only=*/true);
 
   runPass(*M, std::move(map));
 
@@ -217,7 +217,7 @@ TEST_F(ConstantMemoryFoldingTest, FloatLoadFolded) {
   uint8_t data[4];
   std::memcpy(data, &float_bits, 4);
   omill::BinaryMemoryMap map;
-  map.addRegion(0x1000, data, 4);
+  map.addRegion(0x1000, data, 4, /*read_only=*/true);
 
   runPass(*M, std::move(map));
 
@@ -240,7 +240,7 @@ TEST_F(ConstantMemoryFoldingTest, DoubleLoadFolded) {
   uint8_t data[8];
   std::memcpy(data, &dval, 8);
   omill::BinaryMemoryMap map;
-  map.addRegion(0x1000, data, 8);
+  map.addRegion(0x1000, data, 8, /*read_only=*/true);
 
   runPass(*M, std::move(map));
 
@@ -284,7 +284,7 @@ TEST_F(ConstantMemoryFoldingTest, ChainedGEPResolved) {
   data[15] = 0xCA;
 
   omill::BinaryMemoryMap map;
-  map.addRegion(0x1000, data, 16);
+  map.addRegion(0x1000, data, 16, /*read_only=*/true);
 
   runPass(*M, std::move(map));
 

@@ -423,7 +423,7 @@ TEST_F(ResolveDispatchTargetsTest, IterativeConvergence) {
   // Binary memory: at 0x140010000, store the value 0x14001FF00 (LE).
   omill::BinaryMemoryMap map;
   uint64_t stored_val = 0x14001FF00ULL;
-  map.addRegion(0x140010000, reinterpret_cast<const uint8_t *>(&stored_val), 8);
+  map.addRegion(0x140010000, reinterpret_cast<const uint8_t *>(&stored_val), 8, /*read_only=*/true);
 
   runIterativePass(M.get(), std::move(map), 10);
 
@@ -542,7 +542,7 @@ TEST_F(ResolveDispatchTargetsTest, MaxIterationsRespected) {
   uint8_t region[16];
   std::memcpy(region, &val1, 8);
   std::memcpy(region + 8, &val2, 8);
-  map.addRegion(0x140010000, region, 16);
+  map.addRegion(0x140010000, region, 16, /*read_only=*/true);
 
   // With max_iter=1, the iteration should fold the loads and the add in the first
   // iteration, resolve the target, then stop. Let's verify it works with 1 iteration.

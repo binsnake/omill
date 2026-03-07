@@ -41,7 +41,7 @@ class BinaryMemoryMapTest : public ::testing::Test {
 
 TEST_F(BinaryMemoryMapTest, AddRegionAndRead) {
   auto *data = allocBuf({0x41, 0x42, 0x43, 0x44});
-  map.addRegion(0x1000, data, 4);
+  map.addRegion(0x1000, data, 4, /*read_only=*/true);
 
   uint8_t out[4] = {};
   ASSERT_TRUE(map.read(0x1000, out, 4));
@@ -63,7 +63,7 @@ TEST_F(BinaryMemoryMapTest, AddRegionAndRead) {
 
 TEST_F(BinaryMemoryMapTest, ReadAcrossRegionBoundary) {
   auto *data = allocBuf({0x01, 0x02, 0x03, 0x04});
-  map.addRegion(0x2000, data, 4);
+  map.addRegion(0x2000, data, 4, /*read_only=*/true);
 
   uint8_t out[4] = {};
   // Starts at offset 2, wants 4 bytes → overflows by 2.
@@ -76,7 +76,7 @@ TEST_F(BinaryMemoryMapTest, ReadAcrossRegionBoundary) {
 
 TEST_F(BinaryMemoryMapTest, ReadBeforeRegion) {
   auto *data = allocBuf({0xAA, 0xBB});
-  map.addRegion(0x5000, data, 2);
+  map.addRegion(0x5000, data, 2, /*read_only=*/true);
 
   uint8_t out[1] = {};
   EXPECT_FALSE(map.read(0x4FFF, out, 1));
@@ -90,7 +90,7 @@ TEST_F(BinaryMemoryMapTest, ReadBeforeRegion) {
 TEST_F(BinaryMemoryMapTest, ReadInt_LE) {
   // 0xDEADBEEFCAFEBABE in little-endian byte order.
   auto *data = allocBuf({0xBE, 0xBA, 0xFE, 0xCA, 0xEF, 0xBE, 0xAD, 0xDE});
-  map.addRegion(0x3000, data, 8);
+  map.addRegion(0x3000, data, 8, /*read_only=*/true);
 
   // 1-byte
   auto v1 = map.readInt(0x3000, 1);
@@ -119,7 +119,7 @@ TEST_F(BinaryMemoryMapTest, ReadInt_LE) {
 
 TEST_F(BinaryMemoryMapTest, ReadInt_TooLarge) {
   auto *data = allocBuf(16, 0xFF);
-  map.addRegion(0x4000, data, 16);
+  map.addRegion(0x4000, data, 16, /*read_only=*/true);
 
   EXPECT_FALSE(map.readInt(0x4000, 9).has_value());
   EXPECT_FALSE(map.readInt(0x4000, 16).has_value());
@@ -132,8 +132,8 @@ TEST_F(BinaryMemoryMapTest, ReadInt_TooLarge) {
 TEST_F(BinaryMemoryMapTest, MultipleRegions) {
   auto *d1 = allocBuf({0x11, 0x22});
   auto *d2 = allocBuf({0x33, 0x44});
-  map.addRegion(0x1000, d1, 2);
-  map.addRegion(0x9000, d2, 2);
+  map.addRegion(0x1000, d1, 2, /*read_only=*/true);
+  map.addRegion(0x9000, d2, 2, /*read_only=*/true);
 
   uint8_t out1[2] = {};
   ASSERT_TRUE(map.read(0x1000, out1, 2));
@@ -281,7 +281,7 @@ TEST_F(BinaryMemoryMapTest, Empty) {
   EXPECT_TRUE(map.empty());
 
   auto *data = allocBuf({0x00});
-  map.addRegion(0x1000, data, 1);
+  map.addRegion(0x1000, data, 1, /*read_only=*/true);
   EXPECT_FALSE(map.empty());
 }
 

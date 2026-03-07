@@ -150,7 +150,7 @@ TEST_F(Z3DispatchSolverTest, ResolvesDirectArithmetic) {
   omill::BinaryMemoryMap map;
   // Add a dummy region so the pass doesn't bail out on empty map.
   uint8_t dummy = 0;
-  map.addRegion(0x140000000, &dummy, 1);
+  map.addRegion(0x140000000, &dummy, 1, /*read_only=*/true);
 
   runPass(M.get(), std::move(map));
 
@@ -181,7 +181,7 @@ TEST_F(Z3DispatchSolverTest, SkipsConstantTarget) {
 
   omill::BinaryMemoryMap map;
   uint8_t dummy = 0;
-  map.addRegion(0x140000000, &dummy, 1);
+  map.addRegion(0x140000000, &dummy, 1, /*read_only=*/true);
   runPass(M.get(), std::move(map));
 
   EXPECT_EQ(countDispatchJumps(F), 1u);
@@ -240,7 +240,7 @@ TEST_F(Z3DispatchSolverTest, SkipsUnconstrainedTarget) {
 
   omill::BinaryMemoryMap map;
   uint8_t dummy = 0;
-  map.addRegion(0x140000000, &dummy, 1);
+  map.addRegion(0x140000000, &dummy, 1, /*read_only=*/true);
   runPass(M.get(), std::move(map));
 
   // Should be skipped (too many solutions).
@@ -288,7 +288,7 @@ TEST_F(Z3DispatchSolverTest, ResolvesWithAndMask) {
 
   omill::BinaryMemoryMap map;
   uint8_t dummy = 0;
-  map.addRegion(0x140000000, &dummy, 1);
+  map.addRegion(0x140000000, &dummy, 1, /*read_only=*/true);
   runPass(M.get(), std::move(map));
 
   EXPECT_TRUE(hasSwitchInst(F));
@@ -345,7 +345,7 @@ TEST_F(Z3DispatchSolverTest, ResolvesInterFunction) {
 
   omill::BinaryMemoryMap map;
   uint8_t dummy = 0;
-  map.addRegion(0x140000000, &dummy, 1);
+  map.addRegion(0x140000000, &dummy, 1, /*read_only=*/true);
   runPass(M.get(), std::move(map));
 
   // The solver should resolve the inter-function tail call.
@@ -418,7 +418,7 @@ TEST_F(Z3DispatchSolverTest, VerifiesMultipleDispatches) {
 
   omill::BinaryMemoryMap map;
   uint8_t dummy = 0;
-  map.addRegion(0x140000000, &dummy, 1);
+  map.addRegion(0x140000000, &dummy, 1, /*read_only=*/true);
   runPass(M.get(), std::move(map));
 
   // Count switches — should have at least 2.
@@ -510,7 +510,7 @@ TEST_F(Z3DispatchSolverTest, ResolvesWithMemoryDereference) {
   table_data[8] = 0x00; table_data[9] = 0x13;
   table_data[10] = 0x00; table_data[11] = 0x00;
 
-  map.addRegion(0x140020000, table_data, sizeof(table_data));
+  map.addRegion(0x140020000, table_data, sizeof(table_data), /*read_only=*/true);
 
   runPass(M.get(), std::move(map));
 
@@ -578,7 +578,7 @@ TEST_F(Z3DispatchSolverTest, ResolvesNestedJumpTableViaRecursion) {
   table_data[4] = 0x00; table_data[5] = 0x12;
   table_data[6] = 0x00; table_data[7] = 0x00;
 
-  map.addRegion(0x140020000, table_data, sizeof(table_data));
+  map.addRegion(0x140020000, table_data, sizeof(table_data), /*read_only=*/true);
 
   runPass(M.get(), std::move(map));
 
@@ -626,7 +626,7 @@ TEST_F(Z3DispatchSolverTest, UsesOptimizedTactics) {
 
   omill::BinaryMemoryMap map;
   uint8_t dummy = 0;
-  map.addRegion(0x140000000, &dummy, 1);
+  map.addRegion(0x140000000, &dummy, 1, /*read_only=*/true);
   runPass(M.get(), std::move(map));
 
   // The simplify tactic should recognize x^x == 0.

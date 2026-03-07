@@ -174,7 +174,7 @@ TEST_F(RecoverJumpTablesTest, Absolute8ByteTable) {
     table[i] = 0x140001100 + i * 0x10;
 
   omill::BinaryMemoryMap map;
-  map.addRegion(0x140020000, reinterpret_cast<const uint8_t *>(table), 32);
+  map.addRegion(0x140020000, reinterpret_cast<const uint8_t *>(table), 32, /*read_only=*/true);
 
   EXPECT_EQ(countDispatchJumps(F), 2u);  // switch_bb + default_bb
 
@@ -201,7 +201,7 @@ TEST_F(RecoverJumpTablesTest, Relative4ByteTable) {
     table[i] = static_cast<uint32_t>(0x140001100 + i * 0x10 - image_base);
 
   omill::BinaryMemoryMap map;
-  map.addRegion(0x140020000, reinterpret_cast<const uint8_t *>(table), 16);
+  map.addRegion(0x140020000, reinterpret_cast<const uint8_t *>(table), 16, /*read_only=*/true);
 
   runPass(M.get(), std::move(map));
 
@@ -225,7 +225,7 @@ TEST_F(RecoverJumpTablesTest, BoundsFromICmp) {
     table[i] = 0x140001100 + i * 0x10;
 
   omill::BinaryMemoryMap map;
-  map.addRegion(0x140020000, reinterpret_cast<const uint8_t *>(table), 32);
+  map.addRegion(0x140020000, reinterpret_cast<const uint8_t *>(table), 32, /*read_only=*/true);
 
   runPass(M.get(), std::move(map));
 
@@ -261,7 +261,7 @@ TEST_F(RecoverJumpTablesTest, SkipsDynamicBase) {
 
   omill::BinaryMemoryMap map;
   uint64_t dummy[4] = {0};
-  map.addRegion(0x140020000, reinterpret_cast<const uint8_t *>(dummy), 32);
+  map.addRegion(0x140020000, reinterpret_cast<const uint8_t *>(dummy), 32, /*read_only=*/true);
 
   unsigned before = countDispatchJumps(F);
 
@@ -290,7 +290,7 @@ TEST_F(RecoverJumpTablesTest, UnknownEntryFallsToDefault) {
   };
 
   omill::BinaryMemoryMap map;
-  map.addRegion(0x140020000, reinterpret_cast<const uint8_t *>(table), 32);
+  map.addRegion(0x140020000, reinterpret_cast<const uint8_t *>(table), 32, /*read_only=*/true);
 
   runPass(M.get(), std::move(map));
 
@@ -324,7 +324,7 @@ TEST_F(RecoverJumpTablesTest, MixedIntraInterTargets) {
   };
 
   omill::BinaryMemoryMap map;
-  map.addRegion(0x140020000, reinterpret_cast<const uint8_t *>(table), 32);
+  map.addRegion(0x140020000, reinterpret_cast<const uint8_t *>(table), 32, /*read_only=*/true);
 
   runPass(M.get(), std::move(map));
 
@@ -396,7 +396,7 @@ TEST_F(RecoverJumpTablesTest, BoundsFromAndMask) {
     table[i] = 0x140002100 + i * 0x10;
 
   omill::BinaryMemoryMap map;
-  map.addRegion(0x140030000, reinterpret_cast<const uint8_t *>(table), 64);
+  map.addRegion(0x140030000, reinterpret_cast<const uint8_t *>(table), 64, /*read_only=*/true);
 
   runPass(M.get(), std::move(map));
 
@@ -468,7 +468,7 @@ TEST_F(RecoverJumpTablesTest, BoundsFromMultiPredecessor) {
     table[i] = 0x140003100 + i * 0x10;
 
   omill::BinaryMemoryMap map;
-  map.addRegion(0x140040000, reinterpret_cast<const uint8_t *>(table), 32);
+  map.addRegion(0x140040000, reinterpret_cast<const uint8_t *>(table), 32, /*read_only=*/true);
 
   runPass(M.get(), std::move(map));
 
@@ -533,7 +533,7 @@ TEST_F(RecoverJumpTablesTest, BoundsFromULE) {
     table[i] = 0x140004100 + i * 0x10;
 
   omill::BinaryMemoryMap map;
-  map.addRegion(0x140050000, reinterpret_cast<const uint8_t *>(table), 32);
+  map.addRegion(0x140050000, reinterpret_cast<const uint8_t *>(table), 32, /*read_only=*/true);
 
   runPass(M.get(), std::move(map));
 

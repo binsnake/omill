@@ -178,7 +178,7 @@ class IndirectCallResolverTest : public ::testing::Test {
       buf[i] = static_cast<uint8_t>((value >> (i * 8)) & 0xFF);
     auto *ptr = buf.get();
     mem_bufs.push_back(std::move(buf));
-    mem_map.addRegion(addr, ptr, 8);
+    mem_map.addRegion(addr, ptr, 8, /*read_only=*/true);
   }
 
   /// Add a little-endian i32 to the memory map.
@@ -188,7 +188,7 @@ class IndirectCallResolverTest : public ::testing::Test {
       buf[i] = static_cast<uint8_t>((value >> (i * 8)) & 0xFF);
     auto *ptr = buf.get();
     mem_bufs.push_back(std::move(buf));
-    mem_map.addRegion(addr, ptr, 4);
+    mem_map.addRegion(addr, ptr, 4, /*read_only=*/true);
   }
 };
 

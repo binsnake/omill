@@ -261,6 +261,9 @@ bool inlineCalleesForDispatchResolution(
 
   for (auto *F : targets) {
     bool progress = true;
+    // Track already-inlined functions to prevent cyclic expansion
+    // (A→B→C→A where each round re-introduces previously inlined calls).
+    llvm::DenseSet<llvm::Function *> already_inlined_into_F;
     unsigned rounds = 0;
     while (progress && rounds < kMaxInlineRounds) {
       ++rounds;
@@ -289,6 +292,10 @@ bool inlineCalleesForDispatchResolution(
           if (!def || def->isDeclaration())
             continue;
           if (def == F)
+            continue;
+
+          // Skip functions we've already inlined — prevents cyclic expansion.
+          if (already_inlined_into_F.count(def))
             continue;
 
           // Only inline VM handlers — callees that contain dispatch
@@ -331,11 +338,14 @@ bool inlineCalleesForDispatchResolution(
       }
 
       for (auto *CI : to_inline) {
+        auto *callee_def = CI->getCalledFunction();
         llvm::InlineFunctionInfo IFI;
         auto result = llvm::InlineFunction(*CI, IFI);
         if (result.isSuccess()) {
           progress = true;
           inlined_any = true;
+          if (callee_def)
+            already_inlined_into_F.insert(callee_def);
           if (modified_out)
             modified_out->push_back(F);
         }

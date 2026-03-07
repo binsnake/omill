@@ -137,7 +137,7 @@ TEST_F(SymbolicJumpTableSolverTest, ResolvesWithAndMaskBound) {
     table[i] = 0x140001100 + i * 0x10;
 
   omill::BinaryMemoryMap map;
-  map.addRegion(0x140020000, reinterpret_cast<const uint8_t *>(table), 32);
+  map.addRegion(0x140020000, reinterpret_cast<const uint8_t *>(table), 32, /*read_only=*/true);
 
   runPass(M.get(), std::move(map));
 
@@ -201,7 +201,7 @@ TEST_F(SymbolicJumpTableSolverTest, ResolvesWithICmpBound) {
     table[i] = 0x140006100 + i * 0x10;
 
   omill::BinaryMemoryMap map;
-  map.addRegion(0x140060000, reinterpret_cast<const uint8_t *>(table), 32);
+  map.addRegion(0x140060000, reinterpret_cast<const uint8_t *>(table), 32, /*read_only=*/true);
 
   runPass(M.get(), std::move(map));
 
@@ -267,7 +267,7 @@ TEST_F(SymbolicJumpTableSolverTest, SkipsDynamicBase) {
 
   omill::BinaryMemoryMap map;
   uint64_t dummy[4] = {0};
-  map.addRegion(0x140020000, reinterpret_cast<const uint8_t *>(dummy), 32);
+  map.addRegion(0x140020000, reinterpret_cast<const uint8_t *>(dummy), 32, /*read_only=*/true);
 
   unsigned before = countDispatchJumps(F);
   runPass(M.get(), std::move(map));

@@ -221,7 +221,7 @@ TEST_F(IterativeTargetResolutionTest, MultipleIterations_MakesProgress) {
   omill::BinaryMemoryMap map;
   uint64_t stored_val = 0x14001FF00ULL;
   map.addRegion(0x140010000, reinterpret_cast<const uint8_t *>(&stored_val),
-                8);
+                8, /*read_only=*/true);
 
   runPass(M.get(), std::move(map), 10);
 
