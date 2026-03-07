@@ -27,6 +27,7 @@ add_library(omill STATIC
 
   # Passes - Stage 2.5: VM Devirtualization
   Analysis/VMHandlerGraph.cpp
+  Analysis/VMHandlerChainSolver.cpp
   Passes/VMDispatchResolution.cpp
   Passes/VMHashElimination.cpp
 

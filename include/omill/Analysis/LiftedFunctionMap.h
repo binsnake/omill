@@ -1,10 +1,12 @@
 #pragma once
 
-#include <llvm/ADT/DenseMap.h>
-#include <llvm/ADT/DenseSet.h>
+#include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
 
 #include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace llvm {
 class Function;
@@ -20,27 +22,36 @@ class LiftedFunctionMap {
  public:
   /// Look up a lifted function by its entry PC.
   llvm::Function *lookup(uint64_t pc) const {
-    auto it = pc_to_func_.find(pc);
-    return it != pc_to_func_.end() ? it->second : nullptr;
+    if (!module_)
+      return nullptr;
+    auto it = pc_to_name_.find(pc);
+    if (it == pc_to_name_.end())
+      return nullptr;
+    return module_->getFunction(it->second);
   }
 
   /// Check if a function is a known lifted function.
   bool isLifted(const llvm::Function *F) const {
-    return lifted_set_.count(F);
+    return F && lifted_names_.count(F->getName().str());
   }
 
   /// Number of lifted functions found.
-  size_t size() const { return pc_to_func_.size(); }
+  size_t size() const { return pc_to_name_.size(); }
 
   /// Insert a newly-lifted function into the map.
   /// Used by IterativeTargetResolution after auto-lifting.
   void insert(uint64_t pc, llvm::Function *F) {
-    pc_to_func_[pc] = F;
-    lifted_set_.insert(F);
+    if (!F)
+      return;
+    module_ = F->getParent();
+    auto name = F->getName().str();
+    pc_to_name_[pc] = name;
+    lifted_names_.insert(std::move(name));
   }
 
-  /// LLVM analysis invalidation — the map is updated incrementally
-  /// via insert(), so it is never invalidated by the framework.
+  /// LLVM analysis invalidation. Entries are keyed by function name and
+  /// re-resolved through the owning module, so the cache tolerates module
+  /// rewrites that erase/recreate functions with the same lifted names.
   bool invalidate(llvm::Module &, const llvm::PreservedAnalyses &,
                   llvm::ModuleAnalysisManager::Invalidator &) {
     return false;
@@ -48,8 +59,9 @@ class LiftedFunctionMap {
 
  private:
   friend class LiftedFunctionAnalysis;
-  llvm::DenseMap<uint64_t, llvm::Function *> pc_to_func_;
-  llvm::DenseSet<const llvm::Function *> lifted_set_;
+  llvm::Module *module_ = nullptr;
+  std::unordered_map<uint64_t, std::string> pc_to_name_;
+  std::unordered_set<std::string> lifted_names_;
 };
 
 /// Module analysis that builds a LiftedFunctionMap.

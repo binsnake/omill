@@ -452,7 +452,34 @@ llvm::PreservedAnalyses VMDispatchResolutionPass::run(
         if (llvm::isa<llvm::ConstantInt>(target_val))
           continue;
 
-        // Try recursive resolution.
+        // Priority 1: chain-solved targets from VMHandlerChainSolver.
+        // The chain solver concretely emulates handlers and knows the exact
+        // successor VA.  This takes priority over IR pattern matching because
+        // the IR-level `image_base + RVA` formula is wrong for EAC-style VMs
+        // where the dispatch base is `delta` (not image_base).
+        {
+          auto chain_succs = graph.getChainTargets(handler_va);
+          if (chain_succs.size() == 1) {
+            auto *const_target =
+                llvm::ConstantInt::get(i64_ty, chain_succs[0]);
+            call->setArgOperand(1, const_target);
+            ++resolved_count;
+
+            std::string target_name =
+                "sub_" + llvm::Twine::utohexstr(chain_succs[0]).str();
+            if (!M.getFunction(target_name))
+              discovered_targets.insert(chain_succs[0]);
+            continue;
+          }
+          if (chain_succs.size() == 2) {
+            // Two successors — can't determine which branch without
+            // analyzing the condition. For now, skip.
+            // TODO: match the IR-level branch condition to pick the right
+            // successor, or emit a select of both.
+          }
+        }
+
+        // Priority 2: recursive IR pattern resolution.
         llvm::SmallPtrSet<llvm::Value *, 16> visiting;
         if (auto resolved =
                 resolveTargetValue(target_val, graph, memory, handler_va,
@@ -461,7 +488,6 @@ llvm::PreservedAnalyses VMDispatchResolutionPass::run(
           call->setArgOperand(1, const_target);
           ++resolved_count;
 
-          // Check if the target function exists in the module.
           std::string target_name =
               "sub_" + llvm::Twine::utohexstr(*resolved).str();
           if (!M.getFunction(target_name)) {
@@ -470,12 +496,11 @@ llvm::PreservedAnalyses VMDispatchResolutionPass::run(
           continue;
         }
 
-        // Try select-specific resolution.
+        // Priority 3: select-specific resolution.
         if (auto *sel = llvm::dyn_cast<llvm::SelectInst>(target_val)) {
           if (resolveSelectTarget(call, sel, graph, memory, M, handler_va)) {
             ++select_count;
 
-            // Check discovered targets from the select branches.
             if (auto *new_sel =
                     llvm::dyn_cast<llvm::SelectInst>(call->getArgOperand(1))) {
               for (auto *op :

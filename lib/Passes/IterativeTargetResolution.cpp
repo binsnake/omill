@@ -813,7 +813,7 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
         for (auto &F : M) {
           if (F.isDeclaration()) continue;
           for (uint64_t pc : new_pcs) {
-            std::string prefix = "sub_" + llvm::Twine::utohexstr(pc).str();
+            std::string prefix = omill::liftedFunctionName(pc);
             if (F.getName().starts_with(prefix)) {
               new_funcs.push_back(&F);
               // Register in the LiftedFunctionMap so downstream

@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "omill/Analysis/BinaryMemoryMap.h"
+#include "omill/Analysis/VMHandlerChainSolver.h"
 
 namespace omill {
 
@@ -270,6 +271,56 @@ VMHandlerGraph::getHandlerTargets(uint64_t handler_va) const {
   }
 
   return targets;
+}
+
+void VMHandlerGraph::mergeChainResults(
+    const VMHandlerChainSolver &solver) {
+  unsigned added = 0;
+  unsigned chain_count = 0;
+
+  for (auto &entry : solver.chainEntries()) {
+    // Add handler VA as handler entry.
+    if (handler_set_.insert(entry.handler_va).second) {
+      handler_entries_.push_back(entry.handler_va);
+      ++added;
+    }
+
+    // Add each successor VA as a handler entry too.
+    for (uint64_t succ : entry.successors) {
+      if (handler_set_.insert(succ).second) {
+        handler_entries_.push_back(succ);
+        ++added;
+      }
+    }
+
+    // Store chain-solved dispatch targets.
+    if (!entry.successors.empty()) {
+      chain_targets_[entry.handler_va] = entry.successors;
+      ++chain_count;
+    } else if (entry.is_vmexit) {
+      // Terminal vmexit: handler chain ends here.  Store vmexit_va as the
+      // sole successor so VMDispatchResolution can detect this and convert
+      // the dispatch to a function return.
+      chain_targets_[entry.handler_va] = {vmexit_va_};
+      ++chain_count;
+    }
+  }
+
+  // Re-sort handler entries after merging.
+  if (added > 0)
+    llvm::sort(handler_entries_);
+
+  llvm::errs() << "VMHandlerGraph: merged " << solver.chainEntries().size()
+               << " chain entries (" << added << " new handler entries, "
+               << chain_count << " dispatch mappings)\n";
+}
+
+llvm::SmallVector<uint64_t, 2>
+VMHandlerGraph::getChainTargets(uint64_t handler_va) const {
+  auto it = chain_targets_.find(handler_va);
+  if (it != chain_targets_.end())
+    return it->second;
+  return {};
 }
 
 }  // namespace omill

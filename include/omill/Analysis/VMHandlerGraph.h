@@ -16,6 +16,7 @@ class Module;
 namespace omill {
 
 class BinaryMemoryMap;
+class VMHandlerChainSolver;
 
 /// Extracted VM handler dispatch graph from binary byte pattern scanning.
 ///
@@ -29,6 +30,14 @@ class BinaryMemoryMap;
 class VMHandlerGraph {
  public:
   VMHandlerGraph() = default;
+
+  /// Construct with metadata only (no byte-pattern scanning).
+  /// Use with mergeChainResults() to populate from a chain solver.
+  VMHandlerGraph(uint64_t image_base, uint64_t vmenter_va,
+                 uint64_t vmexit_va)
+      : image_base_(image_base),
+        vmenter_va_(vmenter_va),
+        vmexit_va_(vmexit_va) {}
 
   /// Construct by scanning binary memory for dispatch patterns.
   ///
@@ -73,6 +82,17 @@ class VMHandlerGraph {
   /// Number of dispatch sites found in the binary.
   size_t numDispatchSites() const { return dispatch_targets_.size(); }
 
+  /// Merge results from the VMHandlerChainSolver into this graph.
+  ///
+  /// For each chain entry that has resolved successors, adds:
+  ///   - handler_va as a handler entry
+  ///   - each successor as a handler entry + dispatch target
+  ///   - handler_va → successor mapping in chain_targets_
+  void mergeChainResults(const VMHandlerChainSolver &solver);
+
+  /// Get chain-solved successor VAs for a handler.
+  llvm::SmallVector<uint64_t, 2> getChainTargets(uint64_t handler_va) const;
+
   /// LLVM analysis invalidation — the graph is immutable once built.
   bool invalidate(llvm::Module &, const llvm::PreservedAnalyses &,
                   llvm::ModuleAnalysisManager::Invalidator &) {
@@ -111,6 +131,9 @@ class VMHandlerGraph {
 
   /// Fast lookup set for handler VAs.
   llvm::DenseSet<uint64_t> handler_set_;
+
+  /// Chain-solved dispatch targets: handler_va → successor VAs.
+  llvm::DenseMap<uint64_t, llvm::SmallVector<uint64_t, 2>> chain_targets_;
 };
 
 /// Module-level analysis providing the VMHandlerGraph.

@@ -58,6 +58,23 @@ class ExceptionInfo {
     return nullptr;
   }
 
+  /// Look up the nearest RUNTIME_FUNCTION start at or before a given VA.
+  /// This uses only BeginAddress ordering and intentionally ignores EndAddress,
+  /// which is useful when pdata end VAs are unreliable but function starts are
+  /// still trustworthy.
+  const RuntimeFunctionEntry *lookupByStartFloor(uint64_t va) const {
+    ensureSorted();
+    auto it = std::upper_bound(
+        entries_.begin(), entries_.end(), va,
+        [](uint64_t v, const RuntimeFunctionEntry &e) {
+          return v < e.begin_va;
+        });
+    if (it == entries_.begin())
+      return nullptr;
+    --it;
+    return &(*it);
+  }
+
   /// Return unique handler VAs (for auto-lifting).
   std::vector<uint64_t> getHandlerVAs() const {
     std::vector<uint64_t> result;

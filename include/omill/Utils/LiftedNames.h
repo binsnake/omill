@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace llvm {
 class BasicBlock;
@@ -32,6 +33,12 @@ llvm::SmallVector<uint64_t, 8> collectPossiblePCValues(
 /// Extract the entry virtual address from a lifted function name like
 /// "sub_140001280" or "sub_140001280.1".  Returns 0 on failure.
 uint64_t extractEntryVA(llvm::StringRef name);
+
+/// Build the canonical lowercase lifted function name for a VA.
+std::string liftedFunctionName(uint64_t va);
+
+/// Build the canonical lowercase native wrapper name for a VA.
+std::string nativeFunctionName(uint64_t va);
 
 /// Check if a function has the remill lifted signature: (ptr, i64, ptr) -> ptr,
 /// is not a declaration, and doesn't have a __remill_/__omill_ prefix.

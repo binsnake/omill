@@ -7,6 +7,7 @@
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/Support/FormatVariadic.h>
 
 namespace {
 
@@ -266,6 +267,14 @@ uint64_t extractEntryVA(llvm::StringRef name) {
   if (hex.getAsInteger(16, va))
     return 0;
   return va;
+}
+
+std::string liftedFunctionName(uint64_t va) {
+  return "sub_" + llvm::formatv("{0:x}", va).str();
+}
+
+std::string nativeFunctionName(uint64_t va) {
+  return liftedFunctionName(va) + "_native";
 }
 
 bool isLiftedFunction(const llvm::Function &F) {

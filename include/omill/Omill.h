@@ -113,6 +113,18 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM,
 /// Run after ABI recovery and post-ABI deobfuscation, before output.
 void buildLateCleanupPipeline(llvm::ModulePassManager &MPM);
 
+/// Resolve constant inttoptr call targets to direct _native calls and run
+/// bounded post-rewrite inline/cleanup rounds until convergence.
+///
+/// Emits per-round progress metadata in:
+///   !omill.inttoptr_closure_rounds = {round, resolved_calls, remaining_calls}
+void buildIntToPtrClosurePipeline(llvm::ModulePassManager &MPM);
+
+/// Build the post-patch cleanup pipeline used after call-target rewrites.
+/// Includes module inlining and core scalar cleanup passes.
+void buildPostPatchCleanupPipeline(llvm::ModulePassManager &MPM,
+                                   unsigned inline_threshold = 80);
+
 /// Register all omill function-level analyses.
 void registerAnalyses(llvm::FunctionAnalysisManager &FAM);
 

@@ -49,6 +49,7 @@
 #include "omill/Analysis/CallGraphAnalysis.h"
 #include "omill/Analysis/ExceptionInfo.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
+#include "omill/Analysis/VMHandlerChainSolver.h"
 #include "omill/Analysis/VMHandlerGraph.h"
 #include "omill/Omill.h"
 #include "omill/Tools/LiftRunContract.h"
@@ -1484,24 +1485,49 @@ int main(int argc, char **argv) {
   errs() << "Lifting complete\n";
   events.emitInfo("lifting_completed", "lifting complete");
 
-  // VM mode: build handler graph and bulk-lift all discovered handlers.
+  // VM mode: use chain solver to discover handlers reachable from the entry
+  // wrapper, then lift only those.  No byte-pattern bulk scan — further
+  // targets are discovered naturally by the pipeline's iterative resolution.
   std::shared_ptr<omill::VMHandlerGraph> vm_graph;
   if (vm_mode && !RawBinary) {
+    // Start with metadata-only graph — no byte-pattern scanning.
     vm_graph = std::make_shared<omill::VMHandlerGraph>(
-        pe.memory_map, pe.image_base, vm_entry_va, vm_exit_va);
-    events.emitInfo("vm_graph_built", "vm handler graph created",
-                    {{"handlers", static_cast<int64_t>(vm_graph->handlerEntries().size())},
-                     {"dispatch_sites", static_cast<int64_t>(vm_graph->numDispatchSites())}});
+        pe.image_base, vm_entry_va, vm_exit_va);
 
-    errs() << "VM handler graph: " << vm_graph->handlerEntries().size()
-           << " handlers, " << vm_graph->numDispatchSites()
-           << " dispatch sites\n";
+    // Run chain solver to discover handler chains via concrete emulation.
+    std::vector<uint64_t> chain_handler_vas;
+    {
+      omill::VMHandlerChainSolver solver(pe.memory_map, pe.image_base,
+                                         vm_entry_va, vm_exit_va);
 
-    // Lift all discovered handler entry VAs.
+      // Set the handler segment range (seg006 bounds).
+      uint64_t seg_start = vm_entry_va;
+      uint64_t seg_end = vm_entry_va + 0x2000000;
+      pe.memory_map.forEachRegion(
+          [&](uint64_t base, const uint8_t *, size_t size) {
+            if (vm_entry_va >= base && vm_entry_va < base + size) {
+              seg_start = base;
+              seg_end = base + size;
+            }
+          });
+      solver.setHandlerSegmentRange(seg_start, seg_end);
+
+      // Solve from the entry wrapper.
+      auto chain = solver.solveFromWrapper(func_va);
+      if (!chain.empty()) {
+        vm_graph->mergeChainResults(solver);
+        events.emitInfo("vm_chain_solved", "vm handler chain solved",
+                        {{"handlers", static_cast<int64_t>(chain.size())}});
+        for (auto &entry : chain)
+          chain_handler_vas.push_back(entry.handler_va);
+      }
+    }
+
+    // Lift only chain-solved handlers.
     unsigned lifted_count = 0;
     unsigned failed_count = 0;
     unsigned skipped_count = 0;
-    for (uint64_t handler_va : vm_graph->handlerEntries()) {
+    for (uint64_t handler_va : chain_handler_vas) {
       // Skip if already lifted (e.g. func_va or vmenter/vmexit).
       std::string name = "sub_" + Twine::utohexstr(handler_va).str();
       if (auto *existing = module->getFunction(name)) {
@@ -1552,17 +1578,10 @@ int main(int argc, char **argv) {
                      {"skipped", static_cast<int64_t>(skipped_count)},
                      {"failed", static_cast<int64_t>(failed_count)}});
 
-    // Also tag vmenter/vmexit.
-    if (auto *fn = module->getFunction(
-            "sub_" + Twine::utohexstr(vm_entry_va).str()))
-      fn->addFnAttr("omill.vm_handler");
-    if (vm_exit_va != 0) {
-      if (auto *fn = module->getFunction(
-              "sub_" + Twine::utohexstr(vm_exit_va).str()))
-        fn->addFnAttr("omill.vm_handler");
-    }
-
     // Fix DeclareLiftedFunction naming collisions (sub_X.N → sub_X).
+    // Must happen BEFORE setting attributes on vmentry/vmexit, because
+    // the fix erases declarations (which may hold attributes from the
+    // chain handler loop above) and renames definitions (which don't).
     for (auto &F : llvm::make_early_inc_range(*module)) {
       if (!F.isDeclaration())
         continue;
@@ -1579,6 +1598,35 @@ int main(int argc, char **argv) {
             break;
           }
         }
+      }
+    }
+
+    // After naming collisions are fixed, tag vmentry/vmexit as vm_handler
+    // and set internal linkage.  Must happen AFTER the naming fix because
+    // DeclareLiftedFunction creates sub_X.1 definitions for existing sub_X
+    // declarations; the fix erases the declaration (losing any attributes
+    // we set) and renames the definition.
+    //
+    // vmentry must NOT get AlwaysInline.  If inlined at Phase 0, its
+    // __remill_function_return ends up inside DriverEntry; LowerFunctionReturn
+    // (Phase 3b) converts it to `ret`, creating an early return that kills
+    // DriverEntry's continuation code (hash computation + dispatch to the
+    // first handler).  Instead, vmentry is tagged omill.vm_handler so
+    // VMHandlerInlinerPass inlines it at Phase 3.56 — by that point
+    // LowerFunctionReturn has already converted vmentry's return to a plain
+    // `ret`, and LLVM's InlineFunction replaces it with a branch to the
+    // continuation block.  The vmcontext alloca then lands on DriverEntry's
+    // stack (fixing the dangling-pointer / 0xCC sentinel issue).
+    if (auto *fn = module->getFunction(
+            "sub_" + Twine::utohexstr(vm_entry_va).str())) {
+      fn->addFnAttr("omill.vm_handler");
+      fn->setLinkage(llvm::GlobalValue::InternalLinkage);
+    }
+    if (vm_exit_va != 0) {
+      if (auto *fn = module->getFunction(
+              "sub_" + Twine::utohexstr(vm_exit_va).str())) {
+        fn->addFnAttr("omill.vm_handler");
+        fn->setLinkage(llvm::GlobalValue::InternalLinkage);
       }
     }
   }

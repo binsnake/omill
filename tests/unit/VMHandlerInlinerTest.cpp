@@ -10,6 +10,9 @@
 #include <llvm/IR/Verifier.h>
 #include <llvm/Passes/PassBuilder.h>
 
+#include <cstdlib>
+#include <string>
+
 #include <gtest/gtest.h>
 
 namespace {
@@ -17,6 +20,48 @@ namespace {
 class VMHandlerInlinerTest : public ::testing::Test {
  protected:
   llvm::LLVMContext Ctx;
+
+  class ScopedEnvVar {
+   public:
+    ScopedEnvVar(const char *name, const char *value) : name_(name) {
+      const char *old = std::getenv(name_.c_str());
+      had_old_ = (old != nullptr);
+      if (had_old_)
+        old_ = old;
+      set(value);
+    }
+
+    ~ScopedEnvVar() {
+      if (had_old_)
+        set(old_.c_str());
+      else
+        unset();
+    }
+
+   private:
+    void set(const char *value) {
+#if defined(_WIN32)
+      _putenv_s(name_.c_str(), value ? value : "");
+#else
+      if (value)
+        setenv(name_.c_str(), value, 1);
+      else
+        unsetenv(name_.c_str());
+#endif
+    }
+
+    void unset() {
+#if defined(_WIN32)
+      _putenv_s(name_.c_str(), "");
+#else
+      unsetenv(name_.c_str());
+#endif
+    }
+
+    std::string name_;
+    bool had_old_ = false;
+    std::string old_;
+  };
 
   void runPass(llvm::Module &M, unsigned max_instrs = 200,
                unsigned min_callsites = 2) {
@@ -411,6 +456,71 @@ TEST_F(VMHandlerInlinerTest, DeclarationHandler_Skipped) {
     }
   }
   EXPECT_TRUE(has_call);
+}
+
+TEST_F(VMHandlerInlinerTest, AlreadyAlwaysInlineHandler_StillInlined) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *h = createHandler(*M, "vm_preinlined", 9);
+  h->addFnAttr(llvm::Attribute::AlwaysInline);
+
+  createLiftedCaller(*M, "sub_401000", {h});
+  createLiftedCaller(*M, "sub_402000", {h});
+
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+  runPass(*M);
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+
+  auto *caller = M->getFunction("sub_401000");
+  ASSERT_NE(caller, nullptr);
+  bool has_call = false;
+  for (auto &BB : *caller) {
+    for (auto &I : BB) {
+      if (auto *CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
+        auto *callee = CB->getCalledFunction();
+        if (callee && callee->getName() == "vm_preinlined")
+          has_call = true;
+      }
+    }
+  }
+  EXPECT_FALSE(has_call);
+}
+
+TEST_F(VMHandlerInlinerTest, TaggedSingleCallsiteHandler_Inlined) {
+  ScopedEnvVar force_marker("OMILL_INLINE_DIAG_MARKERS", "1");
+  ScopedEnvVar skip_marker("OMILL_SKIP_INLINE_DIAG_MARKERS", "0");
+
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *h = createHandler(*M, "vm_tagged", 3);
+  h->addFnAttr("omill.vm_handler");
+
+  // Single callsite would normally fail threshold; vm_handler tag should win.
+  createLiftedCaller(*M, "sub_401000", {h});
+
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+  runPass(*M, /*max_instrs=*/200, /*min_callsites=*/2);
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+
+  auto *caller = M->getFunction("sub_401000");
+  ASSERT_NE(caller, nullptr);
+  bool has_call = false;
+  for (auto &BB : *caller) {
+    for (auto &I : BB) {
+      if (auto *CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
+        auto *callee = CB->getCalledFunction();
+        if (callee && callee->getName() == "vm_tagged")
+          has_call = true;
+      }
+    }
+  }
+  EXPECT_FALSE(has_call);
 }
 
 }  // namespace

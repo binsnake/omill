@@ -7,6 +7,7 @@
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Operator.h>
+#include <llvm/IR/ValueHandle.h>
 #include <llvm/ADT/SmallPtrSet.h>
 
 #include <map>
@@ -21,6 +22,8 @@ namespace {
 
 /// Maximum expression tree depth to prevent infinite recursion through PHIs.
 static constexpr unsigned kMaxEvalDepth = 24;
+/// Maximum Monte Carlo concrete-eval recursion depth.
+static constexpr unsigned kMaxMCEvalDepth = 128;
 
 /// Check if a pointer is a State struct GEP (getelementptr from arg0).
 bool isStateGEP(llvm::Value *ptr) {
@@ -401,9 +404,9 @@ std::optional<uint64_t> evaluateToConstant(llvm::Value *V,
 
 /// Map from {AllocaInst*, byte_offset} to stored values.
 struct MCStoreEntry {
-  llvm::Value *Val;
+  llvm::WeakTrackingVH Val;
   unsigned BitWidth;
-  llvm::StoreInst *SI;
+  llvm::WeakTrackingVH SI;
 };
 using MCStoreMap = llvm::DenseMap<std::pair<llvm::AllocaInst *, int64_t>,
                                   llvm::SmallVector<MCStoreEntry, 2>>;
@@ -439,7 +442,8 @@ static MCStoreMap buildMCStoreMap(llvm::Function &F,
       if (!Decomp)
         continue;
       Map[*Decomp].push_back(
-          {SI->getValueOperand(), ValTy->getIntegerBitWidth(), SI});
+          {llvm::WeakTrackingVH(SI->getValueOperand()),
+           ValTy->getIntegerBitWidth(), llvm::WeakTrackingVH(SI)});
     }
   return Map;
 }
@@ -463,7 +467,11 @@ mcConcreteEval(llvm::Value *V,
                const llvm::DataLayout &DL,
                const BinaryMemoryMap *BMM,
                llvm::SmallPtrSetImpl<llvm::Value *> &InProgress,
-               uint64_t &RNG) {
+               uint64_t &RNG,
+               unsigned Depth = 0) {
+  if (Depth > kMaxMCEvalDepth)
+    return std::nullopt;
+
   auto CIt = Env.find(V);
   if (CIt != Env.end())
     return CIt->second;
@@ -515,16 +523,21 @@ mcConcreteEval(llvm::Value *V,
           for (auto &E : SIt->second) {
             if (E.BitWidth != LoadBW)
               continue;
-            if (E.SI->getParent() == LI->getParent()) {
-              if (E.SI->comesBefore(LI))
-                BestVal = E.Val;
+            auto *StoreI = llvm::dyn_cast_or_null<llvm::StoreInst>(E.SI);
+            llvm::Value *StoreVal = E.Val;
+            if (!StoreI || !StoreVal)
+              continue;
+            if (StoreI->getParent() == LI->getParent()) {
+              if (StoreI->comesBefore(LI))
+                BestVal = StoreVal;
             } else {
-              BestVal = E.Val;
+              BestVal = StoreVal;
             }
           }
           if (BestVal)
             Result =
-                mcConcreteEval(BestVal, Env, SSM, DL, BMM, InProgress, RNG);
+                mcConcreteEval(BestVal, Env, SSM, DL, BMM, InProgress, RNG,
+                               Depth + 1);
         }
       }
       // Phase 1.5: Same-BB inttoptr store forwarding.
@@ -540,7 +553,8 @@ mcConcreteEval(llvm::Value *V,
           LoadIntVal = ITP->getOperand(0);
         if (LoadIntVal) {
           auto LoadAddr =
-              mcConcreteEval(LoadIntVal, Env, SSM, DL, BMM, InProgress, RNG);
+              mcConcreteEval(LoadIntVal, Env, SSM, DL, BMM, InProgress, RNG,
+                             Depth + 1);
           if (LoadAddr) {
             auto *BB = LI->getParent();
             for (auto It = LI->getIterator(); It != BB->begin();) {
@@ -554,10 +568,11 @@ mcConcreteEval(llvm::Value *V,
                 auto *SP = SI->getPointerOperand()->stripPointerCasts();
                 if (auto *SITP = llvm::dyn_cast<llvm::IntToPtrInst>(SP)) {
                   auto StoreAddr = mcConcreteEval(
-                      SITP->getOperand(0), Env, SSM, DL, BMM, InProgress, RNG);
+                      SITP->getOperand(0), Env, SSM, DL, BMM, InProgress, RNG,
+                      Depth + 1);
                   if (StoreAddr && *StoreAddr == *LoadAddr) {
                     Result = mcConcreteEval(SI->getValueOperand(), Env, SSM, DL,
-                                            BMM, InProgress, RNG);
+                                            BMM, InProgress, RNG, Depth + 1);
                     break;
                   }
                 }
@@ -578,7 +593,8 @@ mcConcreteEval(llvm::Value *V,
           IntVal = ITP->getOperand(0);
         if (IntVal) {
           auto Addr =
-              mcConcreteEval(IntVal, Env, SSM, DL, BMM, InProgress, RNG);
+              mcConcreteEval(IntVal, Env, SSM, DL, BMM, InProgress, RNG,
+                             Depth + 1);
           if (Addr) {
             unsigned LoadSize = LoadBW / 8;
             if (LoadSize <= 8) {
@@ -597,8 +613,10 @@ mcConcreteEval(llvm::Value *V,
       }
     }
   } else if (auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(V)) {
-    auto L = mcConcreteEval(BO->getOperand(0), Env, SSM, DL, BMM, InProgress, RNG);
-    auto R = mcConcreteEval(BO->getOperand(1), Env, SSM, DL, BMM, InProgress, RNG);
+    auto L = mcConcreteEval(BO->getOperand(0), Env, SSM, DL, BMM, InProgress,
+                            RNG, Depth + 1);
+    auto R = mcConcreteEval(BO->getOperand(1), Env, SSM, DL, BMM, InProgress,
+                            RNG, Depth + 1);
     if (L && R) {
       switch (BO->getOpcode()) {
       case llvm::Instruction::Add:  Result = *L + *R; break;
@@ -624,7 +642,8 @@ mcConcreteEval(llvm::Value *V,
     }
   } else if (auto *Cast = llvm::dyn_cast<llvm::CastInst>(V)) {
     auto Op =
-        mcConcreteEval(Cast->getOperand(0), Env, SSM, DL, BMM, InProgress, RNG);
+        mcConcreteEval(Cast->getOperand(0), Env, SSM, DL, BMM, InProgress, RNG,
+                       Depth + 1);
     if (Op) {
       unsigned SrcBits = Cast->getSrcTy()->getScalarSizeInBits();
       unsigned DstBits = Cast->getDestTy()->getScalarSizeInBits();
@@ -654,8 +673,10 @@ mcConcreteEval(llvm::Value *V,
       }
     }
   } else if (auto *IC = llvm::dyn_cast<llvm::ICmpInst>(V)) {
-    auto L = mcConcreteEval(IC->getOperand(0), Env, SSM, DL, BMM, InProgress, RNG);
-    auto R = mcConcreteEval(IC->getOperand(1), Env, SSM, DL, BMM, InProgress, RNG);
+    auto L = mcConcreteEval(IC->getOperand(0), Env, SSM, DL, BMM, InProgress,
+                            RNG, Depth + 1);
+    auto R = mcConcreteEval(IC->getOperand(1), Env, SSM, DL, BMM, InProgress,
+                            RNG, Depth + 1);
     if (L && R) {
       bool Res = false;
       switch (IC->getPredicate()) {
@@ -679,11 +700,14 @@ mcConcreteEval(llvm::Value *V,
     }
   } else if (auto *Sel = llvm::dyn_cast<llvm::SelectInst>(V)) {
     auto Cond =
-        mcConcreteEval(Sel->getCondition(), Env, SSM, DL, BMM, InProgress, RNG);
+        mcConcreteEval(Sel->getCondition(), Env, SSM, DL, BMM, InProgress, RNG,
+                       Depth + 1);
     if (Cond)
       Result = (*Cond & 1)
-          ? mcConcreteEval(Sel->getTrueValue(), Env, SSM, DL, BMM, InProgress, RNG)
-          : mcConcreteEval(Sel->getFalseValue(), Env, SSM, DL, BMM, InProgress, RNG);
+          ? mcConcreteEval(Sel->getTrueValue(), Env, SSM, DL, BMM, InProgress,
+                           RNG, Depth + 1)
+          : mcConcreteEval(Sel->getFalseValue(), Env, SSM, DL, BMM, InProgress,
+                           RNG, Depth + 1);
   } else if (auto *PHI = llvm::dyn_cast<llvm::PHINode>(V)) {
     // For PHI nodes, try evaluating all incoming values.
     // If they all agree, use that.  Otherwise treat as free variable.
@@ -714,7 +738,7 @@ mcConcreteEval(llvm::Value *V,
               CondBr = BI;
         if (CondBr) {
           auto cond = mcConcreteEval(CondBr->getCondition(), Env, SSM, DL, BMM,
-                                      InProgress, RNG);
+                                      InProgress, RNG, Depth + 1);
           if (cond) {
             // Determine which successor is taken.
             auto *taken_succ = (*cond & 1) ? CondBr->getSuccessor(0)
@@ -728,7 +752,7 @@ mcConcreteEval(llvm::Value *V,
               if (inc_bb == taken_succ ||
                   inc_bb == CondBr->getParent()) {
                 Result = mcConcreteEval(PHI->getIncomingValue(i), Env, SSM, DL,
-                                         BMM, InProgress, RNG);
+                                         BMM, InProgress, RNG, Depth + 1);
                 break;
               }
             }
@@ -741,7 +765,7 @@ mcConcreteEval(llvm::Value *V,
         bool all_agree = true;
         for (unsigned i = 0, e = PHI->getNumIncomingValues(); i < e; ++i) {
           auto val = mcConcreteEval(PHI->getIncomingValue(i), Env, SSM, DL, BMM,
-                                    InProgress, RNG);
+                                    InProgress, RNG, Depth + 1);
           if (!val) {
             all_agree = false;
             break;
@@ -1548,7 +1572,7 @@ llvm::PreservedAnalyses IndirectCallResolverPass::run(
   // Collect candidates: dispatch_call and dispatch_jump with non-constant,
   // non-resolved targets.
   struct Candidate {
-    llvm::CallInst *call;
+    llvm::WeakTrackingVH call;
     bool is_jump;
   };
   llvm::SmallVector<Candidate, 8> candidates;
@@ -1573,22 +1597,26 @@ llvm::PreservedAnalyses IndirectCallResolverPass::run(
       if (isAlreadyResolved(target))
         continue;
 
-      candidates.push_back({call, is_jump});
+      candidates.push_back({llvm::WeakTrackingVH(call), is_jump});
     }
   }
 
   if (candidates.empty())
     return llvm::PreservedAnalyses::all();
 
-  // Build the store map once for the entire function — tryMonteCarloResolve
-  // would otherwise rebuild it for each unresolved dispatch candidate.
+  // Build the MC store map once. Entries use WeakTrackingVH so erasing
+  // instructions during dispatch rewrites nulls stale references safely.
   const llvm::DataLayout &DL = F.getDataLayout();
   MCStoreMap SSM = buildMCStoreMap(F, DL);
 
   bool changed = false;
 
   for (auto &cand : candidates) {
-    auto *target = cand.call->getArgOperand(1);
+    auto *call = llvm::dyn_cast_or_null<llvm::CallInst>(cand.call);
+    if (!call || !call->getParent() || call->arg_size() < 3)
+      continue;
+
+    auto *target = call->getArgOperand(1);
     auto resolved = evaluateToConstant(target, *map);
     // Monte Carlo fallback: if the deterministic evaluator fails (e.g., VM
     // handler MBA with symbolic operands that cancel out), try concrete
@@ -1603,7 +1631,7 @@ llvm::PreservedAnalyses IndirectCallResolverPass::run(
     // forward, tracking stores/loads through virtual memory.
     bool from_fwd_mc = false;
     if (!resolved) {
-      resolved = tryForwardMonteCarloResolve(cand.call, F, map);
+      resolved = tryForwardMonteCarloResolve(call, F, map);
       from_fwd_mc = resolved.has_value();
     }
     if (!resolved)
@@ -1630,9 +1658,9 @@ llvm::PreservedAnalyses IndirectCallResolverPass::run(
     }
 
     if (cand.is_jump) {
-      changed |= resolveDispatchJump(cand.call, *resolved, lifted);
+      changed |= resolveDispatchJump(call, *resolved, lifted);
     } else {
-      changed |= resolveDispatchCall(cand.call, *resolved, map, lifted);
+      changed |= resolveDispatchCall(call, *resolved, map, lifted);
     }
   }
 

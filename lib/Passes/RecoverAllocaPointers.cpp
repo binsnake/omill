@@ -18,6 +18,24 @@ using namespace llvm;
 
 namespace {
 
+static std::optional<int64_t> tryConstToI64(const ConstantInt *CI) {
+  if (!CI)
+    return std::nullopt;
+  const APInt &V = CI->getValue();
+  if (V.getSignificantBits() > 64)
+    return std::nullopt;
+  return V.sextOrTrunc(64).getSExtValue();
+}
+
+static std::optional<uint64_t> tryConstToU64(const ConstantInt *CI) {
+  if (!CI)
+    return std::nullopt;
+  const APInt &V = CI->getValue();
+  if (V.getActiveBits() > 64)
+    return std::nullopt;
+  return V.zextOrTrunc(64).getZExtValue();
+}
+
 struct AllocaOffset {
   AllocaInst *AI;
   int64_t Offset;
@@ -149,16 +167,20 @@ resolveToAlloca(Value *V, const DataLayout &DL,
       for (unsigned i = 0; i < 2; ++i) {
         if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(i))) {
           if (auto Base =
-                  resolveToAlloca(BO->getOperand(1 - i), DL, Stores, Visited))
-            return AllocaOffset{Base->AI, Base->Offset + C->getSExtValue()};
+                  resolveToAlloca(BO->getOperand(1 - i), DL, Stores, Visited)) {
+            if (auto Off = tryConstToI64(C))
+              return AllocaOffset{Base->AI, Base->Offset + *Off};
+          }
         }
       }
     }
     if (BO->getOpcode() == Instruction::Sub) {
       if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
         if (auto Base =
-                resolveToAlloca(BO->getOperand(0), DL, Stores, Visited))
-          return AllocaOffset{Base->AI, Base->Offset - C->getSExtValue()};
+                resolveToAlloca(BO->getOperand(0), DL, Stores, Visited)) {
+          if (auto Off = tryConstToI64(C))
+            return AllocaOffset{Base->AI, Base->Offset - *Off};
+        }
       }
     }
   }
@@ -264,7 +286,7 @@ concreteEval(Value *V,
   std::optional<uint64_t> Result;
 
   if (auto *CI = dyn_cast<ConstantInt>(V)) {
-    Result = CI->getZExtValue();
+    Result = tryConstToU64(CI);
 
   } else if (isa<UndefValue>(V) || isa<PoisonValue>(V)) {
     Result = uint64_t(0);
