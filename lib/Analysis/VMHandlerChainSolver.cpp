@@ -1574,7 +1574,12 @@ VMHandlerChainSolver::solveFromHandler(uint64_t handler_va,
   };
 
   std::deque<WorkItem> queue;
-  llvm::DenseSet<uint64_t> visited;
+  // Track (handler_va, hash) pairs — the same handler visited with a
+  // different hash processes different VM bytecode and dispatches to a
+  // different successor.  Keying only on handler_va would prematurely
+  // terminate chains that revisit the same handler (common in EAC's
+  // dispatcher-style handlers that route multiple VM opcodes).
+  llvm::DenseSet<std::pair<uint64_t, uint64_t>> visited;
 
   queue.push_back({handler_va, initial_hash});
 
@@ -1582,9 +1587,10 @@ VMHandlerChainSolver::solveFromHandler(uint64_t handler_va,
     auto item = queue.front();
     queue.pop_front();
 
-    if (visited.count(item.handler_va))
+    auto key = std::make_pair(item.handler_va, item.hash);
+    if (visited.count(key))
       continue;
-    visited.insert(item.handler_va);
+    visited.insert(key);
 
     // Record this handler.
     if (discovered_set_.insert(item.handler_va).second)
@@ -1631,12 +1637,13 @@ VMHandlerChainSolver::solveFromHandler(uint64_t handler_va,
         // and are dispatching to the first handler of the NEXT chain.
         if (entry.is_vmexit && target >= handler_seg_start_ &&
             target < handler_seg_end_) {
-          // If the target is already visited, this is a cycle — the
-          // vmexit trampoline's return address goes back to the wrapper
-          // code of an earlier chain, not a new chain.  In real execution
-          // this would be a return to the caller, so we treat it as
-          // terminal (no successor).
-          if (visited.count(target)) {
+          // Read the new hash from vmcontext (set by the preamble).
+          uint64_t new_hash =
+              readMem(state, mem_, state.regs[R12] + 0x190, 8);
+
+          // If this (target, hash) pair is already visited, the chain
+          // has genuinely cycled — same handler with same VM state.
+          if (visited.count({target, new_hash})) {
             llvm::errs()
                 << "VMHandlerChainSolver: vmexit continuation → "
                 << "0x" << llvm::utohexstr(target)
@@ -1644,10 +1651,6 @@ VMHandlerChainSolver::solveFromHandler(uint64_t handler_va,
             dispatched = true;
             break;
           }
-
-          // Read the new hash from vmcontext (set by the preamble).
-          uint64_t new_hash =
-              readMem(state, mem_, state.regs[R12] + 0x190, 8);
 
           llvm::errs() << "VMHandlerChainSolver: vmexit continuation → "
                        << "next chain at 0x" << llvm::utohexstr(target)
@@ -1775,9 +1778,13 @@ VMHandlerChainSolver::solveFromHandler(uint64_t handler_va,
         uint64_t ret_target = state.rip;
         if (ret_target >= handler_seg_start_ &&
             ret_target < handler_seg_end_) {
-          // Cycle check: if the target is already visited, this is a
-          // return to a previous chain's wrapper, not a new dispatch.
-          if (visited.count(ret_target)) {
+          // This is a vmexit-style return to another handler.
+          uint64_t new_hash =
+              readMem(state, mem_, state.regs[R12] + 0x190, 8);
+
+          // Cycle check: if this (target, hash) pair is already visited,
+          // the chain has genuinely cycled.
+          if (visited.count({ret_target, new_hash})) {
             llvm::errs()
                 << "VMHandlerChainSolver: ret to 0x"
                 << llvm::utohexstr(ret_target)
@@ -1785,13 +1792,6 @@ VMHandlerChainSolver::solveFromHandler(uint64_t handler_va,
             dispatched = true;
             break;
           }
-
-          // This is a vmexit-style return to another handler.
-          // The vmexit function restores r12 from vmcontext — but since
-          // we're tracking vmcontext in our flat buffer, the actual
-          // vmexit restore doesn't apply. Treat as dispatch.
-          uint64_t new_hash =
-              readMem(state, mem_, state.regs[R12] + 0x190, 8);
           entry.successors.push_back(ret_target);
           queue.push_back({ret_target, new_hash});
           dispatched = true;
