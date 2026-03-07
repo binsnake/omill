@@ -1610,7 +1610,7 @@ VMHandlerChainSolver::solveFromHandler(uint64_t handler_va,
     for (unsigned off = 0; off < 0x200; off += 8)
       writeMem(state, state.regs[R12] + off, kSentinel, 8);
 
-    // Set known vmcontext slots.
+    // Set known vmcontext slots (always overwrite — these are per-handler).
     writeMem(state, state.regs[R12] + 0xE0, delta, 8);
     writeMem(state, state.regs[R12] + 0x190, item.hash, 8);
 
@@ -1729,8 +1729,15 @@ VMHandlerChainSolver::solveFromHandler(uint64_t handler_va,
           // Skip the vmexit call — pop return address and continue.
           // This lets us follow through the vmexit trampoline to find
           // the next chain's preamble after re-entry.
+          //
+          // Vmexit restores all native registers from the vmcontext area
+          // (which IS the stack at R12).  After vmexit returns, RSP is
+          // at the vmcontext base (R12).  Simulate this by setting RSP
+          // to R12, so post-vmexit code like `lea rsp,[rsp+1C0h]` /
+          // `call [rsp+8]` reads the native call target from the correct
+          // vmcontext offset.
           uint64_t ret_addr = readMem(state, mem_, state.regs[RSP], 8);
-          state.regs[RSP] += 8;
+          state.regs[RSP] = state.regs[R12];  // vmexit restores RSP ≈ R12
           state.rip = ret_addr;
           entry.is_vmexit = true;  // Mark that we passed through vmexit.
           continue;
@@ -1758,8 +1765,17 @@ VMHandlerChainSolver::solveFromHandler(uint64_t handler_va,
 
         // If we've already passed through vmexit and encounter a CALL
         // to unknown code (like `call [rsp+8]` for the native function),
-        // skip it — we can't emulate arbitrary native code.
+        // record the target for recursive descent lifting, then skip it.
         if (entry.is_vmexit) {
+          uint64_t native_target = state.rip;
+          // Filter out sentinel and zero values — those indicate the
+          // target couldn't be resolved from the emulator state (e.g.,
+          // the native address is on the original caller's stack above
+          // the vmcontext, which the emulator doesn't model).
+          if (native_target != 0 && native_target != kSentinel &&
+              native_call_set_.insert(native_target).second)
+            native_call_targets_.push_back(native_target);
+
           uint64_t ret_addr = readMem(state, mem_, state.regs[RSP], 8);
           state.regs[RSP] += 8;
           state.rip = ret_addr;

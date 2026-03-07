@@ -1659,6 +1659,7 @@ int main(int argc, char **argv) {
 
     // Run chain solver to discover handler chains via concrete emulation.
     std::vector<uint64_t> chain_handler_vas;
+    std::vector<uint64_t> native_call_vas;
     {
       omill::VMHandlerChainSolver solver(pe.memory_map, pe.image_base,
                                          vm_entry_va, vm_exit_va);
@@ -1686,6 +1687,9 @@ int main(int argc, char **argv) {
         for (auto &entry : chain)
           chain_handler_vas.push_back(entry.handler_va);
       }
+
+      // Extract native call targets before solver goes out of scope.
+      native_call_vas = solver.nativeCallTargets();
     }
 
     // Lift only chain-solved handlers.
@@ -1742,6 +1746,39 @@ int main(int argc, char **argv) {
                     {{"lifted", static_cast<int64_t>(lifted_count)},
                      {"skipped", static_cast<int64_t>(skipped_count)},
                      {"failed", static_cast<int64_t>(failed_count)}});
+
+    // Lift native functions called through vmexit→call→vmentry.
+    // These are regular (non-VM) functions that the VM handlers call
+    // through temporary VM exit.  Lifting them enables ResolveIntToPtrCalls
+    // to resolve the constant inttoptr calls after ABI recovery.
+    if (!native_call_vas.empty()) {
+      unsigned native_lifted = 0;
+      for (uint64_t native_va : native_call_vas) {
+        std::string name = "sub_" + Twine::utohexstr(native_va).str();
+        if (auto *existing = module->getFunction(name))
+          if (!existing->isDeclaration())
+            continue;
+
+        // Probe decode — skip if first instruction can't be decoded.
+        {
+          uint8_t probe_buf[15];
+          if (!pe.memory_map.read(native_va, probe_buf, sizeof(probe_buf)))
+            continue;
+          std::string_view probe_bytes(
+              reinterpret_cast<const char *>(probe_buf), sizeof(probe_buf));
+          remill::Instruction probe_inst;
+          if (!arch->DecodeInstruction(native_va, probe_bytes, probe_inst,
+                                       arch->CreateInitialContext()))
+            continue;
+        }
+
+        if (lifter.Lift(native_va))
+          ++native_lifted;
+        // NOT tagged as omill.vm_handler — these are regular functions.
+      }
+      errs() << "VM native lift: " << native_lifted << " native functions"
+             << " (from " << native_call_vas.size() << " targets)\n";
+    }
 
     // Fix DeclareLiftedFunction naming collisions (sub_X.N → sub_X).
     // Must happen BEFORE setting attributes on vmentry/vmexit, because
@@ -2517,7 +2554,11 @@ int main(int argc, char **argv) {
     // Post-ABI deobfuscation on _native functions.  When recover_abi is
     // false (VM mode), Phase 5 ran on pre-ABI sub_* functions, so _native
     // wrappers created by ABI recovery haven't been deobfuscated yet.
-    if (Deobfuscate) {
+    // Also required when --resolve-targets is set: late target discovery
+    // scans for constant inttoptr call targets, but those only fold to
+    // constants after StackConcretization + ConstantMemoryFolding + GVN
+    // run on the _native functions.
+    if (Deobfuscate || ResolveTargets) {
       llvm::FunctionPassManager FPM;
       omill::buildDeobfuscationPipeline(FPM, opts);
       for (auto &F : *module) {
@@ -2533,6 +2574,18 @@ int main(int argc, char **argv) {
       errs() << "Post-ABI deobfuscation complete\n";
       events.emitInfo("post_abi_deobf_completed", "post-ABI deobfuscation completed");
     }
+  }
+
+  // Pre-scan cleanup: run late cleanup pipeline before late discovery
+  // to enable SplitLargeAllocaPass + SROA + InstCombine to fold the
+  // 69KB native_stack alloca into SSA constants.  Without this, the
+  // inttoptr call targets remain as dynamic loads from the alloca and
+  // the late discovery scan can't find them.
+  if (ResolveTargets && !NoABI) {
+    ModulePassManager PreScanMPM;
+    omill::buildLateCleanupPipeline(PreScanMPM);
+    PreScanMPM.run(*module, MAM);
+    errs() << "Pre-scan cleanup complete\n";
   }
 
   // Late target discovery: after ABI recovery folds MBA chains (via
@@ -2599,9 +2652,11 @@ int main(int argc, char **argv) {
           }
         }
       }
-
-      if (late_targets.empty())
+      if (late_targets.empty()) {
+        errs() << "Late discovery round " << (round + 1)
+               << ": no new targets\n";
         break;
+      }
 
       errs() << "Late discovery round " << (round + 1) << ": "
              << late_targets.size() << " new target(s)\n";

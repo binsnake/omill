@@ -81,6 +81,13 @@ class VMHandlerChainSolver {
     return last_chain_results_;
   }
 
+  /// Native function VAs called through the vmexit→call→vmentry pattern.
+  /// Discovered during chain solving — these are functions the VM handlers
+  /// call through temporary VM exit, not VM handlers themselves.
+  const std::vector<uint64_t> &nativeCallTargets() const {
+    return native_call_targets_;
+  }
+
   /// Set maximum number of handlers to solve before giving up.
   void setMaxHandlers(unsigned max) { max_handlers_ = max; }
 
@@ -123,6 +130,10 @@ class VMHandlerChainSolver {
 
   std::vector<uint64_t> discovered_handlers_;
   llvm::DenseSet<uint64_t> discovered_set_;
+
+  /// Native call targets discovered via vmexit→call→vmentry pattern.
+  std::vector<uint64_t> native_call_targets_;
+  llvm::DenseSet<uint64_t> native_call_set_;
 
   /// Stored results from the last solve call (for mergeChainResults).
   std::vector<ChainEntry> last_chain_results_;
