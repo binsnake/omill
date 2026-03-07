@@ -1739,10 +1739,17 @@ VMHandlerChainSolver::solveFromHandler(uint64_t handler_va,
           uint64_t ret_addr = readMem(state, mem_, state.regs[RSP], 8);
           state.regs[RSP] += 8;
           state.rip = ret_addr;
-          // Simulate vmentry's effect: r12 = rsp (vmcontext is on stack).
-          state.regs[R12] = state.regs[RSP];
-          // Write delta to the new vmcontext location.
-          writeMem(state, state.regs[R12] + 0xE0, delta, 8);
+
+          if (entry.is_vmexit) {
+            // Re-entering VM after native call — vmctx still at old R12.
+            // Don't relocate R12.  Reset is_vmexit since we're back in VM.
+            entry.is_vmexit = false;
+          } else {
+            // Fresh VM entry (continuation chain).  Relocate R12 to new
+            // vmctx on the stack.
+            state.regs[R12] = state.regs[RSP];
+            writeMem(state, state.regs[R12] + 0xE0, delta, 8);
+          }
           continue;
         }
 

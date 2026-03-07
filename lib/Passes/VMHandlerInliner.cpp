@@ -239,6 +239,8 @@ llvm::PreservedAnalyses VMHandlerInlinerPass::run(
 
   bool inlined = false;
   bool round_changed;
+  constexpr unsigned kMaxInlineRounds = 16;
+  unsigned inline_round = 0;
   do {
     round_changed = false;
     llvm::SmallVector<llvm::CallBase *, 32> inline_sites;
@@ -255,6 +257,11 @@ llvm::PreservedAnalyses VMHandlerInlinerPass::run(
 
         auto *callee = CB->getCalledFunction();
         if (!callee || !handler_set.contains(callee))
+          continue;
+        // Skip self-recursive calls.  Cyclic handler chains (A → B → A)
+        // produce recursive calls after one round of inlining.  Inlining
+        // these would double the function size every round, causing OOM.
+        if (callee == &F)
           continue;
 
         inline_sites.push_back(CB);
@@ -285,6 +292,8 @@ llvm::PreservedAnalyses VMHandlerInlinerPass::run(
         caller->addFnAttr("omill.needs_cleanup");
       }
     }
+    if (++inline_round >= kMaxInlineRounds)
+      break;
   } while (round_changed);
 
   // Clean up: remove handler functions that are now dead.

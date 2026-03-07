@@ -262,6 +262,8 @@ struct SplitLargeAllocaPass
       llvm::SmallVector<llvm::MemSetInst *, 2> memsets;
       bool has_opaque_use = false;
 
+      bool has_ptrtoint_escape = false;
+
       for (auto *user : alloca->users()) {
         if (auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(user)) {
           llvm::APInt ap_offset(64, 0);
@@ -270,15 +272,34 @@ struct SplitLargeAllocaPass
           } else {
             has_opaque_use = true;
           }
+          // Check if any user of this GEP is a ptrtoint.  A ptrtoint
+          // escapes the alloca address and enables inttoptr-based stores
+          // that may target offsets in different split regions.  Splitting
+          // would break these cross-region references.
+          for (auto *gep_user : GEP->users()) {
+            if (llvm::isa<llvm::PtrToIntInst>(gep_user))
+              has_ptrtoint_escape = true;
+          }
         } else if (auto *MS = llvm::dyn_cast<llvm::MemSetInst>(user)) {
           memsets.push_back(MS);
         } else if (llvm::isa<llvm::PtrToIntInst>(user) ||
                    llvm::isa<llvm::BitCastInst>(user)) {
           has_opaque_use = true;
+          has_ptrtoint_escape = true;
         } else {
           has_opaque_use = true;
         }
       }
+
+      // If the alloca has a ptrtoint escape, don't split — inttoptr-based
+      // stores derived from the ptrtoint (e.g., via VM hash addressing)
+      // may target offsets that span multiple regions.  After splitting,
+      // these cross-region inttoptr addresses become unresolvable by
+      // ConcretizeAllocaPtrsPass, breaking store→load connections.
+      // The late ConcretizeAllocaPtrs + VmContextSlotForwarding passes
+      // can resolve the data flow when the alloca stays intact.
+      if (has_ptrtoint_escape)
+        continue;
 
       if (gep_infos.empty())
         continue;
