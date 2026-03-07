@@ -185,6 +185,12 @@ static cl::opt<std::string> VMExit(
     "vm-exit",
     cl::desc("VM exit (vmexit) function VA for VM devirtualization (hex)"));
 
+static cl::opt<std::string> VMWrapper(
+    "vm-wrapper",
+    cl::desc("VM entry wrapper VA (hex).  If omitted, defaults to --va.  "
+             "Specify this when --va points to an outer function (e.g. "
+             "DriverEntry) that calls the wrapper through a thunk."));
+
 static cl::opt<bool> OmillTimePasses(
     "omill-time-passes",
     cl::desc("Time each omill pass, printing elapsed time on exit"),
@@ -1207,10 +1213,20 @@ int main(int argc, char **argv) {
   if (VMExit.getNumOccurrences() > 0)
     vm_exit_va = parseHexOpt(VMExit);
 
+  uint64_t vm_wrapper_va = 0;
+  if (VMWrapper.getNumOccurrences() > 0)
+    vm_wrapper_va = parseHexOpt(VMWrapper);
+
   bool vm_mode = (vm_entry_va != 0);
   if (vm_mode) {
+    // Default wrapper to func_va if not explicitly specified.
+    if (vm_wrapper_va == 0)
+      vm_wrapper_va = func_va;
     errs() << "VM mode: vmenter=0x" << Twine::utohexstr(vm_entry_va)
-           << " vmexit=0x" << Twine::utohexstr(vm_exit_va) << "\n";
+           << " vmexit=0x" << Twine::utohexstr(vm_exit_va);
+    if (vm_wrapper_va != func_va)
+      errs() << " wrapper=0x" << Twine::utohexstr(vm_wrapper_va);
+    errs() << "\n";
     events.emitInfo("vm_mode",
                     "vm devirtualization mode enabled",
                     {{"vm_entry", ("0x" + Twine::utohexstr(vm_entry_va)).str()},
@@ -1481,6 +1497,119 @@ int main(int argc, char **argv) {
       errs() << "TraceLifter::Lift() failed\n";
       return fail(1, "trace lifter failed");
     }
+
+    // When --vm-wrapper differs from --va, fold jmp-thunks between
+    // func_va and the VM wrapper so that the entry function calls the
+    // wrapper directly.  Without this, remill's TraceLifter follows the
+    // thunk's JMP and duplicates the wrapper's code inside the thunk
+    // function, producing an incomplete copy (only the first VM chain)
+    // that confuses ABI recovery.
+    if (vm_mode && vm_wrapper_va != func_va) {
+      // Ensure the wrapper is lifted.
+      {
+        std::string wrapper_name =
+            "sub_" + llvm::Twine::utohexstr(vm_wrapper_va).str();
+        auto *wrapper_fn = module->getFunction(wrapper_name);
+        if (!wrapper_fn || wrapper_fn->isDeclaration()) {
+          errs() << "Auto-lifting VM wrapper at 0x"
+                 << Twine::utohexstr(vm_wrapper_va) << "\n";
+          lifter.Lift(vm_wrapper_va);
+        }
+      }
+
+      // Detect jmp-thunks between the entry function and the wrapper by
+      // reading binary bytes.  A jmp-thunk is a single E9/EB JMP
+      // instruction that transfers to another function.  When the target
+      // is the VM wrapper (or chains to it), rewrite the caller to call
+      // the wrapper directly.
+      //
+      // Remill's TraceLifter creates DIRECT calls to lifted functions
+      // (e.g. `call @sub_1400d5dc4(...)`) rather than going through
+      // `__remill_function_call`.  So we scan for calls to `sub_*`
+      // functions and check if the callee's VA is a jmp-thunk.
+      auto *entry_fn = module->getFunction(
+          "sub_" + llvm::Twine::utohexstr(func_va).str());
+      if (entry_fn) {
+        for (auto &BB : *entry_fn) {
+          for (auto &I : BB) {
+            auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+            if (!call || call->arg_size() < 2)
+              continue;
+            auto *callee_fn = call->getCalledFunction();
+            if (!callee_fn)
+              continue;
+
+            // Parse VA from the callee function name (sub_<hex>).
+            auto callee_name = callee_fn->getName();
+            if (!callee_name.starts_with("sub_"))
+              continue;
+            uint64_t callee_va = 0;
+            callee_name.drop_front(4).getAsInteger(16, callee_va);
+            if (callee_va == 0 || callee_va == vm_wrapper_va)
+              continue;
+
+            // Follow up to 3 levels of jmp-thunks to find the wrapper.
+            uint64_t resolved = callee_va;
+            for (int hop = 0; hop < 3; ++hop) {
+              uint8_t thunk_buf[16];
+              if (!pe.memory_map.read(resolved, thunk_buf, sizeof(thunk_buf)))
+                break;
+              // E9 rel32 = near relative jmp (5 bytes)
+              if (thunk_buf[0] == 0xE9) {
+                int32_t rel;
+                std::memcpy(&rel, &thunk_buf[1], 4);
+                resolved = resolved + 5 + static_cast<int64_t>(rel);
+              }
+              // EB rel8 = short relative jmp (2 bytes)
+              else if (thunk_buf[0] == 0xEB) {
+                int8_t rel = static_cast<int8_t>(thunk_buf[1]);
+                resolved = resolved + 2 + rel;
+              } else {
+                break;
+              }
+            }
+
+            if (resolved != vm_wrapper_va)
+              continue;
+
+            // This callee is a jmp-thunk chain to the VM wrapper.
+            // Rewrite the call to target the wrapper directly.
+            errs() << "Folding jmp-thunk: sub_"
+                   << Twine::utohexstr(callee_va) << " -> sub_"
+                   << Twine::utohexstr(vm_wrapper_va) << "\n";
+
+            std::string wrapper_name =
+                "sub_" + llvm::Twine::utohexstr(vm_wrapper_va).str();
+            auto *wrapper_fn = module->getFunction(wrapper_name);
+            if (!wrapper_fn)
+              continue;
+
+            // Rewrite: call @sub_<thunk_va>(state, pc, mem)
+            //       → call @sub_<wrapper_va>(state, wrapper_va, mem)
+            call->setCalledFunction(wrapper_fn);
+            // Fix the program_counter argument to the wrapper's address.
+            auto *pc_arg = call->getArgOperand(1);
+            call->setArgOperand(
+                1, llvm::ConstantInt::get(pc_arg->getType(), vm_wrapper_va));
+
+            // Delete the thunk function — it's a duplicated partial
+            // copy of the wrapper that would confuse ABI recovery.
+            std::string thunk_name =
+                "sub_" + llvm::Twine::utohexstr(callee_va).str();
+            if (auto *thunk_fn = module->getFunction(thunk_name)) {
+              if (!thunk_fn->use_empty()) {
+                // Can't delete if it has other uses; just leave it.
+                errs() << "  (thunk has other callers, keeping)\n";
+              } else {
+                thunk_fn->eraseFromParent();
+                errs() << "  (deleted thunk sub_"
+                       << Twine::utohexstr(callee_va) << ")\n";
+              }
+            }
+          }
+        }
+      }
+    }
   }
   errs() << "Lifting complete\n";
   events.emitInfo("lifting_completed", "lifting complete");
@@ -1512,8 +1641,10 @@ int main(int argc, char **argv) {
           });
       solver.setHandlerSegmentRange(seg_start, seg_end);
 
-      // Solve from the entry wrapper.
-      auto chain = solver.solveFromWrapper(func_va);
+      // Solve from the entry wrapper.  Use vm_wrapper_va (which defaults to
+      // func_va) so that --vm-wrapper can point to the actual lea/call pattern
+      // even when --va is an outer function like DriverEntry.
+      auto chain = solver.solveFromWrapper(vm_wrapper_va);
       if (!chain.empty()) {
         vm_graph->mergeChainResults(solver);
         events.emitInfo("vm_chain_solved", "vm handler chain solved",
