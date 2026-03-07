@@ -4,24 +4,22 @@
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/Metadata.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Operator.h>
 
+#include <optional>
+
+#include "omill/Arch/ArchABI.h"
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/CallingConventionAnalysis.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
+#include "omill/Utils/StateFieldMap.h"
 #include "omill/Utils/LiftedNames.h"
 
 namespace omill {
 
 namespace {
-
-// x86-64 State struct offsets (Win64 ABI registers).
-static constexpr uint64_t kRCXOffset = 2248;
-static constexpr uint64_t kRDXOffset = 2264;
-static constexpr uint64_t kR8Offset = 2344;
-static constexpr uint64_t kR9Offset = 2360;
-static constexpr uint64_t kRAXOffset = 2216;
 
 llvm::Value *buildStateLoad(llvm::IRBuilder<> &Builder, llvm::Value *state_ptr,
                             uint64_t offset, const llvm::Twine &name) {
@@ -51,6 +49,49 @@ void buildStateStoreVec(llvm::IRBuilder<> &Builder, llvm::Value *state_ptr,
   auto *gep = Builder.CreateGEP(Builder.getInt8Ty(), state_ptr,
                                 Builder.getInt64(offset));
   Builder.CreateStore(val, gep);
+}
+
+std::optional<unsigned> lookupStateOffset(const StateFieldMap &field_map,
+                                          llvm::StringRef reg_name) {
+  if (auto field = field_map.fieldByName(reg_name)) {
+    return field->offset;
+  }
+  return std::nullopt;
+}
+
+bool collectDynamicDispatchOffsets(
+    const ArchABI &arch_abi, const StateFieldMap &field_map,
+    llvm::SmallVectorImpl<unsigned> &param_offsets,
+    std::optional<unsigned> &ret_offset) {
+  param_offsets.clear();
+  for (auto reg_name : arch_abi.param_regs) {
+    auto offset = lookupStateOffset(field_map, reg_name);
+    if (!offset) {
+      return false;
+    }
+    param_offsets.push_back(*offset);
+  }
+
+  ret_offset = lookupStateOffset(field_map, arch_abi.return_reg);
+  return ret_offset.has_value();
+}
+
+ArchABI getModuleArchABI(llvm::Module &M) {
+  TargetArch arch = TargetArch::kX86_64;
+  std::string os = "windows";
+
+  if (auto *md = M.getModuleFlag("omill.target_arch")) {
+    if (auto *ci = llvm::mdconst::dyn_extract<llvm::ConstantInt>(md)) {
+      arch = static_cast<TargetArch>(ci->getZExtValue());
+    }
+  }
+  if (auto *md = M.getModuleFlag("omill.target_os")) {
+    if (auto *mds = llvm::dyn_cast<llvm::MDString>(md)) {
+      os = mds->getString().str();
+    }
+  }
+
+  return ArchABI::get(arch, os);
 }
 
 llvm::Value *normalizeJumpTargetPC(llvm::IRBuilder<> &Builder,
@@ -279,6 +320,8 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
   auto &cc_info = MAM.getResult<CallingConventionAnalysis>(M);
   auto &lifted = MAM.getResult<LiftedFunctionAnalysis>(M);
   auto &mem_map = MAM.getResult<BinaryMemoryAnalysis>(M);
+  auto arch_abi = getModuleArchABI(M);
+  StateFieldMap field_map(M);
 
   // Pre-compute leaf status for all lifted functions before any mutations.
   // This prevents isLeafLifted from returning stale results after dispatch
@@ -327,6 +370,10 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
         llvm::IRBuilder<> Builder(cand.call);
 
         llvm::SmallVector<llvm::Value *, 12> args;
+        std::optional<unsigned> stack_pointer_offset;
+        if (auto sp = lookupStateOffset(field_map, arch_abi.stack_pointer)) {
+          stack_pointer_offset = *sp;
+        }
 
         // GPR params from State.
         for (auto &param : abi->params) {
@@ -335,11 +382,14 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
               llvm::StringRef(param.reg_name).lower()));
         }
 
-        // Stack-passed params: load from caller's RSP-relative stack area.
+        // Stack-passed params: load from the caller's stack-pointer-relative
+        // area for the active target ABI (e.g. RSP on x86_64, SP on AArch64).
+        if (!abi->stack_params.empty() && !stack_pointer_offset)
+          continue;
         for (auto &sp : abi->stack_params) {
-          // Load RSP, add stack_offset, load the value from that address.
           auto *rsp_val = buildStateLoad(Builder, cand.state_ptr,
-                                         48, "rsp_for_stack");
+                                         *stack_pointer_offset,
+                                         arch_abi.stack_pointer + "_for_stack");
           auto *addr = Builder.CreateAdd(
               rsp_val, Builder.getInt64(sp.stack_offset),
               "stack_arg_addr");
@@ -400,10 +450,17 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
         }
       } else {
         // Dynamic dispatch_call target: emit an indirect call through target PC.
-        // Dynamic dispatch_jump in _native wrappers: materialize RAX only.
+        // Dynamic dispatch_jump in _native wrappers: materialize the active
+        // ABI return register only.
         llvm::IRBuilder<> Builder(cand.call);
         auto *i64_ty = Builder.getInt64Ty();
         auto *target_pc = cand.call->getArgOperand(1);
+        llvm::SmallVector<unsigned, 8> dispatch_param_offsets;
+        std::optional<unsigned> return_reg_offset;
+        if (!collectDynamicDispatchOffsets(
+                arch_abi, field_map, dispatch_param_offsets, return_reg_offset)) {
+          continue;
+        }
 
         if (cand.is_dispatch_jump) {
           // Unresolved dispatch_jump: emit an indirect tail call through
@@ -423,21 +480,18 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
 
           auto *ptr_ty = llvm::PointerType::get(Builder.getContext(), 0);
           auto *fn_ptr = Builder.CreateIntToPtr(target_pc, ptr_ty, "jump.fn");
+          llvm::SmallVector<llvm::Value *, 8> dispatch_args;
+          llvm::SmallVector<llvm::Type *, 8> dispatch_arg_types;
+          for (unsigned i = 0; i < dispatch_param_offsets.size(); ++i) {
+            dispatch_args.push_back(
+                buildStateLoad(Builder, cand.state_ptr, dispatch_param_offsets[i],
+                               llvm::StringRef(arch_abi.param_regs[i]).lower()));
+            dispatch_arg_types.push_back(i64_ty);
+          }
 
-          auto *rcx =
-              buildStateLoad(Builder, cand.state_ptr, kRCXOffset, "rcx");
-          auto *rdx =
-              buildStateLoad(Builder, cand.state_ptr, kRDXOffset, "rdx");
-          auto *r8 =
-              buildStateLoad(Builder, cand.state_ptr, kR8Offset, "r8");
-          auto *r9 =
-              buildStateLoad(Builder, cand.state_ptr, kR9Offset, "r9");
-
-          auto *fn_ty = llvm::FunctionType::get(
-              i64_ty, {i64_ty, i64_ty, i64_ty, i64_ty}, false);
-
-          auto *result = Builder.CreateCall(fn_ty, fn_ptr,
-                                            {rcx, rdx, r8, r9},
+          auto *fn_ty =
+              llvm::FunctionType::get(i64_ty, dispatch_arg_types, false);
+          auto *result = Builder.CreateCall(fn_ty, fn_ptr, dispatch_args,
                                             "jump.result");
           // NOTE: Do NOT mark as tail call.  'tail' implies the callee
           // does not access caller allocas.  After inlining into _native,
@@ -446,38 +500,38 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
           // allocas, causing alias analysis to consider State/stack stores
           // dead and eliminating the function body.
 
-          // For constant targets, store the normalized PC directly to RAX
+          // For constant targets, store the normalized PC directly to the
+          // ABI return register
           // so downstream passes can see the canonical jump target.  For
           // dynamic targets, store the indirect-call return value.
           if (llvm::isa<llvm::ConstantInt>(target_pc)) {
-            buildStateStore(Builder, cand.state_ptr, kRAXOffset, target_pc);
+            buildStateStore(Builder, cand.state_ptr, *return_reg_offset,
+                            target_pc);
           } else {
-            buildStateStore(Builder, cand.state_ptr, kRAXOffset, result);
+            buildStateStore(Builder, cand.state_ptr, *return_reg_offset,
+                            result);
           }
         } else {
           auto *ptr_ty = llvm::PointerType::get(Builder.getContext(), 0);
           auto *fn_ptr = Builder.CreateIntToPtr(target_pc, ptr_ty, "fn.ptr");
+          llvm::SmallVector<llvm::Value *, 8> dispatch_args;
+          llvm::SmallVector<llvm::Type *, 8> dispatch_arg_types;
+          for (unsigned i = 0; i < dispatch_param_offsets.size(); ++i) {
+            dispatch_args.push_back(
+                buildStateLoad(Builder, cand.state_ptr, dispatch_param_offsets[i],
+                               llvm::StringRef(arch_abi.param_regs[i]).lower()));
+            dispatch_arg_types.push_back(i64_ty);
+          }
 
-          auto *rcx =
-              buildStateLoad(Builder, cand.state_ptr, kRCXOffset, "rcx");
-          auto *rdx =
-              buildStateLoad(Builder, cand.state_ptr, kRDXOffset, "rdx");
-          auto *r8 =
-              buildStateLoad(Builder, cand.state_ptr, kR8Offset, "r8");
-          auto *r9 =
-              buildStateLoad(Builder, cand.state_ptr, kR9Offset, "r9");
-
-          auto *fn_ty = llvm::FunctionType::get(
-              i64_ty, {i64_ty, i64_ty, i64_ty, i64_ty}, false);
-
-          auto *result = Builder.CreateCall(fn_ty, fn_ptr,
-                                            {rcx, rdx, r8, r9},
+          auto *fn_ty =
+              llvm::FunctionType::get(i64_ty, dispatch_arg_types, false);
+          auto *result = Builder.CreateCall(fn_ty, fn_ptr, dispatch_args,
                                             "indirect.result");
           // NOTE: Do NOT mark as tail call.  Same reason as above: 'tail'
           // implies no alloca access, which is wrong after inlining into
           // _native where State/stack are local allocas.
 
-          buildStateStore(Builder, cand.state_ptr, kRAXOffset, result);
+          buildStateStore(Builder, cand.state_ptr, *return_reg_offset, result);
         }
       }
 

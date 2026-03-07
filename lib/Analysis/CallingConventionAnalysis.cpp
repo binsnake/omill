@@ -21,6 +21,24 @@ llvm::AnalysisKey CallingConventionAnalysis::Key;
 
 namespace {
 
+ArchABI getModuleArchABI(llvm::Module &M) {
+  TargetArch arch = TargetArch::kX86_64;
+  std::string os = "windows";
+
+  if (auto *md = M.getModuleFlag("omill.target_arch")) {
+    if (auto *ci = llvm::mdconst::dyn_extract<llvm::ConstantInt>(md)) {
+      arch = static_cast<TargetArch>(ci->getZExtValue());
+    }
+  }
+  if (auto *md = M.getModuleFlag("omill.target_os")) {
+    if (auto *mds = llvm::dyn_cast<llvm::MDString>(md)) {
+      os = mds->getString().str();
+    }
+  }
+
+  return ArchABI::get(arch, os);
+}
+
 /// Win64 ABI: integer/pointer parameter registers, in order.
 static constexpr const char *kWin64ParamRegs[] = {
     "RCX", "RDX", "R8", "R9",
@@ -847,7 +865,7 @@ CallingConventionInfo CallingConventionAnalysis::run(
   CallingConventionInfo result;
   auto &DL = M.getDataLayout();
   StateFieldMap field_map(M);
-  auto &arch_abi = MAM.getResult<TargetArchAnalysis>(M);
+  auto arch_abi = getModuleArchABI(M);
 
   for (auto &F : M) {
     if (!isLiftedFunction(F)) continue;

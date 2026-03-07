@@ -98,6 +98,7 @@ add_executable(omill-unit-tests
   unit/LiftedNamesTest.cpp
   unit/LiftedFunctionMapTest.cpp
   unit/BinaryMemoryMapTest.cpp
+  unit/VMDispatchResolutionTest.cpp
   unit/ExceptionInfoTest.cpp
   unit/StateFieldAccessAnalysisTest.cpp
   unit/RemillIntrinsicAnalysisTest.cpp

@@ -228,6 +228,11 @@ static cl::opt<std::string> DeobfSection(
     "deobf-section",
     cl::desc("Scan section and deobfuscate all qualifying functions"));
 
+static cl::opt<bool> AllFunctions(
+    "all-functions",
+    cl::desc("Batch-lift all discovered functions in executable sections"),
+    cl::init(false));
+
 static cl::opt<unsigned> MinFuncSize(
     "min-func-size",
     cl::desc("Minimum function size in bytes for scan/deobf (default: 64)"),
@@ -482,6 +487,8 @@ struct SectionInfo {
   uint64_t va;
   size_t size;
   size_t storage_index;  // index into section_storage
+  std::string segment_name;
+  std::string section_name;
 };
 
 struct PEInfo {
@@ -489,9 +496,59 @@ struct PEInfo {
   omill::BinaryMemoryMap memory_map;
   omill::ExceptionInfo exception_info;
   std::vector<SectionInfo> code_sections;
+  std::vector<uint64_t> discovered_function_starts;
   std::deque<std::vector<uint8_t>> synthetic_dc_storage;
   uint64_t image_base = 0;
+  bool is_macho = false;
 };
+
+static bool sectionContainsVA(const SectionInfo &section, uint64_t va) {
+  return va >= section.va && va < (section.va + section.size);
+}
+
+static bool matchesSectionName(const SectionInfo &section,
+                               llvm::StringRef requested_name) {
+  if (requested_name == section.section_name)
+    return true;
+  if (!section.segment_name.empty() &&
+      requested_name ==
+          (Twine(section.segment_name) + "," + section.section_name).str()) {
+    return true;
+  }
+  return false;
+}
+
+static const SectionInfo *findCodeSection(const PEInfo &pe, uint64_t va) {
+  for (const auto &section : pe.code_sections) {
+    if (sectionContainsVA(section, va))
+      return &section;
+  }
+  return nullptr;
+}
+
+static const SectionInfo *findCodeSectionByName(const PEInfo &pe,
+                                                llvm::StringRef name) {
+  for (const auto &section : pe.code_sections) {
+    if (matchesSectionName(section, name))
+      return &section;
+  }
+  return nullptr;
+}
+
+static std::vector<uint64_t> collectBatchFunctionStarts(const PEInfo &pe) {
+  std::vector<uint64_t> starts;
+  if (pe.is_macho) {
+    starts = pe.discovered_function_starts;
+  } else {
+    starts.reserve(pe.exception_info.entries().size());
+    for (const auto &entry : pe.exception_info.entries())
+      starts.push_back(entry.begin_va);
+  }
+
+  llvm::sort(starts);
+  starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+  return starts;
+}
 
 /// Parse .pdata (exception table) from a PE binary.
 /// Populates exception_info with RUNTIME_FUNCTION entries that have
@@ -566,6 +623,7 @@ void parsePData(const object::COFFObjectFile &coff, uint64_t image_base,
 }
 
 bool loadPE(StringRef path, PEInfo &out) {
+  out.is_macho = false;
   auto buf_or_err = MemoryBuffer::getFile(path);
   if (!buf_or_err) {
     errs() << "Cannot open " << path << ": "
@@ -663,9 +721,15 @@ bool loadPE(StringRef path, PEInfo &out) {
 
     // Track all executable sections for the trace manager.
     const auto *coff_sec = coff.getCOFFSection(sec);
+    Expected<StringRef> name_or = sec.getName();
+    std::string section_name;
+    if (name_or)
+      section_name = name_or->str();
+    else
+      consumeError(name_or.takeError());
     if (coff_sec && (coff_sec->Characteristics &
                      (COFF::IMAGE_SCN_CNT_CODE | COFF::IMAGE_SCN_MEM_EXECUTE))) {
-      out.code_sections.push_back({va, stored.size(), idx});
+      out.code_sections.push_back({va, stored.size(), idx, "", section_name});
     }
   }
 
@@ -680,6 +744,48 @@ bool loadPE(StringRef path, PEInfo &out) {
                                         out.image_base);
 
   return true;
+}
+
+static void collectMachOFunctionStarts(object::MachOObjectFile &macho,
+                                       PEInfo &out) {
+  for (uint64_t start : macho.getFunctionStarts()) {
+    if (findCodeSection(out, start))
+      out.discovered_function_starts.push_back(start);
+  }
+
+  for (const auto &sym : macho.symbols()) {
+    auto type_or = sym.getType();
+    if (!type_or) {
+      consumeError(type_or.takeError());
+      continue;
+    }
+    if (*type_or != object::SymbolRef::ST_Function)
+      continue;
+
+    auto flags_or = sym.getFlags();
+    if (!flags_or) {
+      consumeError(flags_or.takeError());
+      continue;
+    }
+    if (*flags_or & object::BasicSymbolRef::SF_Undefined)
+      continue;
+
+    auto addr_or = sym.getAddress();
+    if (!addr_or) {
+      consumeError(addr_or.takeError());
+      continue;
+    }
+    if (*addr_or == 0)
+      continue;
+    if (findCodeSection(out, *addr_or))
+      out.discovered_function_starts.push_back(*addr_or);
+  }
+
+  llvm::sort(out.discovered_function_starts);
+  out.discovered_function_starts.erase(
+      std::unique(out.discovered_function_starts.begin(),
+                  out.discovered_function_starts.end()),
+      out.discovered_function_starts.end());
 }
 
 /// Helper: parse sections, imports, and relocations from a MachOObjectFile.
@@ -717,13 +823,20 @@ static void parseMachOContents(object::MachOObjectFile &macho,
     out.memory_map.addRegion(va, stored.data(), stored.size());
 
     auto name_or = sec.getName();
-    auto seg_name =
-        macho.getSectionFinalSegmentName(sec.getRawDataRefImpl());
-    if (name_or && seg_name == "__TEXT" &&
-        (*name_or == "__text" || *name_or == "__stubs")) {
-      out.code_sections.push_back({va, stored.size(), idx});
+    std::string section_name;
+    if (name_or)
+      section_name = name_or->str();
+    else
+      consumeError(name_or.takeError());
+    std::string seg_name =
+        macho.getSectionFinalSegmentName(sec.getRawDataRefImpl()).str();
+    if (sec.isText() || section_name == "__stubs") {
+      out.code_sections.push_back(
+          {va, stored.size(), idx, seg_name, section_name});
     }
   }
+
+  collectMachOFunctionStarts(macho, out);
 
   // Parse imports from bind opcodes.
   // The ordinal maps to a library index via getLibraryShortNameByIndex().
@@ -772,6 +885,7 @@ static void parseMachOContents(object::MachOObjectFile &macho,
 /// Returns the detected remill arch name.
 bool loadMachO(StringRef path, PEInfo &out,
                remill::ArchName &out_arch, remill::OSName &out_os) {
+  out.is_macho = true;
   auto buf_or_err = MemoryBuffer::getFile(path);
   if (!buf_or_err) {
     errs() << "Cannot open " << path << ": "
@@ -852,45 +966,61 @@ struct ScanResult {
   SmallVector<StringRef, 2> tags;
 };
 
-/// Scan a PE section, classifying each .pdata function by size and jmp density.
+/// Scan an executable section, classifying discovered functions by size and
+/// simple control-flow heuristics.
 std::vector<ScanResult> scanSection(StringRef section_name, const PEInfo &pe) {
-  // Find the named section's VA range by re-parsing the COFF headers.
-  // loadPE doesn't preserve section names, so we re-open briefly.
-  uint64_t sec_va = 0;
-  uint64_t sec_size = 0;
-  const uint8_t *sec_data = nullptr;
-  {
-    auto buf_or_err = MemoryBuffer::getFile(InputFilename);
-    if (!buf_or_err) return {};
-    auto obj_or_err = object::COFFObjectFile::create(
-        (*buf_or_err)->getMemBufferRef());
-    if (!obj_or_err) { consumeError(obj_or_err.takeError()); return {}; }
-    auto &coff = **obj_or_err;
-    for (const auto &sec : coff.sections()) {
-      Expected<StringRef> name_or = sec.getName();
-      if (!name_or) { consumeError(name_or.takeError()); continue; }
-      if (*name_or == section_name) {
-        sec_va = sec.getAddress();
-        sec_size = sec.getSize();
-        break;
-      }
-    }
-  }
-  if (sec_va == 0) {
+  const SectionInfo *section = findCodeSectionByName(pe, section_name);
+  if (!section) {
     errs() << "Section '" << section_name << "' not found\n";
     return {};
   }
 
-  // Find backing storage for byte-level analysis.
-  for (const auto &si : pe.code_sections) {
-    if (si.va == sec_va) {
-      sec_data = pe.section_storage[si.storage_index].data();
-      break;
-    }
-  }
-
+  const uint8_t *sec_data = pe.section_storage[section->storage_index].data();
+  uint64_t sec_va = section->va;
+  uint64_t sec_size = section->size;
   uint64_t sec_end = sec_va + sec_size;
   std::vector<ScanResult> results;
+
+  if (pe.is_macho) {
+    auto starts = pe.discovered_function_starts;
+    llvm::sort(starts);
+    for (size_t i = 0; i < starts.size(); ++i) {
+      uint64_t start = starts[i];
+      if (!sectionContainsVA(*section, start))
+        continue;
+
+      uint64_t next_start = sec_end;
+      for (size_t j = i + 1; j < starts.size(); ++j) {
+        if (sectionContainsVA(*section, starts[j])) {
+          next_start = starts[j];
+          break;
+        }
+      }
+
+      if (next_start <= start)
+        continue;
+
+      uint32_t func_size = static_cast<uint32_t>(next_start - start);
+      ScanResult sr;
+      sr.va = start;
+      sr.size = func_size;
+
+      if (section->section_name == "__stubs")
+        sr.tags.push_back("stub");
+      else if (func_size < 64)
+        sr.tags.push_back("trivial");
+      else if (func_size <= 256)
+        sr.tags.push_back("stub");
+      else
+        sr.tags.push_back("normal");
+
+      if (func_size > 4096)
+        sr.tags.push_back("large");
+
+      results.push_back(std::move(sr));
+    }
+    return results;
+  }
 
   for (const auto &entry : pe.exception_info.entries()) {
     if (entry.begin_va < sec_va || entry.begin_va >= sec_end)
@@ -1036,7 +1166,8 @@ int main(int argc, char **argv) {
   // Check for batch/scan modes that don't require --va.
   bool batch_mode = (ScanSection.getNumOccurrences() > 0 ||
                      DeobfTargets.getNumOccurrences() > 0 ||
-                     DeobfSection.getNumOccurrences() > 0);
+                     DeobfSection.getNumOccurrences() > 0 ||
+                     AllFunctions);
 
   // Parse VA — for raw binaries, default to base address if --va not given.
   uint64_t func_va = 0;
@@ -1050,8 +1181,8 @@ int main(int argc, char **argv) {
   } else if (RawBinary) {
     func_va = BaseAddress;
   } else if (!batch_mode) {
-    errs() << "--va is required for PE mode\n";
-    return fail(1, "--va is required for PE mode");
+    errs() << "--va is required for single-function lifting\n";
+    return fail(1, "--va is required for single-function lifting");
   }
   if (func_va == 0 && !RawBinary && !batch_mode) {
     errs() << "Invalid VA: " << FuncVA << "\n";
@@ -1158,11 +1289,12 @@ int main(int argc, char **argv) {
              << " (" << cs.size << " bytes)\n";
     }
     if (pe.code_sections.empty()) {
-      errs() << "No executable sections found in PE\n";
+      errs() << "No executable sections found in input binary\n";
       return fail(1, "no executable sections found");
     }
-    events.emitInfo("input_load_completed", "pe input loaded",
-                    {{"mode", "pe"},
+    events.emitInfo("input_load_completed",
+                    pe.is_macho ? "Mach-O input loaded" : "PE input loaded",
+                    {{"mode", pe.is_macho ? "macho" : "pe"},
                      {"image_base", ("0x" + Twine::utohexstr(pe.image_base)).str()},
                      {"code_sections", static_cast<int64_t>(pe.code_sections.size())}});
 
@@ -1206,7 +1338,8 @@ int main(int argc, char **argv) {
     }
   }
 
-  // Collect batch VAs from --deobf-targets or --deobf-section.
+  // Collect batch VAs from --deobf-targets, --deobf-section, or
+  // --all-functions.
   std::vector<uint64_t> batch_vas;
   if (DeobfTargets.getNumOccurrences() > 0) {
     batch_vas = parseDeobfTargets(DeobfTargets);
@@ -1235,6 +1368,21 @@ int main(int argc, char **argv) {
            << MinFuncSize << "B)\n";
     // Force deobfuscation on for --deobf-section.
     Deobfuscate = true;
+  } else if (AllFunctions) {
+    if (RawBinary) {
+      errs() << "--all-functions is not supported for raw binaries\n";
+      return fail(1, "--all-functions is not supported for raw binaries");
+    }
+    batch_vas = collectBatchFunctionStarts(pe);
+    if (batch_vas.empty()) {
+      errs() << "No discovered functions in executable sections\n";
+      return fail(1, "no discovered functions found");
+    }
+    errs() << "All-functions mode: " << batch_vas.size()
+           << " discovered functions\n";
+    events.emitInfo("batch_discovery_started",
+                    "discovering all executable functions",
+                    {{"count", static_cast<int64_t>(batch_vas.size())}});
   }
   if (!batch_vas.empty()) {
     events.emitInfo("batch_targets_ready", "batch target set created",
@@ -1268,10 +1416,10 @@ int main(int argc, char **argv) {
       manager.setCode(stored.data(), stored.size(), cs.va);
     }
   }
-  if (func_va != 0)
-    manager.setBaseAddr(func_va);
-  else if (!batch_vas.empty())
+  if (!batch_vas.empty())
     manager.setBaseAddr(batch_vas.front());
+  else if (func_va != 0)
+    manager.setBaseAddr(func_va);
 
   if (!RawBinary && ResolveExceptions && !pe.exception_info.empty()) {
     errs() << "Parsed .pdata: " << pe.exception_info.getHandlerVAs().size()
@@ -2088,7 +2236,7 @@ int main(int argc, char **argv) {
       }
     }
     ModulePassManager MPM;
-    omill::buildABIRecoveryPipeline(MPM);
+      omill::buildABIRecoveryPipeline(MPM, opts);
     MPM.run(*module, MAM);
     errs() << "ABI recovery complete\n";
     events.emitInfo("abi_recovery_completed", "abi recovery completed");
@@ -2181,7 +2329,7 @@ int main(int argc, char **argv) {
     // wrappers created by ABI recovery haven't been deobfuscated yet.
     if (Deobfuscate) {
       llvm::FunctionPassManager FPM;
-      omill::buildDeobfuscationPipeline(FPM);
+      omill::buildDeobfuscationPipeline(FPM, opts);
       for (auto &F : *module) {
         if (F.isDeclaration() || !F.getName().ends_with("_native"))
           continue;
@@ -2388,7 +2536,7 @@ int main(int argc, char **argv) {
         }
         {
           ModulePassManager MPM;
-          omill::buildABIRecoveryPipeline(MPM);
+    omill::buildABIRecoveryPipeline(MPM, late_opts);
           MPM.run(*late_module, late_MAM);
         }
       }

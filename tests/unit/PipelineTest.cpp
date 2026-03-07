@@ -490,7 +490,8 @@ TEST_F(PipelineTest, FoldCallsToConstantReturn) {
   setEnv("OMILL_SKIP_ABI_FINAL_OPT", "1");
 
   llvm::ModulePassManager MPM;
-  omill::buildABIRecoveryPipeline(MPM);
+  omill::PipelineOptions opts;
+  omill::buildABIRecoveryPipeline(MPM, opts);
   runMPM(MPM, *M);
 
   unsetEnv("OMILL_SKIP_ABI_RECOVER_SIGNATURES");

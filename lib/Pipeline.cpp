@@ -107,6 +107,10 @@ namespace omill {
 
 namespace {
 
+bool isWindowsTargetOS(llvm::StringRef os) {
+  return os.contains_insensitive("windows");
+}
+
 /// Lightweight pass that prints a phase label + elapsed time + function count.
 /// Gated by OMILL_PHASE_TIMING env var to avoid noise in normal operation.
 struct PhaseMarkerPass : llvm::PassInfoMixin<PhaseMarkerPass> {
@@ -799,12 +803,14 @@ struct RepairBeforeInlinePass
 
 }  // namespace
 
-void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
+void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
+                              const PipelineOptions &opts) {
   addPhaseMarker(MPM, "ABI: start (target-cpu)");
 
   // Set target-cpu on all functions so LLVM codegen emits inline CMPXCHG16B
   // instead of library calls for i128 cmpxchg.  x86-64-v2 implies +cx16.
-  if (!envDisabled("OMILL_SKIP_ABI_TARGET_CPU")) {
+  if (opts.target_arch == TargetArch::kX86_64 &&
+      !envDisabled("OMILL_SKIP_ABI_TARGET_CPU")) {
     struct SetTargetCPUPass : llvm::PassInfoMixin<SetTargetCPUPass> {
       llvm::PreservedAnalyses run(llvm::Module &M,
                                    llvm::ModuleAnalysisManager &) {
@@ -1079,7 +1085,10 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
   }
 }
 
-void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM) {
+void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM,
+                                const PipelineOptions &opts) {
+  const bool is_windows = isWindowsTargetOS(opts.target_os);
+
   // Recover stack frame: convert inttoptr(RSP+offset) to alloca GEPs.
   if (!envDisabled("OMILL_SKIP_DEOBF_RECOVER_STACK")) {
     FPM.addPass(SkipOnLiftedControlTransferPass<RecoverStackFramePass>());
@@ -1152,11 +1161,11 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM) {
     FPM.addPass(OutlineConstantStackDataPass());
   }
   // Hash import annotation (uses the now-folded constants).
-  if (!envDisabled("OMILL_SKIP_DEOBF_HASH_IMPORTS")) {
+  if (is_windows && !envDisabled("OMILL_SKIP_DEOBF_HASH_IMPORTS")) {
     FPM.addPass(HashImportAnnotationPass());
   }
   // Replace lazy_importer resolution with direct import references.
-  if (!envDisabled("OMILL_SKIP_DEOBF_RESOLVE_LAZY")) {
+  if (is_windows && !envDisabled("OMILL_SKIP_DEOBF_RESOLVE_LAZY")) {
     FPM.addPass(ResolveLazyImportsPass());
   }
   // Lower resolved dispatch_calls to native Win64 ABI calls so State
@@ -1636,6 +1645,8 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   PhaseMarkerPass::origin() = PhaseMarkerPass::Clock::now();
   addPhaseMarker(MPM, "Phase 0: start");
 
+  const bool is_windows = isWindowsTargetOS(opts.target_os);
+
   // Stamp target architecture metadata so downstream analyses can query it.
   {
     auto arch = opts.target_arch;
@@ -1761,7 +1772,8 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   if (opts.lower_control_flow) {
     llvm::FunctionPassManager FPM;
     if (!envDisabled("OMILL_SKIP_RESOLVE_FORCED_EXCEPTIONS")) {
-      FPM.addPass(ResolveForcedExceptionsPass());
+      if (is_windows)
+        FPM.addPass(ResolveForcedExceptionsPass());
     }
     addScopedFPM(std::move(FPM));
 
@@ -1798,7 +1810,8 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     llvm::FunctionPassManager FPM;
     FPM.addPass(FoldProgramCounterPass());
     FPM.addPass(llvm::InstCombinePass());
-    FPM.addPass(ResolveIATCallsPass());
+    if (is_windows)
+      FPM.addPass(ResolveIATCallsPass());
     FPM.addPass(LowerRemillIntrinsicsPass(LowerCategories::ResolvedDispatch));
     addScopedFPM(std::move(FPM));
   }
@@ -1920,7 +1933,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   addPhaseMarker(MPM, "Phase 4: ABI recovery");
   // Phase 4: ABI Recovery
   if (opts.recover_abi) {
-    buildABIRecoveryPipeline(MPM);
+    buildABIRecoveryPipeline(MPM, opts);
 
     // Phase 4 (late): Refine _native function parameter types.
     if (opts.refine_signatures) {
@@ -1934,7 +1947,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     // Ensure BinaryMemoryAnalysis is cached before function passes need it.
     MPM.addPass(llvm::RequireAnalysisPass<BinaryMemoryAnalysis, llvm::Module>());
     llvm::FunctionPassManager FPM;
-    buildDeobfuscationPipeline(FPM);
+    buildDeobfuscationPipeline(FPM, opts);
     // Deobfuscation only applies to _native wrappers post-ABI.
     MPM.addPass(createScopedFPM(std::move(FPM), [](llvm::Function &F) {
       return F.getName().ends_with("_native");

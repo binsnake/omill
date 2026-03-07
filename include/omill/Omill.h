@@ -102,10 +102,12 @@ void buildStateOptimizationPipeline(llvm::FunctionPassManager &FPM,
 void buildControlFlowPipeline(llvm::FunctionPassManager &FPM);
 
 /// Build only the ABI recovery stage (Stage 5).
-void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM);
+void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
+                              const PipelineOptions &opts);
 
 /// Build only the deobfuscation stage (Stage 6).
-void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM);
+void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM,
+                                const PipelineOptions &opts);
 
 /// Build the late cleanup pipeline (sentinel data elimination + DCE).
 /// Run after ABI recovery and post-ABI deobfuscation, before output.
