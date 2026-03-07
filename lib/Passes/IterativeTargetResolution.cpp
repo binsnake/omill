@@ -817,7 +817,22 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
 #if OMILL_ENABLE_Z3
         FPM.addPass(Z3DispatchSolverPass());
 #endif
-        runFPMOnFunctions(FPM, needs_resolve, MAM, M);
+        // Per-function resolution with progress logging.
+        {
+          auto &FAM = MAM.getResult<
+              llvm::FunctionAnalysisManagerModuleProxy>(M).getManager();
+          for (unsigned i = 0; i < needs_resolve.size(); ++i) {
+            auto *RF = needs_resolve[i];
+            if (RF->isDeclaration())
+              continue;
+            unsigned ic = 0;
+            for (auto &BB : *RF)
+              ic += BB.size();
+            llvm::errs() << "  resolving [" << i << "] "
+                         << RF->getName() << " (" << ic << " insts)\n";
+            FPM.run(*RF, FAM);
+          }
+        }
         for (auto *F : needs_resolve)
           already_resolved.insert(F);
       }

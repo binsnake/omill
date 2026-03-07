@@ -1628,11 +1628,12 @@ llvm::PreservedAnalyses IndirectCallResolverPass::run(
     // Forward MC fallback: if backward MC fails (cross-BB inttoptr stores
     // that the backward evaluator can't forward), walk the function
     // forward, tracking stores/loads through virtual memory.
-    // Skip for very large functions (>5000 instructions) — forward MC
-    // walks the entire function per trial (32+1 trials per candidate),
-    // which is O(candidates * 33 * MaxSteps) and prohibitively slow
-    // on inlined VM handler chains.
-    constexpr unsigned kForwardMCInstLimit = 5000;
+    // Skip for non-trivial functions — forward MC walks the entire
+    // function per trial (33 trials per candidate), which is
+    // O(candidates * 33 * MaxSteps) and prohibitively slow on inlined
+    // VM handler chains.  Limit to small functions where cross-BB
+    // store forwarding is the only reasonable resolution path.
+    constexpr unsigned kForwardMCInstLimit = 1000;
     bool from_fwd_mc = false;
     if (!resolved && inst_count <= kForwardMCInstLimit) {
       resolved = tryForwardMonteCarloResolve(call, F, map);
