@@ -1570,6 +1570,20 @@ llvm::PreservedAnalyses IndirectCallResolverPass::run(
   if (F.isDeclaration())
     return llvm::PreservedAnalyses::all();
 
+  // Skip very large functions entirely.  All resolution strategies
+  // (deterministic evaluator's same-BB store walk, backward MC, forward MC)
+  // scale poorly beyond ~10K instructions.  Constant targets in large
+  // functions should already be folded by GVN/ConstantMemoryFolding;
+  // remaining unresolved targets are genuinely dynamic.
+  {
+    unsigned quick_count = 0;
+    for (auto &BB : F) {
+      quick_count += BB.size();
+      if (quick_count > 10000)
+        return llvm::PreservedAnalyses::all();
+    }
+  }
+
   auto &MAMProxy = AM.getResult<llvm::ModuleAnalysisManagerFunctionProxy>(F);
   auto *map = MAMProxy.getCachedResult<BinaryMemoryAnalysis>(*F.getParent());
   if (!map)
