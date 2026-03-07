@@ -1830,6 +1830,22 @@ int main(int argc, char **argv) {
             "sub_" + Twine::utohexstr(vm_entry_va).str())) {
       fn->addFnAttr("omill.vm_handler");
       fn->setLinkage(llvm::GlobalValue::InternalLinkage);
+      // Tag direct callees of vmentry as vm_handlers too — they're
+      // internal helpers (PIC relocation, etc.) that only make sense
+      // in the caller's stack context and should be inlined into vmentry.
+      for (auto &BB : *fn) {
+        for (auto &I : BB) {
+          if (auto *call = dyn_cast<CallInst>(&I)) {
+            if (auto *callee = call->getCalledFunction()) {
+              if (callee->getName().starts_with("sub_") &&
+                  !callee->isDeclaration()) {
+                callee->addFnAttr("omill.vm_handler");
+                callee->setLinkage(llvm::GlobalValue::InternalLinkage);
+              }
+            }
+          }
+        }
+      }
     }
     if (vm_exit_va != 0) {
       if (auto *fn = module->getFunction(
@@ -2207,8 +2223,24 @@ int main(int argc, char **argv) {
         continue;
       std::string name = "sub_" + Twine::utohexstr(va).str();
       if (auto *fn = module->getFunction(name)) {
-        if (!fn->isDeclaration())
+        if (!fn->isDeclaration()) {
           fn->addFnAttr("omill.vm_handler");
+          // Tag direct callees of vmentry/vmexit as vm_handlers too.
+          if (va == vm_entry_va) {
+            for (auto &BB : *fn) {
+              for (auto &I : BB) {
+                if (auto *call = dyn_cast<CallInst>(&I)) {
+                  if (auto *callee = call->getCalledFunction()) {
+                    if (callee->getName().starts_with("sub_") &&
+                        !callee->isDeclaration()) {
+                      callee->addFnAttr("omill.vm_handler");
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
       }
     }
   };

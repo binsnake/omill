@@ -1160,6 +1160,15 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM,
     FPM.addPass(OptimizeStatePass(OptimizePhases::Roundtrip));
     FPM.addPass(llvm::DCEPass());
   }
+  // VM hash integrity checks: eliminate murmur hash anchors and range checks
+  // that survive into _native functions (e.g. via vmexit→call→vmentry chains).
+  // Must run after GVN folds constants to expose hash anchor patterns.
+  if (!envDisabled("OMILL_SKIP_DEOBF_HASH_ELIM")) {
+    FPM.addPass(CollapseRemillSHRSwitchPass());
+    FPM.addPass(VMHashEliminationPass());
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::ADCEPass());
+  }
   // Control-flow unflattening: after MBA simplification, constant folding,
   // and dead-path elimination have resolved state variable computations.
   if (!envDisabled("OMILL_SKIP_DEOBF_CFF_UNFLATTEN")) {
