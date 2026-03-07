@@ -1615,10 +1615,22 @@ llvm::PreservedAnalyses IndirectCallResolverPass::run(
   if (candidates.empty())
     return llvm::PreservedAnalyses::all();
 
+  // For very large functions (>10K instructions), skip Monte Carlo
+  // resolution entirely.  The deterministic evaluator is fast (SSA walk
+  // bounded by visited set), but backward MC builds a store map across
+  // the entire function and runs 32+ trials with per-trial backward
+  // walks through potentially huge basic blocks.  On 80K+ instruction
+  // VM functions this takes minutes.  Constant targets in large functions
+  // should already be folded by GVN/ConstantMemoryFolding.
+  constexpr unsigned kBackwardMCInstLimit = 10000;
+  bool skip_mc = (inst_count > kBackwardMCInstLimit);
+
   // Build the MC store map once. Entries use WeakTrackingVH so erasing
   // instructions during dispatch rewrites nulls stale references safely.
   const llvm::DataLayout &DL = F.getDataLayout();
-  MCStoreMap SSM = buildMCStoreMap(F, DL);
+  MCStoreMap SSM;
+  if (!skip_mc)
+    SSM = buildMCStoreMap(F, DL);
 
   bool changed = false;
 
@@ -1632,7 +1644,7 @@ llvm::PreservedAnalyses IndirectCallResolverPass::run(
     // Monte Carlo fallback: if the deterministic evaluator fails (e.g., VM
     // handler MBA with symbolic operands that cancel out), try concrete
     // evaluation with random values for unknowns.
-    if (!resolved)
+    if (!resolved && !skip_mc)
       resolved = tryMonteCarloResolve(target, F, map, &SSM);
     // Forward MC fallback: if backward MC fails (cross-BB inttoptr stores
     // that the backward evaluator can't forward), walk the function
