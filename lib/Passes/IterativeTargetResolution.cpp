@@ -252,10 +252,20 @@ bool inlineCalleesForDispatchResolution(
 
   bool inlined_any = false;
 
+  // Only inline VM handlers (functions with dispatch intrinsics), not
+  // normal functions called through vmexit→call→vmentry.  VM handlers
+  // need to be inlined so the optimization pipeline can see through the
+  // handler chain and resolve dispatch targets.  Normal functions called
+  // through native call patterns should stay as separate functions.
+  constexpr unsigned kMaxInlineRounds = 3;
+
   for (auto *F : targets) {
     bool progress = true;
-    while (progress) {
+    unsigned rounds = 0;
+    while (progress && rounds < kMaxInlineRounds) {
+      ++rounds;
       progress = false;
+
       llvm::SmallVector<llvm::CallInst *, 8> to_inline;
 
       for (auto &BB : *F) {
@@ -281,34 +291,35 @@ bool inlineCalleesForDispatchResolution(
           if (def == F)
             continue;
 
-          // Only inline callees that can contribute to dispatch resolution:
-          // they must contain dispatch intrinsics or calls to other sub_*
-          // functions.  Leaf functions without dispatch calls (e.g. security
-          // cookie init) provide no benefit and their inlined code may be
-          // misfolded by ConstantMemoryFolding (reading uninitialized globals
-          // as zero from the static binary kills continuation paths).
+          // Only inline VM handlers — callees that contain dispatch
+          // intrinsics.  Normal functions called via vmexit→call→vmentry
+          // (e.g. security cookie init, utility functions) should NOT be
+          // inlined — they provide no dispatch resolution benefit and
+          // their inlined code may be misfolded by ConstantMemoryFolding
+          // (reading uninitialized globals as zero kills continuation paths).
           {
-            bool has_dispatch_or_subcalls = false;
-            for (auto &DefBB : *def) {
-              for (auto &DefI : DefBB) {
-                auto *DefCI = llvm::dyn_cast<llvm::CallInst>(&DefI);
-                if (!DefCI)
-                  continue;
-                auto *DefCallee = DefCI->getCalledFunction();
-                if (!DefCallee)
-                  continue;
-                auto name = DefCallee->getName();
-                if (name == "__omill_dispatch_call" ||
-                    name == "__omill_dispatch_jump" ||
-                    name.starts_with("sub_")) {
-                  has_dispatch_or_subcalls = true;
-                  break;
+            bool is_vm_handler = def->hasFnAttribute("omill.vm_handler");
+            if (!is_vm_handler) {
+              for (auto &DefBB : *def) {
+                for (auto &DefI : DefBB) {
+                  auto *DefCI = llvm::dyn_cast<llvm::CallInst>(&DefI);
+                  if (!DefCI)
+                    continue;
+                  auto *DefCallee = DefCI->getCalledFunction();
+                  if (!DefCallee)
+                    continue;
+                  auto name = DefCallee->getName();
+                  if (name == "__omill_dispatch_call" ||
+                      name == "__omill_dispatch_jump") {
+                    is_vm_handler = true;
+                    break;
+                  }
                 }
+                if (is_vm_handler)
+                  break;
               }
-              if (has_dispatch_or_subcalls)
-                break;
             }
-            if (!has_dispatch_or_subcalls)
+            if (!is_vm_handler)
               continue;
           }
 
