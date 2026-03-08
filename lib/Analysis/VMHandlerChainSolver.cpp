@@ -43,6 +43,11 @@ struct EmuState {
   uint64_t regs[REG_COUNT] = {};
   Flags flags;
   uint64_t rip = 0;
+  std::array<std::array<uint8_t, 16>, 16> xmm = {};
+  uint64_t gdtr_base = 0xFFFFF80000002000ULL;
+  uint16_t gdtr_limit = 0x007FULL;
+  uint64_t idtr_base = 0xFFFFF80000001000ULL;
+  uint16_t idtr_limit = 0x0FFFULL;
 
   /// Flat memory buffer for vmcontext + handler stack.
   /// The stack grows downward from stack_top toward stack_base.
@@ -95,6 +100,12 @@ static uint64_t readMem(const EmuState &state, const BinaryMemoryMap &mem,
   return val;
 }
 
+static bool readMemBytes(const EmuState &state, const BinaryMemoryMap &mem,
+                         uint64_t addr, uint8_t *out, unsigned size);
+
+static void writeMemBytes(EmuState &state, uint64_t addr,
+                          const uint8_t *data, unsigned size);
+
 /// Write an integer to state memory.
 static void writeMem(EmuState &state, uint64_t addr, uint64_t val,
                      unsigned size) {
@@ -103,6 +114,24 @@ static void writeMem(EmuState &state, uint64_t addr, uint64_t val,
     std::memcpy(state.stackPtr(addr), &val, size);
   }
   // Writes to non-stack addresses are silently dropped.
+}
+
+static bool readMemBytes(const EmuState &state, const BinaryMemoryMap &mem,
+                         uint64_t addr, uint8_t *out, unsigned size) {
+  if (state.isStackAddr(addr) &&
+      state.isStackAddr(addr + size - 1)) {
+    std::memcpy(out, state.stackPtr(addr), size);
+    return true;
+  }
+  return mem.read(addr, out, size);
+}
+
+static void writeMemBytes(EmuState &state, uint64_t addr,
+                          const uint8_t *data, unsigned size) {
+  if (state.isStackAddr(addr) &&
+      state.isStackAddr(addr + size - 1)) {
+    std::memcpy(state.stackPtr(addr), data, size);
+  }
 }
 
 /// Compute effective address for a memory operand.
@@ -389,6 +418,64 @@ static ExecResult stepInstruction(EmuState &state,
   if (opcode == 0x0F) {
     uint8_t opcode2 = buf[pos++];
 
+    // System instruction group: 0F 01 /r
+    if (opcode2 == 0x01) {
+      uint8_t reg_field;
+      Operand rm;
+      unsigned n = decodeModRM(&buf[pos], 15 - pos, has_rex, rex, 1,
+                               rm, reg_field);
+      if (n == 0) return ExecResult::Unsupported;
+      pos += n;
+      state.rip = inst_start + pos;
+
+      switch (reg_field) {
+        case 0:  // SGDT m16&64
+        case 1: {  // SIDT m16&64
+          if (rm.kind != Operand::MEM)
+            return ExecResult::Unsupported;
+          uint8_t desc[10] = {};
+          uint16_t limit =
+              (reg_field == 0) ? state.gdtr_limit : state.idtr_limit;
+          uint64_t base =
+              (reg_field == 0) ? state.gdtr_base : state.idtr_base;
+          std::memcpy(desc, &limit, sizeof(limit));
+          std::memcpy(desc + sizeof(limit), &base, sizeof(base));
+          writeMemBytes(state, computeEA(state, rm), desc, sizeof(desc));
+          return ExecResult::Continue;
+        }
+
+        case 2:  // LGDT m16&64
+        case 3: {  // LIDT m16&64
+          if (rm.kind != Operand::MEM)
+            return ExecResult::Unsupported;
+          uint8_t desc[10] = {};
+          if (readMemBytes(state, mem, computeEA(state, rm), desc,
+                           sizeof(desc))) {
+            uint16_t limit = 0;
+            uint64_t base = 0;
+            std::memcpy(&limit, desc, sizeof(limit));
+            std::memcpy(&base, desc + sizeof(limit), sizeof(base));
+            if (reg_field == 2) {
+              state.gdtr_limit = limit;
+              state.gdtr_base = base;
+            } else {
+              state.idtr_limit = limit;
+              state.idtr_base = base;
+            }
+          }
+          return ExecResult::Continue;
+        }
+
+        case 7:  // INVLPG m8
+          if (rm.kind != Operand::MEM)
+            return ExecResult::Unsupported;
+          return ExecResult::Continue;
+
+        default:
+          return ExecResult::Unsupported;
+      }
+    }
+
     // SETcc r/m8: 0F 9x
     if ((opcode2 & 0xF0) == 0x90) {
       uint8_t reg_field;
@@ -414,6 +501,23 @@ static ExecResult stepInstruction(EmuState &state,
       if (n == 0) return ExecResult::Unsupported;
       pos += n;
       state.rip = inst_start + pos;
+
+      if (rm.kind == Operand::MEM) {
+        uint64_t addr = computeEA(state, rm);
+        if (opcode2 == 0x10)
+          readMemBytes(state, mem, addr, state.xmm[reg_field].data(), 16);
+        else
+          writeMemBytes(state, addr, state.xmm[reg_field].data(), 16);
+        return ExecResult::Continue;
+      }
+
+      if (rm.kind == Operand::REG) {
+        if (opcode2 == 0x10)
+          state.xmm[reg_field] = state.xmm[rm.reg & 0x0F];
+        else
+          state.xmm[rm.reg & 0x0F] = state.xmm[reg_field];
+        return ExecResult::Continue;
+      }
 
       if (rm.kind == Operand::MEM) {
         uint64_t addr = computeEA(state, rm);
@@ -459,6 +563,29 @@ static ExecResult stepInstruction(EmuState &state,
       if (cond)
         state.rip = state.rip + static_cast<int64_t>(rel32);
       return ExecResult::Jump;
+    }
+
+    // CMOVcc r16/32/64, r/m16/32/64: 0F 40-4F
+    if ((opcode2 & 0xF0) == 0x40) {
+      uint8_t reg_field;
+      Operand src;
+      unsigned n = decodeModRM(&buf[pos], 15 - pos, has_rex, rex,
+                               default_op_size, src, reg_field);
+      if (n == 0) return ExecResult::Unsupported;
+      pos += n;
+      state.rip = inst_start + pos;
+      if (evaluateCC(opcode2, state.flags)) {
+        uint64_t val = readOp(state, mem, src);
+        if (default_op_size == 2) {
+          state.regs[reg_field] =
+              (state.regs[reg_field] & ~0xFFFFull) | (val & 0xFFFFu);
+        } else if (default_op_size == 4) {
+          state.regs[reg_field] = val & 0xFFFFFFFFu;
+        } else {
+          state.regs[reg_field] = maskToSize(val, default_op_size);
+        }
+      }
+      return ExecResult::Continue;
     }
 
     // MOVZX r32/64, r/m8: 0F B6
@@ -803,20 +930,23 @@ static ExecResult stepInstruction(EmuState &state,
     }
   }
 
-  // TEST r/m, reg: 85
-  if (opcode == 0x85) {
+  // TEST r/m8, reg8: 84
+  // TEST r/m16/32/64, reg: 85
+  if (opcode == 0x84 || opcode == 0x85) {
+    unsigned test_size = (opcode == 0x84) ? 1 : default_op_size;
     uint8_t reg_field;
     Operand rm;
     unsigned n = decodeModRM(&buf[pos], 15 - pos, has_rex, rex,
-                             default_op_size, rm, reg_field);
+                             test_size, rm, reg_field);
     if (n == 0) return ExecResult::Unsupported;
     pos += n;
     state.rip = inst_start + pos;
 
     uint64_t a = readOp(state, mem, rm);
-    uint64_t b = state.regs[reg_field];
+    uint64_t b = (test_size == 1) ? (state.regs[reg_field] & 0xFF)
+                                  : state.regs[reg_field];
     uint64_t res = a & b;
-    updateFlagsLogical(state.flags, res, default_op_size);
+    updateFlagsLogical(state.flags, res, test_size);
     return ExecResult::Continue;
   }
 
@@ -842,6 +972,20 @@ static ExecResult stepInstruction(EmuState &state,
                          : static_cast<uint64_t>(imm32);
     uint64_t res = state.regs[RAX] & ext;
     updateFlagsLogical(state.flags, res, default_op_size);
+    return ExecResult::Continue;
+  }
+
+  // MOVSXD r64, r/m32: 63 /r
+  if (opcode == 0x63) {
+    uint8_t reg_field;
+    Operand rm;
+    unsigned n = decodeModRM(&buf[pos], 15 - pos, has_rex, rex, 4, rm,
+                             reg_field);
+    if (n == 0) return ExecResult::Unsupported;
+    pos += n;
+    state.rip = inst_start + pos;
+    int64_t val = static_cast<int32_t>(readOp(state, mem, rm) & 0xFFFFFFFFu);
+    state.regs[reg_field] = static_cast<uint64_t>(val);
     return ExecResult::Continue;
   }
 
@@ -1354,6 +1498,15 @@ VMHandlerChainSolver::VMHandlerChainSolver(const BinaryMemoryMap &mem,
   (void)image_base_;  // May be used for validation in future.
 }
 
+bool VMHandlerChainSolver::isVmexitVa(uint64_t va) const {
+  return va == vmexit_va_ ||
+         (true_vmexit_va_ != 0 && va == true_vmexit_va_);
+}
+
+uint64_t VMHandlerChainSolver::syntheticVMContextBase() {
+  return EmuState::kStackBase + 0x200;
+}
+
 std::optional<uint64_t>
 VMHandlerChainSolver::computeDelta(uint64_t subfunc_va,
                                    uint64_t return_addr) {
@@ -1397,12 +1550,37 @@ VMHandlerChainSolver::computeDelta(uint64_t subfunc_va,
 }
 
 VMHandlerChainSolver::WrapperInfo
-VMHandlerChainSolver::parseEntryWrapper(uint64_t wrapper_va) {
+VMHandlerChainSolver::parseEntryWrapper(
+    uint64_t wrapper_va,
+    const std::vector<uint8_t> *initial_vmcontext_snapshot) {
   WrapperInfo info;
+
+  // Nested VM wrappers are often reached through one or more plain jmp-thunks.
+  // Canonicalize the entry VA first so the byte-pattern parser sees the real
+  // wrapper body instead of a one-instruction trampoline.
+  uint64_t entry_va = wrapper_va;
+  for (unsigned depth = 0; depth < 4; ++depth) {
+    uint8_t thunk_buf[16];
+    if (!mem_.read(entry_va, thunk_buf, sizeof(thunk_buf)))
+      break;
+
+    if (thunk_buf[0] == 0xE9) {
+      int32_t rel = 0;
+      std::memcpy(&rel, &thunk_buf[1], 4);
+      entry_va = entry_va + 5 + static_cast<int64_t>(rel);
+      continue;
+    }
+    if (thunk_buf[0] == 0xEB) {
+      int8_t rel = static_cast<int8_t>(thunk_buf[1]);
+      entry_va = entry_va + 2 + rel;
+      continue;
+    }
+    break;
+  }
 
   // Read enough bytes for the wrapper (typically < 80 bytes).
   uint8_t buf[128];
-  if (!mem_.read(wrapper_va, buf, sizeof(buf)))
+  if (!mem_.read(entry_va, buf, sizeof(buf)))
     return info;
 
   unsigned pos = 0;
@@ -1432,7 +1610,7 @@ VMHandlerChainSolver::parseEntryWrapper(uint64_t wrapper_va) {
 
   int32_t call_rel;
   std::memcpy(&call_rel, &buf[pos + 1], 4);
-  uint64_t call_addr = wrapper_va + pos;
+  uint64_t call_addr = entry_va + pos;
   uint64_t call_target = call_addr + 5 + static_cast<int64_t>(call_rel);
   pos += 5;
 
@@ -1473,6 +1651,31 @@ VMHandlerChainSolver::parseEntryWrapper(uint64_t wrapper_va) {
 
   info.delta = *delta;
 
+  // Auto-detect the true vmexit VA. The user-specified vmexit_va_ may point
+  // to the delta-computer function inside vmentry (sub_1402A110E) while VM
+  // handlers actually call the register-restore function that immediately
+  // follows it (sub_1402A112B).  Scan forward from the delta computer for
+  // the retn (0xC3) and treat the byte after it as the true vmexit.
+  if (true_vmexit_va_ == 0 && subfunc_va != 0) {
+    uint8_t scan[64];
+    size_t scan_len = std::min<size_t>(sizeof(scan),
+                                       sizeof(buf));  // reuse same region
+    if (mem_.read(subfunc_va, scan, scan_len)) {
+      for (unsigned k = 0; k < scan_len; ++k) {
+        if (scan[k] == 0xC3) {  // retn
+          true_vmexit_va_ = subfunc_va + k + 1;
+          if (true_vmexit_va_ != vmexit_va_) {
+            llvm::errs() << "VMHandlerChainSolver: auto-detected true vmexit "
+                         << "at 0x" << llvm::utohexstr(true_vmexit_va_)
+                         << " (delta-computer at 0x"
+                         << llvm::utohexstr(subfunc_va) << ")\n";
+          }
+          break;
+        }
+      }
+    }
+  }
+
   // 3) After the call, find: jmp <somewhere> → handler preamble.
   // The preamble contains: mov rax, <hash>; mov [r12+0x190], rax;
   // mov eax, <rva>; add rax, [r12+0xE0]; jmp rax
@@ -1488,13 +1691,23 @@ VMHandlerChainSolver::parseEntryWrapper(uint64_t wrapper_va) {
     writeMem(state, state.regs[R12] + off, kSentinel, 8);
   }
 
+  if (initial_vmcontext_snapshot && !initial_vmcontext_snapshot->empty() &&
+      state.isStackAddr(state.regs[R12])) {
+    size_t avail = EmuState::kStackBase + EmuState::kStackSize -
+                   state.regs[R12];
+    size_t copy_size =
+        std::min<size_t>(avail, initial_vmcontext_snapshot->size());
+    std::memcpy(state.stackPtr(state.regs[R12]),
+                initial_vmcontext_snapshot->data(), copy_size);
+  }
+
   // Store the computed delta at [r12+0xE0].
   writeMem(state, state.regs[R12] + 0xE0, info.delta, 8);
 
   // Set rip to the instruction after the vmentry call in the wrapper.
   // But we need to emulate from the wrapper's post-call code, which
   // includes the jmp to scattered preamble code.
-  state.rip = wrapper_va + pos;
+  state.rip = entry_va + pos;
 
   // Emulate until we hit an indirect jump (the dispatch to first handler).
   for (unsigned step = 0; step < 200; ++step) {
@@ -1507,6 +1720,19 @@ VMHandlerChainSolver::parseEntryWrapper(uint64_t wrapper_va) {
       // Read the hash from [r12+0x190].
       info.initial_hash =
           readMem(state, mem_, state.regs[R12] + 0x190, 8);
+
+      if (state.isStackAddr(state.regs[R12])) {
+        size_t avail = EmuState::kStackBase + EmuState::kStackSize -
+                       state.regs[R12];
+        size_t snap_size = std::min<size_t>(
+            avail,
+            initial_vmcontext_snapshot && !initial_vmcontext_snapshot->empty()
+                ? initial_vmcontext_snapshot->size()
+                : static_cast<size_t>(0x200));
+        info.vmcontext_snapshot.assign(state.stackPtr(state.regs[R12]),
+                                       state.stackPtr(state.regs[R12]) +
+                                           snap_size);
+      }
 
       info.valid = true;
       return info;
@@ -1544,8 +1770,9 @@ VMHandlerChainSolver::solveFromWrapper(uint64_t wrapper_va) {
 
   last_delta_ = info.delta;
 
-  auto results = solveFromHandler(info.first_handler_va, info.delta,
-                                  info.initial_hash);
+  auto results = solveFromHandlerImpl(info.first_handler_va, info.delta,
+                                      info.initial_hash,
+                                      &info.vmcontext_snapshot);
 
   // Prepend a chain entry for the wrapper → first handler mapping.
   // This lets VMDispatchResolutionPass resolve the wrapper's dispatch.
@@ -1563,23 +1790,240 @@ VMHandlerChainSolver::solveFromWrapper(uint64_t wrapper_va) {
 }
 
 std::vector<VMHandlerChainSolver::ChainEntry>
+VMHandlerChainSolver::solveFromWrapperWithSnapshot(
+    uint64_t wrapper_va, const std::vector<uint8_t> &vmcontext_snapshot) {
+  auto info = parseEntryWrapper(wrapper_va, &vmcontext_snapshot);
+  if (!info.valid) {
+    llvm::errs() << "VMHandlerChainSolver: failed to parse wrapper at "
+                 << llvm::utohexstr(wrapper_va) << "\n";
+    return {};
+  }
+
+  llvm::errs() << "VMHandlerChainSolver: wrapper at "
+               << llvm::utohexstr(wrapper_va)
+               << " with injected snapshot"
+               << " â†’ delta=" << llvm::utohexstr(info.delta)
+               << " hash=" << llvm::utohexstr(info.initial_hash)
+               << " first=" << llvm::utohexstr(info.first_handler_va)
+               << "\n";
+
+  last_delta_ = info.delta;
+
+  auto results = solveFromHandlerImpl(info.first_handler_va, info.delta,
+                                      info.initial_hash,
+                                      &info.vmcontext_snapshot);
+
+  ChainEntry wrapper_entry;
+  wrapper_entry.handler_va = wrapper_va;
+  wrapper_entry.successors.push_back(info.first_handler_va);
+  results.insert(results.begin(), wrapper_entry);
+
+  if (discovered_set_.insert(wrapper_va).second)
+    discovered_handlers_.push_back(wrapper_va);
+
+  last_chain_results_ = results;
+  return results;
+}
+
+std::vector<VMHandlerChainSolver::ChainEntry>
+VMHandlerChainSolver::solveFromWrapperWithSnapshotAndHash(
+    uint64_t wrapper_va, const std::vector<uint8_t> &vmcontext_snapshot,
+    uint64_t initial_hash) {
+  auto info = parseEntryWrapper(wrapper_va, &vmcontext_snapshot);
+  if (!info.valid) {
+    llvm::errs() << "VMHandlerChainSolver: failed to parse wrapper at "
+                 << llvm::utohexstr(wrapper_va) << "\n";
+    return {};
+  }
+
+  info.initial_hash = initial_hash;
+
+  llvm::errs() << "VMHandlerChainSolver: wrapper at "
+               << llvm::utohexstr(wrapper_va)
+               << " with injected snapshot and hash override"
+               << " → delta=" << llvm::utohexstr(info.delta)
+               << " hash=" << llvm::utohexstr(info.initial_hash)
+               << " first=" << llvm::utohexstr(info.first_handler_va)
+               << "\n";
+
+  last_delta_ = info.delta;
+
+  auto results = solveFromHandlerImpl(info.first_handler_va, info.delta,
+                                      info.initial_hash,
+                                      &info.vmcontext_snapshot);
+
+  ChainEntry wrapper_entry;
+  wrapper_entry.handler_va = wrapper_va;
+  wrapper_entry.successors.push_back(info.first_handler_va);
+  results.insert(results.begin(), wrapper_entry);
+
+  if (discovered_set_.insert(wrapper_va).second)
+    discovered_handlers_.push_back(wrapper_va);
+
+  last_chain_results_ = results;
+  return results;
+}
+
+std::vector<VMHandlerChainSolver::ChainEntry>
 VMHandlerChainSolver::solveFromHandler(uint64_t handler_va,
                                        uint64_t delta,
                                        uint64_t initial_hash) {
+  return solveFromHandlerImpl(handler_va, delta, initial_hash, nullptr);
+}
+
+std::vector<VMHandlerChainSolver::ChainEntry>
+VMHandlerChainSolver::solveFromHandlerWithSnapshot(
+    uint64_t handler_va, uint64_t delta, uint64_t initial_hash,
+    const std::vector<uint8_t> &vmcontext_snapshot) {
+  llvm::errs() << "VMHandlerChainSolver: handler at "
+               << llvm::utohexstr(handler_va)
+               << " with injected snapshot"
+               << " → delta=" << llvm::utohexstr(delta)
+               << " hash=" << llvm::utohexstr(initial_hash) << "\n";
+  last_delta_ = delta;
+  auto results = solveFromHandlerImpl(handler_va, delta, initial_hash,
+                                      &vmcontext_snapshot);
+  last_chain_results_ = results;
+  return results;
+}
+
+std::vector<VMHandlerChainSolver::ChainEntry>
+VMHandlerChainSolver::solveFromHandlerImpl(
+    uint64_t handler_va, uint64_t delta, uint64_t initial_hash,
+    const std::vector<uint8_t> *vmcontext_snapshot) {
   std::vector<ChainEntry> results;
 
   struct WorkItem {
     uint64_t handler_va;
     uint64_t hash;  // Hash accumulator state entering this handler.
+    std::vector<uint8_t> snapshot;
+    uint64_t regs[REG_COUNT] = {};
+    Flags flags;
+    bool has_state = false;
   };
 
+  auto snapshotSpanSize = [&](const WorkItem &item) {
+    if (!item.snapshot.empty())
+      return item.snapshot.size();
+    if (vmcontext_snapshot && !vmcontext_snapshot->empty())
+      return vmcontext_snapshot->size();
+    return static_cast<size_t>(0x200);
+  };
+
+  bool stateful_mode = vmcontext_snapshot && vmcontext_snapshot->size() > 0x200;
+
+  struct TrackedSlots {
+    uint64_t s38 = 0;
+    uint64_t sB8 = 0;
+    uint64_t sB8p10 = 0;
+    uint64_t sBuf0 = 0;
+    uint64_t sBuf8 = 0;
+    uint64_t s108 = 0;
+    uint64_t s110 = 0;
+    uint64_t s190 = 0;
+    uint64_t s198 = 0;
+    uint64_t s1A0 = 0;
+    uint64_t s1C0 = 0;
+    uint64_t s1C8 = 0;
+  };
+
+  auto captureSyntheticSnapshot = [&](const EmuState &state, size_t size) {
+    std::vector<uint8_t> snapshot;
+    if (stateful_mode) {
+      snapshot.assign(state.stack_mem.begin(), state.stack_mem.end());
+      return snapshot;
+    }
+    uint64_t base = syntheticVMContextBase();
+    if (!state.isStackAddr(base))
+      return snapshot;
+    size_t avail = EmuState::kStackBase + EmuState::kStackSize - base;
+    size_t copy_size = std::min<size_t>(avail, size);
+    snapshot.assign(state.stackPtr(base), state.stackPtr(base) + copy_size);
+    return snapshot;
+  };
+
+  auto stateFingerprint = [&](const WorkItem &item) {
+    auto mix = [](uint64_t acc, uint64_t value) {
+      acc ^= value + 0x9E3779B97F4A7C15ull + (acc << 6) + (acc >> 2);
+      return acc;
+    };
+
+    uint64_t acc = 0xCBF29CE484222325ull;
+    acc = mix(acc, item.handler_va);
+    acc = mix(acc, item.hash);
+    acc = mix(acc, item.has_state ? 1ull : 0ull);
+    for (auto reg : item.regs)
+      acc = mix(acc, reg);
+    acc = mix(acc, item.flags.CF);
+    acc = mix(acc, item.flags.ZF);
+    acc = mix(acc, item.flags.SF);
+    acc = mix(acc, item.flags.OF);
+    for (uint8_t b : item.snapshot)
+      acc = mix(acc, b);
+    return acc;
+  };
+  auto readTrackedSlots = [&](const EmuState &state) {
+    TrackedSlots slots;
+    uint64_t base = state.regs[R12];
+    slots.s38 = readMem(state, mem_, base + 0x38, 8);
+    slots.sB8 = readMem(state, mem_, base + 0xB8, 8);
+    if (state.isStackAddr(slots.sB8 + 0x10))
+      slots.sB8p10 = readMem(state, mem_, slots.sB8 + 0x10, 8);
+    if (state.isStackAddr(slots.s38)) {
+      slots.sBuf0 = readMem(state, mem_, slots.s38, 8);
+      slots.sBuf8 = readMem(state, mem_, slots.s38 + 8, 8);
+    }
+    slots.s108 = readMem(state, mem_, base + 0x108, 8);
+    slots.s110 = readMem(state, mem_, base + 0x110, 8);
+    slots.s190 = readMem(state, mem_, base + 0x190, 8);
+    slots.s198 = readMem(state, mem_, base + 0x198, 8);
+    slots.s1A0 = readMem(state, mem_, base + 0x1A0, 8);
+    slots.s1C0 = readMem(state, mem_, base + 0x1C0, 8);
+    slots.s1C8 = readMem(state, mem_, base + 0x1C8, 8);
+    return slots;
+  };
+  auto shouldTraceSlots = [&](uint64_t handler_va) {
+    if (!stateful_mode || !getenv("OMILL_DEBUG_CHAIN"))
+      return false;
+    switch (handler_va) {
+      case 0x1402A1318ull:
+      case 0x1402A4D29ull:
+      case 0x1402F3EC3ull:
+      case 0x140312ACCull:
+      case 0x1402A1291ull:
+      case 0x1402A17DCull:
+      case 0x1402EEB6Bull:
+      case 0x1402EF44Aull:
+      case 0x1402C1E5Aull:
+        return true;
+      default:
+        return false;
+    }
+  };
+  auto execResultName = [](ExecResult res) {
+    switch (res) {
+      case ExecResult::Continue:
+        return "continue";
+      case ExecResult::Call:
+        return "call";
+      case ExecResult::Jump:
+        return "jump";
+      case ExecResult::IndirectJump:
+        return "indirect-jump";
+      case ExecResult::Ret:
+        return "ret";
+      case ExecResult::Unsupported:
+        return "unsupported";
+    }
+    return "unknown";
+  };
   std::deque<WorkItem> queue;
   // Track (handler_va, hash) pairs — the same handler visited with a
   // different hash processes different VM bytecode and dispatches to a
   // different successor.  Keying only on handler_va would prematurely
   // terminate chains that revisit the same handler (common in EAC's
   // dispatcher-style handlers that route multiple VM opcodes).
-  llvm::DenseSet<std::pair<uint64_t, uint64_t>> visited;
+  llvm::DenseSet<uint64_t> visited;
 
   queue.push_back({handler_va, initial_hash});
 
@@ -1587,7 +2031,7 @@ VMHandlerChainSolver::solveFromHandler(uint64_t handler_va,
     auto item = queue.front();
     queue.pop_front();
 
-    auto key = std::make_pair(item.handler_va, item.hash);
+    uint64_t key = stateFingerprint(item);
     if (visited.count(key))
       continue;
     visited.insert(key);
@@ -1603,21 +2047,172 @@ VMHandlerChainSolver::solveFromHandler(uint64_t handler_va,
     EmuState state;
     state.stack_mem.fill(0);
     state.regs[RSP] = EmuState::kStackBase + EmuState::kStackSize - 0x2000;
-    state.regs[R12] = EmuState::kStackBase + 0x200;
+    state.regs[R12] = syntheticVMContextBase();
     state.rip = item.handler_va;
 
+    if (stateful_mode && item.has_state) {
+      if (!item.snapshot.empty()) {
+        size_t copy_size = std::min<size_t>(state.stack_mem.size(),
+                                            item.snapshot.size());
+        std::memcpy(state.stack_mem.data(), item.snapshot.data(), copy_size);
+      }
+      std::memcpy(state.regs, item.regs, sizeof(state.regs));
+      state.flags = item.flags;
+      state.rip = item.handler_va;
+    } else {
     // Fill vmcontext with sentinel for register slots.
     for (unsigned off = 0; off < 0x200; off += 8)
       writeMem(state, state.regs[R12] + off, kSentinel, 8);
 
-    // Set known vmcontext slots (always overwrite — these are per-handler).
+    if (vmcontext_snapshot && !vmcontext_snapshot->empty() &&
+        state.isStackAddr(state.regs[R12])) {
+      size_t avail = EmuState::kStackBase + EmuState::kStackSize -
+                     state.regs[R12];
+      size_t copy_size =
+          std::min<size_t>(avail, vmcontext_snapshot->size());
+      std::memcpy(state.stackPtr(state.regs[R12]),
+                  vmcontext_snapshot->data(), copy_size);
+      // Wrapper hand-off enters the first handler with RSP pointing at the
+      // vmcontext area. Some shared dispatch handlers read control state from
+      // [rsp+190]/[rsp+198] instead of [r12+...], so preserve that layout.
+      state.regs[RSP] = state.regs[R12];
+    }
+
+    // Set known vmcontext slots. In stateful mode the wrapper-seeded control
+    // tuple at [190]/[198]/[1C0] must be preserved; the real per-call hash
+    // flows through the synthetic buffer/scratch memory, not [190].
     writeMem(state, state.regs[R12] + 0xE0, delta, 8);
-    writeMem(state, state.regs[R12] + 0x190, item.hash, 8);
+    if (!stateful_mode)
+      writeMem(state, state.regs[R12] + 0x190, item.hash, 8);
+    }
+
+    auto enqueueSuccessor = [&](uint64_t target, uint64_t new_hash) {
+      if (!stateful_mode) {
+        queue.push_back({target, new_hash});
+        return;
+      }
+      WorkItem next;
+      next.handler_va = target;
+      next.hash = new_hash;
+      next.snapshot = captureSyntheticSnapshot(state, state.stack_mem.size());
+      std::memcpy(next.regs, state.regs, sizeof(state.regs));
+      next.flags = state.flags;
+      next.has_state = true;
+      queue.push_back(std::move(next));
+    };
+
+    auto recordNativeTarget = [&](uint64_t native_target) {
+      if (native_target == 0 || native_target == kSentinel)
+        return false;
+
+      uint8_t byte = 0;
+      if (!mem_.read(native_target, &byte, 1))
+        return false;
+
+      NativeCallInfo info;
+      info.handler_va = item.handler_va;
+      info.target_va = native_target;
+      info.r12_base = state.regs[R12];
+      info.hash = stateful_mode
+                      ? item.hash
+                      : readMem(state, mem_, state.regs[R12] + 0x190, 8);
+      static_assert(sizeof(info.gprs) == sizeof(state.regs));
+      std::memcpy(info.gprs, state.regs, sizeof(state.regs));
+      if (state.isStackAddr(info.r12_base)) {
+        size_t avail = EmuState::kStackBase + EmuState::kStackSize -
+                       info.r12_base;
+        size_t snap_size = std::min<size_t>(0x200, avail);
+        info.vmcontext_snapshot.assign(
+            state.stackPtr(info.r12_base),
+            state.stackPtr(info.r12_base) + snap_size);
+      }
+      native_call_infos_.push_back(std::move(info));
+
+      if (native_call_set_.insert(native_target).second)
+        native_call_targets_.push_back(native_target);
+      return true;
+    };
+
+    if (stateful_mode && getenv("OMILL_DEBUG_CHAIN") &&
+        item.handler_va == 0x1402A4D29ull) {
+      llvm::errs() << "VMHandlerChainSolver: stateful entry handler=0x"
+                   << llvm::utohexstr(item.handler_va)
+                   << " RSP=0x" << llvm::utohexstr(state.regs[RSP])
+                   << " R12=0x" << llvm::utohexstr(state.regs[R12])
+                   << " [R12+190]=0x"
+                   << llvm::utohexstr(
+                          readMem(state, mem_, state.regs[R12] + 0x190, 8))
+                   << " [R12+E0]=0x"
+                   << llvm::utohexstr(
+                          readMem(state, mem_, state.regs[R12] + 0xE0, 8))
+                   << " [base+E0]=0x"
+                   << llvm::utohexstr(
+                          readMem(state, mem_, syntheticVMContextBase() + 0xE0,
+                                  8))
+                   << "\n";
+    }
 
     // Emulate the handler.
     bool dispatched = false;
+    unsigned call_depth = 0;  // Track internal function call nesting.
     for (unsigned step = 0; step < max_steps_per_handler_; ++step) {
+      bool trace_slots = shouldTraceSlots(item.handler_va);
+      uint64_t inst_va = state.rip;
+      uint64_t rsp_before = state.regs[RSP];
+      uint64_t r12_before = state.regs[R12];
+      auto slots_before = trace_slots ? readTrackedSlots(state) : TrackedSlots{};
       ExecResult res = stepInstruction(state, mem_);
+      if (trace_slots) {
+        auto slots_after = readTrackedSlots(state);
+        bool changed = rsp_before != state.regs[RSP] ||
+                       r12_before != state.regs[R12] ||
+                       slots_before.s38 != slots_after.s38 ||
+                       slots_before.sB8 != slots_after.sB8 ||
+                       slots_before.sB8p10 != slots_after.sB8p10 ||
+                       slots_before.sBuf0 != slots_after.sBuf0 ||
+                       slots_before.sBuf8 != slots_after.sBuf8 ||
+                       slots_before.s108 != slots_after.s108 ||
+                       slots_before.s110 != slots_after.s110 ||
+                       slots_before.s190 != slots_after.s190 ||
+                       slots_before.s198 != slots_after.s198 ||
+                       slots_before.s1A0 != slots_after.s1A0 ||
+                       slots_before.s1C0 != slots_after.s1C0 ||
+                       slots_before.s1C8 != slots_after.s1C8 ||
+                       res != ExecResult::Continue;
+        if (changed) {
+          llvm::errs() << "VMHandlerChainSolver: step handler=0x"
+                       << llvm::utohexstr(item.handler_va)
+                       << " inst=0x" << llvm::utohexstr(inst_va)
+                       << " res=" << execResultName(res)
+                       << " rip=0x" << llvm::utohexstr(state.rip);
+          if (rsp_before != state.regs[RSP])
+            llvm::errs() << " rsp:0x" << llvm::utohexstr(rsp_before)
+                         << "->0x" << llvm::utohexstr(state.regs[RSP]);
+          if (r12_before != state.regs[R12])
+            llvm::errs() << " r12:0x" << llvm::utohexstr(r12_before)
+                         << "->0x" << llvm::utohexstr(state.regs[R12]);
+          auto printSlotChange = [&](const char *name, uint64_t before,
+                                     uint64_t after) {
+            if (before == after)
+              return;
+            llvm::errs() << " " << name << ":0x" << llvm::utohexstr(before)
+                         << "->0x" << llvm::utohexstr(after);
+          };
+          printSlotChange("[38]", slots_before.s38, slots_after.s38);
+          printSlotChange("[B8]", slots_before.sB8, slots_after.sB8);
+          printSlotChange("[*B8+10]", slots_before.sB8p10, slots_after.sB8p10);
+          printSlotChange("[buf+0]", slots_before.sBuf0, slots_after.sBuf0);
+          printSlotChange("[buf+8]", slots_before.sBuf8, slots_after.sBuf8);
+          printSlotChange("[108]", slots_before.s108, slots_after.s108);
+          printSlotChange("[110]", slots_before.s110, slots_after.s110);
+          printSlotChange("[190]", slots_before.s190, slots_after.s190);
+          printSlotChange("[198]", slots_before.s198, slots_after.s198);
+          printSlotChange("[1A0]", slots_before.s1A0, slots_after.s1A0);
+          printSlotChange("[1C0]", slots_before.s1C0, slots_after.s1C0);
+          printSlotChange("[1C8]", slots_before.s1C8, slots_after.s1C8);
+          llvm::errs() << "\n";
+        }
+      }
 
       if (res == ExecResult::Unsupported) {
         llvm::errs() << "VMHandlerChainSolver: unsupported instruction at "
@@ -1638,12 +2233,14 @@ VMHandlerChainSolver::solveFromHandler(uint64_t handler_va,
         if (entry.is_vmexit && target >= handler_seg_start_ &&
             target < handler_seg_end_) {
           // Read the new hash from vmcontext (set by the preamble).
-          uint64_t new_hash =
-              readMem(state, mem_, state.regs[R12] + 0x190, 8);
+          uint64_t new_hash = stateful_mode
+                                  ? item.hash
+                                  : readMem(state, mem_,
+                                            state.regs[R12] + 0x190, 8);
 
           // If this (target, hash) pair is already visited, the chain
           // has genuinely cycled — same handler with same VM state.
-          if (visited.count({target, new_hash})) {
+          if (false) {
             llvm::errs()
                 << "VMHandlerChainSolver: vmexit continuation → "
                 << "0x" << llvm::utohexstr(target)
@@ -1657,13 +2254,13 @@ VMHandlerChainSolver::solveFromHandler(uint64_t handler_va,
                        << " hash=" << llvm::utohexstr(new_hash) << "\n";
 
           entry.successors.push_back(target);
-          queue.push_back({target, new_hash});
+          enqueueSuccessor(target, new_hash);
           dispatched = true;
           break;
         }
 
         // Check if this is a VM exit.
-        if (target == vmexit_va_) {
+        if (isVmexitVa(target)) {
           entry.is_vmexit = true;
           dispatched = true;
           break;
@@ -1693,22 +2290,26 @@ VMHandlerChainSolver::solveFromHandler(uint64_t handler_va,
             // The handler dispatches through a trampoline. The actual next
             // handler is in [r12+0x198]. Read the updated hash from
             // [r12+0x190].
-            uint64_t new_hash =
-                readMem(state, mem_, state.regs[R12] + 0x190, 8);
+            uint64_t new_hash = stateful_mode
+                                    ? item.hash
+                                    : readMem(state, mem_,
+                                              state.regs[R12] + 0x190, 8);
 
             entry.successors.push_back(stored_target);
-            queue.push_back({stored_target, new_hash});
+            enqueueSuccessor(stored_target, new_hash);
             dispatched = true;
             break;
           }
 
           // No stored target — treat the jump target itself as the
           // successor (simple dispatch pattern or trampoline IS handler).
-          uint64_t new_hash =
-              readMem(state, mem_, state.regs[R12] + 0x190, 8);
+          uint64_t new_hash = stateful_mode
+                                  ? item.hash
+                                  : readMem(state, mem_,
+                                            state.regs[R12] + 0x190, 8);
 
           entry.successors.push_back(target);
-          queue.push_back({target, new_hash});
+          enqueueSuccessor(target, new_hash);
           dispatched = true;
           break;
         }
@@ -1716,7 +2317,22 @@ VMHandlerChainSolver::solveFromHandler(uint64_t handler_va,
         // Unknown target — might be a call to native code.
         llvm::errs() << "VMHandlerChainSolver: unknown indirect target "
                      << llvm::utohexstr(target) << " from handler "
-                     << llvm::utohexstr(item.handler_va) << "\n";
+                     << llvm::utohexstr(item.handler_va)
+                     << " rsp=0x" << llvm::utohexstr(state.regs[RSP])
+                     << " r12=0x" << llvm::utohexstr(state.regs[R12])
+                     << " [rsp+b8]=0x"
+                     << llvm::utohexstr(
+                            readMem(state, mem_, state.regs[RSP] + 0xB8, 8))
+                     << " [rsp+190]=0x"
+                     << llvm::utohexstr(
+                            readMem(state, mem_, state.regs[RSP] + 0x190, 8));
+        if (state.isStackAddr(target)) {
+          llvm::errs() << " [target]=0x"
+                       << llvm::utohexstr(readMem(state, mem_, target, 8))
+                       << " [target+8]=0x"
+                       << llvm::utohexstr(readMem(state, mem_, target + 8, 8));
+        }
+        llvm::errs() << "\n";
         entry.is_error = true;
         dispatched = true;
         break;
@@ -1725,7 +2341,12 @@ VMHandlerChainSolver::solveFromHandler(uint64_t handler_va,
       if (res == ExecResult::Call) {
         uint64_t target = state.rip;
 
-        if (target == vmexit_va_) {
+        if (getenv("OMILL_DEBUG_CHAIN"))
+          llvm::errs() << "  Call to 0x" << llvm::utohexstr(target)
+                       << " depth=" << call_depth
+                       << " step=" << step << "\n";
+
+        if (isVmexitVa(target)) {
           // Skip the vmexit call — pop return address and continue.
           // This lets us follow through the vmexit trampoline to find
           // the next chain's preamble after re-entry.
@@ -1737,7 +2358,23 @@ VMHandlerChainSolver::solveFromHandler(uint64_t handler_va,
           // `call [rsp+8]` reads the native call target from the correct
           // vmcontext offset.
           uint64_t ret_addr = readMem(state, mem_, state.regs[RSP], 8);
+          uint64_t vmctx_base = state.regs[R12];
+          state.regs[RBP] = readMem(state, mem_, vmctx_base + 0x30, 8);
+          state.regs[RDX] = readMem(state, mem_, vmctx_base + 0x38, 8);
+          state.regs[RBX] = readMem(state, mem_, vmctx_base + 0x40, 8);
+          state.regs[R8] = readMem(state, mem_, vmctx_base + 0x78, 8);
+          state.regs[R9] = readMem(state, mem_, vmctx_base + 0x80, 8);
+          state.regs[R13] = readMem(state, mem_, vmctx_base + 0x88, 8);
+          state.regs[RCX] = readMem(state, mem_, vmctx_base + 0x90, 8);
+          state.regs[RAX] = readMem(state, mem_, vmctx_base + 0x108, 8);
+          state.regs[R14] = readMem(state, mem_, vmctx_base + 0x110, 8);
+          state.regs[RSI] = readMem(state, mem_, vmctx_base + 0x128, 8);
+          state.regs[R15] = readMem(state, mem_, vmctx_base + 0x140, 8);
+          state.regs[R10] = readMem(state, mem_, vmctx_base + 0x158, 8);
+          state.regs[RDI] = readMem(state, mem_, vmctx_base + 0x170, 8);
+          state.regs[R11] = readMem(state, mem_, vmctx_base + 0x188, 8);
           state.regs[RSP] = state.regs[R12];  // vmexit restores RSP ≈ R12
+          state.regs[RSP] = vmctx_base;
           state.rip = ret_addr;
           entry.is_vmexit = true;  // Mark that we passed through vmexit.
           continue;
@@ -1768,13 +2405,68 @@ VMHandlerChainSolver::solveFromHandler(uint64_t handler_va,
         // record the target for recursive descent lifting, then skip it.
         if (entry.is_vmexit) {
           uint64_t native_target = state.rip;
+          if (native_target >= handler_seg_start_ &&
+              native_target < handler_seg_end_) {
+            if (getenv("OMILL_DEBUG_CHAIN")) {
+              llvm::errs() << "VMHandlerChainSolver: vmexit-call reentering "
+                           << "handler-segment target=0x"
+                           << llvm::utohexstr(native_target)
+                           << " from handler=0x"
+                           << llvm::utohexstr(item.handler_va) << "\n";
+            }
+            ++call_depth;
+            continue;
+          }
+          if (getenv("OMILL_DEBUG_CHAIN")) {
+            llvm::errs() << "VMHandlerChainSolver: vmexit-call handler=0x"
+                         << llvm::utohexstr(item.handler_va)
+                         << " rsp=0x" << llvm::utohexstr(state.regs[RSP])
+                         << " r12=0x" << llvm::utohexstr(state.regs[R12])
+                         << " target=0x" << llvm::utohexstr(native_target)
+                         << " [rsp]=0x"
+                         << llvm::utohexstr(
+                                readMem(state, mem_, state.regs[RSP], 8))
+                         << " [rsp+8]=0x"
+                         << llvm::utohexstr(
+                                readMem(state, mem_, state.regs[RSP] + 8, 8))
+                         << " [r12+1c0]=0x"
+                         << llvm::utohexstr(
+                                readMem(state, mem_, state.regs[R12] + 0x1C0,
+                                        8))
+                         << " [r12+1c8]=0x"
+                         << llvm::utohexstr(
+                                readMem(state, mem_, state.regs[R12] + 0x1C8,
+                                        8))
+                         << "\n";
+          }
           // Filter out sentinel and zero values — those indicate the
           // target couldn't be resolved from the emulator state (e.g.,
           // the native address is on the original caller's stack above
           // the vmcontext, which the emulator doesn't model).
-          if (native_target != 0 && native_target != kSentinel &&
-              native_call_set_.insert(native_target).second)
-            native_call_targets_.push_back(native_target);
+          if (native_target != 0 && native_target != kSentinel) {
+            // Capture per-callsite emulator state for clone specialization.
+            NativeCallInfo info;
+            info.handler_va = item.handler_va;
+            info.target_va = native_target;
+            info.r12_base = state.regs[R12];
+            info.hash = readMem(state, mem_, state.regs[R12] + 0x190, 8);
+            static_assert(sizeof(info.gprs) == sizeof(state.regs));
+            std::memcpy(info.gprs, state.regs, sizeof(state.regs));
+            // Snapshot vmcontext memory (~0x200 bytes from R12).
+            if (state.isStackAddr(info.r12_base)) {
+              size_t avail = EmuState::kStackBase + EmuState::kStackSize -
+                             info.r12_base;
+              size_t snap_size = std::min<size_t>(0x200, avail);
+              info.vmcontext_snapshot.assign(
+                  state.stackPtr(info.r12_base),
+                  state.stackPtr(info.r12_base) + snap_size);
+            }
+            native_call_infos_.push_back(std::move(info));
+
+            // Maintain backward-compat deduplicated VA list.
+            if (native_call_set_.insert(native_target).second)
+              native_call_targets_.push_back(native_target);
+          }
 
           uint64_t ret_addr = readMem(state, mem_, state.regs[RSP], 8);
           state.regs[RSP] += 8;
@@ -1785,22 +2477,56 @@ VMHandlerChainSolver::solveFromHandler(uint64_t handler_va,
         // For other calls (e.g., to sub-functions within the handler),
         // continue emulating into the callee. The return address was
         // already pushed by stepInstruction.
+        //
+        // If this is a top-level call to a function outside the handler
+        // segment, record a NativeCallInfo so per-callsite clone
+        // specialization has the correct GPR/vmcontext state.
+        if (call_depth == 0 &&
+            (target < handler_seg_start_ || target >= handler_seg_end_) &&
+            target != 0 && target != kSentinel) {
+          NativeCallInfo info;
+          info.handler_va = item.handler_va;
+          info.target_va = target;
+          info.r12_base = state.regs[R12];
+          info.hash = readMem(state, mem_, state.regs[R12] + 0x190, 8);
+          static_assert(sizeof(info.gprs) == sizeof(state.regs));
+          std::memcpy(info.gprs, state.regs, sizeof(state.regs));
+          if (state.isStackAddr(info.r12_base)) {
+            size_t avail = EmuState::kStackBase + EmuState::kStackSize -
+                           info.r12_base;
+            size_t snap_size = std::min<size_t>(0x200, avail);
+            info.vmcontext_snapshot.assign(
+                state.stackPtr(info.r12_base),
+                state.stackPtr(info.r12_base) + snap_size);
+          }
+          native_call_infos_.push_back(std::move(info));
+        }
+        ++call_depth;
         continue;
       }
 
       if (res == ExecResult::Ret) {
-        // If we return and the return address is in the handler segment,
-        // it might be a trampoline. Otherwise, it's unusual.
+        // If inside an internal function call, just return to the caller
+        // and continue emulation.
+        if (call_depth > 0) {
+          --call_depth;
+          continue;
+        }
+
+        // Handler-level return: if the return address is in the handler
+        // segment, it might be a trampoline. Otherwise, it's unusual.
         uint64_t ret_target = state.rip;
         if (ret_target >= handler_seg_start_ &&
             ret_target < handler_seg_end_) {
           // This is a vmexit-style return to another handler.
-          uint64_t new_hash =
-              readMem(state, mem_, state.regs[R12] + 0x190, 8);
+          uint64_t new_hash = stateful_mode
+                                  ? item.hash
+                                  : readMem(state, mem_,
+                                            state.regs[R12] + 0x190, 8);
 
           // Cycle check: if this (target, hash) pair is already visited,
           // the chain has genuinely cycled.
-          if (visited.count({ret_target, new_hash})) {
+          if (false) {
             llvm::errs()
                 << "VMHandlerChainSolver: ret to 0x"
                 << llvm::utohexstr(ret_target)
@@ -1809,19 +2535,52 @@ VMHandlerChainSolver::solveFromHandler(uint64_t handler_va,
             break;
           }
           entry.successors.push_back(ret_target);
-          queue.push_back({ret_target, new_hash});
+          enqueueSuccessor(ret_target, new_hash);
           dispatched = true;
           break;
         }
 
         // Check if we're returning to vmexit.
-        if (ret_target == vmexit_va_) {
+        if (isVmexitVa(ret_target)) {
           entry.is_vmexit = true;
           dispatched = true;
           break;
         }
 
         // Unknown return target.
+        if (entry.is_vmexit && getenv("OMILL_DEBUG_CHAIN")) {
+          llvm::errs()
+              << "VMHandlerChainSolver: vmexit-ret state handler=0x"
+              << llvm::utohexstr(item.handler_va)
+              << " ret=0x" << llvm::utohexstr(ret_target)
+              << " rax=0x" << llvm::utohexstr(state.regs[RAX])
+              << " [100]=0x"
+              << llvm::utohexstr(readMem(state, mem_, state.regs[R12] + 0x100,
+                                         8))
+              << " [108]=0x"
+              << llvm::utohexstr(readMem(state, mem_, state.regs[R12] + 0x108,
+                                         8))
+              << " [110]=0x"
+              << llvm::utohexstr(readMem(state, mem_, state.regs[R12] + 0x110,
+                                         8))
+              << " [118]=0x"
+              << llvm::utohexstr(readMem(state, mem_, state.regs[R12] + 0x118,
+                                         8))
+              << " [190]=0x"
+              << llvm::utohexstr(readMem(state, mem_, state.regs[R12] + 0x190,
+                                         8))
+              << " [198]=0x"
+              << llvm::utohexstr(readMem(state, mem_, state.regs[R12] + 0x198,
+                                         8))
+              << " [1A0]=0x"
+              << llvm::utohexstr(readMem(state, mem_, state.regs[R12] + 0x1A0,
+                                         8))
+              << "\n";
+        }
+        if (entry.is_vmexit && recordNativeTarget(state.regs[RAX])) {
+          dispatched = true;
+          break;
+        }
         llvm::errs() << "VMHandlerChainSolver: handler "
                      << llvm::utohexstr(item.handler_va)
                      << " returned to "

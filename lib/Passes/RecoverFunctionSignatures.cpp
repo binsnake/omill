@@ -212,6 +212,23 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
     Builder.CreateStore(param, field_ptr);
   }
 
+  // Store param-to-State-offset metadata so per-callsite clone logic
+  // can map native function params back to emulator GPR indices.
+  {
+    std::string offsets_str;
+    for (unsigned i = 0; i < abi.numParams(); ++i)
+      offsets_str += std::to_string(abi.params[i].state_offset) + ",";
+    for (unsigned i = 0; i < abi.numStackParams(); ++i)
+      offsets_str += "stack,";  // Stack params don't map to GPRs.
+    for (unsigned i = 0; i < abi.numXMMParams(); ++i)
+      offsets_str += "xmm,";   // XMM params don't map to GPRs.
+    for (unsigned i = 0; i < abi.numExtraGPRParams(); ++i)
+      offsets_str += std::to_string(abi.extra_gpr_live_ins[i]) + ",";
+    if (!offsets_str.empty())
+      offsets_str.pop_back();
+    native_fn->addFnAttr("omill.param_state_offsets", offsets_str);
+  }
+
   // Build arguments for the lifted function call.
   // Lifted functions have signature: (State*, i64, Memory*) -> Memory*
   auto *lifted_ty = lifted_fn->getFunctionType();

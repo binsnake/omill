@@ -328,6 +328,11 @@ bool inlineCalleesForDispatchResolution(
             }
             if (!is_vm_handler)
               continue;
+            // Never inline VM wrappers — they are boundary functions
+            // that connect the caller to the VM handler chain.  Inlining
+            // them destroys the call structure that late discovery needs.
+            if (def->hasFnAttribute("omill.vm_wrapper"))
+              continue;
           }
 
           if (callee != def)

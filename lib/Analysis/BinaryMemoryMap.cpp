@@ -16,6 +16,13 @@ void BinaryMemoryMap::addRegion(uint64_t base, const uint8_t *data,
   regions_.insert(it, r);  // Maintain sorted order for binary search.
 }
 
+void BinaryMemoryMap::removeRegion(uint64_t base) {
+  auto it = std::find_if(regions_.begin(), regions_.end(),
+                         [base](const Region &r) { return r.base == base; });
+  if (it != regions_.end())
+    regions_.erase(it);
+}
+
 bool BinaryMemoryMap::read(uint64_t addr, uint8_t *out, unsigned size) const {
   // Binary search for the region containing addr.
   auto it = std::upper_bound(

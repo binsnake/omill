@@ -1,3 +1,4 @@
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
@@ -16,6 +17,7 @@
 #include <llvm/Passes/StandardInstrumentations.h>
 #include <llvm/Transforms/IPO/GlobalDCE.h>
 #include <llvm/Transforms/IPO/Inliner.h>
+#include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar/ADCE.h>
 #include <llvm/Transforms/Scalar/GVN.h>
@@ -54,8 +56,10 @@
 #include "omill/Analysis/VMHandlerGraph.h"
 #include "omill/Omill.h"
 #include "omill/Tools/LiftRunContract.h"
+#include "omill/Utils/StateFieldMap.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <deque>
 #include <memory>
@@ -1477,6 +1481,9 @@ int main(int argc, char **argv) {
     }
   };
 
+  // Wrapper VAs detected during auto-detection (thunk_va, wrapper_va).
+  std::vector<std::pair<uint64_t, uint64_t>> auto_detected_wrappers;
+
   if (!batch_vas.empty()) {
     // Batch lifting mode.
     unsigned lifted = 0, failed = 0;
@@ -1531,6 +1538,97 @@ int main(int argc, char **argv) {
       return fail(1, "trace lifter failed");
     }
     tagOutputRoot(func_va);
+
+    // Auto-detect VM wrappers when --vm-wrapper is not specified.
+    // DriverEntry (or similar outer function) calls thunks (E9 jmp) that
+    // resolve to actual VM wrappers.  Collect ALL detected wrappers.
+    if (vm_mode && vm_wrapper_va == func_va) {
+      auto *entry_fn = module->getFunction(
+          "sub_" + llvm::Twine::utohexstr(func_va).str());
+      if (entry_fn) {
+        for (auto &BB : *entry_fn) {
+          for (auto &I : BB) {
+            auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+            if (!call || call->arg_size() < 2)
+              continue;
+            auto *callee_fn = call->getCalledFunction();
+            if (!callee_fn)
+              continue;
+            auto callee_name = callee_fn->getName();
+            if (!callee_name.starts_with("sub_"))
+              continue;
+            uint64_t callee_va = 0;
+            callee_name.drop_front(4).getAsInteger(16, callee_va);
+            if (callee_va == 0)
+              continue;
+
+            // Follow jmp-thunks to a real function body.
+            uint64_t resolved = callee_va;
+            for (int hop = 0; hop < 4; ++hop) {
+              uint8_t tbuf[16];
+              if (!pe.memory_map.read(resolved, tbuf, sizeof(tbuf)))
+                break;
+              if (tbuf[0] == 0xE9) {
+                int32_t rel;
+                std::memcpy(&rel, &tbuf[1], 4);
+                resolved = resolved + 5 + static_cast<int64_t>(rel);
+              } else if (tbuf[0] == 0xEB) {
+                int8_t rel = static_cast<int8_t>(tbuf[1]);
+                resolved = resolved + 2 + rel;
+              } else {
+                break;
+              }
+            }
+            if (resolved == callee_va)
+              continue;  // not a thunk
+
+            // Probe the resolved VA for the wrapper pattern:
+            //   optional lea rsp,[rsp-N] / sub rsp,N
+            //   E8 <rel32>  (call to vmentry or near it)
+            uint8_t probe[32];
+            if (!pe.memory_map.read(resolved, probe, sizeof(probe)))
+              continue;
+            unsigned p = 0;
+            if (p + 8 <= sizeof(probe) &&
+                probe[p] == 0x48 && probe[p+1] == 0x8D &&
+                probe[p+2] == 0xA4 && probe[p+3] == 0x24) {
+              p += 8;
+            } else if (p + 5 <= sizeof(probe) &&
+                       probe[p] == 0x48 && probe[p+1] == 0x8D &&
+                       probe[p+2] == 0x64 && probe[p+3] == 0x24) {
+              p += 5;
+            } else if (p + 7 <= sizeof(probe) &&
+                       probe[p] == 0x48 && probe[p+1] == 0x81 &&
+                       probe[p+2] == 0xEC) {
+              p += 7;
+            }
+            if (p + 5 > sizeof(probe) || probe[p] != 0xE8)
+              continue;
+            int32_t crel;
+            std::memcpy(&crel, &probe[p+1], 4);
+            uint64_t ctarget = resolved + p + 5 + static_cast<int64_t>(crel);
+            // Accept if the call target is within a reasonable range of vmentry.
+            if (ctarget < vm_entry_va - 0x1000 || ctarget > vm_entry_va + 0x1000)
+              continue;
+
+            // Avoid duplicates (same wrapper from different thunks).
+            bool dup = false;
+            for (auto &[tv, wv] : auto_detected_wrappers)
+              if (wv == resolved) { dup = true; break; }
+            if (dup) continue;
+
+            errs() << "Auto-detected VM wrapper at 0x"
+                   << Twine::utohexstr(resolved)
+                   << " (via thunk sub_"
+                   << Twine::utohexstr(callee_va) << ")\n";
+            auto_detected_wrappers.push_back({callee_va, resolved});
+          }
+        }
+      }
+      // Use the first detected wrapper as the primary one.
+      if (!auto_detected_wrappers.empty())
+        vm_wrapper_va = auto_detected_wrappers.front().second;
+    }
 
     // When --vm-wrapper differs from --va, fold jmp-thunks between
     // func_va and the VM wrapper so that the entry function calls the
@@ -1644,6 +1742,61 @@ int main(int argc, char **argv) {
         }
       }
     }
+
+    // Process additional auto-detected wrappers (beyond the first one
+    // which was handled above as vm_wrapper_va).
+    if (vm_mode && auto_detected_wrappers.size() > 1) {
+      auto *entry_fn = module->getFunction(
+          "sub_" + llvm::Twine::utohexstr(func_va).str());
+      for (size_t wi = 1; wi < auto_detected_wrappers.size(); ++wi) {
+        uint64_t thunk_va = auto_detected_wrappers[wi].first;
+        uint64_t wrapper_va = auto_detected_wrappers[wi].second;
+
+        // Lift the wrapper.
+        std::string wrapper_name =
+            "sub_" + llvm::Twine::utohexstr(wrapper_va).str();
+        auto *wrapper_fn = module->getFunction(wrapper_name);
+        if (!wrapper_fn || wrapper_fn->isDeclaration()) {
+          errs() << "Auto-lifting VM wrapper at 0x"
+                 << Twine::utohexstr(wrapper_va) << "\n";
+          lifter.Lift(wrapper_va);
+          wrapper_fn = module->getFunction(wrapper_name);
+        }
+        if (!wrapper_fn)
+          continue;
+
+        // Fold the thunk to this wrapper.
+        if (entry_fn) {
+          std::string thunk_name =
+              "sub_" + llvm::Twine::utohexstr(thunk_va).str();
+          for (auto &BB : *entry_fn) {
+            for (auto &I : BB) {
+              auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+              if (!call || call->arg_size() < 2)
+                continue;
+              auto *callee_fn = call->getCalledFunction();
+              if (!callee_fn || callee_fn->getName() != thunk_name)
+                continue;
+              errs() << "Folding jmp-thunk: sub_"
+                     << Twine::utohexstr(thunk_va) << " -> sub_"
+                     << Twine::utohexstr(wrapper_va) << "\n";
+              call->setCalledFunction(wrapper_fn);
+              auto *pc_arg = call->getArgOperand(1);
+              call->setArgOperand(
+                  1, llvm::ConstantInt::get(pc_arg->getType(), wrapper_va));
+            }
+          }
+          // Delete the thunk if unused.
+          if (auto *thunk_fn = module->getFunction(thunk_name)) {
+            if (thunk_fn->use_empty()) {
+              thunk_fn->eraseFromParent();
+              errs() << "  (deleted thunk sub_"
+                     << Twine::utohexstr(thunk_va) << ")\n";
+            }
+          }
+        }
+      }
+    }
   }
   errs() << "Lifting complete\n";
   events.emitInfo("lifting_completed", "lifting complete");
@@ -1652,6 +1805,7 @@ int main(int argc, char **argv) {
   // wrapper, then lift only those.  No byte-pattern bulk scan — further
   // targets are discovered naturally by the pipeline's iterative resolution.
   std::shared_ptr<omill::VMHandlerGraph> vm_graph;
+  std::vector<omill::NativeCallInfo> native_call_infos;
   if (vm_mode && !RawBinary) {
     // Start with metadata-only graph — no byte-pattern scanning.
     vm_graph = std::make_shared<omill::VMHandlerGraph>(
@@ -1688,8 +1842,34 @@ int main(int argc, char **argv) {
           chain_handler_vas.push_back(entry.handler_va);
       }
 
+      // Solve from additional auto-detected wrappers.
+      for (size_t wi = 1; wi < auto_detected_wrappers.size(); ++wi) {
+        uint64_t extra_wrapper = auto_detected_wrappers[wi].second;
+        auto extra_chain = solver.solveFromWrapper(extra_wrapper);
+        if (!extra_chain.empty()) {
+          vm_graph->mergeChainResults(solver);
+          for (auto &entry : extra_chain)
+            chain_handler_vas.push_back(entry.handler_va);
+        }
+      }
+
       // Extract native call targets before solver goes out of scope.
       native_call_vas = solver.nativeCallTargets();
+      native_call_infos = solver.nativeCallInfos();
+      errs() << "Chain solver captured " << native_call_infos.size()
+             << " native call infos, " << native_call_vas.size()
+             << " unique targets\n";
+      for (unsigned i = 0; i < native_call_infos.size(); ++i) {
+        errs() << "  [" << i << "] target=0x"
+               << Twine::utohexstr(native_call_infos[i].target_va)
+               << " from handler=0x"
+               << Twine::utohexstr(native_call_infos[i].handler_va)
+               << " R12=0x"
+               << Twine::utohexstr(native_call_infos[i].r12_base)
+               << " vmctx_size="
+               << native_call_infos[i].vmcontext_snapshot.size()
+               << "\n";
+      }
     }
 
     // Lift only chain-solved handlers.
@@ -1708,8 +1888,16 @@ int main(int argc, char **argv) {
           // DriverEntry.  Tag it so VMHandlerInlinerPass excludes it
           // from the handler_set while keeping it in
           // VMDispatchResolution's scope (which requires vm_handler).
-          if (handler_va == vm_wrapper_va)
+          if (handler_va == vm_wrapper_va) {
             existing->addFnAttr("omill.vm_wrapper");
+          } else {
+            for (auto &[tv, wv] : auto_detected_wrappers) {
+              if (handler_va == wv) {
+                existing->addFnAttr("omill.vm_wrapper");
+                break;
+              }
+            }
+          }
           continue;
         }
       }
@@ -2593,6 +2781,141 @@ int main(int argc, char **argv) {
         runPostPatchCleanup("abi_patch_callsites");
     }
 
+    auto fixupB3DispatchArgMismatches = [&]() {
+      // Fixup B3 direct calls whose resolved _native callee ended up with a
+      // different signature. B3 materializes ABI regs plus callee-saved regs;
+      // late discovery can also introduce under-passed direct calls once the
+      // real _native prototype becomes available. Rebuild the call arguments
+      // by matching param State offsets instead of trusting positional order.
+      omill::StateFieldMap sfm(*module);
+      auto arch_abi =
+          omill::ArchABI::get(omill::TargetArch::kX86_64, "windows");
+
+      // Build B3 arg-to-State-offset table (ABI regs then callee-saved).
+      llvm::SmallVector<unsigned, 16> b3_arg_offsets;
+      for (auto &reg : arch_abi.param_regs) {
+        auto f = sfm.fieldByName(reg);
+        if (f) b3_arg_offsets.push_back(f->offset);
+      }
+      for (auto &cs : arch_abi.callee_saved) {
+        auto f = sfm.fieldByName(cs);
+        if (f) b3_arg_offsets.push_back(f->offset);
+      }
+
+      auto *i64_ty = llvm::Type::getInt64Ty(ctx);
+      unsigned fixup_count = 0;
+
+      for (auto &F : *module) {
+        if (!F.getName().ends_with("_native")) continue;
+        llvm::SmallVector<int, 16> caller_param_offsets;
+        if (auto attr = F.getFnAttribute("omill.param_state_offsets");
+            attr.isValid() && attr.isStringAttribute()) {
+          llvm::SmallVector<llvm::StringRef, 16> caller_offset_strs;
+          attr.getValueAsString().split(caller_offset_strs, ',');
+          for (auto &off_str : caller_offset_strs) {
+            if (off_str == "stack" || off_str == "xmm") {
+              caller_param_offsets.push_back(-1);
+              continue;
+            }
+            unsigned off = 0;
+            if (off_str.getAsInteger(10, off))
+              caller_param_offsets.push_back(-1);
+            else
+              caller_param_offsets.push_back(static_cast<int>(off));
+          }
+        }
+        for (auto &BB : F) {
+          for (auto &I : llvm::make_early_inc_range(BB)) {
+            auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+            if (!CI) continue;
+            auto *callee = llvm::dyn_cast<llvm::Function>(
+                CI->getCalledOperand()->stripPointerCasts());
+            if (!callee || !callee->getName().ends_with("_native"))
+              continue;
+            if (callee->hasFnAttribute("omill.vm_handler") &&
+                (F.hasFnAttribute("omill.vm_wrapper") ||
+                 F.getFnAttribute("omill.vm_helper_clone").isValid()))
+              continue;
+            if (CI->arg_size() == callee->arg_size()) continue;
+
+            auto attr =
+                callee->getFnAttribute("omill.param_state_offsets");
+            if (!attr.isValid() || !attr.isStringAttribute()) continue;
+
+            llvm::SmallVector<llvm::StringRef, 16> callee_offset_strs;
+            attr.getValueAsString().split(callee_offset_strs, ',');
+            if (callee_offset_strs.size() != callee->arg_size()) continue;
+
+            // Match each callee param to a B3 arg by State offset.
+            llvm::SmallVector<llvm::Value *, 16> new_args;
+            bool ok = true;
+            for (auto &off_str : callee_offset_strs) {
+              if (off_str == "stack" || off_str == "xmm") {
+                new_args.push_back(llvm::PoisonValue::get(i64_ty));
+                continue;
+              }
+              unsigned target_off;
+              if (off_str.getAsInteger(10, target_off)) {
+                ok = false;
+                break;
+              }
+              bool found = false;
+              for (unsigned i = 0;
+                   i < b3_arg_offsets.size() && i < CI->arg_size(); ++i) {
+                if (b3_arg_offsets[i] == target_off) {
+                  new_args.push_back(CI->getArgOperand(i));
+                  found = true;
+                  break;
+                }
+              }
+              if (!found) {
+                for (unsigned i = 0;
+                     i < caller_param_offsets.size() && i < F.arg_size(); ++i) {
+                  if (caller_param_offsets[i] ==
+                      static_cast<int>(target_off)) {
+                    new_args.push_back(F.getArg(i));
+                    found = true;
+                    break;
+                  }
+                }
+              }
+              if (!found)
+                new_args.push_back(llvm::PoisonValue::get(i64_ty));
+            }
+            if (!ok) continue;
+
+            auto *new_call = llvm::CallInst::Create(
+                callee->getFunctionType(), callee, new_args,
+                CI->getName(), CI->getIterator());
+            new_call->setCallingConv(CI->getCallingConv());
+            new_call->setAttributes(CI->getAttributes());
+            // Handle return type mismatch (B3 returns i64, callee may
+            // return struct).
+            if (!CI->use_empty()) {
+              if (CI->getType() == new_call->getType()) {
+                CI->replaceAllUsesWith(new_call);
+              } else if (llvm::isa<llvm::StructType>(
+                             new_call->getType())) {
+                auto *ev = llvm::ExtractValueInst::Create(
+                    new_call, {0}, "ret.primary",
+                    std::next(new_call->getIterator()));
+                CI->replaceAllUsesWith(ev);
+              } else {
+                CI->replaceAllUsesWith(
+                    llvm::PoisonValue::get(CI->getType()));
+              }
+            }
+            CI->eraseFromParent();
+            ++fixup_count;
+          }
+        }
+      }
+      if (fixup_count > 0)
+        errs() << "Fixed " << fixup_count
+               << " B3 dispatch calls with mismatched arg counts\n";
+    };
+    fixupB3DispatchArgMismatches();
+
     // Post-ABI deobfuscation on _native functions.  When recover_abi is
     // false (VM mode), Phase 5 ran on pre-ABI sub_* functions, so _native
     // wrappers created by ABI recovery haven't been deobfuscated yet.
@@ -2616,6 +2939,225 @@ int main(int argc, char **argv) {
       errs() << "Post-ABI deobfuscation complete\n";
       events.emitInfo("post_abi_deobf_completed", "post-ABI deobfuscation completed");
     }
+
+    // Per-callsite specialization of VM native call targets.
+    // Clone functions like sub_1400dcbf8_native per call site, bake in
+    // emulator-derived GPR constants so hash-based import resolution succeeds.
+    if (vm_mode && !native_call_infos.empty()) {
+      // Build State-offset → emulator RegIdx lookup.
+      // Remill GPR order in State: RAX,RBX,RCX,RDX,RSI,RDI,RSP,RBP,R8..R15.
+      // x86 encoding order (EmuState): RAX=0,RCX=1,RDX=2,RBX=3,RSP=4,...
+      // State offsets: each GPR at 2208 + N*16 + 8 where N is remill order.
+      const unsigned kRemillGPRToRegIdx[] = {
+        0,  // RAX → RegIdx 0
+        3,  // RBX → RegIdx 3
+        1,  // RCX → RegIdx 1
+        2,  // RDX → RegIdx 2
+        6,  // RSI → RegIdx 6
+        7,  // RDI → RegIdx 7
+        4,  // RSP → RegIdx 4
+        5,  // RBP → RegIdx 5
+        8,  // R8  → RegIdx 8
+        9, 10, 11, 12, 13, 14, 15  // R9..R15
+      };
+      llvm::DenseMap<unsigned, unsigned> stateOffsetToRegIdx;
+      for (unsigned i = 0; i < 16; ++i) {
+        unsigned state_offset = 2208 + i * 16 + 8;
+        stateOffsetToRegIdx[state_offset] = kRemillGPRToRegIdx[i];
+      }
+
+      // Find the wrapper's _native function.
+      std::string wrapper_native_name =
+          "sub_" + llvm::Twine::utohexstr(vm_wrapper_va).str() + "_native";
+      auto *wrapper_fn = module->getFunction(wrapper_native_name);
+
+      if (wrapper_fn && !wrapper_fn->isDeclaration()) {
+        // Group NativeCallInfos by target VA.
+        llvm::DenseMap<uint64_t, llvm::SmallVector<unsigned, 4>>
+            target_to_info_indices;
+        for (unsigned i = 0; i < native_call_infos.size(); ++i)
+          target_to_info_indices[native_call_infos[i].target_va].push_back(i);
+
+        auto *i64_ty = llvm::Type::getInt64Ty(module->getContext());
+
+        for (auto &[target_va, info_indices] : target_to_info_indices) {
+          // Only specialize targets that appear multiple times (worth cloning).
+          if (info_indices.size() < 2)
+            continue;
+
+          std::string target_name =
+              "sub_" + llvm::Twine::utohexstr(target_va).str() + "_native";
+          auto *target_fn = module->getFunction(target_name);
+          if (!target_fn || target_fn->isDeclaration())
+            continue;
+
+          // Parse param_state_offsets attribute.
+          auto offsets_attr =
+              target_fn->getFnAttribute("omill.param_state_offsets");
+          if (!offsets_attr.isValid() || !offsets_attr.isStringAttribute())
+            continue;
+
+          llvm::SmallVector<int, 16> param_reg_idx;
+          llvm::StringRef offsets_str = offsets_attr.getValueAsString();
+          while (!offsets_str.empty()) {
+            llvm::StringRef token;
+            std::tie(token, offsets_str) = offsets_str.split(',');
+            if (token == "stack" || token == "xmm") {
+              param_reg_idx.push_back(-1);  // Not a GPR.
+            } else {
+              unsigned offset = 0;
+              if (token.getAsInteger(10, offset)) {
+                param_reg_idx.push_back(-1);
+              } else {
+                auto it = stateOffsetToRegIdx.find(offset);
+                if (it != stateOffsetToRegIdx.end())
+                  param_reg_idx.push_back(static_cast<int>(it->second));
+                else
+                  param_reg_idx.push_back(-1);
+              }
+            }
+          }
+
+          // Determine the number of "standard" params that the caller actually
+          // passes (typically 4 for Win64: RCX, RDX, R8, R9).
+          unsigned num_caller_args = 0;
+          for (auto &BB : *wrapper_fn) {
+            for (auto &I : BB) {
+              auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+              if (!call)
+                continue;
+              if (call->getCalledFunction() != target_fn)
+                continue;
+              num_caller_args = call->arg_size();
+              goto found_call;
+            }
+          }
+          found_call:
+
+          // Collect all calls to the target in the wrapper (in IR order).
+          llvm::SmallVector<llvm::CallInst *, 32> target_calls;
+          for (auto &BB : *wrapper_fn) {
+            for (auto &I : BB) {
+              auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+              if (!call)
+                continue;
+              if (call->getCalledFunction() != target_fn)
+                continue;
+              target_calls.push_back(call);
+            }
+          }
+
+          if (target_calls.size() != info_indices.size()) {
+            errs() << "VM clone: call count mismatch for "
+                   << target_name << " (IR: " << target_calls.size()
+                   << " vs infos: " << info_indices.size() << "), skipping\n";
+            continue;
+          }
+
+          errs() << "VM clone: specializing " << target_name
+                 << " (" << info_indices.size() << " call sites)\n";
+
+          // Create per-callsite clones.
+          auto &FAM =
+              MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(*module)
+                  .getManager();
+
+          for (unsigned ci = 0; ci < info_indices.size(); ++ci) {
+            const auto &info = native_call_infos[info_indices[ci]];
+            std::string clone_name = target_name + "_" + std::to_string(ci);
+
+            // Clone the function.
+            llvm::ValueToValueMapTy VMap;
+            auto *clone = llvm::CloneFunction(target_fn, VMap);
+            clone->setName(clone_name);
+            clone->setLinkage(llvm::GlobalValue::InternalLinkage);
+
+            // Replace extra params with emulator constants.
+            for (unsigned pi = num_caller_args;
+                 pi < clone->arg_size() && pi < param_reg_idx.size(); ++pi) {
+              int reg_idx = param_reg_idx[pi];
+              if (reg_idx < 0 || reg_idx >= 16)
+                continue;
+              auto *arg = clone->getArg(pi);
+              arg->replaceAllUsesWith(
+                  llvm::ConstantInt::get(i64_ty, info.gprs[reg_idx]));
+            }
+
+            // Inject vmcontext memory into BinaryMemoryMap.
+            bool injected_vmctx = false;
+            if (!info.vmcontext_snapshot.empty() && info.r12_base != 0) {
+              pe.memory_map.addRegion(info.r12_base,
+                                      info.vmcontext_snapshot.data(),
+                                      info.vmcontext_snapshot.size(),
+                                      /*read_only=*/true);
+              injected_vmctx = true;
+            }
+
+            // Targeted inlining of helper functions into this clone.
+            bool inlined_any = true;
+            while (inlined_any) {
+              inlined_any = false;
+              for (auto &BB : *clone) {
+                for (auto &I : llvm::make_early_inc_range(BB)) {
+                  auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+                  if (!call || !call->getCalledFunction())
+                    continue;
+                  auto callee_name = call->getCalledFunction()->getName();
+                  // Inline VM wrapper helpers into the clone.
+                  if (!callee_name.ends_with("_native") ||
+                      callee_name == clone_name)
+                    continue;
+                  // Only inline internal helpers, not the wrapper or other
+                  // clones.
+                  auto *callee = call->getCalledFunction();
+                  if (callee->isDeclaration())
+                    continue;
+                  // Skip the wrapper function itself.
+                  if (callee == wrapper_fn)
+                    continue;
+                  llvm::InlineFunctionInfo IFI;
+                  auto result = llvm::InlineFunction(*call, IFI);
+                  if (result.isSuccess())
+                    inlined_any = true;
+                }
+              }
+            }
+
+            // Run deobf pipeline on the specialized clone.
+            {
+              llvm::FunctionPassManager FPM;
+              omill::buildDeobfuscationPipeline(FPM, opts);
+              auto PA = FPM.run(*clone, FAM);
+              if (!PA.areAllPreserved())
+                FAM.invalidate(*clone, PA);
+            }
+
+            // Remove injected vmcontext region.
+            if (injected_vmctx)
+              pe.memory_map.removeRegion(info.r12_base);
+
+            // Update the wrapper's call to point to the clone.
+            auto *orig_call = target_calls[ci];
+            // Build args matching the clone's signature (only the first
+            // num_caller_args, since extra params are baked in).
+            llvm::SmallVector<llvm::Value *, 4> clone_args;
+            for (unsigned ai = 0; ai < num_caller_args; ++ai)
+              clone_args.push_back(orig_call->getArgOperand(ai));
+
+            llvm::IRBuilder<> Builder(orig_call);
+            auto *clone_call =
+                Builder.CreateCall(clone, clone_args, clone_name + ".result");
+            clone_call->setCallingConv(orig_call->getCallingConv());
+            clone_call->setAttributes(orig_call->getAttributes());
+            orig_call->replaceAllUsesWith(clone_call);
+            orig_call->eraseFromParent();
+          }
+
+          errs() << "VM clone: created " << info_indices.size()
+                 << " specialized clones of " << target_name << "\n";
+        }
+      }
+    }
   }
 
   // Pre-scan cleanup: run late cleanup pipeline before late discovery
@@ -2637,6 +3179,532 @@ int main(int argc, char **argv) {
   // state was destroyed by the pipeline), run the pipeline + ABI on it,
   // then link the resulting _native functions back into the main module.
   if (ResolveTargets && !NoABI) {
+    llvm::DenseMap<uint64_t, uint64_t> nested_vm_helper_targets;
+    llvm::DenseMap<uint64_t, uint64_t> nested_vm_helper_deltas;
+    struct NestedHelperCallsite {
+      std::string caller_name;
+      std::string helper_name;
+      unsigned ordinal = 0;
+      std::optional<uint64_t> hash;
+    };
+    struct HashResolvedCall {
+      std::string caller_name;
+      std::string helper_name;
+      unsigned ordinal = 0;
+      uint64_t hash = 0;
+      uint64_t target_va = 0;
+    };
+    auto collectNestedVMHelperTargets = [&]() {
+      nested_vm_helper_targets.clear();
+      nested_vm_helper_deltas.clear();
+      if (!vm_mode || RawBinary)
+        return;
+
+      auto followJmpThunks = [&](uint64_t va) {
+        uint64_t resolved = va;
+        for (unsigned hop = 0; hop < 4; ++hop) {
+          uint8_t thunk_buf[16];
+          if (!pe.memory_map.read(resolved, thunk_buf, sizeof(thunk_buf)))
+            break;
+          if (thunk_buf[0] == 0xE9) {
+            int32_t rel = 0;
+            std::memcpy(&rel, &thunk_buf[1], 4);
+            resolved = resolved + 5 + static_cast<int64_t>(rel);
+            continue;
+          }
+          if (thunk_buf[0] == 0xEB) {
+            int8_t rel = static_cast<int8_t>(thunk_buf[1]);
+            resolved = resolved + 2 + rel;
+            continue;
+          }
+          break;
+        }
+        return resolved;
+      };
+
+      uint64_t seg_start = vm_entry_va;
+      uint64_t seg_end = vm_entry_va + 0x2000000;
+      pe.memory_map.forEachRegion(
+          [&](uint64_t base, const uint8_t *, size_t size) {
+            if (vm_entry_va >= base && vm_entry_va < base + size) {
+              seg_start = base;
+              seg_end = base + size;
+            }
+          });
+
+      omill::VMHandlerChainSolver solver(pe.memory_map, pe.image_base,
+                                         vm_entry_va, vm_exit_va);
+      solver.setHandlerSegmentRange(seg_start, seg_end);
+
+      for (auto &F : *module) {
+        if (F.isDeclaration() || !F.getName().ends_with("_native") ||
+            F.hasFnAttribute("omill.vm_wrapper")) {
+          continue;
+        }
+
+        auto base_name = F.getName().drop_back(strlen("_native"));
+        if (!base_name.starts_with("sub_"))
+          continue;
+
+        uint64_t helper_va = 0;
+        if (base_name.drop_front(4).getAsInteger(16, helper_va) ||
+            helper_va == 0) {
+          continue;
+        }
+
+        llvm::SmallVector<llvm::CallInst *, 2> indirect_calls;
+        for (auto &BB : F) {
+          for (auto &I : BB) {
+            auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+            if (!CI)
+              continue;
+            if (llvm::isa<llvm::Function>(
+                    CI->getCalledOperand()->stripPointerCasts())) {
+              continue;
+            }
+            indirect_calls.push_back(CI);
+          }
+        }
+        if (indirect_calls.size() != 1)
+          continue;
+
+        uint64_t wrapper_va = followJmpThunks(helper_va);
+        if (wrapper_va == 0 || wrapper_va == helper_va ||
+            wrapper_va == vm_wrapper_va) {
+          continue;
+        }
+
+        auto chain = solver.solveFromWrapper(wrapper_va);
+        if (chain.empty() || chain.front().successors.empty())
+          continue;
+
+        uint64_t target_va = chain.front().successors.front();
+        if (target_va == 0)
+          continue;
+
+        nested_vm_helper_targets[helper_va] = target_va;
+        nested_vm_helper_deltas[helper_va] = solver.lastDelta();
+      }
+    };
+
+    struct HashBufferInfo {
+      uint64_t hash = 0;
+      std::array<uint32_t, 5> words = {};
+      std::vector<std::pair<int64_t, uint64_t>> scratch_qwords;
+      std::vector<std::pair<int64_t, uint64_t>> precall_qwords;
+      uint64_t return_seed = 0;
+    };
+
+    auto getAddConst = [&](llvm::Value *V) -> std::optional<int64_t> {
+      auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(V);
+      if (!BO)
+        return std::nullopt;
+      auto *C = llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(1));
+      if (!C || C->getBitWidth() > 64)
+        return std::nullopt;
+      if (BO->getOpcode() == llvm::Instruction::Add)
+        return C->getSExtValue();
+      if (BO->getOpcode() == llvm::Instruction::Sub)
+        return -C->getSExtValue();
+      return std::nullopt;
+    };
+
+    auto getStackDisp = [&](llvm::Value *V) -> std::optional<int64_t> {
+      if (auto disp = getAddConst(V))
+        return disp;
+      auto *GEP = llvm::dyn_cast<llvm::GEPOperator>(V);
+      if (!GEP)
+        return std::nullopt;
+      llvm::APInt offset(64, 0, true);
+      if (!GEP->accumulateConstantOffset(module->getDataLayout(), offset))
+        return std::nullopt;
+      return static_cast<int64_t>(offset.getSExtValue()) - 65504;
+    };
+
+    auto decodeHashBuffer =
+        [&](llvm::CallInst *CI) -> std::optional<HashBufferInfo> {
+      constexpr int64_t kSnapshotSpan = 0x2000;
+      uint32_t words[5] = {};
+      unsigned found = 0;
+      std::vector<std::pair<int64_t, uint64_t>> scratch_qwords;
+      std::vector<std::pair<int64_t, uint64_t>> precall_qwords;
+      for (auto It = CI->getIterator(); It != CI->getParent()->begin();) {
+        --It;
+        if (llvm::isa<llvm::CallBase>(&*It))
+          break;
+        auto *SI = llvm::dyn_cast<llvm::StoreInst>(&*It);
+        if (!SI)
+          continue;
+        auto *C = llvm::dyn_cast<llvm::ConstantInt>(SI->getValueOperand());
+        if (!C)
+          continue;
+        auto disp = getStackDisp(SI->getPointerOperand());
+        if (C->getBitWidth() == 32 && found < 5) {
+          if (disp && *disp < 0 && *disp >= -0x1000)
+            words[found++] = C->getZExtValue();
+          continue;
+        }
+        if (C->getBitWidth() == 64 && disp &&
+            *disp >= -0x1000 && *disp < kSnapshotSpan) {
+          precall_qwords.emplace_back(*disp, C->getZExtValue());
+          if (*disp < 0)
+            scratch_qwords.emplace_back(*disp, C->getZExtValue());
+        }
+      }
+      if (found != 5)
+        return std::nullopt;
+      std::reverse(std::begin(words), std::end(words));
+      uint64_t return_seed = scratch_qwords.empty()
+                                 ? 0
+                                 : scratch_qwords.front().second;
+      std::reverse(scratch_qwords.begin(), scratch_qwords.end());
+      std::reverse(precall_qwords.begin(), precall_qwords.end());
+      HashBufferInfo info;
+      for (unsigned i = 0; i < 5; ++i)
+        info.words[i] = words[i];
+      info.hash = static_cast<uint64_t>(words[0]) |
+                  (static_cast<uint64_t>(words[1]) << 32);
+      info.scratch_qwords = std::move(scratch_qwords);
+      info.precall_qwords = std::move(precall_qwords);
+      info.return_seed = return_seed;
+      return info;
+    };
+
+    auto collectHashResolvedCalls = [&]() {
+      llvm::SmallVector<HashResolvedCall, 8> resolved_calls;
+      if (!vm_mode || RawBinary)
+        return resolved_calls;
+      llvm::DenseMap<llvm::Value *, uint64_t> helper_value_cache;
+      llvm::DenseMap<uint64_t, std::optional<uint64_t>> per_wrapper_seed;
+
+      auto followJmpThunks = [&](uint64_t va) {
+        uint64_t resolved = va;
+        for (unsigned hop = 0; hop < 4; ++hop) {
+          uint8_t thunk_buf[16];
+          if (!pe.memory_map.read(resolved, thunk_buf, sizeof(thunk_buf)))
+            break;
+          if (thunk_buf[0] == 0xE9) {
+            int32_t rel = 0;
+            std::memcpy(&rel, &thunk_buf[1], 4);
+            resolved = resolved + 5 + static_cast<int64_t>(rel);
+            continue;
+          }
+          if (thunk_buf[0] == 0xEB) {
+            int8_t rel = static_cast<int8_t>(thunk_buf[1]);
+            resolved = resolved + 2 + rel;
+            continue;
+          }
+          break;
+        }
+        return resolved;
+      };
+
+      uint64_t seg_start = vm_entry_va;
+      uint64_t seg_end = vm_entry_va + 0x2000000;
+      pe.memory_map.forEachRegion(
+          [&](uint64_t base, const uint8_t *, size_t size) {
+            if (vm_entry_va >= base && vm_entry_va < base + size) {
+              seg_start = base;
+              seg_end = base + size;
+            }
+          });
+
+      auto getConstI64 = [&](llvm::Value *V) -> std::optional<uint64_t> {
+        if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(V))
+          return CI->getZExtValue();
+        return std::nullopt;
+      };
+      auto resolveNestedHelperValue =
+          [&](llvm::Value *V) -> std::optional<uint64_t> {
+        if (auto it = helper_value_cache.find(V); it != helper_value_cache.end())
+          return it->second;
+        auto *CI = llvm::dyn_cast<llvm::CallInst>(V);
+        if (!CI)
+          return std::nullopt;
+        auto *callee = llvm::dyn_cast<llvm::Function>(
+            CI->getCalledOperand()->stripPointerCasts());
+        if (!callee || !callee->getName().ends_with("_native"))
+          return std::nullopt;
+        auto base = callee->getName().drop_back(strlen("_native"));
+        if (!base.starts_with("sub_"))
+          return std::nullopt;
+        uint64_t callee_va = 0;
+        if (base.drop_front(4).getAsInteger(16, callee_va) || callee_va == 0)
+          return std::nullopt;
+        // Only resolve if the callee is a known wrapper.
+        if (!nested_vm_helper_targets.count(callee_va))
+          return std::nullopt;
+        auto &seed = per_wrapper_seed[callee_va];
+        if (!seed) {
+          uint64_t wrapper_va = followJmpThunks(callee_va);
+          if (wrapper_va == 0) wrapper_va = callee_va;
+          omill::VMHandlerChainSolver solver(pe.memory_map, pe.image_base,
+                                             vm_entry_va, vm_exit_va);
+          solver.setHandlerSegmentRange(seg_start, seg_end);
+          auto results = solver.solveFromWrapper(wrapper_va);
+          auto targets = solver.nativeCallTargets();
+          if (targets.size() == 1) {
+            seed = targets.front();
+          } else {
+            for (auto &entry : results) {
+              if (entry.handler_va == wrapper_va || entry.successors.empty())
+                continue;
+              seed = entry.successors.front();
+              break;
+            }
+          }
+        }
+        if (!seed)
+          return std::nullopt;
+        helper_value_cache[V] = *seed;
+        return *seed;
+      };
+      auto getConcreteI64 = [&](llvm::Value *V) -> std::optional<uint64_t> {
+        if (auto c = getConstI64(V))
+          return c;
+        return resolveNestedHelperValue(V);
+      };
+
+      auto buildVMWrapperSnapshot =
+          [&](llvm::CallInst *CI, const HashBufferInfo &buffer_info)
+              -> std::vector<uint8_t> {
+        constexpr size_t kSnapshotSize = 0x2000;
+        constexpr uint64_t kSub1402A110ERet = 0xFFFFFFFFFFD61E74ull;
+
+        std::vector<uint8_t> snapshot(kSnapshotSize, 0);
+        auto putI64 = [&](size_t off, uint64_t value) {
+          if (off + sizeof(value) > snapshot.size())
+            return;
+          std::memcpy(snapshot.data() + off, &value, sizeof(value));
+        };
+        auto putBufferWord = [&](size_t off, uint32_t value) {
+          if (off + sizeof(value) > snapshot.size())
+            return;
+          std::memcpy(snapshot.data() + off, &value, sizeof(value));
+        };
+        auto getArgConcreteOr = [&](unsigned index, uint64_t fallback) {
+          if (index >= CI->arg_size())
+            return fallback;
+          if (auto value = getConcreteI64(CI->getArgOperand(index)))
+            return *value;
+          return fallback;
+        };
+
+        uint64_t synthetic_vm_base =
+            omill::VMHandlerChainSolver::syntheticVMContextBase();
+        uint64_t synthetic_saved_rsp = synthetic_vm_base + 0x1800;
+        auto mapScratchDisp = [&](int64_t disp, int64_t fallback) {
+          if (disp >= 0 || disp < -0x1000)
+            disp = fallback;
+          return synthetic_saved_rsp + disp;
+        };
+        int64_t buffer_disp = -0x150;
+        if (CI->arg_size() > 1) {
+          if (auto disp = getAddConst(CI->getArgOperand(1)))
+            buffer_disp = *disp;
+        }
+        uint64_t synthetic_buffer = mapScratchDisp(buffer_disp, -0x150);
+        size_t buffer_off =
+            static_cast<size_t>(synthetic_buffer - synthetic_vm_base);
+        for (unsigned i = 0; i < buffer_info.words.size(); ++i)
+          putBufferWord(buffer_off + i * sizeof(uint32_t),
+                        buffer_info.words[i]);
+        bool has_explicit_1c0 = false;
+        bool has_explicit_1c8 = false;
+        for (auto &[disp, value] : buffer_info.precall_qwords) {
+          if (disp >= 0) {
+            size_t off = static_cast<size_t>(disp);
+            putI64(off, value);
+            has_explicit_1c0 |= (off == 0x1C0);
+            has_explicit_1c8 |= (off == 0x1C8);
+            continue;
+          }
+          uint64_t addr = mapScratchDisp(disp, disp);
+          size_t off = static_cast<size_t>(addr - synthetic_vm_base);
+          putI64(off, value);
+        }
+
+        int64_t scratch_disp = -0x78;
+        if (CI->arg_size() > 7) {
+          if (auto disp = getAddConst(CI->getArgOperand(7)))
+            scratch_disp = *disp;
+        }
+        uint64_t synthetic_scratch = mapScratchDisp(scratch_disp, -0x78);
+
+        // After ABI recovery, the VM wrapper performs a small setup
+        // around the vmentry and then tail-calls the first handler.
+        // Seed the synthetic register and home-space slots from that
+        // nested callsite, not from the helper's original wrapper arguments.
+        uint64_t chain_rcx = getArgConcreteOr(2, 0);
+        uint64_t chain_rdx = getArgConcreteOr(3, 0);
+        uint64_t chain_r8 = getArgConcreteOr(8, 0);
+        uint64_t home_rcx = chain_rcx;
+        uint64_t home_rdx = chain_rdx;
+        uint64_t home_r8 = chain_r8;
+        uint64_t home_r9 = 0;
+        putI64(0x30, getArgConcreteOr(7, 0));                // RBP
+        putI64(0x38, synthetic_buffer);                      // RDX
+        putI64(0x40, getArgConcreteOr(4, 0));                // RBX
+        putI64(0x50, home_rcx);                              // pre-shift [rsp+8]
+        putI64(0x58, home_rdx);                              // pre-shift [rsp+10]
+        putI64(0x60, home_r8);                               // pre-shift [rsp+18]
+        putI64(0x68, home_r9);                               // pre-shift [rsp+20]
+        putI64(0x78, home_r8);                               // R8
+        putI64(0x80, home_r9);                               // R9
+        putI64(0x88, getArgConcreteOr(9, 0));                // R13
+        putI64(0x90, home_rcx);                              // RCX
+        putI64(0x98, getArgConcreteOr(8, 0));                // R12
+        putI64(0xB8, synthetic_scratch);                     // helper scratch
+        putI64(0xC0, synthetic_saved_rsp);                   // saved RSP-ish
+        putI64(0xE0, kSub1402A110ERet);                      // sub_1402A110E
+        putI64(0x108, 0);                                    // RAX
+        putI64(0x110, getArgConcreteOr(10, 0));              // R14
+        putI64(0x128, getArgConcreteOr(5, 0));               // RSI
+        putI64(0x140, getArgConcreteOr(11, 0));              // R15
+        putI64(0x158, 0);                                    // R10 scratch
+        putI64(0x170, getArgConcreteOr(6, 0));               // RDI
+        putI64(0x188, 0);                                    // R11 scratch
+        // The wrapper stores [vmctx+0x38] to [*[vmctx+0xB8] + 0x10]
+        // before tail-calling the first handler.
+        putI64(static_cast<size_t>(synthetic_scratch - synthetic_vm_base) +
+                   0x10,
+               synthetic_buffer);
+        // The first handler frame-shift re-bases [vmctx+0xB8] by -0x178
+        // before the next stage consumes [*[vmctx+0xB8] + 0x10]. Seed the
+        // shifted alias as well so the buffer pointer survives that move.
+        if (synthetic_scratch >= synthetic_vm_base + 0x168) {
+          putI64(static_cast<size_t>(synthetic_scratch - synthetic_vm_base) -
+                     0x168,
+                 synthetic_buffer);
+        }
+        if (!has_explicit_1c0 && buffer_info.return_seed != 0)
+          putI64(0x1C0, buffer_info.return_seed);
+        else if (!has_explicit_1c0)
+          putI64(0x1C0, 0);
+        if (!has_explicit_1c8)
+          putI64(0x1C8, home_rcx);
+        putI64(0x1D0, home_rdx);
+        putI64(0x1D8, home_r8);
+        putI64(0x1E0, home_r9);
+
+        return snapshot;
+      };
+
+      for (auto &[helper_va, handler_va] : nested_vm_helper_targets) {
+        (void)handler_va;
+        uint64_t delta = nested_vm_helper_deltas.lookup(helper_va);
+        if (delta == 0)
+          continue;
+
+        std::string helper_name =
+            "sub_" + llvm::Twine::utohexstr(helper_va).str() + "_native";
+        uint64_t wrapper_va = followJmpThunks(helper_va);
+        if (wrapper_va == 0)
+          wrapper_va = helper_va;
+        for (auto &F : *module) {
+          unsigned ordinal = 0;
+          for (auto &BB : F) {
+            for (auto &I : BB) {
+              auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+              if (!CI)
+                continue;
+              auto *callee = llvm::dyn_cast<llvm::Function>(
+                  CI->getCalledOperand()->stripPointerCasts());
+              if (!callee || callee->getName() != helper_name)
+                continue;
+
+              auto buffer_info = decodeHashBuffer(CI);
+              if (!buffer_info) {
+                ++ordinal;
+                continue;
+              }
+
+              omill::VMHandlerChainSolver solver(pe.memory_map, pe.image_base,
+                                                 vm_entry_va, vm_exit_va);
+              solver.setHandlerSegmentRange(seg_start, seg_end);
+              auto snapshot = buildVMWrapperSnapshot(CI, *buffer_info);
+              (void)delta;
+              (void)handler_va;
+              (void)solver.solveFromWrapperWithSnapshot(wrapper_va, snapshot);
+              auto targets = solver.nativeCallTargets();
+              if (targets.size() != 1) {
+                errs() << "Hash solve for " << helper_name << " hash=0x"
+                       << Twine::utohexstr(buffer_info->hash) << " produced "
+                       << targets.size() << " native target(s)\n";
+                if (getenv("OMILL_DEBUG_CHAIN")) {
+                  errs() << "  call: ";
+                  CI->print(errs());
+                  errs() << "\n";
+                  errs() << "  precall qwords:";
+                  for (auto &[disp, value] : buffer_info->precall_qwords)
+                    errs() << " [" << disp << "]=0x"
+                           << Twine::utohexstr(value);
+                  errs() << "\n";
+                }
+                ++ordinal;
+                continue;
+              }
+
+              HashResolvedCall resolved;
+              resolved.caller_name = F.getName().str();
+              resolved.helper_name = helper_name;
+              resolved.ordinal = ordinal;
+              resolved.hash = buffer_info->hash;
+              resolved.target_va = targets.front();
+              resolved_calls.push_back(std::move(resolved));
+              ++ordinal;
+            }
+          }
+        }
+      }
+
+      return resolved_calls;
+    };
+
+    auto collectNestedHelperCallsites = [&]() {
+      llvm::SmallVector<NestedHelperCallsite, 8> callsites;
+      if (!vm_mode || RawBinary)
+        return callsites;
+
+      llvm::DenseSet<uint64_t> helper_vas;
+      for (auto &[helper_va, _] : nested_vm_helper_targets)
+        helper_vas.insert(helper_va);
+      if (helper_vas.empty())
+        return callsites;
+
+      for (auto &F : *module) {
+        llvm::DenseMap<uint64_t, unsigned> ordinal_per_helper;
+        for (auto &BB : F) {
+          for (auto &I : BB) {
+            auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+            if (!CI)
+              continue;
+            auto *callee = llvm::dyn_cast<llvm::Function>(
+                CI->getCalledOperand()->stripPointerCasts());
+            if (!callee || !callee->getName().ends_with("_native"))
+              continue;
+            auto base_name = callee->getName().drop_back(strlen("_native"));
+            if (!base_name.starts_with("sub_"))
+              continue;
+            uint64_t helper_va = 0;
+            if (base_name.drop_front(4).getAsInteger(16, helper_va) ||
+                !helper_vas.contains(helper_va)) {
+              continue;
+            }
+
+            NestedHelperCallsite info;
+            info.caller_name = F.getName().str();
+            info.helper_name = callee->getName().str();
+            info.ordinal = ordinal_per_helper[helper_va]++;
+            auto hbuf = decodeHashBuffer(CI);
+            info.hash = hbuf ? std::optional(hbuf->hash) : std::nullopt;
+            callsites.push_back(std::move(info));
+          }
+        }
+      }
+      return callsites;
+    };
+
     for (unsigned round = 0; round < 3; ++round) {
       if (events.detailed()) {
         events.emitInfo("late_discovery_round_started",
@@ -2693,6 +3761,58 @@ int main(int argc, char **argv) {
             late_targets.insert(target);
           }
         }
+      }
+      collectNestedVMHelperTargets();
+
+      // Populate nested_vm_helper_targets for auto-detected wrappers
+      // whose thunks were folded.  After folding, calls go directly to
+      // the wrapper so the helper VA in the map is the wrapper VA.
+      for (auto &[thunk_va, wrapper_va] : auto_detected_wrappers) {
+        if (nested_vm_helper_targets.count(wrapper_va))
+          continue;  // already discovered
+        // Chain-solve from this wrapper to get the first handler target.
+        omill::VMHandlerChainSolver probe(pe.memory_map, pe.image_base,
+                                          vm_entry_va, vm_exit_va);
+        uint64_t seg_start_l = vm_entry_va;
+        uint64_t seg_end_l = vm_entry_va + 0x2000000;
+        pe.memory_map.forEachRegion(
+            [&](uint64_t base, const uint8_t *, size_t size) {
+              if (vm_entry_va >= base && vm_entry_va < base + size) {
+                seg_start_l = base;
+                seg_end_l = base + size;
+              }
+            });
+        probe.setHandlerSegmentRange(seg_start_l, seg_end_l);
+        auto chain = probe.solveFromWrapper(wrapper_va);
+        if (!chain.empty() && !chain.front().successors.empty()) {
+          uint64_t target_va = chain.front().successors.front();
+          nested_vm_helper_targets[wrapper_va] = target_va;
+          nested_vm_helper_deltas[wrapper_va] = probe.lastDelta();
+        }
+      }
+      auto hash_resolved_calls = collectHashResolvedCalls();
+      auto nested_helper_callsites = collectNestedHelperCallsites();
+      for (auto &[helper_va, target_va] : nested_vm_helper_targets) {
+        std::string native_name =
+            "sub_" + llvm::Twine::utohexstr(target_va).str() + "_native";
+        auto *existing = module->getFunction(native_name);
+        if (!existing || existing->isDeclaration())
+          late_targets.insert(target_va);
+        errs() << "Nested VM helper sub_" << Twine::utohexstr(helper_va)
+               << "_native -> first handler 0x"
+               << Twine::utohexstr(target_va) << "\n";
+      }
+      for (auto &resolved : hash_resolved_calls) {
+        std::string native_name =
+            "sub_" + llvm::Twine::utohexstr(resolved.target_va).str() +
+            "_native";
+        auto *existing = module->getFunction(native_name);
+        if (!existing || existing->isDeclaration())
+          late_targets.insert(resolved.target_va);
+        errs() << "Hash-resolved " << resolved.helper_name << " call "
+               << resolved.ordinal << " hash=0x"
+               << Twine::utohexstr(resolved.hash) << " -> 0x"
+               << Twine::utohexstr(resolved.target_va) << "\n";
       }
       if (late_targets.empty()) {
         errs() << "Late discovery round " << (round + 1)
@@ -2899,8 +4019,324 @@ int main(int argc, char **argv) {
                           "patched late inttoptr callsites",
                           {{"round", static_cast<int64_t>(round + 1)},
                            {"patched_uses",
-                            static_cast<int64_t>(late_patched)}});
+                           static_cast<int64_t>(late_patched)}});
         }
+      }
+
+      unsigned helper_patched = 0;
+      for (auto &[helper_va, target_va] : nested_vm_helper_targets) {
+        std::string helper_name =
+            "sub_" + llvm::Twine::utohexstr(helper_va).str() + "_native";
+        std::string target_name =
+            "sub_" + llvm::Twine::utohexstr(target_va).str() + "_native";
+        auto *helper_fn = module->getFunction(helper_name);
+        auto *target_fn = module->getFunction(target_name);
+        if (!helper_fn || helper_fn->isDeclaration() ||
+            !target_fn || target_fn->isDeclaration()) {
+          continue;
+        }
+
+        llvm::SmallVector<llvm::CallInst *, 2> indirect_calls;
+        for (auto &BB : *helper_fn) {
+          for (auto &I : BB) {
+            auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+            if (!CI)
+              continue;
+            if (llvm::isa<llvm::Function>(
+                    CI->getCalledOperand()->stripPointerCasts())) {
+              continue;
+            }
+            indirect_calls.push_back(CI);
+          }
+        }
+        if (indirect_calls.size() != 1)
+          continue;
+
+        auto *CI = indirect_calls.front();
+        llvm::SmallVector<llvm::Value *, 16> args;
+        for (auto &Arg : CI->args())
+          args.push_back(Arg.get());
+
+        llvm::IRBuilder<> Builder(CI);
+        llvm::Value *direct_callee = target_fn;
+        if (target_fn->getType() != CI->getCalledOperand()->getType()) {
+          direct_callee = Builder.CreateBitCast(
+              target_fn, CI->getCalledOperand()->getType(),
+              target_name + ".cast");
+        }
+        auto *new_call = Builder.CreateCall(
+            CI->getFunctionType(), direct_callee, args, CI->getName());
+        new_call->setCallingConv(CI->getCallingConv());
+        new_call->setAttributes(CI->getAttributes());
+        if (!CI->use_empty())
+          CI->replaceAllUsesWith(new_call);
+        CI->eraseFromParent();
+        ++helper_patched;
+      }
+      if (helper_patched > 0) {
+        errs() << "Patched " << helper_patched
+               << " nested VM helper call(s) to direct targets\n";
+        runPostPatchCleanup("nested_vm_helpers");
+      }
+
+      unsigned hash_patched = 0;
+      // Pre-collect all call targets before erasing any, so ordinals
+      // remain stable across the entire collection phase.
+      struct HashPatchTarget {
+        llvm::CallInst *call;
+        uint64_t target_va;
+      };
+      llvm::SmallVector<HashPatchTarget, 8> hash_patch_targets;
+      for (const auto &resolved : hash_resolved_calls) {
+        auto *caller_fn = module->getFunction(resolved.caller_name);
+        if (!caller_fn || caller_fn->isDeclaration())
+          continue;
+
+        unsigned ordinal = 0;
+        llvm::CallInst *target_call = nullptr;
+        for (auto &BB : *caller_fn) {
+          for (auto &I : BB) {
+            auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+            if (!CI)
+              continue;
+            auto *callee = llvm::dyn_cast<llvm::Function>(
+                CI->getCalledOperand()->stripPointerCasts());
+            if (!callee || callee->getName() != resolved.helper_name)
+              continue;
+            if (ordinal++ == resolved.ordinal) {
+              target_call = CI;
+              break;
+            }
+          }
+          if (target_call)
+            break;
+        }
+        if (target_call)
+          hash_patch_targets.push_back({target_call, resolved.target_va});
+      }
+      for (auto &[call, target_va] : hash_patch_targets) {
+        auto *resolved_ci = llvm::ConstantInt::get(
+            llvm::Type::getInt64Ty(ctx), target_va);
+        call->replaceAllUsesWith(resolved_ci);
+        call->eraseFromParent();
+        ++hash_patched;
+      }
+      if (hash_patched > 0) {
+        errs() << "Patched " << hash_patched
+               << " hash-resolved helper call(s) to constants\n";
+        runPostPatchCleanup("hash_resolved_helpers");
+      }
+
+      unsigned helper_clone_count = 0;
+      llvm::StringMap<unsigned> helper_callsite_counts;
+      llvm::StringMap<llvm::SmallVector<NestedHelperCallsite, 4>>
+          helper_callsites_by_key;
+      auto helperCloneKey = [&](const NestedHelperCallsite &info) {
+        return info.caller_name + "||" + info.helper_name;
+      };
+      for (const auto &info : nested_helper_callsites) {
+        ++helper_callsite_counts[helperCloneKey(info)];
+        helper_callsites_by_key[helperCloneKey(info)].push_back(info);
+      }
+
+      for (auto &entry : helper_callsites_by_key) {
+        auto key = entry.getKey();
+        auto &infos = entry.getValue();
+        if (helper_callsite_counts[key] < 2)
+          continue;
+
+        llvm::sort(infos, [](const NestedHelperCallsite &lhs,
+                             const NestedHelperCallsite &rhs) {
+          return lhs.ordinal > rhs.ordinal;
+        });
+
+        llvm::SmallVector<llvm::CallInst *, 8> current_calls;
+        auto *caller_fn = module->getFunction(infos.front().caller_name);
+        auto *helper_fn = module->getFunction(infos.front().helper_name);
+        if (!caller_fn || caller_fn->isDeclaration() ||
+            !helper_fn || helper_fn->isDeclaration()) {
+          continue;
+        }
+        for (auto &BB : *caller_fn) {
+          for (auto &I : BB) {
+            auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+            if (!CI)
+              continue;
+            auto *callee = llvm::dyn_cast<llvm::Function>(
+                CI->getCalledOperand()->stripPointerCasts());
+            if (callee == helper_fn)
+              current_calls.push_back(CI);
+          }
+        }
+
+        for (const auto &info : infos) {
+          if (info.ordinal >= current_calls.size())
+            continue;
+          llvm::CallInst *target_call = current_calls[info.ordinal];
+          if (!target_call)
+            continue;
+
+          std::string clone_name = info.helper_name + "__" + info.caller_name +
+                                   "_" + std::to_string(info.ordinal);
+          if (info.hash)
+            clone_name += "_h" + llvm::utohexstr(*info.hash);
+
+          llvm::ValueToValueMapTy VMap;
+          auto *clone = llvm::CloneFunction(helper_fn, VMap);
+          clone->setName(clone_name);
+          clone->setLinkage(llvm::GlobalValue::InternalLinkage);
+          clone->addFnAttr(llvm::Attribute::NoInline);
+          clone->addFnAttr("omill.vm_helper_clone", "1");
+          if (info.hash)
+            clone->addFnAttr("omill.vm_helper_hash",
+                             llvm::utohexstr(*info.hash));
+          clone->addFnAttr("omill.vm_helper_caller", info.caller_name);
+
+          llvm::SmallVector<llvm::Value *, 16> args;
+          for (auto &Arg : target_call->args())
+            args.push_back(Arg.get());
+
+          llvm::IRBuilder<> Builder(target_call);
+          auto *clone_call =
+              Builder.CreateCall(clone, args, clone_name + ".result");
+          clone_call->setCallingConv(target_call->getCallingConv());
+          clone_call->setAttributes(target_call->getAttributes());
+          target_call->replaceAllUsesWith(clone_call);
+          target_call->eraseFromParent();
+          current_calls[info.ordinal] = nullptr;
+          ++helper_clone_count;
+        }
+      }
+      if (helper_clone_count > 0) {
+        errs() << "Cloned " << helper_clone_count
+               << " nested VM helper call(s) for IR continuity\n";
+      }
+
+      {
+        omill::StateFieldMap sfm(*module);
+        auto arch_abi =
+            omill::ArchABI::get(omill::TargetArch::kX86_64, "windows");
+        llvm::SmallVector<unsigned, 16> b3_arg_offsets;
+        for (auto &reg : arch_abi.param_regs) {
+          auto f = sfm.fieldByName(reg);
+          if (f) b3_arg_offsets.push_back(f->offset);
+        }
+        for (auto &cs : arch_abi.callee_saved) {
+          auto f = sfm.fieldByName(cs);
+          if (f) b3_arg_offsets.push_back(f->offset);
+        }
+
+        auto *i64_ty = llvm::Type::getInt64Ty(ctx);
+        unsigned fixup_count = 0;
+        for (auto &F : *module) {
+          if (!F.getName().ends_with("_native"))
+            continue;
+          llvm::SmallVector<int, 16> caller_param_offsets;
+          if (auto attr = F.getFnAttribute("omill.param_state_offsets");
+              attr.isValid() && attr.isStringAttribute()) {
+            llvm::SmallVector<llvm::StringRef, 16> caller_offset_strs;
+            attr.getValueAsString().split(caller_offset_strs, ',');
+            for (auto &off_str : caller_offset_strs) {
+              if (off_str == "stack" || off_str == "xmm") {
+                caller_param_offsets.push_back(-1);
+                continue;
+              }
+              unsigned off = 0;
+              if (off_str.getAsInteger(10, off))
+                caller_param_offsets.push_back(-1);
+              else
+                caller_param_offsets.push_back(static_cast<int>(off));
+            }
+          }
+          for (auto &BB : F) {
+            for (auto &I : llvm::make_early_inc_range(BB)) {
+              auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+              if (!CI)
+                continue;
+              auto *callee = llvm::dyn_cast<llvm::Function>(
+                  CI->getCalledOperand()->stripPointerCasts());
+              if (!callee || !callee->getName().ends_with("_native") ||
+                  CI->arg_size() == callee->arg_size())
+                continue;
+              if (callee->hasFnAttribute("omill.vm_handler") &&
+                  (F.hasFnAttribute("omill.vm_wrapper") ||
+                   F.getFnAttribute("omill.vm_helper_clone").isValid()))
+                continue;
+
+              auto attr = callee->getFnAttribute("omill.param_state_offsets");
+              if (!attr.isValid() || !attr.isStringAttribute())
+                continue;
+
+              llvm::SmallVector<llvm::StringRef, 16> callee_offset_strs;
+              attr.getValueAsString().split(callee_offset_strs, ',');
+              if (callee_offset_strs.size() != callee->arg_size())
+                continue;
+
+              llvm::SmallVector<llvm::Value *, 16> new_args;
+              bool ok = true;
+              for (auto &off_str : callee_offset_strs) {
+                if (off_str == "stack" || off_str == "xmm") {
+                  new_args.push_back(llvm::PoisonValue::get(i64_ty));
+                  continue;
+                }
+                unsigned target_off = 0;
+                if (off_str.getAsInteger(10, target_off)) {
+                  ok = false;
+                  break;
+                }
+                bool found = false;
+                for (unsigned i = 0;
+                     i < b3_arg_offsets.size() && i < CI->arg_size(); ++i) {
+                  if (b3_arg_offsets[i] == target_off) {
+                    new_args.push_back(CI->getArgOperand(i));
+                    found = true;
+                    break;
+                  }
+                }
+                if (!found) {
+                  for (unsigned i = 0;
+                       i < caller_param_offsets.size() && i < F.arg_size();
+                       ++i) {
+                    if (caller_param_offsets[i] ==
+                        static_cast<int>(target_off)) {
+                      new_args.push_back(F.getArg(i));
+                      found = true;
+                      break;
+                    }
+                  }
+                }
+                if (!found)
+                  new_args.push_back(llvm::PoisonValue::get(i64_ty));
+              }
+              if (!ok)
+                continue;
+
+              auto *new_call = llvm::CallInst::Create(
+                  callee->getFunctionType(), callee, new_args, CI->getName(),
+                  CI->getIterator());
+              new_call->setCallingConv(CI->getCallingConv());
+              new_call->setAttributes(CI->getAttributes());
+              if (!CI->use_empty()) {
+                if (CI->getType() == new_call->getType()) {
+                  CI->replaceAllUsesWith(new_call);
+                } else if (llvm::isa<llvm::StructType>(new_call->getType())) {
+                  auto *ev = llvm::ExtractValueInst::Create(
+                      new_call, {0}, "ret.primary",
+                      std::next(new_call->getIterator()));
+                  CI->replaceAllUsesWith(ev);
+                } else {
+                  CI->replaceAllUsesWith(
+                      llvm::PoisonValue::get(CI->getType()));
+                }
+              }
+              CI->eraseFromParent();
+              ++fixup_count;
+            }
+          }
+        }
+        if (fixup_count > 0)
+          errs() << "Fixed " << fixup_count
+                 << " B3 dispatch calls with mismatched arg counts\n";
       }
 
       errs() << "Late discovery round " << (round + 1) << " complete\n";

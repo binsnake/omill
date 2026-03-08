@@ -1,1 +1,1 @@
-D:\binsnake\omill\build-remill\tools\omill-lift>omill-lift --vm-entry 0x1402A1000 --vm-exit 0x1402A112B --va 0x1400d5dc4 --deobfuscate eac.sys -o eac_vm_hash_test.ll
+D:\binsnake\omill\build-remill\tools\omill-lift>omill-lift --resolve-targets --vm-entry 0x1402A1000 --vm-exit 0x1402A112B --va 0x1400d5dc4 --deobfuscate eac.sys -o eac_vm_hash_test.ll

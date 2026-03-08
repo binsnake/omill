@@ -49,6 +49,10 @@ class BinaryMemoryMap {
   void addRegion(uint64_t base, const uint8_t *data, size_t size,
                  bool read_only);
 
+  /// Remove a previously-added region by its base address.
+  /// Used to swap per-clone vmcontext snapshots during sequential processing.
+  void removeRegion(uint64_t base);
+
   /// Register an IAT entry mapping an IAT slot VA to an import name.
   void addImport(uint64_t iat_va, std::string module, std::string function);
 

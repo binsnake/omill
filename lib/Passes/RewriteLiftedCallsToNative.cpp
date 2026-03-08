@@ -510,12 +510,27 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
         } else {
           auto *ptr_ty = llvm::PointerType::get(Builder.getContext(), 0);
           auto *fn_ptr = Builder.CreateIntToPtr(target_pc, ptr_ty, "fn.ptr");
-          llvm::SmallVector<llvm::Value *, 8> dispatch_args;
-          llvm::SmallVector<llvm::Type *, 8> dispatch_arg_types;
+          llvm::SmallVector<llvm::Value *, 16> dispatch_args;
+          llvm::SmallVector<llvm::Type *, 16> dispatch_arg_types;
+          // Standard ABI params (RCX, RDX, R8, R9).
           for (unsigned i = 0; i < dispatch_param_offsets.size(); ++i) {
             dispatch_args.push_back(
                 buildStateLoad(Builder, cand.state_ptr, dispatch_param_offsets[i],
                                llvm::StringRef(arch_abi.param_regs[i]).lower()));
+            dispatch_arg_types.push_back(i64_ty);
+          }
+
+          // Also load callee-saved registers from State.  When the target
+          // resolves to a _native function with extra_gpr_live_ins (e.g.
+          // VM import resolvers that use R12 as vmcontext pointer), these
+          // values carry the per-callsite differentiation that constant
+          // propagation needs.
+          for (const auto &cs_name : arch_abi.callee_saved) {
+            auto off = lookupStateOffset(field_map, cs_name);
+            if (!off) continue;
+            dispatch_args.push_back(
+                buildStateLoad(Builder, cand.state_ptr, *off,
+                               llvm::StringRef(cs_name).lower()));
             dispatch_arg_types.push_back(i64_ty);
           }
 
