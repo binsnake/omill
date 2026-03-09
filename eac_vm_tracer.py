@@ -1117,6 +1117,142 @@ class DispatchChainResolver:
             return (hv & 0xFFFFFFFFFFFFFFFF, dc)
         return None
 
+    # -- Byte pattern for ctx[198] (extra/dispatch target) store --
+    EXTRA_STORE_DISP = b'\x24\x98\x01\x00\x00'  # SIB + disp32 for [r12+198h]
+
+    def parse_vm_wrapper_full(self, wrapper_addr):
+        """Parse a VM re-entry wrapper.  Returns (hash, dispatch_const, first_handler_va) or None.
+
+        Extends parse_vm_wrapper to also extract the first inner handler VA by
+        parsing the ctx[198] store (the dispatch loop reads this as the first
+        dispatch stub address).
+        """
+        # Follow thunk if needed
+        raw = self._read_va(wrapper_addr, 5)
+        if raw is None:
+            return None
+        if raw[0] == 0xE9:
+            rel = struct.unpack_from('<i', raw, 1)[0]
+            wrapper_addr = (wrapper_addr + 5 + rel) & 0xFFFFFFFFFFFFFFFF
+        d = self._read_va(wrapper_addr, 18)
+        if d is None or len(d) < 18:
+            return None
+        if d[:8] != self.WRAPPER_PFX or d[8] != 0xE8:
+            return None
+        rel = struct.unpack_from('<i', d, 9)[0]
+        if (wrapper_addr + 13 + rel) & 0xFFFFFFFFFFFFFFFF != self.VMENTER:
+            return None
+        if d[13] != 0xE9:
+            return None
+        jr = struct.unpack_from('<i', d, 14)[0]
+        pv = (wrapper_addr + 18 + jr) & 0xFFFFFFFFFFFFFFFF
+        buf = self._read_va(pv, 256)
+        if buf is None:
+            return None
+
+        # Extract hash: mov [r12+190h], imm32 (sign-extended)
+        hv = None
+        for i in range(len(buf) - 12):
+            if buf[i:i+8] == self.HASH_MOV_SIG:
+                hv = struct.unpack_from('<i', buf, i+8)[0]
+                break
+        # Extract dispatch const: add rax/rdx, imm32
+        dc = None
+        for i in range(len(buf) - 8):
+            if buf[i] == 0x48 and buf[i+1] == 0x05:
+                dc = struct.unpack_from('<i', buf, i+2)[0]
+                break
+            if buf[i] == 0x48 and buf[i+1] == 0x81 and (buf[i+2] & 0xF8) == 0xC0:
+                dc = struct.unpack_from('<i', buf, i+3)[0]
+                break
+            # add rdx, imm32: 48 81 C2 xx xx xx xx
+            if buf[i] == 0x48 and buf[i+1] == 0x81 and buf[i+2] == 0xC2:
+                dc = struct.unpack_from('<i', buf, i+3)[0]
+                break
+        if hv is None or dc is None:
+            return None
+        hv = hv & 0xFFFFFFFFFFFFFFFF
+
+        # Extract ctx[198] (extra): the first dispatch stub of the inner VM.
+        # Pattern: 49/4D 89 <modrm> 24 98 01 00 00 where modrm encodes the source reg.
+        # Preceding instruction: lea <src_reg>, [<base_reg> + disp32]
+        first_handler = 0
+        for i in range(len(buf) - 8):
+            idx = buf.find(self.EXTRA_STORE_DISP, i)
+            if idx == -1:
+                break
+            if idx < 3:
+                i = idx + 1
+                continue
+            modrm = buf[idx - 1]
+            if buf[idx - 2] != 0x89 or buf[idx - 3] not in (0x49, 0x4D):
+                i = idx + 1
+                continue
+            src_reg = (modrm >> 3) & 7
+            # Find lea <src_reg>, [any_reg + disp32]
+            for j in range(max(0, idx - 25), idx):
+                if buf[j] not in (0x48, 0x4C) or buf[j + 1] != 0x8D:
+                    continue
+                lea_modrm = buf[j + 2]
+                if (lea_modrm & 0xC0) != 0x80:  # mod=10 (disp32)
+                    continue
+                if ((lea_modrm >> 3) & 7) != src_reg:
+                    continue
+                if (lea_modrm & 7) == 4:  # SIB form — skip
+                    continue
+                extra_const = struct.unpack_from('<i', buf, j + 3)[0]
+                stub_va = (BASE_DELTA + extra_const) & 0xFFFFFFFFFFFFFFFF
+                sb = self._read_va(stub_va, 5)
+                if sb and sb[0] == 0xE9:
+                    rel = struct.unpack_from('<i', sb, 1)[0]
+                    first_handler = (stub_va + 5 + rel) & 0xFFFFFFFFFFFFFFFF
+                else:
+                    first_handler = stub_va
+                break
+            if first_handler:
+                break
+            i = idx + 1
+
+        return (hv, dc, first_handler)
+
+    def resolve_native_as_vmenter(self, native_target):
+        """Check if a native call target is a VM re-entry wrapper.
+
+        Follows up to 3 thunks from native_target, trying parse_vm_wrapper_full
+        at each step.  Returns (hash, dispatch_const, first_handler_va) or None.
+        """
+        addr = native_target
+        for _ in range(3):
+            result = self.parse_vm_wrapper_full(addr)
+            if result is not None:
+                return result
+            # Follow thunk
+            raw = self._read_va(addr, 5)
+            if raw is None or raw[0] != 0xE9:
+                return None
+            rel = struct.unpack_from('<i', raw, 1)[0]
+            addr = (addr + 5 + rel) & 0xFFFFFFFFFFFFFFFF
+        return None
+
+    def resolve_inner_vm_chain(self, native_target, max_steps=200, outer_ctx=None):
+        """If native_target is a vmenter wrapper, trace the inner VM handler chain.
+
+        Returns a list of edges: [(handler_va, hash_in, next_handler_va, hash_out, const), ...]
+        with a final entry marked as 'exit' when the inner VM exits.
+        Returns empty list if native_target is not a vmenter wrapper.
+        """
+        entry = self.resolve_native_as_vmenter(native_target)
+        if entry is None:
+            return []
+        inner_hash, inner_dc, first_handler = entry
+        if not first_handler:
+            return []
+        if self.verbose >= 1:
+            print(f'    [inner VM] native 0x{native_target:X} -> vmenter hash=0x{inner_hash:016X} handler=0x{first_handler:X}')
+
+        chain = self.trace_chain(first_handler, inner_hash, max_steps=max_steps, initial_ctx=outer_ctx)
+        return chain
+
     def resolve_native_wrapper(self, stub_target, hash_val, out_ctx):
         """Try to resolve the hash continuation after a native call stub."""
         # Not yet implemented for trace_chain. Requires knowing which
@@ -1139,12 +1275,14 @@ class DispatchChainResolver:
                 pos = idx + 1
         return results
 
-    def trace_chain(self, first_handler, first_hash, max_steps=50):
-        """Walk the dispatch chain step by step, chaining context between handlers."""
+    def trace_chain(self, first_handler, first_hash, max_steps=50, initial_ctx=None):
+        """Walk the dispatch chain step by step, chaining context between handlers.
+        If initial_ctx is provided (bytes), it is used as context for the first handler.
+        """
         chain = []
         handler = first_handler
         hash_val = first_hash
-        prev_ctx = None  # first handler gets fresh context
+        prev_ctx = initial_ctx  # None means resolve_handler uses fresh context
 
         for step in range(1, max_steps + 1):
             r = self.resolve_handler(handler, hash_val, prev_ctx=prev_ctx)
@@ -1545,6 +1683,140 @@ def main():
             print(f"    [{i+1}/{len(unique_has)}] extended={native_extended}")
     print(f"  Extended {native_extended} edges through {len(unique_has)} unique handler_after targets")
 
+    # 9c. Resolve inner VM chains: for native_call edges where the native
+    #     target is a vmenter wrapper, trace the inner VM handler chain
+    #     and add those edges to the dispatch graph.
+    print(f"\n  Inner VM chain resolution...")
+    inner_vm_entries = {}  # native_target_va -> (inner_hash, first_handler_va)
+    inner_vm_edges = 0
+    # Collect all native call targets from edges
+    native_targets = set()
+    native_edge_info = {}  # (h_va, hash_in) -> caller_addr (the native call stub)
+    for (h, hi), (nh, ho, c) in edges.items():
+        if isinstance(nh, str) and nh.startswith('native_call'):
+            caller = c  # for native_call edges, c = caller_addr (the stub)
+            if isinstance(caller, int):
+                nk, ninfo = resolver.classify_dispatch_entry(caller)
+                if nk == 'native_call':
+                    ha = ninfo.get('handler_after', 0)
+                    if ha:
+                        native_edge_info[(h, hi)] = (caller, ha)
+    # For each native call edge, find the actual native target.
+    # The native target is the function called at [rsp+8] inside the stub.
+    # We can read the native target from the stub's call [rsp+8] instruction.
+    # For now, we use the end-to-end trace data if available, or we try to
+    # detect vmenter wrappers among all known thunk targets in the binary.
+    #
+    # Strategy: for each handler_after, check if ANY of the known vmenter
+    # wrappers produce a valid inner VM chain. Since the native target is
+    # only known at runtime (it's read from [rsp+8]), we check whether
+    # known thunk targets near native call stubs are wrappers.
+    #
+    # Actually, the robust approach: we already have the 351 wrappers.
+    # Build a map: wrapper_body_addr -> (hash, dc, first_handler).
+    # Then for each native call stub, the jmp at offset 30 gives handler_after,
+    # but the call at offset 13 (call [rsp+8]) calls the native target which
+    # at RUNTIME may be a wrapper.  We can't know statically which wrapper it is.
+    #
+    # Instead: for the outer handler that makes the native call, use the e2e trace
+    # (if available) or the dispatch graph's native_target_va to identify the wrapper.
+    # For a broader solution, for each native_call_stub edge, try resolving
+    # handler_after with the hash from each wrapper (37 hashes) and if the
+    # handler_after dispatches to a known handler, that inner chain is valid.
+    #
+    # Simplest approach for now: scan the e2e trace's native_calls list.
+    # If a native call target is a vmenter wrapper, trace its inner chain.
+    #
+    # Even simpler: for each unique wrapper (37 hashes), resolve the inner VM chain
+    # starting from its first_handler.  These chains are independent of which
+    # native call stub invoked them.  Then link native_call edges that target
+    # a vmenter wrapper to the inner chain's first handler.
+    #
+    # Build: inner_hash -> [(handler, hash_in, next_handler, hash_out, const), ...]
+    wrapper_db = {}  # wrapper_hash -> {first_handler, chain: [...]}
+    seen_wrapper_hashes = set()
+    for w in wrappers:
+        wh = w['hash']
+        if wh in seen_wrapper_hashes:
+            continue
+        seen_wrapper_hashes.add(wh)
+        result = resolver.parse_vm_wrapper_full(w['addr'])
+        if result is None:
+            continue
+        inner_hash, inner_dc, first_handler = result
+        if not first_handler:
+            continue
+        wrapper_db[wh] = {'first_handler': first_handler, 'chain': None}
+    print(f"  {len(wrapper_db)} unique vmenter wrappers with known first handlers")
+
+    # Now trace each inner VM chain (only unique first_handlers).
+    # Use a warm context from the main resolution pass — inner VM handlers
+    # need realistic pointer values (not filler) for context fields like
+    # ctx[0x108], ctx[0xB8], etc.
+    warm_ctx = None
+    if ctx_out:
+        for (h, hi), (nh, ho, c) in edges.items():
+            if isinstance(nh, int) and h in ctx_out:
+                warm_ctx = ctx_out[h]
+                break
+        if warm_ctx is None:
+            warm_ctx = next(iter(ctx_out.values()))
+    first_handler_to_chain = {}  # first_handler -> chain
+    for wh, winfo in wrapper_db.items():
+        fh = winfo['first_handler']
+        if fh in first_handler_to_chain:
+            winfo['chain'] = first_handler_to_chain[fh]
+            continue
+        chain = resolver.trace_chain(fh, wh, max_steps=200, initial_ctx=warm_ctx)
+        winfo['chain'] = chain
+        first_handler_to_chain[fh] = chain
+        # Add chain edges to the main edges dict
+        for step in chain:
+            h_va = step['handler']
+            h_in = step['hash_in']
+            if 'next_handler' in step:
+                nh = step['next_handler']
+                ho = step.get('hash_out', 0)
+                c = step.get('const', 0)
+                key = (h_va, h_in)
+                if key not in edges:
+                    edges[key] = (nh, ho, c)
+                    inner_vm_edges += 1
+            elif step.get('kind') == 'exit':
+                exits.add(h_va)
+            elif step.get('dispatch_kind') == 'native_call':
+                ha = step.get('handler_after', 0)
+                c = step.get('const', 0)
+                target = step.get('target', 0)
+                key = (h_va, h_in)
+                if key not in edges:
+                    edges[key] = ('native_call', 0, target)
+                    inner_vm_edges += 1
+    print(f"  Traced {len(first_handler_to_chain)} unique inner VM chains, added {inner_vm_edges} edges")
+
+    # Build lookup: first_handler -> wrapper_hash (for linking native call edges)
+    first_handler_to_whash = {}  # first_handler -> wrapper_hash
+    for wh, winfo in wrapper_db.items():
+        fh = winfo['first_handler']
+        if fh not in first_handler_to_whash:
+            first_handler_to_whash[fh] = wh
+
+    # Also build: wrapper_body_addr -> first_handler (for native target resolution)
+    # All wrappers with the same hash share the same first_handler.
+    wrapper_addr_to_first = {}  # wrapper body VA -> first_handler
+    for w in wrappers:
+        result = resolver.parse_vm_wrapper_full(w['addr'])
+        if result and result[2]:
+            wrapper_addr_to_first[w['addr']] = result[2]
+            # Also map thunk targets
+            raw = resolver._read_va(w['addr'], 5)
+            if raw and raw[0] == 0xE9:
+                rel = struct.unpack_from('<i', raw, 1)[0]
+                body = (w['addr'] + 5 + rel) & 0xFFFFFFFFFFFFFFFF
+                wrapper_addr_to_first[body] = result[2]
+
+    print(f"  {len(wrapper_addr_to_first)} wrapper addresses mapped to first handlers")
+
     # Final graph export (after native call extension)
     graph_out = Path(r'D:\binsnake\tracer\dispatch_graph.json')
     total_dispatch = sum(1 for (h,_), (nh,_,_) in edges.items() if isinstance(nh, int) and nh != h)
@@ -1617,15 +1889,19 @@ def main():
         elif isinstance(nh, str) and nh.startswith('native_call'):
             # Native call: set handler_after as successor so VMDispatchResolution
             # can resolve the dispatch_jump to the correct handler.
+            # Also: if the native call target is a vmenter wrapper, add the
+            # first inner handler as a successor for reachability.
             caller = c
             ha = stub_to_ha.get(caller, 0) if isinstance(caller, int) else 0
+            successors = []
             if ha:
-                rec['successors'] = [f'0x{ha:X}']
+                successors.append(f'0x{ha:X}')
                 rec['native_target_va'] = f'0x{caller:X}' if isinstance(caller, int) else '0x0'
                 # If we resolved handler_after's continuation, also set outgoing_hash
                 if ha in ha_cache and ha_cache[ha]:
                     _, _, nc_ho, _ = ha_cache[ha]
                     rec['outgoing_hash'] = f'0x{nc_ho:016X}'
+            rec['successors'] = successors
         graph_records.append(rec)
     # Mark exit handlers
     for h in exits:
@@ -1662,11 +1938,22 @@ def main():
     entry_handler = '0x140C5416E'  # first handler from DriverEntry trace
     # Build adjacency from graph_records (handler_va -> successor handler_vas)
     rec_adj = {}  # handler_va -> set of successor handler_va strings
+    native_call_handlers = set()  # handlers that make native calls
     for rec in graph_records:
         h = rec['handler_va']
         for s in rec.get('successors', []):
             rec_adj.setdefault(h, set()).add(s)
         rec_adj.setdefault(h, set())  # ensure entry
+        # Track handlers that make native calls (for inner VM linking)
+        if rec.get('native_target_va', '0x0') != '0x0':
+            native_call_handlers.add(h)
+    # For native call handlers, add inner VM first handlers as successors.
+    # At runtime, a native call may invoke a vmenter wrapper (recursive VM entry).
+    # We add edges from every native-call handler to every inner VM first handler
+    # as a conservative reachability approximation.
+    inner_first_strs = set(f'0x{fh:X}' for fh in first_handler_to_whash if fh)
+    for h in native_call_handlers:
+        rec_adj.setdefault(h, set()).update(inner_first_strs)
     visited = set()
     queue = [entry_handler]
     while queue:
