@@ -107,7 +107,8 @@ bool resolveDispatchTargets(llvm::Function &F,
     struct JumpCandidate {
       llvm::CallInst *call;
       llvm::ReturnInst *ret;
-      uint64_t target_pc;
+      uint64_t target_pc = 0;
+      llvm::Function *target_fn = nullptr;
     };
     llvm::SmallVector<JumpCandidate, 4> candidates;
 
@@ -122,21 +123,68 @@ bool resolveDispatchTargets(llvm::Function &F,
         if (call->arg_size() < 3)
           continue;
 
-        auto *ci = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
-        if (!ci)
-          continue;
-
         auto *ret = llvm::dyn_cast<llvm::ReturnInst>(call->getNextNode());
         if (!ret)
           continue;
 
-        candidates.push_back({call, ret, ci->getZExtValue()});
+        uint64_t target_pc = 0;
+        llvm::Function *target_fn = nullptr;
+        if (auto *ci = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1))) {
+          target_pc = ci->getZExtValue();
+        } else if (auto *ptoi =
+                       llvm::dyn_cast<llvm::PtrToIntOperator>(call->getArgOperand(1))) {
+          target_fn = llvm::dyn_cast<llvm::Function>(ptoi->getPointerOperand());
+          if (!target_fn)
+            continue;
+        } else {
+          continue;
+        }
+
+        candidates.push_back({call, ret, target_pc, target_fn});
       }
     }
 
-    for (auto &[call, ret, target_pc] : candidates) {
+    for (auto &[call, ret, target_pc, target_fn] : candidates) {
       auto *BB = call->getParent();
       llvm::SmallVector<llvm::BasicBlock *, 4> old_succs(successors(BB));
+
+      auto lowerDirectJumpToFunction = [&](llvm::Function *direct_target,
+                                           llvm::CallInst *dispatch_call,
+                                           llvm::ReturnInst *dispatch_ret) {
+        llvm::IRBuilder<> Builder(dispatch_call);
+        auto *state = dispatch_call->getArgOperand(0);
+        auto *pc_val = dispatch_call->getArgOperand(1);
+        auto *mem = dispatch_call->getArgOperand(2);
+
+        auto *tail_call = Builder.CreateCall(direct_target, {state, pc_val, mem});
+        tail_call->setTailCallKind(llvm::CallInst::TCK_MustTail);
+        auto *new_ret = Builder.CreateRet(tail_call);
+
+        dispatch_call->replaceAllUsesWith(
+            llvm::PoisonValue::get(dispatch_call->getType()));
+        dispatch_ret->eraseFromParent();
+        dispatch_call->eraseFromParent();
+
+        while (&BB->back() != new_ret) {
+          auto &dead = BB->back();
+          if (!dead.use_empty())
+            dead.replaceAllUsesWith(llvm::PoisonValue::get(dead.getType()));
+          dead.eraseFromParent();
+        }
+
+        llvm::SmallPtrSet<llvm::BasicBlock *, 4> new_succs(
+            successors(BB).begin(), successors(BB).end());
+        for (auto *old_succ : old_succs)
+          if (!new_succs.count(old_succ))
+            old_succ->removePredecessor(BB);
+
+        changed = true;
+      };
+
+      if (target_fn) {
+        lowerDirectJumpToFunction(target_fn, call, ret);
+        continue;
+      }
 
       // Priority 1: Intra-function branch.
       if (auto *target_bb = findBlockForPC(F, target_pc)) {
@@ -165,35 +213,10 @@ bool resolveDispatchTargets(llvm::Function &F,
       }
 
       // Priority 2: Inter-function tail call.
-      auto *target_fn = lifted ? lifted->lookup(target_pc) : nullptr;
+      target_fn = lifted ? lifted->lookup(target_pc) : nullptr;
       if (target_fn) {
-        llvm::IRBuilder<> Builder(call);
-        auto *state = call->getArgOperand(0);
-        auto *pc_val = call->getArgOperand(1);
-        auto *mem = call->getArgOperand(2);
-
-        auto *tail_call = Builder.CreateCall(target_fn, {state, pc_val, mem});
-        tail_call->setTailCallKind(llvm::CallInst::TCK_MustTail);
-        auto *new_ret = Builder.CreateRet(tail_call);
-
-        call->replaceAllUsesWith(llvm::PoisonValue::get(call->getType()));
-        ret->eraseFromParent();
-        call->eraseFromParent();
-
-        while (&BB->back() != new_ret) {
-          auto &dead = BB->back();
-          if (!dead.use_empty())
-            dead.replaceAllUsesWith(llvm::PoisonValue::get(dead.getType()));
-          dead.eraseFromParent();
-        }
-
-        llvm::SmallPtrSet<llvm::BasicBlock *, 4> new_succs(
-            successors(BB).begin(), successors(BB).end());
-        for (auto *old_succ : old_succs)
-          if (!new_succs.count(old_succ))
-            old_succ->removePredecessor(BB);
-
-        changed = true;
+        lowerDirectJumpToFunction(target_fn, call, ret);
+        continue;
       }
     }
   }

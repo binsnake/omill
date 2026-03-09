@@ -1,4 +1,4 @@
-#include "omill/Analysis/VMHandlerChainSolver.h"
+#include "omill/Analysis/VMTraceEmulator.h"
 
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/Support/raw_ostream.h>
@@ -1484,10 +1484,10 @@ static ExecResult stepInstruction(EmuState &state,
 }  // anonymous namespace
 
 // ============================================================================
-// VMHandlerChainSolver Implementation
+// VMTraceEmulator Implementation
 // ============================================================================
 
-VMHandlerChainSolver::VMHandlerChainSolver(const BinaryMemoryMap &mem,
+VMTraceEmulator::VMTraceEmulator(const BinaryMemoryMap &mem,
                                            uint64_t image_base,
                                            uint64_t vmenter_va,
                                            uint64_t vmexit_va)
@@ -1498,17 +1498,17 @@ VMHandlerChainSolver::VMHandlerChainSolver(const BinaryMemoryMap &mem,
   (void)image_base_;  // May be used for validation in future.
 }
 
-bool VMHandlerChainSolver::isVmexitVa(uint64_t va) const {
+bool VMTraceEmulator::isVmexitVa(uint64_t va) const {
   return va == vmexit_va_ ||
          (true_vmexit_va_ != 0 && va == true_vmexit_va_);
 }
 
-uint64_t VMHandlerChainSolver::syntheticVMContextBase() {
+uint64_t VMTraceEmulator::syntheticVMContextBase() {
   return EmuState::kStackBase + 0x200;
 }
 
 std::optional<uint64_t>
-VMHandlerChainSolver::computeDelta(uint64_t subfunc_va,
+VMTraceEmulator::computeDelta(uint64_t subfunc_va,
                                    uint64_t return_addr) {
   // Pattern:
   //   push rax; push rbx;
@@ -1549,8 +1549,8 @@ VMHandlerChainSolver::computeDelta(uint64_t subfunc_va,
   return std::nullopt;
 }
 
-VMHandlerChainSolver::WrapperInfo
-VMHandlerChainSolver::parseEntryWrapper(
+VMTraceEmulator::WrapperInfo
+VMTraceEmulator::parseEntryWrapper(
     uint64_t wrapper_va,
     const std::vector<uint8_t> *initial_vmcontext_snapshot) {
   WrapperInfo info;
@@ -1665,7 +1665,7 @@ VMHandlerChainSolver::parseEntryWrapper(
         if (scan[k] == 0xC3) {  // retn
           true_vmexit_va_ = subfunc_va + k + 1;
           if (true_vmexit_va_ != vmexit_va_) {
-            llvm::errs() << "VMHandlerChainSolver: auto-detected true vmexit "
+            llvm::errs() << "VMTraceEmulator: auto-detected true vmexit "
                          << "at 0x" << llvm::utohexstr(true_vmexit_va_)
                          << " (delta-computer at 0x"
                          << llvm::utohexstr(subfunc_va) << ")\n";
@@ -1752,146 +1752,152 @@ VMHandlerChainSolver::parseEntryWrapper(
   return info;
 }
 
-std::vector<VMHandlerChainSolver::ChainEntry>
-VMHandlerChainSolver::solveFromWrapper(uint64_t wrapper_va) {
+std::vector<VMTraceEmulator::TraceEntry>
+VMTraceEmulator::traceFromWrapper(uint64_t wrapper_va) {
   auto info = parseEntryWrapper(wrapper_va);
   if (!info.valid) {
-    llvm::errs() << "VMHandlerChainSolver: failed to parse wrapper at "
+    llvm::errs() << "VMTraceEmulator: failed to parse wrapper at "
                  << llvm::utohexstr(wrapper_va) << "\n";
     return {};
   }
 
-  llvm::errs() << "VMHandlerChainSolver: wrapper at "
+  llvm::errs() << "VMTraceEmulator: wrapper at "
                << llvm::utohexstr(wrapper_va)
-               << " → delta=" << llvm::utohexstr(info.delta)
+               << " -> delta=" << llvm::utohexstr(info.delta)
                << " hash=" << llvm::utohexstr(info.initial_hash)
                << " first=" << llvm::utohexstr(info.first_handler_va)
                << "\n";
 
   last_delta_ = info.delta;
 
-  auto results = solveFromHandlerImpl(info.first_handler_va, info.delta,
+  auto results = traceFromHandlerImpl(info.first_handler_va, info.delta,
                                       info.initial_hash,
                                       &info.vmcontext_snapshot);
 
-  // Prepend a chain entry for the wrapper → first handler mapping.
-  // This lets VMDispatchResolutionPass resolve the wrapper's dispatch.
-  ChainEntry wrapper_entry;
+  TraceEntry wrapper_entry;
   wrapper_entry.handler_va = wrapper_va;
+  wrapper_entry.incoming_hash = info.initial_hash;
+  wrapper_entry.outgoing_hash = info.initial_hash;
+  wrapper_entry.exit_target_va = info.first_handler_va;
   wrapper_entry.successors.push_back(info.first_handler_va);
   results.insert(results.begin(), wrapper_entry);
 
-  // Add wrapper to discovered handlers.
   if (discovered_set_.insert(wrapper_va).second)
     discovered_handlers_.push_back(wrapper_va);
 
-  last_chain_results_ = results;
+  last_trace_results_ = results;
   return results;
 }
 
-std::vector<VMHandlerChainSolver::ChainEntry>
-VMHandlerChainSolver::solveFromWrapperWithSnapshot(
+std::vector<VMTraceEmulator::TraceEntry>
+VMTraceEmulator::traceFromWrapperWithSnapshot(
     uint64_t wrapper_va, const std::vector<uint8_t> &vmcontext_snapshot) {
   auto info = parseEntryWrapper(wrapper_va, &vmcontext_snapshot);
   if (!info.valid) {
-    llvm::errs() << "VMHandlerChainSolver: failed to parse wrapper at "
+    llvm::errs() << "VMTraceEmulator: failed to parse wrapper at "
                  << llvm::utohexstr(wrapper_va) << "\n";
     return {};
   }
 
-  llvm::errs() << "VMHandlerChainSolver: wrapper at "
+  llvm::errs() << "VMTraceEmulator: wrapper at "
                << llvm::utohexstr(wrapper_va)
                << " with injected snapshot"
-               << " â†’ delta=" << llvm::utohexstr(info.delta)
+               << " -> delta=" << llvm::utohexstr(info.delta)
                << " hash=" << llvm::utohexstr(info.initial_hash)
                << " first=" << llvm::utohexstr(info.first_handler_va)
                << "\n";
 
   last_delta_ = info.delta;
 
-  auto results = solveFromHandlerImpl(info.first_handler_va, info.delta,
+  auto results = traceFromHandlerImpl(info.first_handler_va, info.delta,
                                       info.initial_hash,
                                       &info.vmcontext_snapshot);
 
-  ChainEntry wrapper_entry;
+  TraceEntry wrapper_entry;
   wrapper_entry.handler_va = wrapper_va;
+  wrapper_entry.incoming_hash = info.initial_hash;
+  wrapper_entry.outgoing_hash = info.initial_hash;
+  wrapper_entry.exit_target_va = info.first_handler_va;
   wrapper_entry.successors.push_back(info.first_handler_va);
   results.insert(results.begin(), wrapper_entry);
 
   if (discovered_set_.insert(wrapper_va).second)
     discovered_handlers_.push_back(wrapper_va);
 
-  last_chain_results_ = results;
+  last_trace_results_ = results;
   return results;
 }
 
-std::vector<VMHandlerChainSolver::ChainEntry>
-VMHandlerChainSolver::solveFromWrapperWithSnapshotAndHash(
+std::vector<VMTraceEmulator::TraceEntry>
+VMTraceEmulator::traceFromWrapperWithSnapshotAndHash(
     uint64_t wrapper_va, const std::vector<uint8_t> &vmcontext_snapshot,
     uint64_t initial_hash) {
   auto info = parseEntryWrapper(wrapper_va, &vmcontext_snapshot);
   if (!info.valid) {
-    llvm::errs() << "VMHandlerChainSolver: failed to parse wrapper at "
+    llvm::errs() << "VMTraceEmulator: failed to parse wrapper at "
                  << llvm::utohexstr(wrapper_va) << "\n";
     return {};
   }
 
   info.initial_hash = initial_hash;
 
-  llvm::errs() << "VMHandlerChainSolver: wrapper at "
+  llvm::errs() << "VMTraceEmulator: wrapper at "
                << llvm::utohexstr(wrapper_va)
                << " with injected snapshot and hash override"
-               << " → delta=" << llvm::utohexstr(info.delta)
+               << " -> delta=" << llvm::utohexstr(info.delta)
                << " hash=" << llvm::utohexstr(info.initial_hash)
                << " first=" << llvm::utohexstr(info.first_handler_va)
                << "\n";
 
   last_delta_ = info.delta;
 
-  auto results = solveFromHandlerImpl(info.first_handler_va, info.delta,
+  auto results = traceFromHandlerImpl(info.first_handler_va, info.delta,
                                       info.initial_hash,
                                       &info.vmcontext_snapshot);
 
-  ChainEntry wrapper_entry;
+  TraceEntry wrapper_entry;
   wrapper_entry.handler_va = wrapper_va;
+  wrapper_entry.incoming_hash = info.initial_hash;
+  wrapper_entry.outgoing_hash = info.initial_hash;
+  wrapper_entry.exit_target_va = info.first_handler_va;
   wrapper_entry.successors.push_back(info.first_handler_va);
   results.insert(results.begin(), wrapper_entry);
 
   if (discovered_set_.insert(wrapper_va).second)
     discovered_handlers_.push_back(wrapper_va);
 
-  last_chain_results_ = results;
+  last_trace_results_ = results;
   return results;
 }
 
-std::vector<VMHandlerChainSolver::ChainEntry>
-VMHandlerChainSolver::solveFromHandler(uint64_t handler_va,
+std::vector<VMTraceEmulator::TraceEntry>
+VMTraceEmulator::traceFromHandler(uint64_t handler_va,
                                        uint64_t delta,
                                        uint64_t initial_hash) {
-  return solveFromHandlerImpl(handler_va, delta, initial_hash, nullptr);
+  return traceFromHandlerImpl(handler_va, delta, initial_hash, nullptr);
 }
 
-std::vector<VMHandlerChainSolver::ChainEntry>
-VMHandlerChainSolver::solveFromHandlerWithSnapshot(
+std::vector<VMTraceEmulator::TraceEntry>
+VMTraceEmulator::traceFromHandlerWithSnapshot(
     uint64_t handler_va, uint64_t delta, uint64_t initial_hash,
     const std::vector<uint8_t> &vmcontext_snapshot) {
-  llvm::errs() << "VMHandlerChainSolver: handler at "
+  llvm::errs() << "VMTraceEmulator: handler at "
                << llvm::utohexstr(handler_va)
                << " with injected snapshot"
-               << " → delta=" << llvm::utohexstr(delta)
+               << " -> delta=" << llvm::utohexstr(delta)
                << " hash=" << llvm::utohexstr(initial_hash) << "\n";
   last_delta_ = delta;
-  auto results = solveFromHandlerImpl(handler_va, delta, initial_hash,
+  auto results = traceFromHandlerImpl(handler_va, delta, initial_hash,
                                       &vmcontext_snapshot);
-  last_chain_results_ = results;
+  last_trace_results_ = results;
   return results;
 }
 
-std::vector<VMHandlerChainSolver::ChainEntry>
-VMHandlerChainSolver::solveFromHandlerImpl(
+std::vector<VMTraceEmulator::TraceEntry>
+VMTraceEmulator::traceFromHandlerImpl(
     uint64_t handler_va, uint64_t delta, uint64_t initial_hash,
     const std::vector<uint8_t> *vmcontext_snapshot) {
-  std::vector<ChainEntry> results;
+  std::vector<TraceEntry> results;
 
   struct WorkItem {
     uint64_t handler_va;
@@ -1902,13 +1908,6 @@ VMHandlerChainSolver::solveFromHandlerImpl(
     bool has_state = false;
   };
 
-  auto snapshotSpanSize = [&](const WorkItem &item) {
-    if (!item.snapshot.empty())
-      return item.snapshot.size();
-    if (vmcontext_snapshot && !vmcontext_snapshot->empty())
-      return vmcontext_snapshot->size();
-    return static_cast<size_t>(0x200);
-  };
 
   bool stateful_mode = vmcontext_snapshot && vmcontext_snapshot->size() > 0x200;
 
@@ -2025,7 +2024,7 @@ VMHandlerChainSolver::solveFromHandlerImpl(
   // dispatcher-style handlers that route multiple VM opcodes).
   llvm::DenseSet<uint64_t> visited;
 
-  queue.push_back({handler_va, initial_hash});
+  queue.push_back({handler_va, initial_hash, {}, {}, Flags{}, false});
 
   while (!queue.empty() && results.size() < max_handlers_) {
     auto item = queue.front();
@@ -2040,9 +2039,9 @@ VMHandlerChainSolver::solveFromHandlerImpl(
     if (discovered_set_.insert(item.handler_va).second)
       discovered_handlers_.push_back(item.handler_va);
 
-    ChainEntry entry;
+    TraceEntry entry;
     entry.handler_va = item.handler_va;
-
+    entry.incoming_hash = item.hash;
     // Set up emulator state.
     EmuState state;
     state.stack_mem.fill(0);
@@ -2088,7 +2087,7 @@ VMHandlerChainSolver::solveFromHandlerImpl(
 
     auto enqueueSuccessor = [&](uint64_t target, uint64_t new_hash) {
       if (!stateful_mode) {
-        queue.push_back({target, new_hash});
+        queue.push_back({target, new_hash, {}, {}, Flags{}, false});
         return;
       }
       WorkItem next;
@@ -2135,7 +2134,7 @@ VMHandlerChainSolver::solveFromHandlerImpl(
 
     if (stateful_mode && getenv("OMILL_DEBUG_CHAIN") &&
         item.handler_va == 0x1402A4D29ull) {
-      llvm::errs() << "VMHandlerChainSolver: stateful entry handler=0x"
+      llvm::errs() << "VMTraceEmulator: stateful entry handler=0x"
                    << llvm::utohexstr(item.handler_va)
                    << " RSP=0x" << llvm::utohexstr(state.regs[RSP])
                    << " R12=0x" << llvm::utohexstr(state.regs[R12])
@@ -2180,7 +2179,7 @@ VMHandlerChainSolver::solveFromHandlerImpl(
                        slots_before.s1C8 != slots_after.s1C8 ||
                        res != ExecResult::Continue;
         if (changed) {
-          llvm::errs() << "VMHandlerChainSolver: step handler=0x"
+          llvm::errs() << "VMTraceEmulator: step handler=0x"
                        << llvm::utohexstr(item.handler_va)
                        << " inst=0x" << llvm::utohexstr(inst_va)
                        << " res=" << execResultName(res)
@@ -2215,7 +2214,7 @@ VMHandlerChainSolver::solveFromHandlerImpl(
       }
 
       if (res == ExecResult::Unsupported) {
-        llvm::errs() << "VMHandlerChainSolver: unsupported instruction at "
+        llvm::errs() << "VMTraceEmulator: unsupported instruction at "
                      << llvm::utohexstr(state.rip) << " in handler "
                      << llvm::utohexstr(item.handler_va)
                      << " (step " << step << ")\n";
@@ -2229,30 +2228,30 @@ VMHandlerChainSolver::solveFromHandlerImpl(
 
         // If we already passed through vmexit and are in the trampoline
         // code, an indirect jump means we've gone through the preamble
-        // and are dispatching to the first handler of the NEXT chain.
+        // and are dispatching to the first handler of the next trace.
         if (entry.is_vmexit && target >= handler_seg_start_ &&
             target < handler_seg_end_) {
-          // Read the new hash from vmcontext (set by the preamble).
           uint64_t new_hash = stateful_mode
                                   ? item.hash
                                   : readMem(state, mem_,
                                             state.regs[R12] + 0x190, 8);
 
-          // If this (target, hash) pair is already visited, the chain
-          // has genuinely cycled — same handler with same VM state.
           if (false) {
             llvm::errs()
-                << "VMHandlerChainSolver: vmexit continuation → "
-                << "0x" << llvm::utohexstr(target)
+                << "VMTraceEmulator: vmexit continuation -> 0x"
+                << llvm::utohexstr(target)
                 << " (already visited, treating as terminal vmexit)\n";
             dispatched = true;
             break;
           }
 
-          llvm::errs() << "VMHandlerChainSolver: vmexit continuation → "
-                       << "next chain at 0x" << llvm::utohexstr(target)
+          llvm::errs() << "VMTraceEmulator: vmexit continuation -> "
+                       << "next trace at 0x" << llvm::utohexstr(target)
                        << " hash=" << llvm::utohexstr(new_hash) << "\n";
 
+          entry.passed_vmexit = true;
+          entry.exit_target_va = target;
+          entry.outgoing_hash = new_hash;
           entry.successors.push_back(target);
           enqueueSuccessor(target, new_hash);
           dispatched = true;
@@ -2261,6 +2260,8 @@ VMHandlerChainSolver::solveFromHandlerImpl(
 
         // Check if this is a VM exit.
         if (isVmexitVa(target)) {
+          entry.passed_vmexit = true;
+          entry.exit_target_va = target;
           entry.is_vmexit = true;
           dispatched = true;
           break;
@@ -2268,6 +2269,7 @@ VMHandlerChainSolver::solveFromHandlerImpl(
 
         // Check if target is a vmentry (re-virtualized call).
         if (target == vmenter_va_) {
+          entry.exit_target_va = target;
           // For now, mark as vmexit (can't follow nested VM).
           entry.is_vmexit = true;
           dispatched = true;
@@ -2276,9 +2278,11 @@ VMHandlerChainSolver::solveFromHandlerImpl(
 
         // Check if target is in the handler segment.
         if (target >= handler_seg_start_ && target < handler_seg_end_) {
+          entry.exit_target_va = target;
+
           // EAC dispatch: handlers store the actual next handler VA at
-          // [r12+0x198] and jump to a dispatch trampoline.  The trampoline
-          // copies vmcontext and then `jmp [rsp+0x198]`.  Check if the
+          // [r12+0x198] and jump to a dispatch trampoline. The trampoline
+          // copies vmcontext and then `jmp [rsp+0x198]`. Check if the
           // handler wrote a valid target at [r12+0x198].
           uint64_t stored_target =
               readMem(state, mem_, state.regs[R12] + 0x198, 8);
@@ -2287,27 +2291,24 @@ VMHandlerChainSolver::solveFromHandlerImpl(
               stored_target >= handler_seg_start_ &&
               stored_target < handler_seg_end_ &&
               stored_target != target) {
-            // The handler dispatches through a trampoline. The actual next
-            // handler is in [r12+0x198]. Read the updated hash from
-            // [r12+0x190].
             uint64_t new_hash = stateful_mode
                                     ? item.hash
                                     : readMem(state, mem_,
                                               state.regs[R12] + 0x190, 8);
 
+            entry.outgoing_hash = new_hash;
             entry.successors.push_back(stored_target);
             enqueueSuccessor(stored_target, new_hash);
             dispatched = true;
             break;
           }
 
-          // No stored target — treat the jump target itself as the
-          // successor (simple dispatch pattern or trampoline IS handler).
           uint64_t new_hash = stateful_mode
                                   ? item.hash
                                   : readMem(state, mem_,
                                             state.regs[R12] + 0x190, 8);
 
+          entry.outgoing_hash = new_hash;
           entry.successors.push_back(target);
           enqueueSuccessor(target, new_hash);
           dispatched = true;
@@ -2315,7 +2316,8 @@ VMHandlerChainSolver::solveFromHandlerImpl(
         }
 
         // Unknown target — might be a call to native code.
-        llvm::errs() << "VMHandlerChainSolver: unknown indirect target "
+        entry.exit_target_va = target;
+        llvm::errs() << "VMTraceEmulator: unknown indirect target "
                      << llvm::utohexstr(target) << " from handler "
                      << llvm::utohexstr(item.handler_va)
                      << " rsp=0x" << llvm::utohexstr(state.regs[RSP])
@@ -2349,14 +2351,7 @@ VMHandlerChainSolver::solveFromHandlerImpl(
         if (isVmexitVa(target)) {
           // Skip the vmexit call — pop return address and continue.
           // This lets us follow through the vmexit trampoline to find
-          // the next chain's preamble after re-entry.
-          //
-          // Vmexit restores all native registers from the vmcontext area
-          // (which IS the stack at R12).  After vmexit returns, RSP is
-          // at the vmcontext base (R12).  Simulate this by setting RSP
-          // to R12, so post-vmexit code like `lea rsp,[rsp+1C0h]` /
-          // `call [rsp+8]` reads the native call target from the correct
-          // vmcontext offset.
+          // the next trace preamble after re-entry.
           uint64_t ret_addr = readMem(state, mem_, state.regs[RSP], 8);
           uint64_t vmctx_base = state.regs[R12];
           state.regs[RBP] = readMem(state, mem_, vmctx_base + 0x30, 8);
@@ -2373,10 +2368,11 @@ VMHandlerChainSolver::solveFromHandlerImpl(
           state.regs[R10] = readMem(state, mem_, vmctx_base + 0x158, 8);
           state.regs[RDI] = readMem(state, mem_, vmctx_base + 0x170, 8);
           state.regs[R11] = readMem(state, mem_, vmctx_base + 0x188, 8);
-          state.regs[RSP] = state.regs[R12];  // vmexit restores RSP ≈ R12
           state.regs[RSP] = vmctx_base;
           state.rip = ret_addr;
-          entry.is_vmexit = true;  // Mark that we passed through vmexit.
+          entry.exit_target_va = target;
+          entry.passed_vmexit = true;
+          entry.is_vmexit = true;
           continue;
         }
 
@@ -2389,26 +2385,26 @@ VMHandlerChainSolver::solveFromHandlerImpl(
 
           if (entry.is_vmexit) {
             // Re-entering VM after native call — vmctx still at old R12.
-            // Don't relocate R12.  Reset is_vmexit since we're back in VM.
+            // Don't relocate R12. Reset is_vmexit since we're back in VM.
             entry.is_vmexit = false;
           } else {
-            // Fresh VM entry (continuation chain).  Relocate R12 to new
-            // vmctx on the stack.
+            // Fresh VM entry (continuation chain). Relocate R12 to new vmctx
+            // on the stack.
             state.regs[R12] = state.regs[RSP];
             writeMem(state, state.regs[R12] + 0xE0, delta, 8);
           }
           continue;
         }
 
-        // If we've already passed through vmexit and encounter a CALL
-        // to unknown code (like `call [rsp+8]` for the native function),
-        // record the target for recursive descent lifting, then skip it.
+        // If we've already passed through vmexit and encounter a CALL to
+        // unknown code (like `call [rsp+8]` for the native function), record
+        // the target for recursive descent lifting, then skip it.
         if (entry.is_vmexit) {
           uint64_t native_target = state.rip;
           if (native_target >= handler_seg_start_ &&
               native_target < handler_seg_end_) {
             if (getenv("OMILL_DEBUG_CHAIN")) {
-              llvm::errs() << "VMHandlerChainSolver: vmexit-call reentering "
+              llvm::errs() << "VMTraceEmulator: vmexit-call reentering "
                            << "handler-segment target=0x"
                            << llvm::utohexstr(native_target)
                            << " from handler=0x"
@@ -2418,7 +2414,7 @@ VMHandlerChainSolver::solveFromHandlerImpl(
             continue;
           }
           if (getenv("OMILL_DEBUG_CHAIN")) {
-            llvm::errs() << "VMHandlerChainSolver: vmexit-call handler=0x"
+            llvm::errs() << "VMTraceEmulator: vmexit-call handler=0x"
                          << llvm::utohexstr(item.handler_va)
                          << " rsp=0x" << llvm::utohexstr(state.regs[RSP])
                          << " r12=0x" << llvm::utohexstr(state.regs[R12])
@@ -2439,12 +2435,8 @@ VMHandlerChainSolver::solveFromHandlerImpl(
                                         8))
                          << "\n";
           }
-          // Filter out sentinel and zero values — those indicate the
-          // target couldn't be resolved from the emulator state (e.g.,
-          // the native address is on the original caller's stack above
-          // the vmcontext, which the emulator doesn't model).
           if (native_target != 0 && native_target != kSentinel) {
-            // Capture per-callsite emulator state for clone specialization.
+            entry.native_target_va = native_target;
             NativeCallInfo info;
             info.handler_va = item.handler_va;
             info.target_va = native_target;
@@ -2452,7 +2444,6 @@ VMHandlerChainSolver::solveFromHandlerImpl(
             info.hash = readMem(state, mem_, state.regs[R12] + 0x190, 8);
             static_assert(sizeof(info.gprs) == sizeof(state.regs));
             std::memcpy(info.gprs, state.regs, sizeof(state.regs));
-            // Snapshot vmcontext memory (~0x200 bytes from R12).
             if (state.isStackAddr(info.r12_base)) {
               size_t avail = EmuState::kStackBase + EmuState::kStackSize -
                              info.r12_base;
@@ -2463,7 +2454,6 @@ VMHandlerChainSolver::solveFromHandlerImpl(
             }
             native_call_infos_.push_back(std::move(info));
 
-            // Maintain backward-compat deduplicated VA list.
             if (native_call_set_.insert(native_target).second)
               native_call_targets_.push_back(native_target);
           }
@@ -2474,13 +2464,9 @@ VMHandlerChainSolver::solveFromHandlerImpl(
           continue;
         }
 
-        // For other calls (e.g., to sub-functions within the handler),
-        // continue emulating into the callee. The return address was
-        // already pushed by stepInstruction.
-        //
-        // If this is a top-level call to a function outside the handler
-        // segment, record a NativeCallInfo so per-callsite clone
-        // specialization has the correct GPR/vmcontext state.
+        // For other calls (e.g., to sub-functions within the handler), continue
+        // emulating into the callee. The return address was already pushed by
+        // stepInstruction.
         if (call_depth == 0 &&
             (target < handler_seg_start_ || target >= handler_seg_end_) &&
             target != 0 && target != kSentinel) {
@@ -2516,41 +2502,39 @@ VMHandlerChainSolver::solveFromHandlerImpl(
         // Handler-level return: if the return address is in the handler
         // segment, it might be a trampoline. Otherwise, it's unusual.
         uint64_t ret_target = state.rip;
+        entry.exit_target_va = ret_target;
         if (ret_target >= handler_seg_start_ &&
             ret_target < handler_seg_end_) {
-          // This is a vmexit-style return to another handler.
           uint64_t new_hash = stateful_mode
                                   ? item.hash
                                   : readMem(state, mem_,
                                             state.regs[R12] + 0x190, 8);
 
-          // Cycle check: if this (target, hash) pair is already visited,
-          // the chain has genuinely cycled.
           if (false) {
             llvm::errs()
-                << "VMHandlerChainSolver: ret to 0x"
+                << "VMTraceEmulator: ret to 0x"
                 << llvm::utohexstr(ret_target)
                 << " (already visited, treating as terminal)\n";
             dispatched = true;
             break;
           }
+          entry.outgoing_hash = new_hash;
           entry.successors.push_back(ret_target);
           enqueueSuccessor(ret_target, new_hash);
           dispatched = true;
           break;
         }
 
-        // Check if we're returning to vmexit.
         if (isVmexitVa(ret_target)) {
+          entry.passed_vmexit = true;
           entry.is_vmexit = true;
           dispatched = true;
           break;
         }
 
-        // Unknown return target.
         if (entry.is_vmexit && getenv("OMILL_DEBUG_CHAIN")) {
           llvm::errs()
-              << "VMHandlerChainSolver: vmexit-ret state handler=0x"
+              << "VMTraceEmulator: vmexit-ret state handler=0x"
               << llvm::utohexstr(item.handler_va)
               << " ret=0x" << llvm::utohexstr(ret_target)
               << " rax=0x" << llvm::utohexstr(state.regs[RAX])
@@ -2578,15 +2562,15 @@ VMHandlerChainSolver::solveFromHandlerImpl(
               << "\n";
         }
         if (entry.is_vmexit && recordNativeTarget(state.regs[RAX])) {
+          entry.native_target_va = state.regs[RAX];
           dispatched = true;
           break;
         }
-        llvm::errs() << "VMHandlerChainSolver: handler "
+        llvm::errs() << "VMTraceEmulator: handler "
                      << llvm::utohexstr(item.handler_va)
                      << " returned to "
                      << llvm::utohexstr(ret_target) << "\n";
         entry.is_error = true;
-        dispatched = true;
         break;
       }
 
@@ -2594,7 +2578,7 @@ VMHandlerChainSolver::solveFromHandlerImpl(
     }
 
     if (!dispatched) {
-      llvm::errs() << "VMHandlerChainSolver: handler "
+      llvm::errs() << "VMTraceEmulator: handler "
                    << llvm::utohexstr(item.handler_va)
                    << " exceeded step limit\n";
       entry.is_error = true;
@@ -2606,7 +2590,7 @@ VMHandlerChainSolver::solveFromHandlerImpl(
   // Sort discovered handlers.
   llvm::sort(discovered_handlers_);
 
-  llvm::errs() << "VMHandlerChainSolver: solved " << results.size()
+  llvm::errs() << "VMTraceEmulator: traced " << results.size()
                << " handlers";
   unsigned exits = 0, errors = 0;
   for (auto &e : results) {
@@ -2619,16 +2603,25 @@ VMHandlerChainSolver::solveFromHandlerImpl(
     llvm::errs() << ", " << errors << " errors";
   llvm::errs() << "\n";
 
-  // Print chain details.
   for (unsigned i = 0; i < results.size(); ++i) {
     auto &e = results[i];
-    llvm::errs() << "  [" << i << "] handler 0x" << llvm::utohexstr(e.handler_va);
+    llvm::errs() << "  [" << i << "] handler 0x"
+                 << llvm::utohexstr(e.handler_va)
+                 << " hash=0x" << llvm::utohexstr(e.incoming_hash);
+    if (e.outgoing_hash != 0)
+      llvm::errs() << " -> hash=0x" << llvm::utohexstr(e.outgoing_hash);
+    if (e.exit_target_va != 0)
+      llvm::errs() << " target=0x" << llvm::utohexstr(e.exit_target_va);
+    if (e.native_target_va != 0)
+      llvm::errs() << " native=0x" << llvm::utohexstr(e.native_target_va);
+    if (e.passed_vmexit)
+      llvm::errs() << " via-vmexit";
     if (e.is_vmexit)
-      llvm::errs() << " → vmexit";
+      llvm::errs() << " -> vmexit";
     else if (e.is_error)
-      llvm::errs() << " → ERROR";
+      llvm::errs() << " -> ERROR";
     else {
-      llvm::errs() << " → ";
+      llvm::errs() << " -> ";
       for (unsigned j = 0; j < e.successors.size(); ++j) {
         if (j > 0) llvm::errs() << ", ";
         llvm::errs() << "0x" << llvm::utohexstr(e.successors[j]);
@@ -2637,7 +2630,7 @@ VMHandlerChainSolver::solveFromHandlerImpl(
     llvm::errs() << "\n";
   }
 
-  last_chain_results_ = results;
+  last_trace_results_ = results;
   return results;
 }
 

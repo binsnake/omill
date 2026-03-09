@@ -4,24 +4,18 @@
 
 namespace omill {
 
-/// Resolves VM handler dispatch targets using binary-extracted handler graph.
+/// Resolves VM handler dispatch targets using emulator-derived flat traces.
 ///
-/// EAC-style VMs compute dispatch targets as `image_base + RVA` where the
-/// image base is loaded from an opaque VM context.  Standard optimization
-/// cannot resolve these because the image base is runtime-variable in the IR.
+/// richardvm dispatch cannot be reconstructed reliably from lifted IR alone:
+/// the target base is `base_delta`, not the PE image base, and merged handlers
+/// select exits from the incoming hash stored in the VM context. This pass
+/// therefore trusts only the concrete trace map produced by VMTraceEmulator.
 ///
-/// This pass bypasses IR analysis entirely: it uses the VMHandlerGraph
-/// (extracted from binary byte pattern scanning) to directly replace opaque
-/// dispatch targets with known constant VAs.
-///
-/// For each function tagged with "omill.vm_handler":
-///   1. Extract the handler's entry VA from its name (sub_<hex>)
-///   2. Look up successor target VAs in the handler graph
-///   3. Find __omill_dispatch_jump / __omill_dispatch_call calls
-///   4. Replace the target operand with the resolved constant VA
-///
-/// After this pass, LowerResolvedDispatchCalls can convert the now-constant
-/// dispatch calls into direct function calls.
+/// For each function tagged with `omill.vm_handler`, the pass looks up the
+/// traced successor VA for that handler and replaces opaque
+/// `__omill_dispatch_jump` targets with a constant VA. `__omill_dispatch_call`
+/// sites are intentionally ignored here because they represent native calls
+/// through the vmexit trampoline, not handler-to-handler dispatch.
 class VMDispatchResolutionPass
     : public llvm::PassInfoMixin<VMDispatchResolutionPass> {
  public:

@@ -78,7 +78,7 @@ TEST_F(ForcedExceptionTest, HandlerInlined) {
   uint64_t handler_data_value = 0x12345678AABBCCDDULL;
   mem_map.addRegion(handler_data_va,
                     reinterpret_cast<const uint8_t *>(&handler_data_value),
-                    sizeof(handler_data_value));
+                    sizeof(handler_data_value), /*read_only=*/true);
 
   // Run pipeline.
   omill::PipelineOptions opts;
@@ -133,7 +133,7 @@ TEST_F(ForcedExceptionTest, HandlerDataChainFolded) {
   uint64_t folded_value = 0xDEADBEEFCAFEBABEULL;
   mem_map.addRegion(handler_data_va,
                     reinterpret_cast<const uint8_t *>(&folded_value),
-                    sizeof(folded_value));
+                    sizeof(folded_value), /*read_only=*/true);
 
   omill::PipelineOptions opts;
   opts.recover_abi = false;
@@ -191,7 +191,7 @@ TEST_F(ForcedExceptionTest, HandlerWithComputation) {
   uint64_t rva_value = 0x1000;
   mem_map.addRegion(handler_data_va,
                     reinterpret_cast<const uint8_t *>(&rva_value),
-                    sizeof(rva_value));
+                    sizeof(rva_value), /*read_only=*/true);
 
   omill::PipelineOptions opts;
   opts.recover_abi = false;
@@ -284,7 +284,7 @@ TEST_F(ForcedExceptionTest, ContextOpaquePredicateFolded) {
   uint64_t payload = 0xCAFEBABE12345678ULL;
   mem_map.addRegion(handler_data_va,
                     reinterpret_cast<const uint8_t *>(&payload),
-                    sizeof(payload));
+                    sizeof(payload), /*read_only=*/true);
 
   // Need interprocedural_const_prop for Phase 3.7 (GVN forwards R8 store),
   // and deobfuscate for Phase 5 (ConstantMemoryFolding resolves [ctx+0xF8]).

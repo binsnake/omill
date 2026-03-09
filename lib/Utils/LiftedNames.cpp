@@ -259,10 +259,14 @@ llvm::BasicBlock *findBlockForPC(llvm::Function &F, uint64_t pc) {
 uint64_t extractEntryVA(llvm::StringRef name) {
   if (!name.starts_with("sub_"))
     return 0;
-  llvm::StringRef hex = name.drop_front(4);
-  auto dot = hex.find('.');
-  if (dot != llvm::StringRef::npos)
-    hex = hex.substr(0, dot);
+  llvm::StringRef rest = name.drop_front(4);
+  size_t hex_len = 0;
+  while (hex_len < rest.size() && llvm::isHexDigit(rest[hex_len]))
+    ++hex_len;
+  if (hex_len == 0)
+    return 0;
+
+  llvm::StringRef hex = rest.substr(0, hex_len);
   uint64_t va = 0;
   if (hex.getAsInteger(16, va))
     return 0;
@@ -270,7 +274,12 @@ uint64_t extractEntryVA(llvm::StringRef name) {
 }
 
 std::string liftedFunctionName(uint64_t va) {
-  return "sub_" + llvm::formatv("{0:x}", va).str();
+  return "sub_" + llvm::utohexstr(va, true);
+}
+
+std::string demergedHandlerCloneName(uint64_t va, uint64_t incoming_hash) {
+  return liftedFunctionName(va) + "__vm_" +
+         llvm::utohexstr(incoming_hash, true);
 }
 
 std::string nativeFunctionName(uint64_t va) {

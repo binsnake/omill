@@ -56,9 +56,9 @@ struct PipelineOptions {
   /// Opt-in; runs late in Phase 4 after ABI recovery.
   bool refine_signatures = false;
 
-  /// VM devirtualization: resolve dispatch targets and eliminate hash integrity
-  /// checks for EAC-style hash-threaded interpreter VMs.  Requires
-  /// VMHandlerGraphAnalysis to be registered.
+  /// VM devirtualization: resolve dispatch targets from emulator-derived flat
+  /// traces for EAC-style hash-dispatch VMs. Requires VMTraceMapAnalysis to be
+  /// registered.
   bool vm_devirtualize = false;
 
   /// When set, per-function pass adaptors in Phases 1–3.5 run only on

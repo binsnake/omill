@@ -16,6 +16,7 @@ add_library(omill STATIC
   Analysis/StateFieldAccessAnalysis.cpp
   Analysis/ExceptionInfo.cpp
   Analysis/SegmentsAA.cpp
+  Analysis/VirtualCalleeRegistry.cpp
 
   # Passes - Stage 2: Intrinsic Lowering
   Passes/LowerRemillIntrinsics.cpp
@@ -26,10 +27,10 @@ add_library(omill STATIC
   Passes/MemoryPointerElimination.cpp
 
   # Passes - Stage 2.5: VM Devirtualization
-  Analysis/VMHandlerGraph.cpp
-  Analysis/VMHandlerChainSolver.cpp
+  Analysis/VMTraceMap.cpp
+  Analysis/VMTraceEmulator.cpp
   Passes/VMDispatchResolution.cpp
-  Passes/VMHashElimination.cpp
+  Passes/VMDeadMergedHandlerElimination.cpp
 
   # Passes - Stage 4: Control Flow Recovery
   Passes/ResolveForcedExceptions.cpp

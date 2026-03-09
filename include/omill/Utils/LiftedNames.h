@@ -37,6 +37,10 @@ uint64_t extractEntryVA(llvm::StringRef name);
 /// Build the canonical lowercase lifted function name for a VA.
 std::string liftedFunctionName(uint64_t va);
 
+/// Build the canonical lowercase demerged handler clone name for a
+/// (handler VA, incoming hash) pair.
+std::string demergedHandlerCloneName(uint64_t va, uint64_t incoming_hash);
+
 /// Build the canonical lowercase native wrapper name for a VA.
 std::string nativeFunctionName(uint64_t va);
 

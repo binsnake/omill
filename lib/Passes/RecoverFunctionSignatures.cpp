@@ -96,12 +96,31 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
       native_ty, llvm::Function::ExternalLinkage, native_name, M);
   native_fn->addFnAttr(llvm::Attribute::MustProgress);
   native_fn->addFnAttr(llvm::Attribute::NoUnwind);
-  // Propagate omill.vm_handler so post-ABI passes can identify VM handler wrappers.
+  // Propagate VM handler metadata so downstream passes preserve exact richardvm
+  // identity across ABI wrapper generation.
   if (lifted_fn->hasFnAttribute("omill.vm_handler"))
     native_fn->addFnAttr("omill.vm_handler");
-  // Propagate omill.vm_wrapper so InlineVMHandlersAndCleanupPass skips it.
   if (lifted_fn->hasFnAttribute("omill.vm_wrapper"))
     native_fn->addFnAttr("omill.vm_wrapper");
+  auto propagateStringAttr = [&](llvm::StringRef name) {
+    auto attr = lifted_fn->getFnAttribute(name);
+    if (attr.isValid() && attr.isStringAttribute())
+      native_fn->addFnAttr(name, attr.getValueAsString());
+  };
+  propagateStringAttr("omill.vm_trace_in_hash");
+  propagateStringAttr("omill.vm_demerged_clone");
+  propagateStringAttr("omill.vm_outlined_virtual_call");
+  propagateStringAttr("omill.vm_helper_hash");
+  propagateStringAttr("omill.vm_helper_caller");
+  propagateStringAttr("omill.vm_virtual_callee_kind");
+  propagateStringAttr("omill.vm_virtual_callee_base");
+  propagateStringAttr("omill.vm_virtual_callee_round");
+  propagateStringAttr("omill.vm_handler_va");
+  propagateStringAttr("omill.vm_trace_hash");
+  if (native_fn->getFnAttribute("omill.vm_demerged_clone").isValid() ||
+      native_fn->getFnAttribute("omill.vm_outlined_virtual_call").isValid()) {
+    native_fn->addFnAttr(llvm::Attribute::NoInline);
+  }
   if (lifted_fn->hasFnAttribute("omill.vm_entry_seed"))
     native_fn->addFnAttr("omill.vm_entry_seed");
   if (lifted_fn->hasFnAttribute("omill.output_root"))

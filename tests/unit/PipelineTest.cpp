@@ -1,4 +1,5 @@
 #include "omill/Omill.h"
+#include "omill/Analysis/VirtualCalleeRegistry.h"
 
 #include <llvm/Analysis/CGSCCPassManager.h>
 #include <llvm/Analysis/LoopAnalysisManager.h>
@@ -520,6 +521,105 @@ TEST_F(PipelineTest, FoldCallsToConstantReturn) {
   EXPECT_FALSE(foundCallToConst)
       << "Call to returns_42 should have been folded to constant";
 }
+
+TEST_F(PipelineTest, AbiPipelineKeepsRegistryMarkedVirtualCalleeOutlined) {
+  auto M = createModule();
+
+  auto *wrapper = createDefinedFunction(*M, "sub_401100__vm_deadbeef_native");
+  wrapper->addFnAttr("omill.vm_handler");
+
+  std::vector<omill::VirtualCalleeRecord> records = {
+      {"sub_401100__vm_deadbeef_native", "sub_401100_native", "caller_native",
+       "hash_resolved", 0xDEADBEEFULL, 1, 0x500000ULL, 0xDEADBEEFULL, false},
+  };
+  omill::setVirtualCalleeRegistryMetadata(*M, records);
+
+  auto *caller = createDefinedFunction(*M, "sub_caller_registry");
+  caller->deleteBody();
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", caller);
+  llvm::IRBuilder<> B(entry);
+  B.CreateCall(wrapper);
+  B.CreateRetVoid();
+
+  setEnv("OMILL_SKIP_ABI_RECOVER_SIGNATURES", "1");
+  setEnv("OMILL_SKIP_ABI_REWRITE_LIFTED_LATE", "1");
+  setEnv("OMILL_SKIP_ABI_DEAD_STATE_STORE_DSE", "1");
+  setEnv("OMILL_SKIP_ABI_GLOBAL_DCE", "1");
+  setEnv("OMILL_SKIP_ABI_FINAL_OPT", "1");
+
+  llvm::ModulePassManager MPM;
+  omill::PipelineOptions opts;
+  omill::buildABIRecoveryPipeline(MPM, opts);
+  runMPM(MPM, *M);
+
+  unsetEnv("OMILL_SKIP_ABI_RECOVER_SIGNATURES");
+  unsetEnv("OMILL_SKIP_ABI_REWRITE_LIFTED_LATE");
+  unsetEnv("OMILL_SKIP_ABI_DEAD_STATE_STORE_DSE");
+  unsetEnv("OMILL_SKIP_ABI_GLOBAL_DCE");
+  unsetEnv("OMILL_SKIP_ABI_FINAL_OPT");
+
+  auto *callerAfter = M->getFunction("sub_caller_registry");
+  ASSERT_NE(callerAfter, nullptr);
+  bool stillCallsWrapper = false;
+  for (auto &BB : *callerAfter) {
+    for (auto &I : BB) {
+      if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I)) {
+        auto *callee = CI->getCalledFunction();
+        if (callee && callee->getName() == "sub_401100__vm_deadbeef_native")
+          stillCallsWrapper = true;
+      }
+    }
+  }
+  EXPECT_TRUE(stillCallsWrapper);
+}
+
+
+TEST_F(PipelineTest, AbiPipelineKeepsDemergedWrapperOutlined) {
+  auto M = createModule();
+
+  auto *wrapper = createDefinedFunction(*M, "sub_401000__vm_abcdef_native");
+  wrapper->addFnAttr("omill.vm_handler");
+  wrapper->addFnAttr("omill.vm_demerged_clone", "1");
+  wrapper->addFnAttr("omill.vm_outlined_virtual_call", "1");
+  auto *caller = createDefinedFunction(*M, "sub_caller");
+  caller->deleteBody();
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", caller);
+  llvm::IRBuilder<> B(entry);
+  B.CreateCall(wrapper);
+  B.CreateRetVoid();
+
+  setEnv("OMILL_SKIP_ABI_RECOVER_SIGNATURES", "1");
+  setEnv("OMILL_SKIP_ABI_REWRITE_LIFTED_LATE", "1");
+  setEnv("OMILL_SKIP_ABI_DEAD_STATE_STORE_DSE", "1");
+  setEnv("OMILL_SKIP_ABI_GLOBAL_DCE", "1");
+  setEnv("OMILL_SKIP_ABI_FINAL_OPT", "1");
+
+  llvm::ModulePassManager MPM;
+  omill::PipelineOptions opts;
+  omill::buildABIRecoveryPipeline(MPM, opts);
+  runMPM(MPM, *M);
+
+  unsetEnv("OMILL_SKIP_ABI_RECOVER_SIGNATURES");
+  unsetEnv("OMILL_SKIP_ABI_REWRITE_LIFTED_LATE");
+  unsetEnv("OMILL_SKIP_ABI_DEAD_STATE_STORE_DSE");
+  unsetEnv("OMILL_SKIP_ABI_GLOBAL_DCE");
+  unsetEnv("OMILL_SKIP_ABI_FINAL_OPT");
+
+  auto *callerAfter = M->getFunction("sub_caller");
+  ASSERT_NE(callerAfter, nullptr);
+  bool stillCallsWrapper = false;
+  for (auto &BB : *callerAfter) {
+    for (auto &I : BB) {
+      if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I)) {
+        auto *callee = CI->getCalledFunction();
+        if (callee && callee->getName() == "sub_401000__vm_abcdef_native")
+          stillCallsWrapper = true;
+      }
+    }
+  }
+  EXPECT_TRUE(stillCallsWrapper);
+}
+
 
 // ===----------------------------------------------------------------------===
 // GlobalDCE removes dead internalized functions

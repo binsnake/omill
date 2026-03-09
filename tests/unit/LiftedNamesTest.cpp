@@ -70,6 +70,17 @@ TEST_F(LiftedNamesTest, ExtractEntryVA_DotSuffix) {
   EXPECT_EQ(omill::extractEntryVA("sub_DEAD.i"), 0xDEADULL);
 }
 
+TEST_F(LiftedNamesTest, ExtractEntryVA_DemergedCloneSuffix) {
+  EXPECT_EQ(omill::extractEntryVA("sub_180001000__vm_abcdef"),
+            0x180001000ULL);
+}
+
+TEST_F(LiftedNamesTest, DemergedHandlerCloneName_IsCanonical) {
+  EXPECT_EQ(omill::demergedHandlerCloneName(0x180001000ULL, 0xABCDEFULL),
+            "sub_180001000__vm_abcdef");
+}
+
+
 // ===----------------------------------------------------------------------===
 // extractBlockPC
 // ===----------------------------------------------------------------------===

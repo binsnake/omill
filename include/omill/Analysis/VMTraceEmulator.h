@@ -27,32 +27,36 @@ struct NativeCallInfo {
 
 class BinaryMemoryMap;
 
-/// Concrete x86-64 emulator that walks VM handler chains to resolve dispatch
-/// targets statically.
+/// Concrete x86-64 emulator for the EasyAntiCheat hash-dispatch VM.
 ///
-/// EAC-style VMs use hash-threaded dispatch: each handler computes the next
-/// handler's address through complex arithmetic on a hash accumulator
-/// ([r12+0x190]), RVA constants, and an image base delta ([r12+0xE0]).  The
-/// hash accumulator is initialized by the entry wrapper and updated
-/// deterministically by each handler, making the entire chain statically
-/// solvable via concrete execution.
-///
-/// The solver embeds a lightweight x86-64 emulator that handles the ~20
-/// instruction forms used in VM handlers (integer arithmetic, comparisons,
-/// conditional sets, memory load/store to vmcontext/stack).
-class VMHandlerChainSolver {
+/// The architecture is flat and trace-driven: a wrapper seeds [r12+0x190] with
+/// an incoming hash, dispatches into a merged handler body, and the handler's
+/// MBA-obfuscated hash selection deterministically chooses one outgoing path for
+/// that specific hash. This emulator follows that concrete path and records the
+/// resulting handler-to-handler trace without relying on IR hash elimination or
+/// byte-pattern graph recovery.
+class VMTraceEmulator {
  public:
-  /// A single resolved handler in the chain.
-  struct ChainEntry {
+  /// One concrete handler step in a flat trace.
+  struct TraceEntry {
     uint64_t handler_va = 0;
+    uint64_t incoming_hash = 0;
+    uint64_t outgoing_hash = 0;
+    uint64_t exit_target_va = 0;
+    uint64_t native_target_va = 0;
 
-    /// Resolved successor handler VAs (1 for linear, 2 for conditional).
+    /// Resolved successor handler VAs (normally one, occasionally two when the
+    /// traced exit fans out into a trampoline-driven continuation).
     llvm::SmallVector<uint64_t, 2> successors;
 
-    /// True if this handler dispatches to the VM exit function.
+    /// True if execution passed through the vmexit trampoline while producing
+    /// this entry's final outcome (native call, terminal exit, or re-entry).
+    bool passed_vmexit = false;
+
+    /// True if this handler exits the VM without a traced successor handler.
     bool is_vmexit = false;
 
-    /// True if the emulator hit an error (unhandled instruction, etc.).
+    /// True if the emulator hit an unsupported instruction or unresolved exit.
     bool is_error = false;
   };
 
@@ -60,75 +64,63 @@ class VMHandlerChainSolver {
   /// \param image_base PE image base address.
   /// \param vmenter_va VA of the VM entry function (context save).
   /// \param vmexit_va  VA of the VM exit function (context restore).
-  VMHandlerChainSolver(const BinaryMemoryMap &mem, uint64_t image_base,
-                       uint64_t vmenter_va, uint64_t vmexit_va);
+  VMTraceEmulator(const BinaryMemoryMap &mem, uint64_t image_base,
+                  uint64_t vmenter_va, uint64_t vmexit_va);
 
-  /// Solve the handler chain starting from a VM entry wrapper function.
+  /// Trace starting from a VM entry wrapper function.
   ///
-  /// The wrapper is expected to have the structure:
-  ///   lea rsp, [rsp-N]
-  ///   call <vmentry>
-  ///   <jmp to handler preamble>
-  ///   mov rax, <hash_constant>
-  ///   mov [r12+0x190], rax
-  ///   mov eax, <first_rva>
-  ///   add rax, [r12+0xE0]
-  ///   jmp rax
-  ///
-  /// Returns the list of all discovered handlers in BFS order.
-  std::vector<ChainEntry> solveFromWrapper(uint64_t wrapper_va);
+  /// The wrapper is expected to seed the hash and dispatch through the
+  /// hash-dispatch preamble described in VM_ARCHITECTURE.md.
+  std::vector<TraceEntry> traceFromWrapper(uint64_t wrapper_va);
 
-  /// Solve starting from a wrapper with caller-provided vmcontext contents.
+  /// Trace from a wrapper with caller-provided vmcontext contents.
   /// The snapshot is copied into synthetic memory at syntheticVMContextBase().
-  std::vector<ChainEntry> solveFromWrapperWithSnapshot(
+  std::vector<TraceEntry> traceFromWrapperWithSnapshot(
       uint64_t wrapper_va, const std::vector<uint8_t> &vmcontext_snapshot);
 
-  /// Solve from a wrapper with caller-provided vmcontext contents while
+  /// Trace from a wrapper with caller-provided vmcontext contents while
   /// overriding the initial hash accumulator value.
-  std::vector<ChainEntry> solveFromWrapperWithSnapshotAndHash(
+  std::vector<TraceEntry> traceFromWrapperWithSnapshotAndHash(
       uint64_t wrapper_va, const std::vector<uint8_t> &vmcontext_snapshot,
       uint64_t initial_hash);
 
-  /// Solve starting from a known handler VA with an explicit initial
-  /// vmcontext state (delta and hash already known).
-  std::vector<ChainEntry> solveFromHandler(uint64_t handler_va,
-                                           uint64_t delta,
+  /// Trace from a known handler VA with an explicit initial vmcontext state
+  /// (delta and hash already known).
+  std::vector<TraceEntry> traceFromHandler(uint64_t handler_va, uint64_t delta,
                                            uint64_t initial_hash);
 
-  /// Solve from a known handler using caller-provided vmcontext contents
-  /// while overriding the initial hash accumulator value.
-  std::vector<ChainEntry> solveFromHandlerWithSnapshot(
+  /// Trace from a known handler using caller-provided vmcontext contents while
+  /// overriding the initial hash accumulator value.
+  std::vector<TraceEntry> traceFromHandlerWithSnapshot(
       uint64_t handler_va, uint64_t delta, uint64_t initial_hash,
       const std::vector<uint8_t> &vmcontext_snapshot);
 
-  /// All unique handler VAs discovered across all solve calls.
+  /// All unique handler VAs discovered across all trace calls.
   const std::vector<uint64_t> &discoveredHandlers() const {
     return discovered_handlers_;
   }
 
-  /// Chain entries from the last solveFromWrapper/solveFromHandler call.
-  /// Includes the wrapper→first_handler entry when called via
-  /// solveFromWrapper.
-  const std::vector<ChainEntry> &chainEntries() const {
-    return last_chain_results_;
+  /// Entries from the last traceFromWrapper/traceFromHandler call.
+  /// Includes the wrapper -> first handler mapping when tracing from a wrapper.
+  const std::vector<TraceEntry> &traceEntries() const {
+    return last_trace_results_;
   }
 
-  /// Native function VAs called through the vmexit→call→vmentry pattern.
-  /// Discovered during chain solving — these are functions the VM handlers
-  /// call through temporary VM exit, not VM handlers themselves.
   uint64_t lastDelta() const { return last_delta_; }
 
+  /// Native function VAs called through the vmexit -> call [rsp+8] -> vmentry
+  /// trampoline pattern.
   const std::vector<uint64_t> &nativeCallTargets() const {
     return native_call_targets_;
   }
 
   /// Per-callsite native call info with emulator state snapshots.
-  /// Ordered by encounter during BFS (NOT deduplicated by target VA).
+  /// Ordered by encounter during tracing (NOT deduplicated by target VA).
   const std::vector<NativeCallInfo> &nativeCallInfos() const {
     return native_call_infos_;
   }
 
-  /// Set maximum number of handlers to solve before giving up.
+  /// Set maximum number of handlers to trace before giving up.
   void setMaxHandlers(unsigned max) { max_handlers_ = max; }
 
   /// Set maximum emulation steps per handler.
@@ -146,9 +138,9 @@ class VMHandlerChainSolver {
  private:
   /// Parse a VM entry wrapper to extract initial state.
   struct WrapperInfo {
-    uint64_t delta = 0;           ///< Image base delta from vmentry sub-func.
+    uint64_t delta = 0;           ///< base_delta from the vmenter helper.
     uint64_t initial_hash = 0;    ///< Constant stored to [r12+0x190].
-    uint64_t first_handler_va = 0;///< First handler's VA.
+    uint64_t first_handler_va = 0;///< First handler VA after thunk following.
     std::vector<uint8_t> vmcontext_snapshot; ///< Wrapper-seeded vmctx bytes.
     bool valid = false;
   };
@@ -157,13 +149,11 @@ class VMHandlerChainSolver {
       uint64_t wrapper_va,
       const std::vector<uint8_t> *initial_vmcontext_snapshot = nullptr);
 
-  std::vector<ChainEntry> solveFromHandlerImpl(
+  std::vector<TraceEntry> traceFromHandlerImpl(
       uint64_t handler_va, uint64_t delta, uint64_t initial_hash,
       const std::vector<uint8_t> *vmcontext_snapshot);
 
-  /// Compute the delta value from the vmentry sub-function.
-  /// The sub-function pattern: push rax; push rbx; mov rax, <const>;
-  /// mov rbx, [rsp+10h]; lea rbx, [rbx+rax]; store; pop; pop; ret
+  /// Compute the base_delta value from the vmentry helper sub-function.
   std::optional<uint64_t> computeDelta(uint64_t subfunc_va,
                                        uint64_t return_addr);
 
@@ -175,7 +165,7 @@ class VMHandlerChainSolver {
   uint64_t image_base_;
   uint64_t vmenter_va_;
   uint64_t vmexit_va_;
-  uint64_t true_vmexit_va_ = 0;  ///< Auto-detected vmexit (past delta computer).
+  uint64_t true_vmexit_va_ = 0;  ///< Auto-detected vmexit (past delta helper).
 
   uint64_t handler_seg_start_ = 0;
   uint64_t handler_seg_end_ = UINT64_MAX;
@@ -186,15 +176,15 @@ class VMHandlerChainSolver {
   std::vector<uint64_t> discovered_handlers_;
   llvm::DenseSet<uint64_t> discovered_set_;
 
-  /// Native call targets discovered via vmexit→call→vmentry pattern.
+  /// Native call targets discovered via vmexit -> call -> vmentry.
   std::vector<uint64_t> native_call_targets_;
   llvm::DenseSet<uint64_t> native_call_set_;
 
   /// Per-callsite native call info (ordered, not deduplicated).
   std::vector<NativeCallInfo> native_call_infos_;
 
-  /// Stored results from the last solve call (for mergeChainResults).
-  std::vector<ChainEntry> last_chain_results_;
+  /// Stored results from the last trace call (for VMTraceMap).
+  std::vector<TraceEntry> last_trace_results_;
 
   /// Delta value from the last parseEntryWrapper call.
   uint64_t last_delta_ = 0;

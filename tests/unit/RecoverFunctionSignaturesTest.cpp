@@ -192,4 +192,98 @@ TEST_F(RecoverFunctionSignaturesTest, VoidReturnWrapper) {
   EXPECT_EQ(native_fn->getFunctionType()->getNumParams(), 1u);
 }
 
+TEST_F(RecoverFunctionSignaturesTest, PropagatesDemergedVmAttributesToNativeWrapper) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *state_ty = llvm::StructType::create(Ctx, "struct.State");
+  auto *arr_ty = llvm::ArrayType::get(llvm::Type::getInt8Ty(Ctx), 3504);
+  state_ty->setBody({arr_ty});
+
+  auto *bb_fn_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *bb_fn = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "__remill_basic_block", *M);
+  auto *bb_entry = llvm::BasicBlock::Create(Ctx, "entry", bb_fn);
+  llvm::IRBuilder<> BBB(bb_entry);
+  auto *bb_state = bb_fn->getArg(0);
+  BBB.CreateConstGEP1_64(BBB.getInt8Ty(), bb_state, 0, "RAX");
+  BBB.CreateConstGEP1_64(BBB.getInt8Ty(), bb_state, 16, "RCX");
+  BBB.CreateRet(bb_fn->getArg(2));
+
+  auto *fn_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *test_fn = llvm::Function::Create(
+      fn_ty, llvm::Function::ExternalLinkage, "sub_401000__vm_abcdef", *M);
+  test_fn->addFnAttr("omill.vm_handler");
+  test_fn->addFnAttr("omill.vm_demerged_clone", "1");
+  test_fn->addFnAttr("omill.vm_outlined_virtual_call", "1");
+  test_fn->addFnAttr("omill.vm_trace_in_hash", "abcdef");
+  test_fn->addFnAttr("omill.vm_helper_hash", "abcdef");
+  test_fn->addFnAttr("omill.vm_handler_va", "401000");
+  test_fn->addFnAttr("omill.vm_trace_hash", "abcdef");
+  test_fn->addFnAttr("omill.vm_helper_caller", "caller_native");
+  test_fn->addFnAttr("omill.vm_virtual_callee_kind", "hash_resolved");
+  test_fn->addFnAttr("omill.vm_virtual_callee_base", "sub_401000_native");
+  test_fn->addFnAttr("omill.vm_virtual_callee_round", "2");
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", test_fn);
+  llvm::IRBuilder<> B(entry);
+  B.CreateRet(test_fn->getArg(2));
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+
+  llvm::ModulePassManager MPM;
+  MPM.addPass(omill::RecoverFunctionSignaturesPass());
+  MPM.run(*M, MAM);
+
+  auto *native_fn = M->getFunction("sub_401000__vm_abcdef_native");
+  ASSERT_NE(native_fn, nullptr);
+  EXPECT_TRUE(native_fn->hasFnAttribute("omill.vm_handler"));
+  EXPECT_TRUE(native_fn->getFnAttribute("omill.vm_demerged_clone").isValid());
+  EXPECT_TRUE(
+      native_fn->getFnAttribute("omill.vm_outlined_virtual_call").isValid());
+  EXPECT_TRUE(native_fn->hasFnAttribute(llvm::Attribute::NoInline));
+  auto hash_attr = native_fn->getFnAttribute("omill.vm_trace_in_hash");
+  ASSERT_TRUE(hash_attr.isValid());
+  EXPECT_EQ(hash_attr.getValueAsString(), "abcdef");
+  auto helper_hash_attr = native_fn->getFnAttribute("omill.vm_helper_hash");
+  ASSERT_TRUE(helper_hash_attr.isValid());
+  EXPECT_EQ(helper_hash_attr.getValueAsString(), "abcdef");
+  auto helper_caller_attr = native_fn->getFnAttribute("omill.vm_helper_caller");
+  ASSERT_TRUE(helper_caller_attr.isValid());
+  EXPECT_EQ(helper_caller_attr.getValueAsString(), "caller_native");
+  auto kind_attr = native_fn->getFnAttribute("omill.vm_virtual_callee_kind");
+  ASSERT_TRUE(kind_attr.isValid());
+  EXPECT_EQ(kind_attr.getValueAsString(), "hash_resolved");
+  auto base_attr = native_fn->getFnAttribute("omill.vm_virtual_callee_base");
+  ASSERT_TRUE(base_attr.isValid());
+  EXPECT_EQ(base_attr.getValueAsString(), "sub_401000_native");
+  auto round_attr = native_fn->getFnAttribute("omill.vm_virtual_callee_round");
+  ASSERT_TRUE(round_attr.isValid());
+  EXPECT_EQ(round_attr.getValueAsString(), "2");
+  auto handler_va_attr = native_fn->getFnAttribute("omill.vm_handler_va");
+  ASSERT_TRUE(handler_va_attr.isValid());
+  EXPECT_EQ(handler_va_attr.getValueAsString(), "401000");
+  auto trace_hash_attr = native_fn->getFnAttribute("omill.vm_trace_hash");
+  ASSERT_TRUE(trace_hash_attr.isValid());
+  EXPECT_EQ(trace_hash_attr.getValueAsString(), "abcdef");
+}
+
+
 }  // namespace

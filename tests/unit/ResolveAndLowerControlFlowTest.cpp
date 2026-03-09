@@ -196,6 +196,38 @@ TEST_F(ResolveAndLowerControlFlowTest, ConstantDispatchJump_BecomesBranch) {
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
 }
 
+TEST_F(ResolveAndLowerControlFlowTest, PtrToIntDispatchJump_BecomesDirectCall) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(kDataLayout);
+
+  createDispatchJumpDecl(*M);
+
+  auto *target_fn =
+      llvm::Function::Create(liftedFnType(), llvm::Function::InternalLinkage,
+                             "sub_402000__vm_1111", *M);
+  auto *target_entry = llvm::BasicBlock::Create(Ctx, "entry", target_fn);
+  llvm::IRBuilder<>(target_entry).CreateRet(target_fn->getArg(2));
+
+  auto *F = llvm::Function::Create(liftedFnType(),
+                                   llvm::Function::ExternalLinkage,
+                                   "sub_401000", *M);
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  llvm::IRBuilder<> B(entry);
+  auto *dispatch = M->getFunction("__omill_dispatch_jump");
+  auto *target_ptr = B.CreatePtrToInt(target_fn, B.getInt64Ty());
+  auto *result = B.CreateCall(dispatch, {F->getArg(0), target_ptr, F->getArg(2)});
+  B.CreateRet(result);
+
+  EXPECT_EQ(1u, countDispatchJumps(F));
+
+  runResolvePass(M.get());
+
+  EXPECT_EQ(0u, countDispatchJumps(F));
+  EXPECT_TRUE(hasDirectCallTo(F, "sub_402000__vm_1111"));
+  EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+}
+
+
 // dispatch_jump with dynamic (non-constant) target → preserved.
 TEST_F(ResolveAndLowerControlFlowTest, NonConstantDispatch_Preserved) {
   auto M = std::make_unique<llvm::Module>("test", Ctx);

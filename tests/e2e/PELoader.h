@@ -74,7 +74,12 @@ inline bool loadPE(llvm::StringRef path, PEInfo &out) {
         reinterpret_cast<const uint8_t *>(contents.data()) + contents.size());
     auto &stored = out.section_storage.back();
 
-    out.memory_map.addRegion(va, stored.data(), stored.size());
+    // Sections without IMAGE_SCN_MEM_WRITE are immutable at runtime.
+    const llvm::object::coff_section *coff_sec = coff.getCOFFSection(sec);
+    bool read_only = !coff_sec ||
+                     !(coff_sec->Characteristics &
+                       llvm::COFF::IMAGE_SCN_MEM_WRITE);
+    out.memory_map.addRegion(va, stored.data(), stored.size(), read_only);
 
     if (name == ".text") {
       out.text_base = va;

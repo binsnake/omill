@@ -20,6 +20,7 @@
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/ModuleUtils.h>
 
+#include "omill/Analysis/VirtualCalleeRegistry.h"
 #include "omill/Utils/LiftedNames.h"
 
 namespace omill {
@@ -145,7 +146,8 @@ void collectCallTargets(
 /// Identify VM handler candidates: small functions called from multiple
 /// sites within lifted functions.
 llvm::SmallVector<llvm::Function *, 16> identifyHandlers(
-    llvm::Module &M, unsigned max_instrs, unsigned min_callsites) {
+    llvm::Module &M, const VirtualCalleeRegistry *virtual_callees,
+    unsigned max_instrs, unsigned min_callsites) {
   bool has_tagged_handlers = false;
   for (auto &F : M) {
     if (!F.isDeclaration() && F.hasFnAttribute("omill.vm_handler")) {
@@ -182,7 +184,7 @@ llvm::SmallVector<llvm::Function *, 16> identifyHandlers(
       continue;
 
     // Skip if function is too large to be a handler, UNLESS it's
-    // explicitly tagged by the chain solver — those are known VM handlers
+    // explicitly tagged by the trace emulator — those are known VM handlers
     // that must be inlined regardless of size.
     unsigned size = countMeaningfulInstructions(*func);
     if (size > max_instrs && !func->hasFnAttribute("omill.vm_handler"))
@@ -190,17 +192,20 @@ llvm::SmallVector<llvm::Function *, 16> identifyHandlers(
 
     // Skip functions that are lifted (sub_*) — those are real functions,
     // not VM handlers — UNLESS they're explicitly tagged as vm_handler
-    // by the chain solver (in which case they ARE handler bodies to inline).
+    // by the trace emulator (in which case they ARE handler bodies to inline).
     if (isLiftedFunction(*func) &&
         !func->hasFnAttribute("omill.vm_handler"))
       continue;
 
     // The VM wrapper is a boundary function: handlers get inlined INTO it,
     // but it must NOT be inlined into its callers (e.g. DriverEntry).
-    // Excluding it from handler_set means VMHandlerInlinerPass won't
-    // collect inline sites targeting it, while still allowing handler_set
-    // members called FROM the wrapper to be inlined into it.
-    if (func->hasFnAttribute("omill.vm_wrapper"))
+    // Demerged clones and outlined virtual-call wrappers are also boundaries:
+    // they represent recovered per-call/per-hash functions that must stay
+    // callable for further optimization.
+    if (func->hasFnAttribute("omill.vm_wrapper") ||
+        func->getFnAttribute("omill.vm_demerged_clone").isValid() ||
+        func->getFnAttribute("omill.vm_outlined_virtual_call").isValid() ||
+        (virtual_callees && virtual_callees->lookup(func->getName()).has_value()))
       continue;
 
     handlers.push_back(func);
@@ -212,9 +217,10 @@ llvm::SmallVector<llvm::Function *, 16> identifyHandlers(
 }  // namespace
 
 llvm::PreservedAnalyses VMHandlerInlinerPass::run(
-    llvm::Module &M, llvm::ModuleAnalysisManager &) {
-  auto handlers =
-      identifyHandlers(M, max_handler_instrs_, min_callsites_);
+    llvm::Module &M, llvm::ModuleAnalysisManager &MAM) {
+  auto &virtual_callees = MAM.getResult<VirtualCalleeRegistryAnalysis>(M);
+  auto handlers = identifyHandlers(M, &virtual_callees, max_handler_instrs_,
+                                   min_callsites_);
 
   if (handlers.empty())
     return llvm::PreservedAnalyses::all();
@@ -309,9 +315,9 @@ llvm::PreservedAnalyses VMHandlerInlinerPass::run(
     if (!F->use_empty())
       continue;
 
-    // VM handlers tagged by the chain solver are implementation details
+    // VM handlers tagged by the trace emulator are implementation details
     // that should always be cleaned up after inlining, regardless of
-    // linkage.  Non-tagged handlers respect the original linkage guard.
+    // linkage. Non-tagged handlers respect the original linkage guard.
     if (F->hasFnAttribute("omill.vm_handler") || !F->hasExternalLinkage()) {
       F->eraseFromParent();
     }

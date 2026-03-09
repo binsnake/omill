@@ -52,10 +52,12 @@
 #include "omill/Analysis/CallGraphAnalysis.h"
 #include "omill/Analysis/ExceptionInfo.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
-#include "omill/Analysis/VMHandlerChainSolver.h"
-#include "omill/Analysis/VMHandlerGraph.h"
+#include "omill/Analysis/VMTraceEmulator.h"
+#include "omill/Analysis/VMTraceMap.h"
+#include "omill/Analysis/VirtualCalleeRegistry.h"
 #include "omill/Omill.h"
 #include "omill/Tools/LiftRunContract.h"
+#include "omill/Utils/LiftedNames.h"
 #include "omill/Utils/StateFieldMap.h"
 
 #include <algorithm>
@@ -195,6 +197,12 @@ static cl::opt<std::string> VMWrapper(
     cl::desc("VM entry wrapper VA (hex).  If omitted, defaults to --va.  "
              "Specify this when --va points to an outer function (e.g. "
              "DriverEntry) that calls the wrapper through a thunk."));
+
+static cl::opt<std::string> VMTraceJSON(
+    "vm-trace-json",
+    cl::desc("Path to an external VMTraceRecord JSON file (e.g. from "
+             "eac_vm_tracer.py).  Populates the VMTraceMap analysis from "
+             "pre-computed trace data instead of running the built-in emulator."));
 
 static cl::opt<bool> OmillTimePasses(
     "omill-time-passes",
@@ -1167,6 +1175,106 @@ std::vector<uint64_t> parseDeobfTargets(StringRef path) {
   return vas;
 }
 
+/// Parse an external VMTraceRecord JSON file (e.g. from eac_vm_tracer.py)
+/// and populate a VMTraceMap.
+//
+/// Expected JSON schema:
+///   {
+///     "vmenter_va": "0x...",
+///     "vmexit_va":  "0x...",
+///     "records": [
+///       {
+///         "handler_va":       "0x...",
+///         "incoming_hash":    "0x...",
+///         "outgoing_hash":    "0x...",
+///         "exit_target_va":   "0x...",
+///         "native_target_va": "0x...",
+///         "successors":       ["0x..."],
+///         "passed_vmexit":    bool,
+///         "is_vmexit":        bool,
+///         "is_error":         bool
+///       }
+///     ]
+///   }
+std::shared_ptr<omill::VMTraceMap>
+parseExternalVMTrace(StringRef path) {
+  auto buf = MemoryBuffer::getFile(path);
+  if (!buf) {
+    errs() << "Cannot open VM trace JSON " << path << ": "
+           << buf.getError().message() << "\n";
+    return nullptr;
+  }
+  auto parsed = json::parse((*buf)->getBuffer());
+  if (!parsed) {
+    errs() << "VM trace JSON parse error: "
+           << toString(parsed.takeError()) << "\n";
+    return nullptr;
+  }
+  auto *root = parsed->getAsObject();
+  if (!root) {
+    errs() << "Expected JSON object at root of VM trace\n";
+    return nullptr;
+  }
+
+  auto parseHex = [](std::optional<StringRef> s) -> uint64_t {
+    if (!s) return 0;
+    StringRef sr = *s;
+    if (sr.starts_with("0x") || sr.starts_with("0X"))
+      sr = sr.drop_front(2);
+    uint64_t val = 0;
+    sr.getAsInteger(16, val);
+    return val;
+  };
+
+  uint64_t vmenter = parseHex(root->getString("vmenter_va"));
+  uint64_t vmexit  = parseHex(root->getString("vmexit_va"));
+  auto graph = std::make_shared<omill::VMTraceMap>(vmenter, vmexit);
+
+  auto *records = root->getArray("records");
+  if (!records) {
+    errs() << "No 'records' array in VM trace JSON\n";
+    return nullptr;
+  }
+
+  unsigned imported = 0;
+  for (const auto &item : *records) {
+    auto *obj = item.getAsObject();
+    if (!obj) continue;
+
+    omill::VMTraceRecord rec;
+    rec.handler_va       = parseHex(obj->getString("handler_va"));
+    rec.incoming_hash    = parseHex(obj->getString("incoming_hash"));
+    rec.outgoing_hash    = parseHex(obj->getString("outgoing_hash"));
+    rec.exit_target_va   = parseHex(obj->getString("exit_target_va"));
+    rec.native_target_va = parseHex(obj->getString("native_target_va"));
+    rec.passed_vmexit    = obj->getBoolean("passed_vmexit").value_or(false);
+    rec.is_vmexit        = obj->getBoolean("is_vmexit").value_or(false);
+    rec.is_error         = obj->getBoolean("is_error").value_or(false);
+
+    if (auto *succs = obj->getArray("successors")) {
+      for (const auto &sv : *succs) {
+        if (auto ss = sv.getAsString()) {
+          uint64_t succ = 0;
+          StringRef sr = *ss;
+          if (sr.starts_with("0x") || sr.starts_with("0X"))
+            sr = sr.drop_front(2);
+          sr.getAsInteger(16, succ);
+          if (succ) rec.successors.push_back(succ);
+        }
+      }
+    }
+
+    if (rec.handler_va == 0) continue;
+    graph->recordTrace(std::move(rec));
+    ++imported;
+  }
+
+  errs() << "VMTraceMap: imported " << imported << " records from "
+         << path << " (vmenter=0x" << utohexstr(vmenter)
+         << " vmexit=0x" << utohexstr(vmexit) << ")\n";
+  return graph;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -1801,22 +1909,81 @@ int main(int argc, char **argv) {
   errs() << "Lifting complete\n";
   events.emitInfo("lifting_completed", "lifting complete");
 
-  // VM mode: use chain solver to discover handlers reachable from the entry
-  // wrapper, then lift only those.  No byte-pattern bulk scan — further
+  // VM mode: use the trace emulator to discover handlers reachable from the
+  // entry wrapper, then lift only those. No byte-pattern bulk scan — further
   // targets are discovered naturally by the pipeline's iterative resolution.
-  std::shared_ptr<omill::VMHandlerGraph> vm_graph;
+  std::shared_ptr<omill::VMTraceMap> vm_graph;
   std::vector<omill::NativeCallInfo> native_call_infos;
   if (vm_mode && !RawBinary) {
-    // Start with metadata-only graph — no byte-pattern scanning.
-    vm_graph = std::make_shared<omill::VMHandlerGraph>(
-        pe.image_base, vm_entry_va, vm_exit_va);
+    vm_graph = std::make_shared<omill::VMTraceMap>(vm_entry_va, vm_exit_va);
 
-    // Run chain solver to discover handler chains via concrete emulation.
-    std::vector<uint64_t> chain_handler_vas;
+    struct VMTraceLiftKey {
+      uint64_t handler_va = 0;
+      uint64_t incoming_hash = 0;
+    };
+
+    std::vector<VMTraceLiftKey> trace_work_items;
     std::vector<uint64_t> native_call_vas;
-    {
-      omill::VMHandlerChainSolver solver(pe.memory_map, pe.image_base,
-                                         vm_entry_va, vm_exit_va);
+    llvm::DenseSet<uint64_t> seen_vm_trace_work;
+    llvm::DenseMap<uint64_t, llvm::SmallVector<uint64_t, 2>>
+        handler_trace_hashes;
+
+    // Demerging must preserve distinct incoming hashes for the same handler VA.
+    // Deduplicating only on handler_va would collapse merged ops back together
+    // before clone generation even begins, so the lift worklist is keyed by
+    // (handler_va, incoming_hash).
+    auto recordTraceWorkItem = [&](uint64_t handler_va, uint64_t incoming_hash) {
+      uint64_t key = incoming_hash ^
+                     (handler_va + 0x9E3779B97F4A7C15ull +
+                      (incoming_hash << 6) + (incoming_hash >> 2));
+      if (seen_vm_trace_work.insert(key).second)
+        trace_work_items.push_back({handler_va, incoming_hash});
+
+      auto &hashes = handler_trace_hashes[handler_va];
+      if (std::find(hashes.begin(), hashes.end(), incoming_hash) == hashes.end())
+        hashes.push_back(incoming_hash);
+    };
+    auto rememberFlatTrace = [&](const auto &records) {
+      for (const auto &record : records)
+        recordTraceWorkItem(record.handler_va, record.incoming_hash);
+    };
+
+    auto rememberRawTrace = [&](const auto &entries) {
+      for (const auto &entry : entries)
+        recordTraceWorkItem(entry.handler_va, entry.incoming_hash);
+    };
+
+    auto tagExactTraceHash = [&](llvm::Function &F, uint64_t handler_va) {
+      auto it = handler_trace_hashes.find(handler_va);
+      if (it == handler_trace_hashes.end() || it->second.size() != 1) {
+        F.removeFnAttr("omill.vm_trace_in_hash");
+        return;
+      }
+      F.addFnAttr("omill.vm_trace_in_hash",
+                  llvm::utohexstr(it->second.front()));
+    };
+    // --- Populate vm_graph and trace_work_items from either external JSON
+    //     or the built-in emulator. ---
+    if (VMTraceJSON.getNumOccurrences()) {
+      // External trace: load pre-computed VMTraceRecords from JSON.
+      auto ext_graph = parseExternalVMTrace(VMTraceJSON);
+      if (!ext_graph)
+        return fail(1, "failed to parse --vm-trace-json");
+      vm_graph = std::move(ext_graph);
+
+      // Populate lift work items from the imported trace records.
+      for (const auto &handler_va : vm_graph->handlerEntries()) {
+        auto records = vm_graph->getTraceRecords(handler_va);
+        for (const auto &rec : records)
+          recordTraceWorkItem(rec.handler_va, rec.incoming_hash);
+      }
+      events.emitInfo("vm_trace_imported", "external VM trace loaded",
+                      {{"records",
+                        static_cast<int64_t>(trace_work_items.size())},
+                       {"source", VMTraceJSON.getValue()}});
+    } else {
+      omill::VMTraceEmulator solver(pe.memory_map, pe.image_base,
+                                    vm_entry_va, vm_exit_va);
 
       // Set the handler segment range (seg006 bounds).
       uint64_t seg_start = vm_entry_va;
@@ -1830,33 +1997,46 @@ int main(int argc, char **argv) {
           });
       solver.setHandlerSegmentRange(seg_start, seg_end);
 
-      // Solve from the entry wrapper.  Use vm_wrapper_va (which defaults to
+      // Trace from the entry wrapper. Use vm_wrapper_va (which defaults to
       // func_va) so that --vm-wrapper can point to the actual lea/call pattern
       // even when --va is an outer function like DriverEntry.
-      auto chain = solver.solveFromWrapper(vm_wrapper_va);
-      if (!chain.empty()) {
-        vm_graph->mergeChainResults(solver);
-        events.emitInfo("vm_chain_solved", "vm handler chain solved",
-                        {{"handlers", static_cast<int64_t>(chain.size())}});
-        for (auto &entry : chain)
-          chain_handler_vas.push_back(entry.handler_va);
-      }
-
-      // Solve from additional auto-detected wrappers.
-      for (size_t wi = 1; wi < auto_detected_wrappers.size(); ++wi) {
-        uint64_t extra_wrapper = auto_detected_wrappers[wi].second;
-        auto extra_chain = solver.solveFromWrapper(extra_wrapper);
-        if (!extra_chain.empty()) {
-          vm_graph->mergeChainResults(solver);
-          for (auto &entry : extra_chain)
-            chain_handler_vas.push_back(entry.handler_va);
+      auto trace = solver.traceFromWrapper(vm_wrapper_va);
+      if (!trace.empty()) {
+        vm_graph->mergeTraceResults(solver);
+        auto flat =
+            vm_graph->followFlatTrace(vm_wrapper_va, trace.front().incoming_hash);
+        events.emitInfo("vm_trace_built", "vm flat trace built",
+                        {{"handlers", static_cast<int64_t>(flat.records.empty()
+                                                           ? trace.size()
+                                                           : flat.records.size())},
+                         {"complete", flat.completed() ? int64_t{1} : int64_t{0}}});
+        if (!flat.records.empty()) {
+          rememberFlatTrace(flat.records);
+        } else {
+          rememberRawTrace(trace);
         }
       }
 
-      // Extract native call targets before solver goes out of scope.
+      // Trace from additional auto-detected wrappers.
+      for (size_t wi = 1; wi < auto_detected_wrappers.size(); ++wi) {
+        uint64_t extra_wrapper = auto_detected_wrappers[wi].second;
+        auto extra_trace = solver.traceFromWrapper(extra_wrapper);
+        if (!extra_trace.empty()) {
+          vm_graph->mergeTraceResults(solver);
+          auto flat = vm_graph->followFlatTrace(extra_wrapper,
+                                                extra_trace.front().incoming_hash);
+          if (!flat.records.empty()) {
+            rememberFlatTrace(flat.records);
+          } else {
+            rememberRawTrace(extra_trace);
+          }
+        }
+      }
+
+      // Extract native call targets before the emulator goes out of scope.
       native_call_vas = solver.nativeCallTargets();
       native_call_infos = solver.nativeCallInfos();
-      errs() << "Chain solver captured " << native_call_infos.size()
+      errs() << "Trace emulator captured " << native_call_infos.size()
              << " native call infos, " << native_call_vas.size()
              << " unique targets\n";
       for (unsigned i = 0; i < native_call_infos.size(); ++i) {
@@ -1872,17 +2052,19 @@ int main(int argc, char **argv) {
       }
     }
 
-    // Lift only chain-solved handlers.
+    // Lift only trace-reachable handlers.
     unsigned lifted_count = 0;
     unsigned failed_count = 0;
     unsigned skipped_count = 0;
-    for (uint64_t handler_va : chain_handler_vas) {
+    for (const auto &trace_item : trace_work_items) {
+      uint64_t handler_va = trace_item.handler_va;
       // Skip if already lifted (e.g. func_va or vmenter/vmexit).
       std::string name = "sub_" + Twine::utohexstr(handler_va).str();
       if (auto *existing = module->getFunction(name)) {
         if (!existing->isDeclaration()) {
           // Tag existing function as a VM handler.
           existing->addFnAttr("omill.vm_handler");
+          tagExactTraceHash(*existing, handler_va);
           // The VM wrapper is a boundary function: handlers get inlined
           // INTO it, but it must NOT be inlined into callers like
           // DriverEntry.  Tag it so VMHandlerInlinerPass excludes it
@@ -1924,8 +2106,10 @@ int main(int argc, char **argv) {
       if (lifter.Lift(handler_va)) {
         ++lifted_count;
         // Tag the lifted function.
-        if (auto *fn = module->getFunction(name))
+        if (auto *fn = module->getFunction(name)) {
           fn->addFnAttr("omill.vm_handler");
+          tagExactTraceHash(*fn, handler_va);
+        }
       } else {
         ++failed_count;
       }
@@ -1998,6 +2182,64 @@ int main(int argc, char **argv) {
       }
     }
 
+    bool verbose_vm_demerge = (std::getenv("OMILL_VM_VERBOSE") != nullptr);
+    unsigned demerged_clone_count = 0;
+    for (auto &[handler_va, hashes] : handler_trace_hashes) {
+      if (hashes.size() <= 1)
+        continue;
+
+      bool is_vm_wrapper_handler = (handler_va == vm_wrapper_va) ||
+                                   (handler_va == vm_entry_va) ||
+                                   (handler_va == vm_exit_va);
+      if (!is_vm_wrapper_handler) {
+        for (auto &[tv, wv] : auto_detected_wrappers) {
+          if (handler_va == wv) {
+            is_vm_wrapper_handler = true;
+            break;
+          }
+        }
+      }
+      if (is_vm_wrapper_handler)
+        continue;
+
+      auto *base_fn = module->getFunction(omill::liftedFunctionName(handler_va));
+      if (!base_fn || base_fn->isDeclaration())
+        continue;
+
+      for (uint64_t incoming_hash : hashes) {
+        std::string clone_name =
+            omill::demergedHandlerCloneName(handler_va, incoming_hash);
+        if (module->getFunction(clone_name))
+          continue;
+
+        llvm::ValueToValueMapTy VMap;
+        auto *clone = llvm::CloneFunction(base_fn, VMap);
+        clone->setName(clone_name);
+        clone->setLinkage(llvm::GlobalValue::InternalLinkage);
+        clone->addFnAttr("omill.vm_handler");
+        clone->addFnAttr("omill.vm_demerged_clone", "1");
+        clone->addFnAttr("omill.vm_trace_in_hash",
+                         llvm::utohexstr(incoming_hash));
+        ++demerged_clone_count;
+
+        if (verbose_vm_demerge) {
+          errs() << "Demerged VM handler clone " << clone_name
+                 << " from 0x" << Twine::utohexstr(handler_va)
+                 << " hash=0x" << Twine::utohexstr(incoming_hash) << "\n";
+        }
+      }
+    }
+    if (demerged_clone_count > 0) {
+      errs() << "VM demerge: materialized " << demerged_clone_count
+             << " hash-keyed handler clones\n";
+      if (events.enabled()) {
+        events.emitInfo("vm_demerge_materialized",
+                        "vm demerged handler clones materialized",
+                        {{"clones", static_cast<int64_t>(demerged_clone_count)}});
+      }
+    }
+
+
     // After naming collisions are fixed, tag vmentry/vmexit as vm_handler
     // and set internal linkage.  Must happen AFTER the naming fix because
     // DeclareLiftedFunction creates sub_X.1 definitions for existing sub_X
@@ -2029,6 +2271,46 @@ int main(int argc, char **argv) {
                   !callee->isDeclaration()) {
                 callee->addFnAttr("omill.vm_handler");
                 callee->setLinkage(llvm::GlobalValue::InternalLinkage);
+              }
+            }
+          }
+        }
+      }
+    } else {
+      // vm_entry function not found at its exact VA — likely a thunk/E9
+      // chain was resolved by remill, folding the vm_entry code into the
+      // thunk's function.  Find functions that contain __remill_jump
+      // (i.e., the unresolved indirect jump from the vm_enter tail) and tag
+      // them as vm_handlers so VMDispatchResolution can resolve them.
+      // At this point the passes haven't run yet, so the intrinsic is still
+      // __remill_jump (later lowered to __omill_dispatch_jump).
+      auto *jump_fn = module->getFunction("__remill_jump");
+      if (jump_fn) {
+        for (auto *user : jump_fn->users()) {
+          if (auto *call = dyn_cast<CallInst>(user)) {
+            auto *parent = call->getFunction();
+            if (parent && !parent->isDeclaration() &&
+                parent->getName().starts_with("sub_") &&
+                !parent->hasFnAttribute("omill.vm_handler")) {
+              parent->addFnAttr("omill.vm_handler");
+              parent->addFnAttr("omill.vm_wrapper");
+              parent->setLinkage(llvm::GlobalValue::InternalLinkage);
+              errs() << "VM thunk fixup: tagged " << parent->getName()
+                     << " as vm_handler+vm_wrapper (thunk-resolved vmenter)\n";
+              // Also tag its callees
+              for (auto &BB : *parent) {
+                for (auto &I : BB) {
+                  if (auto *inner_call = dyn_cast<CallInst>(&I)) {
+                    if (auto *callee = inner_call->getCalledFunction()) {
+                      if (callee->getName().starts_with("sub_") &&
+                          !callee->isDeclaration() &&
+                          !callee->hasFnAttribute("omill.vm_handler")) {
+                        callee->addFnAttr("omill.vm_handler");
+                        callee->setLinkage(llvm::GlobalValue::InternalLinkage);
+                      }
+                    }
+                  }
+                }
               }
             }
           }
@@ -2309,17 +2591,18 @@ int main(int argc, char **argv) {
   MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
   MAM.registerPass([&] { return omill::CallGraphAnalysis(); });
   MAM.registerPass([&] { return omill::LiftedFunctionAnalysis(); });
+  MAM.registerPass([&] { return omill::VirtualCalleeRegistryAnalysis(); });
   if (!ResolveExceptions) {
     MAM.registerPass([&] { return omill::ExceptionInfoAnalysis(); });
   }
 
-  // Register VM handler graph analysis if in VM mode.
+  // Register the emulator-derived VM trace map analysis.
   if (vm_graph) {
     MAM.registerPass([vm_graph] {
-      return omill::VMHandlerGraphAnalysis(*vm_graph);
+      return omill::VMTraceMapAnalysis(*vm_graph);
     });
   } else {
-    MAM.registerPass([&] { return omill::VMHandlerGraphAnalysis(); });
+    MAM.registerPass([&] { return omill::VMTraceMapAnalysis(); });
   }
 
   // Register trace-lift callback so IterativeTargetResolutionPass can
@@ -2834,7 +3117,7 @@ int main(int argc, char **argv) {
               continue;
             if (callee->hasFnAttribute("omill.vm_handler") &&
                 (F.hasFnAttribute("omill.vm_wrapper") ||
-                 F.getFnAttribute("omill.vm_helper_clone").isValid()))
+                 F.getFnAttribute("omill.vm_outlined_virtual_call").isValid()))
               continue;
             if (CI->arg_size() == callee->arg_size()) continue;
 
@@ -3194,6 +3477,103 @@ int main(int argc, char **argv) {
       uint64_t hash = 0;
       uint64_t target_va = 0;
     };
+    // --- Virtual callee registry (formal, first-class) ---
+    // VirtualCalleeRecord is the canonical data structure.  We keep a
+    // separate Function* cache because VirtualCalleeRecord is serializable
+    // (no LLVM pointers) while the Function* is session-local.
+    llvm::StringMap<omill::VirtualCalleeRecord> outlined_virtual_callee_records;
+    llvm::StringMap<llvm::Function *> outlined_virtual_callee_fns;
+    bool verbose_vm_outlined = (std::getenv("OMILL_VM_VERBOSE") != nullptr);
+
+    auto ensureOutlinedVirtualCallee = [&](llvm::Function *base_fn,
+                                           const std::string &clone_name,
+                                           llvm::StringRef caller_name,
+                                           std::optional<uint64_t> hash,
+                                           llvm::StringRef kind,
+                                           unsigned round_index,
+                                           uint64_t handler_va = 0,
+                                           std::optional<uint64_t> trace_hash = std::nullopt)
+        -> std::pair<llvm::Function *, bool> {
+      if (!base_fn || base_fn->isDeclaration())
+        return {nullptr, false};
+
+      auto fn_it = outlined_virtual_callee_fns.find(clone_name);
+      if (fn_it != outlined_virtual_callee_fns.end()) {
+        if (fn_it->second)
+          return {fn_it->second, false};
+      }
+
+      llvm::Function *clone = base_fn->getParent()->getFunction(clone_name);
+      bool created = false;
+      if (!clone) {
+        llvm::ValueToValueMapTy VMap;
+        clone = llvm::CloneFunction(base_fn, VMap);
+        clone->setName(clone_name);
+        created = true;
+      }
+
+      // Boundary markers — these are the minimal attrs that downstream passes
+      // check for inlining/outlining decisions.  Detail data lives in the
+      // registry metadata, not duplicated as attrs.
+      clone->setLinkage(llvm::GlobalValue::InternalLinkage);
+      clone->addFnAttr(llvm::Attribute::NoInline);
+      clone->addFnAttr("omill.vm_outlined_virtual_call", "1");
+      // Trace linkage attrs — propagated through ABI wrapper generation by
+      // RecoverFunctionSignatures so the registry can reconstruct trace keys
+      // from the _native function after the pipeline.
+      if (handler_va != 0)
+        clone->addFnAttr("omill.vm_handler_va",
+                         llvm::utohexstr(handler_va));
+      if (trace_hash)
+        clone->addFnAttr("omill.vm_trace_hash",
+                         llvm::utohexstr(*trace_hash));
+      if (hash)
+        clone->addFnAttr("omill.vm_helper_hash", llvm::utohexstr(*hash));
+      else
+        clone->removeFnAttr("omill.vm_helper_hash");
+
+      outlined_virtual_callee_fns[clone_name] = clone;
+
+      auto &record = outlined_virtual_callee_records[clone_name];
+      if (record.clone_name.empty()) {
+        record.clone_name = clone_name;
+        record.base_name = base_fn->getName().str();
+        record.caller_name = caller_name.str();
+        record.kind = kind.str();
+        record.hash = hash;
+        record.first_round = round_index;
+        record.handler_va = handler_va;
+        record.trace_hash = trace_hash;
+      }
+
+      if (created && verbose_vm_outlined) {
+        errs() << "Outlined virtual callee " << clone_name
+               << " kind=" << kind
+               << " base=" << base_fn->getName();
+        if (hash)
+          errs() << " hash=0x" << Twine::utohexstr(*hash);
+        if (handler_va != 0)
+          errs() << " handler_va=0x" << Twine::utohexstr(handler_va);
+        if (trace_hash)
+          errs() << " trace_hash=0x" << Twine::utohexstr(*trace_hash);
+        errs() << " caller=" << caller_name
+               << " round=" << round_index << "\n";
+      }
+
+      return {clone, created};
+    };
+
+
+    auto syncOutlinedVirtualCalleeRegistry = [&]() {
+      std::vector<omill::VirtualCalleeRecord> records;
+      records.reserve(outlined_virtual_callee_records.size());
+      for (const auto &entry : outlined_virtual_callee_records) {
+        records.push_back(entry.getValue());
+      }
+      omill::setVirtualCalleeRegistryMetadata(*module, records);
+    };
+
+
     auto collectNestedVMHelperTargets = [&]() {
       nested_vm_helper_targets.clear();
       nested_vm_helper_deltas.clear();
@@ -3232,7 +3612,7 @@ int main(int argc, char **argv) {
             }
           });
 
-      omill::VMHandlerChainSolver solver(pe.memory_map, pe.image_base,
+      omill::VMTraceEmulator solver(pe.memory_map, pe.image_base,
                                          vm_entry_va, vm_exit_va);
       solver.setHandlerSegmentRange(seg_start, seg_end);
 
@@ -3274,11 +3654,11 @@ int main(int argc, char **argv) {
           continue;
         }
 
-        auto chain = solver.solveFromWrapper(wrapper_va);
-        if (chain.empty() || chain.front().successors.empty())
+        auto trace = solver.traceFromWrapper(wrapper_va);
+        if (trace.empty() || trace.front().successors.empty())
           continue;
 
-        uint64_t target_va = chain.front().successors.front();
+        uint64_t target_va = trace.front().successors.front();
         if (target_va == 0)
           continue;
 
@@ -3438,10 +3818,10 @@ int main(int argc, char **argv) {
         if (!seed) {
           uint64_t wrapper_va = followJmpThunks(callee_va);
           if (wrapper_va == 0) wrapper_va = callee_va;
-          omill::VMHandlerChainSolver solver(pe.memory_map, pe.image_base,
+          omill::VMTraceEmulator solver(pe.memory_map, pe.image_base,
                                              vm_entry_va, vm_exit_va);
           solver.setHandlerSegmentRange(seg_start, seg_end);
-          auto results = solver.solveFromWrapper(wrapper_va);
+          auto results = solver.traceFromWrapper(wrapper_va);
           auto targets = solver.nativeCallTargets();
           if (targets.size() == 1) {
             seed = targets.front();
@@ -3491,7 +3871,7 @@ int main(int argc, char **argv) {
         };
 
         uint64_t synthetic_vm_base =
-            omill::VMHandlerChainSolver::syntheticVMContextBase();
+            omill::VMTraceEmulator::syntheticVMContextBase();
         uint64_t synthetic_saved_rsp = synthetic_vm_base + 0x1800;
         auto mapScratchDisp = [&](int64_t disp, int64_t fallback) {
           if (disp >= 0 || disp < -0x1000)
@@ -3619,17 +3999,18 @@ int main(int argc, char **argv) {
                 continue;
               }
 
-              omill::VMHandlerChainSolver solver(pe.memory_map, pe.image_base,
+              omill::VMTraceEmulator solver(pe.memory_map, pe.image_base,
                                                  vm_entry_va, vm_exit_va);
               solver.setHandlerSegmentRange(seg_start, seg_end);
               auto snapshot = buildVMWrapperSnapshot(CI, *buffer_info);
               (void)delta;
               (void)handler_va;
-              (void)solver.solveFromWrapperWithSnapshot(wrapper_va, snapshot);
+              (void)solver.traceFromWrapperWithSnapshot(wrapper_va, snapshot);
               auto targets = solver.nativeCallTargets();
               if (targets.size() != 1) {
-                errs() << "Hash solve for " << helper_name << " hash=0x"
-                       << Twine::utohexstr(buffer_info->hash) << " produced "
+                errs() << "Trace-emulated resolve for " << helper_name
+                       << " hash=0x" << Twine::utohexstr(buffer_info->hash)
+                       << " produced "
                        << targets.size() << " native target(s)\n";
                 if (getenv("OMILL_DEBUG_CHAIN")) {
                   errs() << "  call: ";
@@ -3770,9 +4151,9 @@ int main(int argc, char **argv) {
       for (auto &[thunk_va, wrapper_va] : auto_detected_wrappers) {
         if (nested_vm_helper_targets.count(wrapper_va))
           continue;  // already discovered
-        // Chain-solve from this wrapper to get the first handler target.
-        omill::VMHandlerChainSolver probe(pe.memory_map, pe.image_base,
-                                          vm_entry_va, vm_exit_va);
+        // Trace from this wrapper to get the first handler target.
+        omill::VMTraceEmulator probe(pe.memory_map, pe.image_base,
+                                     vm_entry_va, vm_exit_va);
         uint64_t seg_start_l = vm_entry_va;
         uint64_t seg_end_l = vm_entry_va + 0x2000000;
         pe.memory_map.forEachRegion(
@@ -3783,9 +4164,9 @@ int main(int argc, char **argv) {
               }
             });
         probe.setHandlerSegmentRange(seg_start_l, seg_end_l);
-        auto chain = probe.solveFromWrapper(wrapper_va);
-        if (!chain.empty() && !chain.front().successors.empty()) {
-          uint64_t target_va = chain.front().successors.front();
+        auto trace = probe.traceFromWrapper(wrapper_va);
+        if (!trace.empty() && !trace.front().successors.empty()) {
+          uint64_t target_va = trace.front().successors.front();
           nested_vm_helper_targets[wrapper_va] = target_va;
           nested_vm_helper_deltas[wrapper_va] = probe.lastDelta();
         }
@@ -3925,7 +4306,7 @@ int main(int argc, char **argv) {
           return omill::TraceLiftAnalysis(omill::TraceLiftCallback{});
         });
         late_MAM.registerPass([&] {
-          return omill::VMHandlerGraphAnalysis();
+          return omill::VMTraceMapAnalysis();
         });
 
         omill::PipelineOptions late_opts = opts;
@@ -4079,18 +4460,17 @@ int main(int argc, char **argv) {
         runPostPatchCleanup("nested_vm_helpers");
       }
 
-      unsigned hash_patched = 0;
-      // Pre-collect all call targets before erasing any, so ordinals
-      // remain stable across the entire collection phase.
-      struct HashPatchTarget {
-        llvm::CallInst *call;
-        uint64_t target_va;
-      };
-      llvm::SmallVector<HashPatchTarget, 8> hash_patch_targets;
+      // Do NOT fold hash-resolved helper calls to constants. Those helpers
+      // represent distinct virtualized callees and must remain outlined so the
+      // recovered demerged control flow stays modelled as callable functions.
+      unsigned hash_helper_clone_count = 0;
       for (const auto &resolved : hash_resolved_calls) {
         auto *caller_fn = module->getFunction(resolved.caller_name);
-        if (!caller_fn || caller_fn->isDeclaration())
+        auto *helper_fn = module->getFunction(resolved.helper_name);
+        if (!caller_fn || caller_fn->isDeclaration() ||
+            !helper_fn || helper_fn->isDeclaration()) {
           continue;
+        }
 
         unsigned ordinal = 0;
         llvm::CallInst *target_call = nullptr;
@@ -4111,19 +4491,46 @@ int main(int argc, char **argv) {
           if (target_call)
             break;
         }
-        if (target_call)
-          hash_patch_targets.push_back({target_call, resolved.target_va});
+        if (!target_call)
+          continue;
+
+        std::string clone_name = resolved.helper_name + "__" +
+                                 resolved.caller_name + "_" +
+                                 std::to_string(resolved.ordinal) +
+                                 "_h" + llvm::utohexstr(resolved.hash);
+        // Extract handler VA from helper name for trace linkage.
+        uint64_t helper_va_for_trace = 0;
+        {
+          llvm::StringRef bn = llvm::StringRef(resolved.helper_name);
+          if (bn.ends_with("_native"))
+            bn = bn.drop_back(7);  // strlen("_native")
+          if (bn.starts_with("sub_"))
+            bn.drop_front(4).getAsInteger(16, helper_va_for_trace);
+        }
+        auto [clone, created] = ensureOutlinedVirtualCallee(
+            helper_fn, clone_name, resolved.caller_name, resolved.hash,
+            "hash_resolved", round + 1, helper_va_for_trace,
+            std::optional<uint64_t>(resolved.hash));
+        if (!clone)
+          continue;
+        if (created)
+          ++hash_helper_clone_count;
+
+        llvm::SmallVector<llvm::Value *, 16> args;
+        for (auto &Arg : target_call->args())
+          args.push_back(Arg.get());
+
+        llvm::IRBuilder<> Builder(target_call);
+        auto *clone_call =
+            Builder.CreateCall(clone, args, clone_name + ".result");
+        clone_call->setCallingConv(target_call->getCallingConv());
+        clone_call->setAttributes(target_call->getAttributes());
+        target_call->replaceAllUsesWith(clone_call);
+        target_call->eraseFromParent();
       }
-      for (auto &[call, target_va] : hash_patch_targets) {
-        auto *resolved_ci = llvm::ConstantInt::get(
-            llvm::Type::getInt64Ty(ctx), target_va);
-        call->replaceAllUsesWith(resolved_ci);
-        call->eraseFromParent();
-        ++hash_patched;
-      }
-      if (hash_patched > 0) {
-        errs() << "Patched " << hash_patched
-               << " hash-resolved helper call(s) to constants\n";
+      if (hash_helper_clone_count > 0) {
+        errs() << "Cloned " << hash_helper_clone_count
+               << " hash-resolved helper call(s) to outlined wrappers\n";
         runPostPatchCleanup("hash_resolved_helpers");
       }
 
@@ -4140,10 +4547,7 @@ int main(int argc, char **argv) {
       }
 
       for (auto &entry : helper_callsites_by_key) {
-        auto key = entry.getKey();
         auto &infos = entry.getValue();
-        if (helper_callsite_counts[key] < 2)
-          continue;
 
         llvm::sort(infos, [](const NestedHelperCallsite &lhs,
                              const NestedHelperCallsite &rhs) {
@@ -4181,16 +4585,20 @@ int main(int argc, char **argv) {
           if (info.hash)
             clone_name += "_h" + llvm::utohexstr(*info.hash);
 
-          llvm::ValueToValueMapTy VMap;
-          auto *clone = llvm::CloneFunction(helper_fn, VMap);
-          clone->setName(clone_name);
-          clone->setLinkage(llvm::GlobalValue::InternalLinkage);
-          clone->addFnAttr(llvm::Attribute::NoInline);
-          clone->addFnAttr("omill.vm_helper_clone", "1");
-          if (info.hash)
-            clone->addFnAttr("omill.vm_helper_hash",
-                             llvm::utohexstr(*info.hash));
-          clone->addFnAttr("omill.vm_helper_caller", info.caller_name);
+          // Extract handler VA from helper name for trace linkage.
+          uint64_t nested_helper_va = 0;
+          {
+            llvm::StringRef bn = llvm::StringRef(info.helper_name);
+            if (bn.ends_with("_native"))
+              bn = bn.drop_back(7);
+            if (bn.starts_with("sub_"))
+              bn.drop_front(4).getAsInteger(16, nested_helper_va);
+          }
+          auto [clone, created] = ensureOutlinedVirtualCallee(
+              helper_fn, clone_name, info.caller_name, info.hash,
+              "nested_helper", round + 1, nested_helper_va, info.hash);
+          if (!clone)
+            continue;
 
           llvm::SmallVector<llvm::Value *, 16> args;
           for (auto &Arg : target_call->args())
@@ -4204,12 +4612,14 @@ int main(int argc, char **argv) {
           target_call->replaceAllUsesWith(clone_call);
           target_call->eraseFromParent();
           current_calls[info.ordinal] = nullptr;
-          ++helper_clone_count;
+          if (created)
+            ++helper_clone_count;
         }
       }
       if (helper_clone_count > 0) {
         errs() << "Cloned " << helper_clone_count
                << " nested VM helper call(s) for IR continuity\n";
+        runPostPatchCleanup("nested_vm_helper_clones");
       }
 
       {
@@ -4260,7 +4670,7 @@ int main(int argc, char **argv) {
                 continue;
               if (callee->hasFnAttribute("omill.vm_handler") &&
                   (F.hasFnAttribute("omill.vm_wrapper") ||
-                   F.getFnAttribute("omill.vm_helper_clone").isValid()))
+                   F.getFnAttribute("omill.vm_outlined_virtual_call").isValid()))
                 continue;
 
               auto attr = callee->getFnAttribute("omill.param_state_offsets");
@@ -4339,10 +4749,37 @@ int main(int argc, char **argv) {
                  << " B3 dispatch calls with mismatched arg counts\n";
       }
 
-      errs() << "Late discovery round " << (round + 1) << " complete\n";
+      syncOutlinedVirtualCalleeRegistry();
+
+
+      unsigned created_hash_resolved = 0;
+      unsigned created_nested_helper = 0;
+      for (const auto &entry : outlined_virtual_callee_records) {
+        const auto &record = entry.getValue();
+        if (record.first_round != round + 1)
+          continue;
+        if (record.kind == "hash_resolved")
+          ++created_hash_resolved;
+        else if (record.kind == "nested_helper")
+          ++created_nested_helper;
+      }
+
+      errs() << "Late discovery round " << (round + 1) << " complete";
+      if (created_hash_resolved > 0 || created_nested_helper > 0) {
+        errs() << " (outlined virtual callees: hash="
+               << created_hash_resolved
+               << ", nested=" << created_nested_helper << ")";
+      }
+      errs() << "\n";
       events.emitInfo("late_discovery_round_completed",
                       "late discovery round completed",
-                      {{"round", static_cast<int64_t>(round + 1)}});
+                      {{"round", static_cast<int64_t>(round + 1)},
+                       {"outlined_hash_resolved",
+                        static_cast<int64_t>(created_hash_resolved)},
+                       {"outlined_nested_helper",
+                        static_cast<int64_t>(created_nested_helper)},
+                       {"outlined_total",
+                        static_cast<int64_t>(outlined_virtual_callee_records.size())}});
     }
   }
 

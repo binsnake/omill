@@ -56,6 +56,7 @@
 #include "omill/Passes/EliminateStateStruct.h"
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/CallingConventionAnalysis.h"
+#include "omill/Analysis/VirtualCalleeRegistry.h"
 #include "omill/Passes/ConstantMemoryFolding.h"
 #include "omill/Passes/DeadStateStoreDSE.h"
 #include "omill/Passes/HashImportAnnotation.h"
@@ -84,9 +85,9 @@
 #include "omill/Passes/StackConcretization.h"
 #include "omill/Passes/TypeRecovery.h"
 #include "omill/Passes/VMHandlerInliner.h"
-#include "omill/Analysis/VMHandlerGraph.h"
+#include "omill/Analysis/VMTraceMap.h"
 #include "omill/Passes/VMDispatchResolution.h"
-#include "omill/Passes/VMHashElimination.h"
+#include "omill/Passes/VMDeadMergedHandlerElimination.h"
 #include "omill/Passes/RewriteLiftedCallsToNative.h"
 #if OMILL_ENABLE_Z3
 #include "omill/Passes/Z3DispatchSolver.h"
@@ -137,6 +138,78 @@ void addPhaseMarker(llvm::ModulePassManager &MPM, llvm::StringRef label) {
   static bool enabled = (std::getenv("OMILL_PHASE_TIMING") != nullptr);
   if (enabled)
     MPM.addPass(PhaseMarkerPass(label));
+}
+
+struct VMVerboseStatePass : llvm::PassInfoMixin<VMVerboseStatePass> {
+  std::string label_;
+
+  explicit VMVerboseStatePass(llvm::StringRef label) : label_(label) {}
+
+  llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &MAM) {
+    unsigned handlers = 0;
+    unsigned wrappers = 0;
+    unsigned exact_hash_handlers = 0;
+    unsigned demerged_clones = 0;
+    unsigned dispatch_jumps = 0;
+    unsigned dispatch_calls = 0;
+
+    auto &virtual_callees = MAM.getResult<VirtualCalleeRegistryAnalysis>(M);
+    size_t outlined_virtuals = virtual_callees.size();
+    size_t outlined_hash_resolved = virtual_callees.countKind("hash_resolved");
+    size_t outlined_nested_helper = virtual_callees.countKind("nested_helper");
+    size_t outlined_trace_linked = virtual_callees.countTraceLinked();
+
+    for (auto &F : M) {
+      if (F.isDeclaration())
+        continue;
+
+      if (F.hasFnAttribute("omill.vm_handler"))
+        ++handlers;
+      if (F.hasFnAttribute("omill.vm_wrapper"))
+        ++wrappers;
+      if (F.getFnAttribute("omill.vm_trace_in_hash").isValid())
+        ++exact_hash_handlers;
+      if (F.getFnAttribute("omill.vm_demerged_clone").isValid())
+        ++demerged_clones;
+
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+          if (!CB)
+            continue;
+          auto *callee = CB->getCalledFunction();
+          if (!callee)
+            continue;
+          auto name = callee->getName();
+          if (name == "__omill_dispatch_jump")
+            ++dispatch_jumps;
+          else if (name == "__omill_dispatch_call")
+            ++dispatch_calls;
+        }
+      }
+    }
+
+    llvm::errs() << "[omill-vm] " << label_
+                 << " handlers=" << handlers
+                 << " wrappers=" << wrappers
+                 << " exact=" << exact_hash_handlers
+                 << " clones=" << demerged_clones
+                 << " dispatch_jumps=" << dispatch_jumps
+                 << " dispatch_calls=" << dispatch_calls
+                 << " outlined_virtuals=" << outlined_virtuals
+                 << " outlined_hash=" << outlined_hash_resolved
+                 << " outlined_nested=" << outlined_nested_helper
+                 << " trace_linked=" << outlined_trace_linked << "\n";
+    return llvm::PreservedAnalyses::all();
+  }
+
+  static bool isRequired() { return true; }
+};
+
+void addVMVerboseMarker(llvm::ModulePassManager &MPM, llvm::StringRef label) {
+  static bool enabled = (std::getenv("OMILL_VM_VERBOSE") != nullptr);
+  if (enabled)
+    MPM.addPass(VMVerboseStatePass(label));
 }
 
 bool envDisabled(const char *name) {
@@ -937,13 +1010,11 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
       FPM.addPass(llvm::GVNPass());
       MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
     }
-    addPhaseMarker(MPM, "ABI: final-opt SHR+Hash+MBA");
+    addPhaseMarker(MPM, "ABI: final-opt SHR+MBA");
     {
       llvm::FunctionPassManager FPM;
       FPM.addPass(SimplifyVectorReassemblyPass());
       FPM.addPass(CollapseRemillSHRSwitchPass());
-      // Hash integrity checks become dead after SHR switch collapse.
-      FPM.addPass(VMHashEliminationPass());
 #if OMILL_ENABLE_SIMPLIFIER
       FPM.addPass(SimplifyMBAPass());
 #endif
@@ -1011,6 +1082,8 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
                                    llvm::ModuleAnalysisManager &MAM) {
         // Mark VM handler functions for inlining and collect caller names
         // so we can find them after inlining (Function* may be invalidated).
+        auto &virtual_callees =
+            MAM.getResult<VirtualCalleeRegistryAnalysis>(M);
         bool has_vm_handlers = false;
         llvm::SmallVector<std::string, 16> caller_names;
         llvm::DenseSet<llvm::Function *> inline_targets;
@@ -1025,8 +1098,13 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
             continue;  // Has a _native wrapper — skip the original.
           // The VM wrapper is a boundary function — handlers are inlined
           // INTO it, but it must NOT be inlined into its callers (e.g.
-          // DriverEntry).  Skip it to preserve the call boundary.
-          if (F.hasFnAttribute("omill.vm_wrapper"))
+          // DriverEntry). Demerged clone wrappers and registry-modeled
+          // outlined virtual callees must also remain outlined so recovered
+          // virtualized callees survive as separate functions.
+          if (F.hasFnAttribute("omill.vm_wrapper") ||
+              F.getFnAttribute("omill.vm_demerged_clone").isValid() ||
+              F.getFnAttribute("omill.vm_outlined_virtual_call").isValid() ||
+              virtual_callees.lookup(F.getName()).has_value())
             continue;
           // Only inline VM handlers that have callers.  Uncalled handlers
           // (deferred functions whose addresses weren't resolved to direct
@@ -1097,11 +1175,25 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
           CleanMPM.run(M, MAM);
         }
 
+        // Cross-link registry records against the emulator trace map so the
+        // downstream VMDeadMergedHandlerElimination pass has trace coverage.
+        auto &trace_map = MAM.getResult<VMTraceMapAnalysis>(M);
+        if (unsigned linked = virtual_callees.linkToTraceMap(trace_map)) {
+          static bool vm_verbose =
+              (std::getenv("OMILL_VM_VERBOSE") != nullptr);
+          if (vm_verbose)
+            llvm::errs() << "[omill] trace-linked " << linked
+                         << " virtual callee records\n";
+        }
+
+
         return llvm::PreservedAnalyses::none();
       }
       static bool isRequired() { return true; }
     };
     MPM.addPass(InlineVMHandlersAndCleanupPass{});
+    // After ABI-phase handler inlining, remove fully-demerged merged bodies.
+    MPM.addPass(VMDeadMergedHandlerEliminationPass());
   }
   addPhaseMarker(MPM, "ABI: final cleanup");
   // Strip @llvm.compiler.used and run GlobalDCE to remove dead ISEL stubs.
@@ -1159,15 +1251,6 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM,
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(OptimizeStatePass(OptimizePhases::Roundtrip));
     FPM.addPass(llvm::DCEPass());
-  }
-  // VM hash integrity checks: eliminate murmur hash anchors and range checks
-  // that survive into _native functions (e.g. via vmexit→call→vmentry chains).
-  // Must run after GVN folds constants to expose hash anchor patterns.
-  if (!envDisabled("OMILL_SKIP_DEOBF_HASH_ELIM")) {
-    FPM.addPass(CollapseRemillSHRSwitchPass());
-    FPM.addPass(VMHashEliminationPass());
-    FPM.addPass(llvm::InstCombinePass());
-    FPM.addPass(llvm::ADCEPass());
   }
   // Control-flow unflattening: after MBA simplification, constant folding,
   // and dead-path elimination have resolved state variable computations.
@@ -1867,12 +1950,14 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
 
   addPhaseMarker(MPM, "Phase 3.56: VM devirtualization");
   // Phase 3.56: VM Devirtualization.
-  // Resolve handler dispatch targets via binary graph lookup and eliminate
-  // hash integrity checks.  Must run after Phase 3 has lowered __remill_jump
-  // to __omill_dispatch_jump and before Phase 3.6 resolves them.
+  // Resolve handler dispatch targets from the emulator-derived flat trace map.
+  // Must run after Phase 3 has lowered __remill_jump to __omill_dispatch_jump
+  // and before Phase 3.6 resolves them.
   if (opts.vm_devirtualize) {
-    // Resolve opaque dispatch targets using the handler graph.
+    addVMVerboseMarker(MPM, "vm.pre-dispatch-resolution");
+    // Resolve opaque dispatch targets using the trace map.
     MPM.addPass(VMDispatchResolutionPass());
+    addVMVerboseMarker(MPM, "vm.post-dispatch-resolution");
 
     // Lower resolved dispatch targets to direct calls.
     {
@@ -1885,23 +1970,15 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
           LowerRemillIntrinsicsPass(LowerCategories::ResolvedDispatch));
       MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
     }
-
-    // Eliminate hash integrity checks in handler functions.
-    {
-      llvm::FunctionPassManager FPM;
-      FPM.addPass(VMHashEliminationPass());
-      FPM.addPass(llvm::InstCombinePass());
-      FPM.addPass(llvm::GVNPass());
-      FPM.addPass(llvm::ADCEPass());
-      MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
-    }
+    addVMVerboseMarker(MPM, "vm.post-resolved-dispatch-lowering");
 
     addPhaseMarker(MPM, "Phase 3.56: VM handler inlining");
-    // Inline small handler calls.  VMHandlerInlinerPass performs its own
+    // Inline small handler calls. VMHandlerInlinerPass performs its own
     // inlining via llvm::InlineFunction and erases dead handlers, so no
     // separate AlwaysInlinerPass is needed.
     MPM.addPass(VMHandlerInlinerPass(/*max_handler_instrs=*/500,
                                      /*min_callsites=*/1));
+    addVMVerboseMarker(MPM, "vm.post-handler-inlining");
 
     addPhaseMarker(MPM, "Phase 3.56: post-handler cleanup");
     // Clean up after handler inlining — scoped to functions that
@@ -1910,8 +1987,6 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
       llvm::FunctionPassManager FPM;
       FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
       FPM.addPass(RecoverAllocaPointersPass());
-      // Second hash elimination: inlined handlers may expose new murmur rounds.
-      FPM.addPass(VMHashEliminationPass());
       FPM.addPass(llvm::InstCombinePass());
       FPM.addPass(llvm::GVNPass());
       FPM.addPass(llvm::ADCEPass());
@@ -1923,6 +1998,14 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
         return true;
       }));
     }
+    addVMVerboseMarker(MPM, "vm.post-handler-cleanup");
+
+    // Eliminate merged handler bodies that have been fully demerged.
+    // After VMHandlerInliner inlines handlers into callers, merged bodies
+    // that are fully covered (every incoming hash has a demerged clone)
+    // and have no remaining uses can be safely deleted.
+    MPM.addPass(VMDeadMergedHandlerEliminationPass());
+    addVMVerboseMarker(MPM, "vm.post-dead-merged-elimination");
   }
 
   addPhaseMarker(MPM, "Phase 3.6: iterative target resolution");
@@ -3543,7 +3626,8 @@ void registerModuleAnalyses(llvm::ModuleAnalysisManager &MAM) {
   MAM.registerPass([&] { return LiftedFunctionAnalysis(); });
   MAM.registerPass([&] { return ExceptionInfoAnalysis(); });
   MAM.registerPass([&] { return BlockLiftAnalysis(); });
-  MAM.registerPass([&] { return VMHandlerGraphAnalysis(); });
+  MAM.registerPass([&] { return VMTraceMapAnalysis(); });
+  MAM.registerPass([&] { return VirtualCalleeRegistryAnalysis(); });
 }
 
 void registerAAWithManager(llvm::AAManager &AAM) {

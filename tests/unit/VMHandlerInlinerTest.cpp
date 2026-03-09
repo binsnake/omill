@@ -1,4 +1,5 @@
 #include "omill/Passes/VMHandlerInliner.h"
+#include "omill/Analysis/VirtualCalleeRegistry.h"
 
 #include <llvm/Analysis/CGSCCPassManager.h>
 #include <llvm/Analysis/LoopAnalysisManager.h>
@@ -77,6 +78,7 @@ class VMHandlerInlinerTest : public ::testing::Test {
     PB.registerFunctionAnalyses(FAM);
     PB.registerLoopAnalyses(LAM);
     PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+    MAM.registerPass([&] { return omill::VirtualCalleeRegistryAnalysis(); });
     MPM.run(M, MAM);
   }
 
@@ -521,6 +523,75 @@ TEST_F(VMHandlerInlinerTest, TaggedSingleCallsiteHandler_Inlined) {
     }
   }
   EXPECT_FALSE(has_call);
+}
+
+TEST_F(VMHandlerInlinerTest, RegistryMarkedOutlinedVirtualCallee_RemainsOutlined) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *clone = createHandler(*M, "sub_401200__vm_deadbeef", 9);
+  clone->addFnAttr("omill.vm_handler");
+  createLiftedCaller(*M, "sub_401000", {clone});
+  createLiftedCaller(*M, "sub_402000", {clone});
+
+  std::vector<omill::VirtualCalleeRecord> records = {
+      {"sub_401200__vm_deadbeef", "sub_401200", "caller_native",
+       "hash_resolved", 0xDEADBEEFULL, 1,
+       0x500000ULL, 0xDEADBEEFULL, false},
+  };
+  omill::setVirtualCalleeRegistryMetadata(*M, records);
+
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+  runPass(*M, /*max_instrs=*/200, /*min_callsites=*/1);
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+
+  auto *caller = M->getFunction("sub_401000");
+  ASSERT_NE(caller, nullptr);
+  bool has_clone_call = false;
+  for (auto &BB : *caller) {
+    for (auto &I : BB) {
+      if (auto *CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
+        auto *callee = CB->getCalledFunction();
+        if (callee && callee->getName() == "sub_401200__vm_deadbeef")
+          has_clone_call = true;
+      }
+    }
+  }
+  EXPECT_TRUE(has_clone_call);
+}
+
+
+TEST_F(VMHandlerInlinerTest, DemergedClone_RemainsOutlined) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *clone = createHandler(*M, "sub_401100__vm_abcdef", 7);
+  clone->addFnAttr("omill.vm_handler");
+  clone->addFnAttr("omill.vm_demerged_clone", "1");
+  createLiftedCaller(*M, "sub_401000", {clone});
+  createLiftedCaller(*M, "sub_402000", {clone});
+
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+  runPass(*M, /*max_instrs=*/200, /*min_callsites=*/1);
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+
+  auto *caller = M->getFunction("sub_401000");
+  ASSERT_NE(caller, nullptr);
+  bool has_clone_call = false;
+  for (auto &BB : *caller) {
+    for (auto &I : BB) {
+      if (auto *CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
+        auto *callee = CB->getCalledFunction();
+        if (callee && callee->getName() == "sub_401100__vm_abcdef")
+          has_clone_call = true;
+      }
+    }
+  }
+  EXPECT_TRUE(has_clone_call);
 }
 
 }  // namespace
