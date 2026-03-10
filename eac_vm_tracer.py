@@ -57,6 +57,7 @@ import pefile
 from unicorn import *
 from unicorn.x86_const import *
 from capstone import Cs, CS_ARCH_X86, CS_MODE_64
+from capstone.x86_const import X86_OP_MEM
 
 # -- Constants ----------------------------------------------------------------
 BINARY_PATH  = Path(r"D:\binsnake\omill\build-remill\tools\omill-lift\EasyAntiCheat_EOS.sys")
@@ -552,6 +553,7 @@ class VMTracer:
         self.pe = pefile.PE(pe_path)
         self.mu = Uc(UC_ARCH_X86, UC_MODE_64)
         self.cs = Cs(CS_ARCH_X86, CS_MODE_64)
+        self.cs.detail = True
         self.kernel_exec = EXECUTE_FROM_KERNEL_ALIAS
         self.runtime_imagebase = KERNEL_IMAGEBASE if self.kernel_exec else IMAGEBASE
         self.image_size = 0
@@ -637,6 +639,27 @@ class VMTracer:
         self._record_watched_mem(access, address, size, value, rip)
         return True
 
+    def _resolve_mem_operand(self, uc, insn):
+        if not getattr(insn, 'operands', None):
+            return None
+        for op in insn.operands:
+            if op.type != X86_OP_MEM:
+                continue
+            mem = op.mem
+            addr = mem.disp
+            if mem.base:
+                base_name = insn.reg_name(mem.base)
+                uc_reg = UC_REG_BY_NAME.get(base_name.lower())
+                if uc_reg is not None:
+                    addr += uc.reg_read(uc_reg)
+            if mem.index:
+                index_name = insn.reg_name(mem.index)
+                uc_reg = UC_REG_BY_NAME.get(index_name.lower())
+                if uc_reg is not None:
+                    addr += uc.reg_read(uc_reg) * (mem.scale or 1)
+            return addr & 0xFFFFFFFFFFFFFFFF
+        return None
+
     def _maybe_log_special_insn(self, uc, insn):
         ops = insn.op_str or ''
         mn = insn.mnemonic.lower()
@@ -650,10 +673,24 @@ class VMTracer:
             'rip': self._to_image_va(insn.address),
             'mnemonic': insn.mnemonic,
             'op_str': insn.op_str,
+            'rax': uc.reg_read(UC_X86_REG_RAX),
+            'rcx': uc.reg_read(UC_X86_REG_RCX),
+            'rdx': uc.reg_read(UC_X86_REG_RDX),
+            'r8': uc.reg_read(UC_X86_REG_R8),
+            'r9': uc.reg_read(UC_X86_REG_R9),
+            'gs_base': uc.reg_read(UC_X86_REG_GS_BASE),
+            'gdtr': uc.reg_read(UC_X86_REG_GDTR),
+            'idtr': uc.reg_read(UC_X86_REG_IDTR),
+            'tr': uc.reg_read(UC_X86_REG_TR),
+            'ldtr': uc.reg_read(UC_X86_REG_LDTR),
         }
+        mem_addr = self._resolve_mem_operand(uc, insn)
+        if mem_addr is not None:
+            event['mem_addr'] = mem_addr
         self.privileged_insn_events.append(event)
         if self.verbose >= 1:
-            print(f"  [cpu] 0x{self._to_image_va(insn.address):X}: {insn.mnemonic} {insn.op_str}")
+            target = f" -> 0x{self._to_image_va(mem_addr):X}" if mem_addr is not None else ''
+            print(f"  [cpu] 0x{self._to_image_va(insn.address):X}: {insn.mnemonic} {insn.op_str}{target}")
 
     def _clone_runtime_regions(self, uc):
         regions = []
