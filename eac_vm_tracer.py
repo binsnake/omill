@@ -148,6 +148,18 @@ WATCHED_PAGES = {
     TSS_BASE & ~0xFFF,
     LDT_BASE & ~0xFFF,
 }
+WATCHED_PAGE_LABELS = {
+    0x140225000: 'page_140225000',
+    0x140226000: 'page_140226000',
+    0x140270000: 'page_140270000',
+    0x140277000: 'page_140277000',
+    KUSER_SHARED_DATA & ~0xFFF: 'kuser_shared_data',
+    KPCR_BASE & ~0xFFF: 'kpcr',
+    GDT_BASE & ~0xFFF: 'gdt',
+    IDT_BASE & ~0xFFF: 'idt',
+    TSS_BASE & ~0xFFF: 'tss',
+    LDT_BASE & ~0xFFF: 'ldt',
+}
 PRIVILEGED_MNEMONICS = {
     'cli', 'sti', 'hlt', 'swapgs',
     'rdmsr', 'wrmsr', 'rdpmc', 'rdtsc', 'rdtscp',
@@ -156,6 +168,7 @@ PRIVILEGED_MNEMONICS = {
     'in', 'insb', 'insd', 'insw', 'out', 'outsb', 'outsd', 'outsw',
 }
 SPECIAL_REG_TOKEN_RE = re.compile(r'\b(?:cr\d+|dr\d+|tr\d+|msr)\b')
+SEGMENT_MEM_TOKEN_RE = re.compile(r'\b(?:fs|gs):')
 NATIVE_PROBE_EXTRA_PAGES = {
     0x1401660E0: [
         0x140270CE0 & ~0xFFF,
@@ -623,7 +636,7 @@ class VMTracer:
             'size': size,
             'value': value,
             'rip': self._to_image_va(rip),
-            'label': WATCHED_GLOBALS.get(image_addr, ''),
+            'label': WATCHED_GLOBALS.get(image_addr, WATCHED_PAGE_LABELS.get(page, '')),
         }
         self.watched_mem_events.append(event)
         if self.verbose >= 1:
@@ -663,7 +676,8 @@ class VMTracer:
     def _maybe_log_special_insn(self, uc, insn):
         ops = insn.op_str or ''
         mn = insn.mnemonic.lower()
-        if mn not in PRIVILEGED_MNEMONICS and not SPECIAL_REG_TOKEN_RE.search(ops.lower()):
+        ops_lower = ops.lower()
+        if mn not in PRIVILEGED_MNEMONICS and not SPECIAL_REG_TOKEN_RE.search(ops_lower) and not SEGMENT_MEM_TOKEN_RE.search(ops_lower):
             return
         key = (self._to_image_va(insn.address), mn, ops)
         if key in self._privileged_insn_seen:
@@ -673,6 +687,7 @@ class VMTracer:
             'rip': self._to_image_va(insn.address),
             'mnemonic': insn.mnemonic,
             'op_str': insn.op_str,
+            'probe_kind': 'segment' if SEGMENT_MEM_TOKEN_RE.search(ops_lower) and mn not in PRIVILEGED_MNEMONICS else 'system',
             'rax': uc.reg_read(UC_X86_REG_RAX),
             'rcx': uc.reg_read(UC_X86_REG_RCX),
             'rdx': uc.reg_read(UC_X86_REG_RDX),
@@ -1880,6 +1895,7 @@ def replay_native_snapshot(snapshot, max_insns=200000):
             pass
 
     cs = Cs(CS_ARCH_X86, CS_MODE_64)
+    cs.detail = True
     insn_count = 0
     indirect_calls = []
     visited = []
@@ -1903,7 +1919,7 @@ def replay_native_snapshot(snapshot, max_insns=200000):
                     'size': size,
                     'value': value,
                     'rip': runtime_to_image(rip),
-                    'label': WATCHED_GLOBALS.get(image_addr, ''),
+                    'label': WATCHED_GLOBALS.get(image_addr, WATCHED_PAGE_LABELS.get(page, '')),
                 })
         mem_events.append({
             'access': int(access),
@@ -1927,6 +1943,27 @@ def replay_native_snapshot(snapshot, max_insns=200000):
         except:
             return False
 
+    def resolve_mem_operand(uc, insn):
+        if not getattr(insn, 'operands', None):
+            return None
+        for op in insn.operands:
+            if op.type != X86_OP_MEM:
+                continue
+            mem = op.mem
+            addr = mem.disp
+            if mem.base:
+                base_name = insn.reg_name(mem.base)
+                uc_reg = UC_REG_BY_NAME.get(base_name.lower())
+                if uc_reg is not None:
+                    addr += uc.reg_read(uc_reg)
+            if mem.index:
+                index_name = insn.reg_name(mem.index)
+                uc_reg = UC_REG_BY_NAME.get(index_name.lower())
+                if uc_reg is not None:
+                    addr += uc.reg_read(uc_reg) * (mem.scale or 1)
+            return addr & 0xFFFFFFFFFFFFFFFF
+        return None
+
     def hook_code(uc, address, size, _):
         nonlocal insn_count
         insn_count += 1
@@ -1942,14 +1979,28 @@ def replay_native_snapshot(snapshot, max_insns=200000):
             insn = None
         if insn:
             mn = insn.mnemonic.lower()
-            if mn in PRIVILEGED_MNEMONICS or SPECIAL_REG_TOKEN_RE.search((insn.op_str or '').lower()):
+            ops_lower = (insn.op_str or '').lower()
+            if mn in PRIVILEGED_MNEMONICS or SPECIAL_REG_TOKEN_RE.search(ops_lower) or SEGMENT_MEM_TOKEN_RE.search(ops_lower):
                 key = (runtime_to_image(insn.address), mn, insn.op_str)
                 if key not in privileged_seen:
                     privileged_seen.add(key)
+                    mem_addr = resolve_mem_operand(uc, insn)
                     privileged_events.append({
                         'rip': runtime_to_image(insn.address),
                         'mnemonic': insn.mnemonic,
                         'op_str': insn.op_str,
+                        'probe_kind': 'segment' if SEGMENT_MEM_TOKEN_RE.search(ops_lower) and mn not in PRIVILEGED_MNEMONICS else 'system',
+                        'mem_addr': runtime_to_image(mem_addr) if mem_addr is not None else None,
+                        'rax': uc.reg_read(UC_X86_REG_RAX),
+                        'rcx': uc.reg_read(UC_X86_REG_RCX),
+                        'rdx': uc.reg_read(UC_X86_REG_RDX),
+                        'r8': uc.reg_read(UC_X86_REG_R8),
+                        'r9': uc.reg_read(UC_X86_REG_R9),
+                        'gs_base': uc.reg_read(UC_X86_REG_GS_BASE),
+                        'gdtr': uc.reg_read(UC_X86_REG_GDTR),
+                        'idtr': uc.reg_read(UC_X86_REG_IDTR),
+                        'tr': uc.reg_read(UC_X86_REG_TR),
+                        'ldtr': uc.reg_read(UC_X86_REG_LDTR),
                     })
         if insn and insn.mnemonic == 'call' and insn.op_str.startswith('rax'):
             indirect_calls.append({
@@ -2004,15 +2055,171 @@ def replay_native_snapshot(snapshot, max_insns=200000):
     }
 
 
-def export_native_call_artifacts(trace, out_dir):
-    def maybe_hex(value):
-        if value is None:
-            return None
-        try:
-            return f'0x{int(value):X}'
-        except (TypeError, ValueError):
-            return value
+def maybe_hex(value):
+    if value is None:
+        return None
+    try:
+        return f'0x{int(value):X}'
+    except (TypeError, ValueError):
+        return value
 
+
+def serialize_system_tuple(value, kind='table'):
+    if not isinstance(value, (tuple, list)) or len(value) != 4:
+        return value
+    head_key = 'selector' if kind in ('segment', 'task') else 'reserved'
+    return {
+        head_key: maybe_hex(value[0]),
+        'base': maybe_hex(value[1]),
+        'limit': maybe_hex(value[2]),
+        'flags': maybe_hex(value[3]),
+    }
+
+
+def serialize_probe_event(event):
+    item = {
+        'rip': maybe_hex(event.get('rip')),
+        'mnemonic': event.get('mnemonic', ''),
+        'op_str': event.get('op_str', ''),
+        'probe_kind': event.get('probe_kind', ''),
+        'mem_addr': maybe_hex(event.get('mem_addr')),
+        'rax': maybe_hex(event.get('rax')),
+        'rcx': maybe_hex(event.get('rcx')),
+        'rdx': maybe_hex(event.get('rdx')),
+        'r8': maybe_hex(event.get('r8')),
+        'r9': maybe_hex(event.get('r9')),
+        'gs_base': maybe_hex(event.get('gs_base')),
+        'gdtr': serialize_system_tuple(event.get('gdtr'), kind='table'),
+        'idtr': serialize_system_tuple(event.get('idtr'), kind='table'),
+        'tr': serialize_system_tuple(event.get('tr'), kind='task'),
+        'ldtr': serialize_system_tuple(event.get('ldtr'), kind='segment'),
+    }
+    return {k: v for k, v in item.items() if v not in (None, '', {})}
+
+
+def serialize_watched_event(event):
+    return {
+        'access': int(event.get('access', 0)),
+        'address': maybe_hex(event.get('address')),
+        'size': int(event.get('size', 0)),
+        'value': maybe_hex(event.get('value')),
+        'rip': maybe_hex(event.get('rip')),
+        'label': event.get('label', ''),
+    }
+
+
+def collect_trace_probe_events(trace):
+    privileged_events = []
+    watched_events = []
+    seen_priv = set()
+    seen_watch = set()
+    for record in trace:
+        for event in record.get('privileged_insn_events', []):
+            key = (
+                event.get('rip'),
+                event.get('mnemonic'),
+                event.get('op_str'),
+                event.get('mem_addr'),
+            )
+            if key in seen_priv:
+                continue
+            seen_priv.add(key)
+            privileged_events.append(event)
+        for event in record.get('watched_mem_events', []):
+            key = (
+                event.get('access'),
+                event.get('address'),
+                event.get('size'),
+                event.get('value'),
+                event.get('rip'),
+            )
+            if key in seen_watch:
+                continue
+            seen_watch.add(key)
+            watched_events.append(event)
+    return privileged_events, watched_events
+
+
+def export_kernel_probe_report(trace, out_dir, native_probe_results=None):
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    privileged_events, watched_events = collect_trace_probe_events(trace)
+
+    native_probe_results = native_probe_results or []
+    native_privileged = []
+    native_watched = []
+    for result in native_probe_results:
+        native_privileged.extend(result.get('privileged_insn_events', []))
+        native_watched.extend(result.get('watched_mem_events', []))
+
+    kernel_watch_events = [
+        event for event in watched_events + native_watched
+        if ((int(event.get('address', 0)) & ~0xFFF) in WATCHED_PAGES)
+    ]
+
+    unique_probe_sites = sorted({
+        (int(event.get('rip', 0)), event.get('mnemonic', ''), event.get('op_str', ''))
+        for event in privileged_events + native_privileged
+    })
+    probe_counts = defaultdict(int)
+    for _, mnemonic, _ in unique_probe_sites:
+        probe_counts[mnemonic] += 1
+
+    report = {
+        'config': {
+            'imagebase': maybe_hex(IMAGEBASE),
+            'kernel_imagebase': maybe_hex(KERNEL_IMAGEBASE),
+            'execute_from_kernel_alias': bool(EXECUTE_FROM_KERNEL_ALIAS),
+            'kernel_alias_enabled': bool(ENABLE_KERNEL_IMAGE_ALIAS),
+            'kuser_shared_data': maybe_hex(KUSER_SHARED_DATA),
+            'kpcr_base': maybe_hex(KPCR_BASE),
+            'gdt_base': maybe_hex(GDT_BASE),
+            'idt_base': maybe_hex(IDT_BASE),
+            'tss_base': maybe_hex(TSS_BASE),
+            'ldt_base': maybe_hex(LDT_BASE),
+            'selectors': {
+                'cs': maybe_hex(KERNEL_CS),
+                'ds': maybe_hex(KERNEL_DS),
+                'ss': maybe_hex(KERNEL_SS),
+                'tr': maybe_hex(KERNEL_TR),
+                'ldt': maybe_hex(KERNEL_LDT),
+            },
+            'seeded_registers': {
+                'gs_base': maybe_hex(KPCR_BASE),
+                'gdtr': serialize_system_tuple((0, GDT_BASE, GDT_SIZE - 1, 0), kind='table'),
+                'idtr': serialize_system_tuple((0, IDT_BASE, IDT_SIZE - 1, 0), kind='table'),
+                'tr': serialize_system_tuple((KERNEL_TR, TSS_BASE, TSS_SIZE - 1, 0), kind='task'),
+                'ldtr': serialize_system_tuple((KERNEL_LDT, LDT_BASE, LDT_SIZE - 1, 0), kind='segment'),
+            },
+        },
+        'summary': {
+            'trace_probe_count': len(privileged_events),
+            'native_probe_count': len(native_privileged),
+            'kernel_watch_count': len(kernel_watch_events),
+            'unique_probe_sites': len(unique_probe_sites),
+            'probe_mnemonics': dict(sorted(probe_counts.items())),
+        },
+        'trace_probe_events': [serialize_probe_event(event) for event in privileged_events],
+        'native_probe_events': [serialize_probe_event(event) for event in native_privileged],
+        'kernel_watch_events': [serialize_watched_event(event) for event in kernel_watch_events],
+        'unique_probe_sites': [
+            {
+                'rip': maybe_hex(rip),
+                'mnemonic': mnemonic,
+                'op_str': op_str,
+            }
+            for rip, mnemonic, op_str in unique_probe_sites
+        ],
+    }
+
+    out_path = out_dir / 'kernel_probe_report.json'
+    with open(out_path, 'w') as f:
+        json.dump(report, f, indent=2)
+    print(f'  Exported kernel probe report -> {out_path}')
+    return report
+
+
+def export_native_call_artifacts(trace, out_dir):
     snapshots = collect_native_call_snapshots(trace)
     if not snapshots:
         return [], []
@@ -2084,23 +2291,9 @@ def export_native_call_artifacts(trace, out_dir):
         item['unmapped_events'] = converted_events
         watched_events = []
         for event in item.get('watched_mem_events', []):
-            watched_events.append({
-                'access': event.get('access'),
-                'address': maybe_hex(event.get('address')),
-                'size': event.get('size'),
-                'value': maybe_hex(event.get('value')),
-                'rip': maybe_hex(event.get('rip')),
-                'label': event.get('label', ''),
-            })
+            watched_events.append(serialize_watched_event(event))
         item['watched_mem_events'] = watched_events
-        item['privileged_insn_events'] = [
-            {
-                'rip': maybe_hex(event.get('rip')),
-                'mnemonic': event.get('mnemonic', ''),
-                'op_str': event.get('op_str', ''),
-            }
-            for event in item.get('privileged_insn_events', [])
-        ]
+        item['privileged_insn_events'] = [serialize_probe_event(event) for event in item.get('privileged_insn_events', [])]
         item['exception_state'] = {
             key: maybe_hex(value)
             for key, value in item.get('exception_state', {}).items()
@@ -3072,7 +3265,9 @@ def main():
         unicorn_trace_payload = export_omill_trace_json(trace, db, trace_json)
         unicorn_trace_payload = augment_records_with_live_snapshots(
             trace, unicorn_trace_payload, resolver)
-        export_native_call_artifacts(trace, Path(r"D:\binsnake\tracer"))
+        native_probe_results = []
+        _, native_probe_results = export_native_call_artifacts(trace, Path(r"D:\binsnake\tracer"))
+        export_kernel_probe_report(trace, Path(r"D:\binsnake\tracer"), native_probe_results=native_probe_results)
         concrete_out = Path(r"D:\binsnake\tracer\vm_trace_concrete.json")
         with open(concrete_out, 'w') as f:
             json.dump(unicorn_trace_payload, f, indent=2)
