@@ -69,6 +69,7 @@ class VMTraceMap {
   const std::vector<uint64_t> &handlerEntries() const {
     return handler_entries_;
   }
+  uint64_t entryHandlerVA() const { return entry_handler_va_; }
 
   uint64_t vmenterVA() const { return vmenter_va_; }
   uint64_t vmexitVA() const { return vmexit_va_; }
@@ -113,6 +114,7 @@ class VMTraceMap {
 
   uint64_t vmenter_va_ = 0;
   uint64_t vmexit_va_ = 0;
+  uint64_t entry_handler_va_ = 0;
 
   std::vector<uint64_t> handler_entries_;
   llvm::DenseSet<uint64_t> handler_set_;

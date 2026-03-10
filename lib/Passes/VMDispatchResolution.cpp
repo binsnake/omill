@@ -9,6 +9,7 @@
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/Transforms/Utils/Cloning.h>
 
 #include "omill/Analysis/VMTraceMap.h"
 #include "omill/Utils/LiftedNames.h"
@@ -34,6 +35,26 @@ static std::optional<uint64_t> extractTraceHashAttr(const llvm::Function &F) {
   return hash;
 }
 
+static std::optional<uint64_t> extractHexStringAttr(const llvm::Function &F,
+                                                    llvm::StringRef name) {
+  auto attr = F.getFnAttribute(name);
+  if (!attr.isValid() || !attr.isStringAttribute())
+    return std::nullopt;
+
+  uint64_t value = 0;
+  if (attr.getValueAsString().getAsInteger(16, value))
+    return std::nullopt;
+  return value;
+}
+
+static std::string specializedWrapperCloneName(uint64_t wrapper_va,
+                                               uint64_t successor_va,
+                                               uint64_t outgoing_hash) {
+  return liftedFunctionName(wrapper_va) + "__vmwrap_" +
+         llvm::Twine::utohexstr(successor_va).str() + "_" +
+         llvm::Twine::utohexstr(outgoing_hash).str();
+}
+
 static llvm::Function *findDemergedHandlerClone(llvm::Module &M,
                                                 uint64_t handler_va,
                                                 uint64_t incoming_hash) {
@@ -51,6 +72,56 @@ static llvm::Function *findDemergedHandlerClone(llvm::Module &M,
       return &F;
   }
   return nullptr;
+}
+
+static llvm::Function *getOrCreateDemergedHandlerClone(llvm::Module &M,
+                                                       uint64_t handler_va,
+                                                       uint64_t incoming_hash) {
+  if (auto *clone = findDemergedHandlerClone(M, handler_va, incoming_hash))
+    return clone;
+
+  auto *base_fn = M.getFunction(liftedFunctionName(handler_va));
+  if (!base_fn || base_fn->isDeclaration())
+    return nullptr;
+
+  std::string clone_name =
+      demergedHandlerCloneName(handler_va, incoming_hash);
+  llvm::ValueToValueMapTy VMap;
+  auto *clone = llvm::CloneFunction(base_fn, VMap);
+  clone->setName(clone_name);
+  clone->setLinkage(llvm::GlobalValue::InternalLinkage);
+  clone->addFnAttr("omill.vm_handler");
+  clone->addFnAttr("omill.vm_demerged_clone", "1");
+  clone->addFnAttr("omill.vm_trace_in_hash",
+                   llvm::Twine::utohexstr(incoming_hash).str());
+  return clone;
+}
+
+static llvm::Function *getOrCreateSpecializedWrapperClone(llvm::Module &M,
+                                                          uint64_t wrapper_va,
+                                                          uint64_t successor_va,
+                                                          uint64_t outgoing_hash) {
+  auto clone_name =
+      specializedWrapperCloneName(wrapper_va, successor_va, outgoing_hash);
+  if (auto *clone = M.getFunction(clone_name))
+    return clone;
+
+  auto *base_fn = M.getFunction(liftedFunctionName(wrapper_va));
+  if (!base_fn || base_fn->isDeclaration())
+    return nullptr;
+
+  llvm::ValueToValueMapTy VMap;
+  auto *clone = llvm::CloneFunction(base_fn, VMap);
+  clone->setName(clone_name);
+  clone->setLinkage(llvm::GlobalValue::InternalLinkage);
+  clone->addFnAttr("omill.vm_wrapper");
+  clone->addFnAttr("omill.vm_handler");
+  clone->addFnAttr("omill.vm_wrapper_specialized", "1");
+  clone->addFnAttr("omill.vm_trace_successor",
+                   llvm::Twine::utohexstr(successor_va).str());
+  clone->addFnAttr("omill.vm_trace_out_hash",
+                   llvm::Twine::utohexstr(outgoing_hash).str());
+  return clone;
 }
 
 static void collectDispatchJumps(
@@ -94,6 +165,10 @@ llvm::PreservedAnalyses VMDispatchResolutionPass::run(
       continue;
 
     auto exact_hash = extractTraceHashAttr(F);
+    auto forced_successor =
+        extractHexStringAttr(F, "omill.vm_trace_successor");
+    auto forced_out_hash =
+        extractHexStringAttr(F, "omill.vm_trace_out_hash");
     auto trace_targets = trace_map.getTraceTargets(*handler_va);
     llvm::Function *exact_clone_target = nullptr;
 
@@ -101,10 +176,17 @@ llvm::PreservedAnalyses VMDispatchResolutionPass::run(
     // thunk-resolved vmenter wrapper (remill folded the vmenter code into a
     // preceding thunk function).  Fall back to the first handler entry in the
     // trace map, which is the initial dispatch target of the VM.
-    if (trace_targets.empty() && !exact_hash &&
-        !trace_map.handlerEntries().empty() &&
+    uint64_t entry_handler_va = trace_map.entryHandlerVA();
+    if (entry_handler_va == 0 && !trace_map.handlerEntries().empty())
+      entry_handler_va = trace_map.handlerEntries().front();
+
+    if (trace_targets.empty() && entry_handler_va != 0 &&
         !trace_map.isVMHandler(*handler_va)) {
-      trace_targets.push_back(trace_map.handlerEntries().front());
+      trace_targets.push_back(entry_handler_va);
+      if (exact_hash) {
+        exact_clone_target = getOrCreateDemergedHandlerClone(
+            M, entry_handler_va, *exact_hash);
+      }
     }
 
     // Resolve native call target if present (inner VM call boundary).
@@ -115,11 +197,30 @@ llvm::PreservedAnalyses VMDispatchResolutionPass::run(
         native_call_va = exact_record->native_target_va;
         if (exact_record->successors.size() == 1 &&
             exact_record->outgoing_hash != 0) {
-          exact_clone_target = findDemergedHandlerClone(
+          exact_clone_target = getOrCreateDemergedHandlerClone(
               M, exact_record->successors.front(), exact_record->outgoing_hash);
         }
       }
+    } else {
+      auto records = trace_map.getTraceRecords(*handler_va);
+      if (records.size() == 1) {
+        const auto &record = records.front();
+        trace_targets = record.successors;
+        native_call_va = record.native_target_va;
+        if (record.successors.size() == 1 && record.outgoing_hash != 0) {
+          exact_clone_target = getOrCreateDemergedHandlerClone(
+              M, record.successors.front(), record.outgoing_hash);
+        }
+      }
     }
+
+    if (forced_successor && forced_out_hash) {
+      trace_targets.clear();
+      trace_targets.push_back(*forced_successor);
+      exact_clone_target = getOrCreateDemergedHandlerClone(
+          M, *forced_successor, *forced_out_hash);
+    }
+
     llvm::SmallVector<llvm::CallInst *, 4> dispatch_jumps;
     collectDispatchJumps(F, dispatch_jumps);
 
@@ -153,20 +254,36 @@ llvm::PreservedAnalyses VMDispatchResolutionPass::run(
       }
 
       if (trace_targets.size() != 1) {
-        ++skipped_count;
-        continue;
+        bool resolved_from_pc_eval = false;
+        if (exact_hash || forced_out_hash) {
+          auto pcs = collectPossiblePCValues(call->getArgOperand(1), F, 4);
+          if (pcs.size() == 1 && pcs.front() != 0) {
+            uint64_t target_va = pcs.front();
+            call->setArgOperand(1, llvm::ConstantInt::get(i64_ty, target_va));
+            ++resolved_count;
+            discovered_targets.insert(target_va);
+            resolved_from_pc_eval = true;
+          }
+        }
+        if (!resolved_from_pc_eval) {
+          ++skipped_count;
+          continue;
+        }
       }
 
-      uint64_t target_va = trace_targets.front();
-      if (exact_clone_target) {
-        llvm::IRBuilder<> builder(call);
-        auto *fn_addr = builder.CreatePtrToInt(exact_clone_target, i64_ty,
-                                               exact_clone_target->getName() + ".addr");
-        call->setArgOperand(1, fn_addr);
-      } else {
-        call->setArgOperand(1, llvm::ConstantInt::get(i64_ty, target_va));
+      uint64_t target_va = 0;
+      if (trace_targets.size() == 1) {
+        target_va = trace_targets.front();
+        if (exact_clone_target) {
+          llvm::IRBuilder<> builder(call);
+          auto *fn_addr = builder.CreatePtrToInt(exact_clone_target, i64_ty,
+                                                 exact_clone_target->getName() + ".addr");
+          call->setArgOperand(1, fn_addr);
+        } else {
+          call->setArgOperand(1, llvm::ConstantInt::get(i64_ty, target_va));
+        }
+        ++resolved_count;
       }
-      ++resolved_count;
 
       // Emit native call before the dispatch_jump if this handler has a
       // native call target (e.g. vmenter wrapper for inner VM re-entry).
@@ -176,7 +293,34 @@ llvm::PreservedAnalyses VMDispatchResolutionPass::run(
       if (native_call_va != 0) {
         std::string native_fn_name =
             "sub_" + llvm::Twine::utohexstr(native_call_va).str();
-        if (auto *native_fn = M.getFunction(native_fn_name)) {
+        llvm::Function *native_fn = M.getFunction(native_fn_name);
+        if (native_fn && native_fn->hasFnAttribute("omill.vm_wrapper") &&
+            trace_targets.size() == 1) {
+          uint64_t specialized_successor = trace_targets.front();
+          uint64_t specialized_out_hash = 0;
+          if (forced_out_hash) {
+            specialized_out_hash = *forced_out_hash;
+          } else if (exact_hash) {
+            if (auto exact_record =
+                    trace_map.getTraceForHash(*handler_va, *exact_hash)) {
+              specialized_out_hash = exact_record->outgoing_hash;
+            }
+          } else {
+            auto records = trace_map.getTraceRecords(*handler_va);
+            if (records.size() == 1)
+              specialized_out_hash = records.front().outgoing_hash;
+          }
+
+          if (specialized_out_hash != 0) {
+            if (auto *specialized = getOrCreateSpecializedWrapperClone(
+                    M, native_call_va, specialized_successor,
+                    specialized_out_hash)) {
+              native_fn = specialized;
+            }
+          }
+        }
+
+        if (native_fn) {
           llvm::IRBuilder<> builder(call);
           auto *state = call->getArgOperand(0);
           auto *mem = call->getArgOperand(2);
@@ -188,7 +332,7 @@ llvm::PreservedAnalyses VMDispatchResolutionPass::run(
         }
       }
 
-      if (!exact_clone_target) {
+      if (!exact_clone_target && target_va != 0) {
         std::string target_name =
             "sub_" + llvm::Twine::utohexstr(target_va).str();
         if (!M.getFunction(target_name))

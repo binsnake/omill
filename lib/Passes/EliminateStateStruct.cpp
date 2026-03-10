@@ -20,8 +20,16 @@ void internalizeRecoveredFunctions(llvm::Module &M) {
     std::string native_name = F.getName().str() + "_native";
     if (M.getFunction(native_name)) {
       F.setLinkage(llvm::GlobalValue::InternalLinkage);
-      F.removeFnAttr(llvm::Attribute::NoInline);
-      F.addFnAttr(llvm::Attribute::AlwaysInline);
+      if (F.hasFnAttribute("omill.output_root")) {
+        // Keeping the exported lifted root as a call boundary avoids
+        // force-inlining the whole stateful body into the public wrapper,
+        // which can collapse the concrete success path into the fastfail arm.
+        F.removeFnAttr(llvm::Attribute::AlwaysInline);
+        F.addFnAttr(llvm::Attribute::NoInline);
+      } else {
+        F.removeFnAttr(llvm::Attribute::NoInline);
+        F.addFnAttr(llvm::Attribute::AlwaysInline);
+      }
     }
   }
 }

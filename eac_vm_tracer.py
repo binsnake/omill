@@ -49,6 +49,7 @@ import struct
 import json
 import sys
 import time
+import re
 from pathlib import Path
 from collections import defaultdict
 
@@ -101,6 +102,65 @@ CTX_OFF = {
 
 GPR_NAMES = ['rax','rbx','rcx','rdx','rsp','rbp','rsi','rdi',
              'r8','r9','r10','r11','r12','r13','r14','r15']
+WATCHED_GLOBALS = {
+    0x140225720: 'slot_140225720',
+    0x1402264D0: 'slot_1402264D0',
+    0x1402264F0: 'slot_1402264F0',
+    0x140226500: 'slot_140226500',
+    0x140270CE0: 'qword_140270CE0',
+    0x140277BC8: 'qword_140277BC8',
+}
+WATCHED_PAGES = {
+    0x140225000,
+    0x140226000,
+    0x140270000,
+    0x140277000,
+}
+PRIVILEGED_MNEMONICS = {
+    'cli', 'sti', 'hlt', 'swapgs',
+    'rdmsr', 'wrmsr', 'rdpmc', 'rdtsc', 'rdtscp',
+    'xgetbv', 'xsetbv',
+    'sgdt', 'sidt', 'sldt', 'str', 'smsw', 'lmsw',
+    'in', 'insb', 'insd', 'insw', 'out', 'outsb', 'outsd', 'outsw',
+}
+SPECIAL_REG_TOKEN_RE = re.compile(r'\b(?:cr\d+|dr\d+|tr\d+|msr)\b')
+NATIVE_PROBE_EXTRA_PAGES = {
+    0x1401660E0: [
+        0x140270CE0 & ~0xFFF,
+        0x140277BC8 & ~0xFFF,
+    ],
+}
+
+UC_REG_BY_NAME = {
+    'rax': UC_X86_REG_RAX,
+    'rbx': UC_X86_REG_RBX,
+    'rcx': UC_X86_REG_RCX,
+    'rdx': UC_X86_REG_RDX,
+    'rsp': UC_X86_REG_RSP,
+    'rbp': UC_X86_REG_RBP,
+    'rsi': UC_X86_REG_RSI,
+    'rdi': UC_X86_REG_RDI,
+    'r8': UC_X86_REG_R8,
+    'r9': UC_X86_REG_R9,
+    'r10': UC_X86_REG_R10,
+    'r11': UC_X86_REG_R11,
+    'r12': UC_X86_REG_R12,
+    'r13': UC_X86_REG_R13,
+    'r14': UC_X86_REG_R14,
+    'r15': UC_X86_REG_R15,
+}
+
+VM_DISPATCH_LOOP = 0x1402A1318
+VM_DISPATCH_JMP  = 0x1402A1366
+
+# Known giant loop heads that are safe to summarize with the isolated resolver
+# and then skip back into the live Unicorn VM at their resolved continuation.
+JIT_OUTLINE_LOOP_HEADS = {
+    0x14170D5A2,
+}
+
+OUTLINE_LIVE_MAX_INSNS = 250_000
+OUTLINE_SYNTH_MAX_INSNS = 250_000
 
 
 # =============================================================================
@@ -271,9 +331,10 @@ class DispatchDB:
 # =============================================================================
 
 class VMTracer:
-    def __init__(self, pe_path, db, verbose=2):
+    def __init__(self, pe_path, db, verbose=2, resolver=None, outline_loop_heads=None):
         self.verbose = verbose
         self.db = db
+        self.resolver = resolver
         self.pe = pefile.PE(pe_path)
         self.mu = Uc(UC_ARCH_X86, UC_MODE_64)
         self.cs = Cs(CS_ARCH_X86, CS_MODE_64)
@@ -293,8 +354,208 @@ class VMTracer:
         self.pending_native_target = 0    # resolved native function VA
         self.native_calls = []            # list of {step, native_target_va, stub_addr}
 
+        # VM nesting depth: incremented at VM_SETUP entry, decremented at
+        # non-transient vmexit.  Only depth==1 is the final (outer VM) exit.
+        self.vm_depth = 0
+        self.final_vmexit_seen = False
+        self.post_dispatch_targets = []
+        self.outline_loop_heads = set(outline_loop_heads or JIT_OUTLINE_LOOP_HEADS)
+        self.outline_attempted = set()
+        self.outline_hits = 0
+        self.outline_failures = 0
+        self.watched_mem_events = []
+        self._watched_mem_seen = set()
+        self.privileged_insn_events = []
+        self._privileged_insn_seen = set()
+
         self._map_pe()
         self._setup()
+
+    def _record_watched_mem(self, access, address, size, value, rip):
+        page = address & ~0xFFF
+        if address not in WATCHED_GLOBALS and page not in WATCHED_PAGES:
+            return
+        key = (access, address, size, value, rip)
+        if key in self._watched_mem_seen:
+            return
+        self._watched_mem_seen.add(key)
+        event = {
+            'access': access,
+            'address': address,
+            'size': size,
+            'value': value,
+            'rip': rip,
+            'label': WATCHED_GLOBALS.get(address, ''),
+        }
+        self.watched_mem_events.append(event)
+        if self.verbose >= 1:
+            atype = {
+                UC_MEM_READ: 'READ',
+                UC_MEM_WRITE: 'WRITE',
+            }.get(access, f'ACC{access}')
+            label = f" {event['label']}" if event['label'] else ''
+            print(f'  [watch] {atype}{label} addr=0x{address:X} size={size} value=0x{value:X} rip=0x{rip:X}')
+
+    def _hook_mem_access(self, uc, access, address, size, value, _):
+        rip = uc.reg_read(UC_X86_REG_RIP)
+        self._record_watched_mem(access, address, size, value, rip)
+        return True
+
+    def _maybe_log_special_insn(self, uc, insn):
+        ops = insn.op_str or ''
+        mn = insn.mnemonic.lower()
+        if mn not in PRIVILEGED_MNEMONICS and not SPECIAL_REG_TOKEN_RE.search(ops.lower()):
+            return
+        key = (insn.address, mn, ops)
+        if key in self._privileged_insn_seen:
+            return
+        self._privileged_insn_seen.add(key)
+        event = {
+            'rip': insn.address,
+            'mnemonic': insn.mnemonic,
+            'op_str': insn.op_str,
+        }
+        self.privileged_insn_events.append(event)
+        if self.verbose >= 1:
+            print(f"  [cpu] 0x{insn.address:X}: {insn.mnemonic} {insn.op_str}")
+
+    def _clone_runtime_regions(self, uc):
+        regions = []
+
+        def _append_region(base, size):
+            try:
+                regions.append({
+                    'base': base,
+                    'size': size,
+                    'data': bytes(uc.mem_read(base, size)),
+                })
+            except:
+                pass
+
+        seen = set()
+        for base, size in (
+            (DRIVER_OBJ, 0x10000),
+            (REG_PATH, 0x10000),
+            (STUB_BASE, 0x10000),
+            (KUSER_SHARED_DATA, KUSD_PAGE_SIZE),
+        ):
+            key = (base, size)
+            if key in seen:
+                continue
+            seen.add(key)
+            _append_region(base, size)
+
+        for page in sorted(self.auto_mapped):
+            key = (page, 0x1000)
+            if key in seen:
+                continue
+            seen.add(key)
+            _append_region(page, 0x1000)
+
+        return regions
+
+    def _capture_native_call_snapshot(self, uc, native_target, stub_addr=0,
+                                      call_addr=0, source='live_stub',
+                                      handler_after=0):
+        try:
+            regs = {name: uc.reg_read(reg) for name, reg in UC_REG_BY_NAME.items()}
+            eflags = uc.reg_read(UC_X86_REG_EFLAGS)
+            rsp_pre_call = regs['rsp']
+            stack_base = max(rsp_pre_call - 0x40, STACK_BASE)
+            stack_size = min(0x200, STACK_BASE + STACK_SIZE - stack_base)
+            stack_bytes = bytes(uc.mem_read(stack_base, stack_size))
+            snapshot = {
+                'source': source,
+                'native_target_va': native_target,
+                'stub_addr': stub_addr,
+                'call_addr': call_addr,
+                'handler_after_va': handler_after,
+                'regs': regs,
+                'eflags': eflags,
+                'rsp_pre_call': rsp_pre_call,
+                'entry_rsp': (rsp_pre_call - 8) & 0xFFFFFFFFFFFFFFFF,
+                'stack_base': stack_base,
+                'stack_bytes': stack_bytes.hex(),
+                'runtime_regions': self._clone_runtime_regions(uc),
+            }
+            return snapshot
+        except:
+            return None
+
+    def _clone_native_probe_pages(self, uc, native_target):
+        regions = []
+        seen = set()
+        for page in NATIVE_PROBE_EXTRA_PAGES.get(native_target, []):
+            if page in seen:
+                continue
+            seen.add(page)
+            try:
+                regions.append({
+                    'base': page,
+                    'size': 0x1000,
+                    'data': bytes(uc.mem_read(page, 0x1000)),
+                })
+            except:
+                pass
+        return regions
+
+    def _synthesize_native_call_snapshot(self, ctx_bytes, native_target,
+                                         stub_addr=0, handler_after=0,
+                                         source='outlined_ctx',
+                                         runtime_regions=None):
+        if ctx_bytes is None:
+            return None
+        try:
+            regs = {}
+            for name in GPR_NAMES:
+                regs[name] = struct.unpack(
+                    '<Q',
+                    ctx_bytes[CTX_OFF[name]:CTX_OFF[name] + 8])[0]
+            original_rsp = regs['rsp']
+            entry_rsp = (original_rsp - 8) & 0xFFFFFFFFFFFFFFFF
+            stack_base = max(entry_rsp - 0x40, STACK_BASE)
+            stack_span = min(0x200, STACK_BASE + STACK_SIZE - stack_base)
+            stack = bytearray(stack_span)
+            ret_sentinel = 0xDEADDEADDEADDEAD
+            if stack_base <= entry_rsp < stack_base + stack_span:
+                off = entry_rsp - stack_base
+                struct.pack_into('<Q', stack, off, ret_sentinel)
+            snapshot = {
+                'source': source,
+                'native_target_va': native_target,
+                'stub_addr': stub_addr,
+                'call_addr': 0,
+                'handler_after_va': handler_after,
+                'regs': regs,
+                'eflags': struct.unpack(
+                    '<Q',
+                    ctx_bytes[CTX_OFF['rflags']:CTX_OFF['rflags'] + 8])[0],
+                'rsp_pre_call': original_rsp,
+                'entry_rsp': entry_rsp,
+                'stack_base': stack_base,
+                'stack_bytes': bytes(stack).hex(),
+                'runtime_regions': list(runtime_regions or []),
+            }
+            return snapshot
+        except:
+            return None
+
+    def _capture_vm_snapshot(self, uc):
+        """Capture the live VM context at handler entry for targeted re-resolution."""
+        try:
+            r12 = uc.reg_read(UC_X86_REG_R12)
+            rsp = uc.reg_read(UC_X86_REG_RSP)
+            ctx_size = getattr(self.resolver, 'CTX_SIZE', 0x1A0) if self.resolver else 0x1A0
+            ctx_bytes = bytes(uc.mem_read(r12, ctx_size))
+            stack_bytes = bytes(uc.mem_read(rsp, min(0x200, 0x1000)))
+            return {
+                'r12': r12,
+                'rsp': rsp,
+                'ctx': ctx_bytes,
+                'stack': stack_bytes,
+            }
+        except:
+            return None
 
     def _map_pe(self):
         for sec in self.pe.sections:
@@ -370,15 +631,21 @@ class VMTracer:
             print(f'\n[!] Instruction limit (5M) reached @ RIP=0x{address:X}')
             uc.emu_stop()
             return
+        if address in self.outline_loop_heads and self._try_outline_loop(uc, address):
+            return
+        insn = None
+        if size <= 15:
+            try:
+                insn = next(self.cs.disasm(bytes(uc.mem_read(address, size)), address))
+                self._maybe_log_special_insn(uc, insn)
+            except:
+                insn = None
         # Detect dispatch: add rax, [r12+E0h]
         if size == 8:
             code = bytes(uc.mem_read(address, 8))
             if code == DISPATCH_SIG:
                 self._on_dispatch(uc, address)
                 return
-        # Detect dispatch loop entry at 0x1402A1318
-        VM_DISPATCH_LOOP = 0x1402A1318
-        VM_DISPATCH_JMP = 0x1402A1366
         if address == VM_DISPATCH_LOOP:
             # At entry, rax/rbx not yet loaded; read directly from context
             rsp = uc.reg_read(UC_X86_REG_RSP)
@@ -432,6 +699,8 @@ class VMTracer:
                     dest_str = f' -> 0x{thunk_dest:X}' if thunk_dest else ''
                     vm_exit = thunk_dest == VM_EXIT if thunk_dest else False
                     tag = ' [VM EXIT path]' if vm_exit else ''
+                    if thunk_dest and not vm_exit:
+                        self.post_dispatch_targets.append(thunk_dest)
                     if self.verbose >= 1:
                         print(f'  [epilog] jmp {regname} = 0x{reg:X}{dest_str}{tag}')
         # Detect native call: call [rsp+8] (FF 54 24 08) inside a native stub
@@ -447,11 +716,34 @@ class VMTracer:
             # Record in the last trace entry
             if self.trace:
                 self.trace[-1]['native_target_va'] = native_target
+                self.trace[-1]['dispatch_kind'] = 'native_call'
+                self.trace[-1]['native_stub_va'] = self.native_stub_addr
+                native_snapshot = self._capture_native_call_snapshot(
+                    uc,
+                    native_target,
+                    stub_addr=self.native_stub_addr,
+                    call_addr=address,
+                    source='live_stub',
+                    handler_after=self.trace[-1].get('handler_after_native', 0),
+                )
+                if native_snapshot is not None:
+                    self.trace[-1]['_native_snapshot'] = native_snapshot
             self.native_calls.append({
                 'step': self.step,
                 'native_target_va': native_target,
                 'stub_addr': self.native_stub_addr,
             })
+
+        # Track VM nesting. A vmenter call at the tail of a native-call stub
+        # is only a re-entry into the current VM level, not a nested VM.
+        if address == VM_SETUP:
+            if self._is_native_stub_reentry(uc):
+                if self.verbose >= 1:
+                    print(f'  [vmenter reentry] depth still {self.vm_depth}')
+            else:
+                self.vm_depth += 1
+                if self.verbose >= 1:
+                    print(f'  [vmenter] depth now {self.vm_depth}')
 
         if address == VM_EXIT:
             self._on_vm_exit(uc)
@@ -499,6 +791,270 @@ class VMTracer:
     def _ctx_qword(self, uc, field):
         r12 = uc.reg_read(UC_X86_REG_R12)
         return struct.unpack('<Q', bytes(uc.mem_read(r12 + CTX_OFF[field], 8)))[0]
+
+    def _is_native_stub_reentry(self, uc):
+        """Return True when VM_SETUP was reached from a native-call stub re-entry."""
+        rsp = uc.reg_read(UC_X86_REG_RSP)
+        try:
+            ret_addr = struct.unpack('<Q', bytes(uc.mem_read(rsp, 8)))[0]
+        except:
+            return False
+
+        if not ret_addr:
+            return False
+
+        try:
+            jmp_byte = bytes(uc.mem_read(ret_addr, 1))
+            mid_addr = ret_addr - len(NATIVE_CALL_MID) - 5
+            mid = bytes(uc.mem_read(mid_addr, len(NATIVE_CALL_MID)))
+        except:
+            return False
+
+        return jmp_byte == b'\xE9' and mid == NATIVE_CALL_MID
+
+    def _outline_trace_entry(self):
+        if not self.trace:
+            return None
+        return self.trace[-1]
+
+    def _finish_outlined_exit(self, uc):
+        self.vm_depth = 0
+        self.final_vmexit_seen = True
+        rax = self._ctx_qword(uc, 'rax')
+        hsh = self._ctx_qword(uc, 'hash')
+        print(f"\n{'='*70}")
+        print(f" VM EXIT after {self.step} steps ({self.insn_count} insns) [outlined]")
+        print(f"   ctx.rax = 0x{rax:X}  last_hash = 0x{hsh:016X}")
+        if self.native_calls:
+            print(f"   native calls: {len(self.native_calls)}")
+            for nc in self.native_calls:
+                print(f"     step {nc['step']}: 0x{nc['native_target_va']:X} (stub 0x{nc['stub_addr']:X})")
+        print(f"{'='*70}")
+        uc.emu_stop()
+
+    def _summarize_outline_telemetry(self, telemetry):
+        if not telemetry:
+            return None
+        summary = {}
+        for key in ('mem_read_count', 'mem_write_count', 'unmapped_count', 'instr_count'):
+            if key in telemetry:
+                summary[key] = telemetry[key]
+        events = telemetry.get('events', [])
+        if events:
+            summary['events'] = events[:8]
+        if telemetry.get('error'):
+            summary['error'] = telemetry['error']
+        return summary if summary else None
+
+    def _try_outline_loop(self, uc, address):
+        if self.resolver is None or address not in self.outline_loop_heads or not self.trace:
+            return False
+
+        ctx_base = uc.reg_read(UC_X86_REG_R12)
+        ctx_size = getattr(self.resolver, 'CTX_SIZE', 0x1A0)
+        try:
+            live_ctx = bytes(uc.mem_read(ctx_base, ctx_size))
+            hash_in = struct.unpack('<Q', live_ctx[CTX_OFF['hash']:CTX_OFF['hash'] + 8])[0]
+        except:
+            return False
+
+        key = (self.step, address, hash_in)
+        if key in self.outline_attempted:
+            return False
+        self.outline_attempted.add(key)
+
+        entry = self._outline_trace_entry()
+        if entry is not None:
+            entry['outlined_loop_head_va'] = address
+            entry['outline_hash_in'] = hash_in
+
+        trace_hash = entry.get('hash') if isinstance(entry, dict) else None
+        candidate_hashes = []
+        for candidate in (hash_in, trace_hash):
+            if isinstance(candidate, int) and candidate not in candidate_hashes:
+                candidate_hashes.append(candidate)
+        if entry is not None and candidate_hashes:
+            entry['outline_hash_candidates'] = candidate_hashes
+
+        outline_mode = None
+        selected_hash = None
+        resolved = None
+        committed_ctx = False
+        attempt_summaries = []
+
+        def _record_attempt(mode, attempt_hash, telemetry, error=None):
+            summary = self._summarize_outline_telemetry(telemetry)
+            if summary is None:
+                summary = {}
+            summary['mode'] = mode
+            summary['hash_in'] = f'0x{attempt_hash:016X}'
+            if error:
+                summary['outline_error'] = error
+            attempt_summaries.append(summary)
+
+        for attempt_hash in candidate_hashes:
+            telemetry = {}
+            try:
+                resolved = self.resolver.resolve_handler(
+                    address,
+                    attempt_hash,
+                    prev_ctx=live_ctx,
+                    telemetry=telemetry,
+                    max_insns=OUTLINE_LIVE_MAX_INSNS,
+                )
+            except Exception as e:
+                _record_attempt('live', attempt_hash, telemetry, str(e))
+                if entry is not None:
+                    entry['outline_error'] = str(e)
+            else:
+                if resolved is not None:
+                    outline_mode = 'live'
+                    selected_hash = attempt_hash
+                    _record_attempt('live', attempt_hash, telemetry)
+                    break
+                _record_attempt('live', attempt_hash, telemetry)
+
+        if resolved is None:
+            for attempt_hash in candidate_hashes:
+                telemetry = {}
+                try:
+                    resolved = self.resolver.resolve_handler(
+                        address,
+                        attempt_hash,
+                        prev_ctx=None,
+                        telemetry=telemetry,
+                        max_insns=OUTLINE_SYNTH_MAX_INSNS,
+                    )
+                except Exception as e:
+                    _record_attempt('synthetic', attempt_hash, telemetry, str(e))
+                    if entry is not None:
+                        entry['outline_fallback_error'] = str(e)
+                else:
+                    if resolved is not None:
+                        outline_mode = 'synthetic'
+                        selected_hash = attempt_hash
+                        _record_attempt('synthetic', attempt_hash, telemetry)
+                        break
+                    _record_attempt('synthetic', attempt_hash, telemetry)
+
+        if entry is not None and attempt_summaries:
+            entry['outline_attempts'] = attempt_summaries
+
+        if resolved is None:
+            self.outline_failures += 1
+            return False
+
+        kind, const_or_caller, hash_out_or_ha, out_ctx = resolved
+        snapshot_ctx = out_ctx if out_ctx is not None else live_ctx
+        if out_ctx is not None and outline_mode == 'live':
+            try:
+                uc.mem_write(ctx_base, out_ctx)
+                committed_ctx = True
+            except:
+                pass
+
+        self.outline_hits += 1
+        self.post_dispatch_targets = []
+        self.in_native_stub = False
+        self.native_stub_addr = 0
+        self.native_call_addr = 0
+        uc.reg_write(UC_X86_REG_R12, ctx_base)
+        uc.reg_write(UC_X86_REG_RSP, ctx_base)
+
+        if entry is not None:
+            entry['outline_kind'] = kind
+            entry['outline_ctx_mode'] = outline_mode
+            entry['outline_selected_hash'] = selected_hash
+            entry['outline_context_committed'] = committed_ctx
+
+        if kind == 'exit':
+            if entry is not None:
+                entry['final_vmexit_seen'] = True
+            self._finish_outlined_exit(uc)
+            return True
+
+        if kind == 'dispatch':
+            target = (const_or_caller + BASE_DELTA) & 0xFFFFFFFFFFFFFFFF
+            dtype, dinfo = self.resolver.classify_dispatch_entry(target)
+            if entry is not None:
+                entry['outlined_dispatch_target_va'] = target
+            if dtype == 'jmp':
+                next_handler = dinfo['handler']
+                if entry is not None:
+                    entry['outlined_resume_handler_va'] = next_handler
+                    entry['outlined_resume_kind'] = 'jmp'
+                uc.reg_write(UC_X86_REG_RIP, next_handler)
+                return True
+            if dtype == 'native_call':
+                handler_after = dinfo.get('handler_after', 0)
+                if entry is not None:
+                    entry['dispatch_kind'] = 'native_call'
+                    entry['handler_after_native'] = handler_after
+                    entry['outlined_resume_handler_va'] = handler_after
+                    entry['outlined_resume_kind'] = 'native_call'
+                if self.resolver._last_native_target:
+                    if entry is not None:
+                        entry['native_target_va'] = self.resolver._last_native_target
+                        native_snapshot = self._synthesize_native_call_snapshot(
+                            snapshot_ctx,
+                            self.resolver._last_native_target,
+                            stub_addr=target,
+                            handler_after=handler_after,
+                            source='outlined_dispatch',
+                            runtime_regions=self._clone_native_probe_pages(
+                                uc, self.resolver._last_native_target),
+                        )
+                        if native_snapshot is not None:
+                            entry['_native_snapshot'] = native_snapshot
+                    self.native_calls.append({
+                        'step': self.step,
+                        'native_target_va': self.resolver._last_native_target,
+                        'stub_addr': target,
+                    })
+                if handler_after:
+                    uc.reg_write(UC_X86_REG_RIP, handler_after)
+                    return True
+            if dtype == 'final_exit':
+                if entry is not None:
+                    entry['final_vmexit_seen'] = True
+                self._finish_outlined_exit(uc)
+                return True
+            self.outline_failures += 1
+            return False
+
+        if kind == 'native_call':
+            handler_after = hash_out_or_ha if isinstance(hash_out_or_ha, int) else 0
+            if entry is not None:
+                entry['dispatch_kind'] = 'native_call'
+                entry['handler_after_native'] = handler_after
+                entry['outlined_resume_handler_va'] = handler_after
+                entry['outlined_resume_kind'] = 'native_call'
+                entry['outlined_native_stub_va'] = const_or_caller
+            if self.resolver._last_native_target:
+                if entry is not None:
+                    entry['native_target_va'] = self.resolver._last_native_target
+                    native_snapshot = self._synthesize_native_call_snapshot(
+                        snapshot_ctx,
+                        self.resolver._last_native_target,
+                        stub_addr=const_or_caller,
+                        handler_after=handler_after,
+                        source='outlined_native_call',
+                        runtime_regions=self._clone_native_probe_pages(
+                            uc, self.resolver._last_native_target),
+                    )
+                    if native_snapshot is not None:
+                        entry['_native_snapshot'] = native_snapshot
+                self.native_calls.append({
+                    'step': self.step,
+                    'native_target_va': self.resolver._last_native_target,
+                    'stub_addr': const_or_caller,
+                })
+            if handler_after:
+                uc.reg_write(UC_X86_REG_RIP, handler_after)
+                return True
+
+        self.outline_failures += 1
+        return False
 
     def _classify_dispatch_target(self, uc, target):
         """Classify a dispatch target as 'jmp' (simple handler) or 'native_call' (stub).
@@ -579,8 +1135,13 @@ class VMTracer:
             'extra': vm_extra,
             'dispatch_kind': kind,
             'handler_after_native': handler_after,
+            'vm_depth': self.vm_depth,
         }
+        snapshot = self._capture_vm_snapshot(uc)
+        if snapshot is not None:
+            entry['_vm_snapshot'] = snapshot
         self.trace.append(entry)
+        self.post_dispatch_targets = []
 
         kind_tag = ''
         if kind == 'native_call':
@@ -645,7 +1206,19 @@ class VMTracer:
                 print(f'  [VM EXIT transient] ret -> 0x{ret_addr:X} (native call stub @ 0x{stub_addr:X})')
             return  # let emulation continue through the stub
 
-        # Final vmexit — the VM is done.
+        # Inner VM exit: if we're nested (depth > 1), this is not the outer
+        # VM's exit.  The inner VM returns to the vmenter wrapper body which
+        # then returns to the outer VM's native call stub.  Decrement depth
+        # and let emulation continue.
+        if self.vm_depth > 1:
+            self.vm_depth -= 1
+            if self.verbose >= 1:
+                print(f'  [VM EXIT inner] depth now {self.vm_depth}  ret -> 0x{ret_addr:X}')
+            return  # let emulation continue out of the inner VM
+
+        # Final vmexit — the outermost VM is done.
+        self.vm_depth = 0
+        self.final_vmexit_seen = True
         rax = self._ctx_qword(uc, 'rax')
         hsh = self._ctx_qword(uc, 'hash')
         print(f"\n{'='*70}")
@@ -661,8 +1234,14 @@ class VMTracer:
     def run(self, max_steps=300, start=None):
         self.max_steps = max_steps
         entry = start or DRIVER_ENTRY
+        self.final_vmexit_seen = False
+        self.post_dispatch_targets = []
+        self.outline_attempted.clear()
+        self.outline_hits = 0
+        self.outline_failures = 0
 
         self.mu.hook_add(UC_HOOK_CODE, self._hook_code)
+        self.mu.hook_add(UC_HOOK_MEM_READ | UC_HOOK_MEM_WRITE, self._hook_mem_access)
         self.mu.hook_add(
             UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED |
             UC_HOOK_MEM_FETCH_UNMAPPED, self._hook_mem)
@@ -689,6 +1268,22 @@ class VMTracer:
         dt = time.time() - t0
         print(f"\n Emulation: {self.step} dispatches, {self.insn_count} insns, {dt:.2f}s")
         print(f" Auto-mapped pages: {len(self.auto_mapped)}  Skips: {self.skip_count}")
+        if self.outline_hits or self.outline_failures:
+            print(f" Outlined loops: {self.outline_hits}  Outline failures: {self.outline_failures}")
+        if self.watched_mem_events:
+            print(f" Watched memory events: {len(self.watched_mem_events)}")
+        if self.privileged_insn_events:
+            print(f" Privileged/special instructions: {len(self.privileged_insn_events)}")
+        if self.trace:
+            if not self.final_vmexit_seen and self.post_dispatch_targets:
+                counts = {}
+                for target in self.post_dispatch_targets:
+                    counts[target] = counts.get(target, 0) + 1
+                internal_resume_va = max(counts.items(), key=lambda kv: kv[1])[0]
+                self.trace[-1]['internal_resume_va'] = internal_resume_va
+            self.trace[-1]['final_vmexit_seen'] = self.final_vmexit_seen
+            self.trace[-1]['watched_mem_events'] = self.watched_mem_events[:128]
+            self.trace[-1]['privileged_insn_events'] = self.privileged_insn_events[:64]
         return self.trace
 
 
@@ -745,6 +1340,14 @@ def export_omill_trace_json(trace, db, out_path):
     if not trace:
         return
 
+    def _resume_step_index(start_idx):
+        current_depth = trace[start_idx].get('vm_depth', 0)
+        for idx in range(start_idx + 1, len(trace)):
+            if trace[idx].get('vm_depth', 0) <= current_depth:
+                return idx
+        return None
+
+    final_vmexit_seen = bool(trace[-1].get('final_vmexit_seen'))
     records = []
     for i, step in enumerate(trace):
         handler_va = step.get('thunk') or step.get('target', 0)
@@ -753,27 +1356,24 @@ def export_omill_trace_json(trace, db, out_path):
         native_target = step.get('native_target_va', 0)
         handler_after_native = step.get('handler_after_native', 0)
 
-        if i + 1 < len(trace):
-            nxt = trace[i + 1]
+        next_idx = i + 1 if i + 1 < len(trace) else None
+        if dispatch_kind == 'native_call':
+            next_idx = _resume_step_index(i)
+
+        if next_idx is not None:
+            nxt = trace[next_idx]
             outgoing_hash = nxt.get('hash', 0)
             exit_target_va = nxt.get('target', 0)
-
-            if dispatch_kind == 'native_call':
-                # Native call stub: successor is the handler after the native
-                # call returns and the VM re-enters.  That handler is the one
-                # whose dispatch we see in the NEXT step (i+1).
-                succ_va = nxt.get('thunk') or nxt.get('target', 0)
-            else:
-                succ_va = nxt.get('thunk') or nxt.get('target', 0)
+            succ_va = nxt.get('thunk') or nxt.get('target', 0)
 
             successors = [succ_va] if succ_va else []
             is_vmexit = False
         else:
-            # Last step: this handler exits the VM
+            # Last step only exits the VM if emulation actually reached final vmexit.
             outgoing_hash = 0
             exit_target_va = 0
             successors = []
-            is_vmexit = True
+            is_vmexit = final_vmexit_seen
 
         records.append({
             'handler_va':       f'0x{handler_va:X}',
@@ -797,6 +1397,727 @@ def export_omill_trace_json(trace, db, out_path):
     with open(out_path, 'w') as f:
         json.dump(payload, f, indent=2)
     print(f'\n Exported {len(records)} VMTraceRecords to {out_path}')
+    return payload
+
+
+def _hex_int(value):
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value, 16)
+        except ValueError:
+            return 0
+    return 0
+
+
+def _is_zero_hex(value):
+    return _hex_int(value) == 0
+
+
+def _merge_vmtrace_record(primary, secondary):
+    """Merge two VMTraceRecord-like dicts, preferring observed primary data."""
+    merged = dict(secondary)
+    merged.update(primary)
+
+    primary_kind = primary.get('dispatch_kind', 'unknown')
+    if primary_kind == 'native_call' and primary.get('successors'):
+        merged['successors'] = list(primary['successors'])
+        if not _is_zero_hex(primary.get('outgoing_hash', '0x0')):
+            merged['outgoing_hash'] = primary['outgoing_hash']
+        if not _is_zero_hex(primary.get('exit_target_va', '0x0')):
+            merged['exit_target_va'] = primary['exit_target_va']
+        if not _is_zero_hex(primary.get('native_target_va', '0x0')):
+            merged['native_target_va'] = primary['native_target_va']
+        if primary_kind != 'unknown':
+            merged['dispatch_kind'] = primary_kind
+        return merged
+
+    for field in ('outgoing_hash', 'exit_target_va', 'native_target_va'):
+        if _is_zero_hex(merged.get(field, '0x0')) and not _is_zero_hex(secondary.get(field, '0x0')):
+            merged[field] = secondary[field]
+
+    if not merged.get('successors') and secondary.get('successors'):
+        merged['successors'] = list(secondary['successors'])
+    elif merged.get('successors') and secondary.get('successors'):
+        seen = set()
+        succs = []
+        for succ in list(merged['successors']) + list(secondary['successors']):
+            if succ not in seen:
+                seen.add(succ)
+                succs.append(succ)
+        merged['successors'] = succs
+
+    if not merged.get('passed_vmexit', False) and secondary.get('passed_vmexit', False):
+        merged['passed_vmexit'] = True
+    if not merged.get('is_vmexit', False) and secondary.get('is_vmexit', False):
+        merged['is_vmexit'] = True
+    if not merged.get('is_error', False) and secondary.get('is_error', False):
+        merged['is_error'] = True
+
+    if merged.get('dispatch_kind', 'unknown') == 'unknown':
+        alt_kind = secondary.get('dispatch_kind', 'unknown')
+        if alt_kind != 'unknown':
+            merged['dispatch_kind'] = alt_kind
+
+    return merged
+
+
+def merge_vmtrace_records(primary_records, secondary_records):
+    """Merge record lists by (handler_va, incoming_hash), primary wins on conflicts."""
+    merged = {}
+    order = []
+
+    for rec in secondary_records:
+        key = (rec['handler_va'], rec['incoming_hash'])
+        if key not in merged:
+            merged[key] = dict(rec)
+            order.append(key)
+        else:
+            merged[key] = _merge_vmtrace_record(rec, merged[key])
+
+    for rec in primary_records:
+        key = (rec['handler_va'], rec['incoming_hash'])
+        if key not in merged:
+            merged[key] = dict(rec)
+            order.append(key)
+        else:
+            merged[key] = _merge_vmtrace_record(rec, merged[key])
+
+    return [merged[key] for key in order]
+
+
+def collect_native_call_snapshots(trace):
+    snapshots = []
+    for step in trace or []:
+        snap = step.get('_native_snapshot')
+        if not snap:
+            continue
+        item = dict(snap)
+        item['step'] = step.get('step', 0)
+        item['dispatch_hash'] = step.get('hash', 0)
+        item['dispatch_target_va'] = step.get('target', 0)
+        item['dispatch_kind'] = step.get('dispatch_kind', 'unknown')
+        snapshots.append(item)
+    return snapshots
+
+
+def replay_native_snapshot(snapshot, max_insns=200000):
+    def maybe_int(value, default=0):
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    mu = Uc(UC_ARCH_X86, UC_MODE_64)
+    pe = pefile.PE(str(BINARY_PATH))
+
+    for sec in pe.sections:
+        va = IMAGEBASE + sec.VirtualAddress
+        data = sec.get_data()
+        vsize = max(sec.Misc_VirtualSize, len(data))
+        size = (vsize + 0xFFF) & ~0xFFF
+        if size == 0:
+            size = 0x1000
+        mu.mem_map(va, size)
+        mu.mem_write(va, data[:vsize])
+
+    auto_mapped = set()
+
+    def map_region(base, size, data_hex=None):
+        if size <= 0:
+            return
+        try:
+            mu.mem_map(base, size)
+        except UcError:
+            pass
+        if data_hex:
+            try:
+                mu.mem_write(base, bytes.fromhex(data_hex))
+            except:
+                pass
+
+    for base, size in (
+        (STACK_BASE, STACK_SIZE),
+        (DRIVER_OBJ, 0x10000),
+        (REG_PATH, 0x10000),
+        (STUB_BASE, 0x10000),
+        (KUSER_SHARED_DATA, KUSD_PAGE_SIZE),
+    ):
+        map_region(base, size)
+
+    for region in snapshot.get('runtime_regions', []):
+        base = maybe_int(region.get('base', 0))
+        size = maybe_int(region.get('size', 0))
+        data = region.get('data', b'')
+        if isinstance(data, bytes):
+            data_hex = data.hex()
+        else:
+            data_hex = region.get('data_hex', '')
+        map_region(base, size, data_hex)
+        if size == 0x1000:
+            auto_mapped.add(base)
+
+    # Mirror the tracer's deterministic synthetic runtime setup.
+    kusd = bytearray(KUSD_PAGE_SIZE)
+    filetime = 0x01DA5E9847800000
+    struct.pack_into('<I', kusd, 0x14, filetime & 0xFFFFFFFF)
+    struct.pack_into('<i', kusd, 0x18, (filetime >> 32) & 0xFFFFFFFF)
+    struct.pack_into('<i', kusd, 0x1C, (filetime >> 32) & 0xFFFFFFFF)
+    struct.pack_into('<I', kusd, 0x08, filetime & 0xFFFFFFFF)
+    struct.pack_into('<i', kusd, 0x0C, (filetime >> 32) & 0xFFFFFFFF)
+    struct.pack_into('<i', kusd, 0x10, (filetime >> 32) & 0xFFFFFFFF)
+    struct.pack_into('<I', kusd, 0x26C, 10)
+    struct.pack_into('<I', kusd, 0x270, 0)
+    mu.mem_write(KUSER_SHARED_DATA, bytes(kusd))
+
+    for off in range(0, 0x2000, 8):
+        mu.mem_write(DRIVER_OBJ + off, struct.pack('<Q', 0xDEAD000000000000 | off))
+
+    mu.mem_write(STUB_BASE, b'\xC3')
+    mu.mem_write(STUB_BASE + 0x10, b'\x31\xC0\xC3')
+    mu.mem_write(0x14019E000, struct.pack('<Q', STUB_BASE + 0x10))
+    mu.mem_write(0x14019E010, struct.pack('<Q', STUB_BASE))
+    cookie = 0xDEADBEEFCAFEBABE
+    mu.mem_write(0x140221028, struct.pack('<Q', cookie))
+    mu.mem_write(0x140221030, struct.pack('<Q', (~cookie) & 0xFFFFFFFFFFFFFFFF))
+
+    stack_base = maybe_int(snapshot.get('stack_base', 0))
+    stack_hex = snapshot.get('stack_bytes', '')
+    if stack_base and stack_hex:
+        try:
+            mu.mem_write(stack_base, bytes.fromhex(stack_hex))
+        except:
+            pass
+
+    regs = snapshot.get('regs', {})
+    for name, reg in UC_REG_BY_NAME.items():
+        if name in regs:
+            mu.reg_write(reg, maybe_int(regs[name]))
+    entry_rsp = maybe_int(snapshot.get('entry_rsp', regs.get('rsp', 0)))
+    if entry_rsp:
+        mu.reg_write(UC_X86_REG_RSP, entry_rsp)
+    mu.reg_write(UC_X86_REG_EFLAGS, maybe_int(snapshot.get('eflags', 0x202), 0x202))
+
+    sentinel = 0xDEADDEADDEADDEAD
+    if entry_rsp:
+        try:
+            mu.mem_write(entry_rsp, struct.pack('<Q', sentinel))
+        except:
+            pass
+
+    cs = Cs(CS_ARCH_X86, CS_MODE_64)
+    insn_count = 0
+    indirect_calls = []
+    visited = []
+    mem_events = []
+    watched_mem_events = []
+    watched_mem_seen = set()
+    privileged_events = []
+    privileged_seen = set()
+
+    def hook_mem(uc, access, address, size, value, _):
+        rip = uc.reg_read(UC_X86_REG_RIP)
+        page = address & ~0xFFF
+        if address in WATCHED_GLOBALS or page in WATCHED_PAGES:
+            key = (access, address, size, value, rip)
+            if key not in watched_mem_seen:
+                watched_mem_seen.add(key)
+                watched_mem_events.append({
+                    'access': int(access),
+                    'address': address,
+                    'size': size,
+                    'value': value,
+                    'rip': rip,
+                    'label': WATCHED_GLOBALS.get(address, ''),
+                })
+        mem_events.append({
+            'access': int(access),
+            'address': address,
+            'size': size,
+            'value': value,
+            'rip': rip,
+        })
+        if access == UC_MEM_FETCH_UNMAPPED:
+            return False
+        if page in auto_mapped:
+            return True
+        try:
+            mu.mem_map(page, 0x1000)
+            fill = bytearray(0x1000)
+            for off in range(0, 0x1000, 8):
+                struct.pack_into('<Q', fill, off, page + off)
+            mu.mem_write(page, bytes(fill))
+            auto_mapped.add(page)
+            return True
+        except:
+            return False
+
+    def hook_code(uc, address, size, _):
+        nonlocal insn_count
+        insn_count += 1
+        if len(visited) < 256:
+            visited.append(address)
+        if address == sentinel:
+            uc.emu_stop()
+            return
+        try:
+            code = bytes(uc.mem_read(address, size))
+            insn = next(cs.disasm(code, address))
+        except:
+            insn = None
+        if insn:
+            mn = insn.mnemonic.lower()
+            if mn in PRIVILEGED_MNEMONICS or SPECIAL_REG_TOKEN_RE.search((insn.op_str or '').lower()):
+                key = (insn.address, mn, insn.op_str)
+                if key not in privileged_seen:
+                    privileged_seen.add(key)
+                    privileged_events.append({
+                        'rip': insn.address,
+                        'mnemonic': insn.mnemonic,
+                        'op_str': insn.op_str,
+                    })
+        if insn and insn.mnemonic == 'call' and insn.op_str.startswith('rax'):
+            indirect_calls.append({
+                'callsite_va': address,
+                'target_va': uc.reg_read(UC_X86_REG_RAX),
+                'rcx': uc.reg_read(UC_X86_REG_RCX),
+                'rdx': uc.reg_read(UC_X86_REG_RDX),
+            })
+        if insn_count >= max_insns:
+            uc.emu_stop()
+
+    mu.hook_add(UC_HOOK_CODE, hook_code)
+    mu.hook_add(UC_HOOK_MEM_READ | UC_HOOK_MEM_WRITE, hook_mem)
+    mu.hook_add(
+        UC_HOOK_MEM_READ_UNMAPPED |
+        UC_HOOK_MEM_WRITE_UNMAPPED |
+        UC_HOOK_MEM_FETCH_UNMAPPED,
+        hook_mem)
+
+    stop_reason = 'limit'
+    exception_state = {}
+    try:
+        mu.emu_start(maybe_int(snapshot.get('native_target_va', 0)), sentinel, count=max_insns)
+        stop_reason = 'returned'
+    except UcError as e:
+        stop_reason = f'uc_error:{e}'
+        exception_state = {
+            'rip': mu.reg_read(UC_X86_REG_RIP),
+            'rax': mu.reg_read(UC_X86_REG_RAX),
+            'rcx': mu.reg_read(UC_X86_REG_RCX),
+            'rdx': mu.reg_read(UC_X86_REG_RDX),
+            'r10': mu.reg_read(UC_X86_REG_R10),
+        }
+
+    return {
+        'native_target_va': maybe_int(snapshot.get('native_target_va', 0)),
+        'source': snapshot.get('source', 'unknown'),
+        'step': maybe_int(snapshot.get('step', 0)),
+        'dispatch_hash': maybe_int(snapshot.get('dispatch_hash', 0)),
+        'stub_addr': maybe_int(snapshot.get('stub_addr', 0)),
+        'handler_after_va': maybe_int(snapshot.get('handler_after_va', 0)),
+        'entry_rsp': entry_rsp,
+        'stop_reason': stop_reason,
+        'insn_count': insn_count,
+        'indirect_calls': indirect_calls,
+        'visited_prefix': [f'0x{va:X}' for va in visited[:96]],
+        'unmapped_events': mem_events[:32],
+        'watched_mem_events': watched_mem_events[:64],
+        'privileged_insn_events': privileged_events[:32],
+        'exception_state': exception_state,
+    }
+
+
+def export_native_call_artifacts(trace, out_dir):
+    def maybe_hex(value):
+        if value is None:
+            return None
+        try:
+            return f'0x{int(value):X}'
+        except (TypeError, ValueError):
+            return value
+
+    snapshots = collect_native_call_snapshots(trace)
+    if not snapshots:
+        return [], []
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    serializable_snapshots = []
+    for snap in snapshots:
+        item = dict(snap)
+        item['regs'] = {
+            k: maybe_hex(v) for k, v in item.get('regs', {}).items()
+        }
+        for key in (
+            'native_target_va', 'stub_addr', 'call_addr', 'handler_after_va',
+            'rsp_pre_call', 'entry_rsp', 'stack_base', 'dispatch_hash',
+            'dispatch_target_va',
+        ):
+            if key in item:
+                item[key] = maybe_hex(item[key])
+        runtime_regions = []
+        for region in item.get('runtime_regions', []):
+            runtime_regions.append({
+                'base': maybe_hex(region.get('base', 0)),
+                'size': int(region.get('size', 0)),
+                'data_hex': region.get('data', b'').hex() if isinstance(region.get('data'), bytes) else region.get('data_hex', ''),
+            })
+        item['runtime_regions'] = runtime_regions
+        serializable_snapshots.append(item)
+
+    snapshots_out = out_dir / 'native_call_snapshots.json'
+    with open(snapshots_out, 'w') as f:
+        json.dump({'snapshots': serializable_snapshots}, f, indent=2)
+
+    probe_results = []
+    seen_targets = set()
+    for snap in snapshots:
+        target = int(snap.get('native_target_va', 0))
+        if not target or target in seen_targets:
+            continue
+        seen_targets.add(target)
+        probe_results.append(replay_native_snapshot(snap))
+
+    serializable_results = []
+    for result in probe_results:
+        item = dict(result)
+        for key in ('native_target_va', 'dispatch_hash', 'stub_addr', 'handler_after_va', 'entry_rsp'):
+            item[key] = maybe_hex(item.get(key, 0))
+        converted_calls = []
+        for call in item.get('indirect_calls', []):
+            converted_calls.append({
+                'callsite_va': maybe_hex(call.get('callsite_va')),
+                'target_va': maybe_hex(call.get('target_va')),
+                'rcx': maybe_hex(call.get('rcx')),
+                'rdx': maybe_hex(call.get('rdx')),
+            })
+        item['indirect_calls'] = converted_calls
+        converted_events = []
+        for event in item.get('unmapped_events', []):
+            converted_events.append({
+                'access': event.get('access'),
+                'address': maybe_hex(event.get('address')),
+                'size': event.get('size'),
+                'value': maybe_hex(event.get('value')),
+                'rip': maybe_hex(event.get('rip')),
+            })
+        item['unmapped_events'] = converted_events
+        watched_events = []
+        for event in item.get('watched_mem_events', []):
+            watched_events.append({
+                'access': event.get('access'),
+                'address': maybe_hex(event.get('address')),
+                'size': event.get('size'),
+                'value': maybe_hex(event.get('value')),
+                'rip': maybe_hex(event.get('rip')),
+                'label': event.get('label', ''),
+            })
+        item['watched_mem_events'] = watched_events
+        item['privileged_insn_events'] = [
+            {
+                'rip': maybe_hex(event.get('rip')),
+                'mnemonic': event.get('mnemonic', ''),
+                'op_str': event.get('op_str', ''),
+            }
+            for event in item.get('privileged_insn_events', [])
+        ]
+        item['exception_state'] = {
+            key: maybe_hex(value)
+            for key, value in item.get('exception_state', {}).items()
+        }
+        serializable_results.append(item)
+
+    probes_out = out_dir / 'native_call_probes.json'
+    with open(probes_out, 'w') as f:
+        json.dump({'results': serializable_results}, f, indent=2)
+
+    print(f'  Exported {len(serializable_snapshots)} native snapshots -> {snapshots_out}')
+    print(f'  Exported {len(serializable_results)} native probes -> {probes_out}')
+    return serializable_snapshots, serializable_results
+
+
+def _first_concrete_handler_from_chain(chain, fallback=0):
+    """Return the first real handler reached by an inner-VM chain.
+
+    parse_vm_wrapper_full can identify a wrapper's initial dispatch helper,
+    but that helper may just be glue (e.g. 0x140C04245) before the first
+    semantically relevant traced handler.  Prefer the first concrete handler
+    in the traced chain when available.
+    """
+    if chain:
+        first = chain[0]
+        next_handler = first.get('next_handler', 0)
+        if next_handler:
+            return next_handler
+        handler = first.get('handler', 0)
+        if handler:
+            return handler
+        for step in chain[1:]:
+            handler = step.get('handler', 0)
+            if handler:
+                return handler
+            next_handler = step.get('next_handler', 0)
+            if next_handler:
+                return next_handler
+    return fallback
+
+
+def normalize_wrapper_trace_records(records, wrapper_seed_info):
+    """Rewrite wrapper/native-target records to resume at traced inner handlers.
+
+    `wrapper_seed_info` maps wrapper/native target VA -> (inner_hash, first_handler).
+    The imported Unicorn record for a wrapper often uses incoming_hash=0 and points
+    at a wrapper helper instead of the first traced inner handler.  Normalize that
+    record in-place so the lifter can follow the wrapped inner chain.
+    """
+    if not records or not wrapper_seed_info:
+        return records
+
+    def _parse_u64(value):
+        if isinstance(value, int):
+            return value & 0xFFFFFFFFFFFFFFFF
+        if isinstance(value, str):
+            try:
+                return int(value, 0) & 0xFFFFFFFFFFFFFFFF
+            except ValueError:
+                return 0
+        return 0
+
+    def _best_inbound_wrapper_record(wrapper_va, seed_hash):
+        candidates = []
+        for cand in records:
+            if cand.get('native_target_va') != wrapper_va:
+                continue
+            succs = [s for s in cand.get('successors', [])
+                     if isinstance(s, str) and s and s != wrapper_va]
+            if not succs:
+                continue
+            cand_hash = _parse_u64(cand.get('outgoing_hash'))
+            score = 0
+            if seed_hash and cand_hash == seed_hash:
+                score += 10
+            if cand.get('dispatch_kind') == 'jmp':
+                score += 2
+            if cand.get('exit_target_va') not in (None, '0x0', '0'):
+                score += 1
+            score -= len(succs)
+            candidates.append((score, cand, succs))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0]
+
+    record_by_key = {(rec.get('handler_va'), rec.get('incoming_hash')): rec
+                     for rec in records}
+    for nt_va, (inner_hash, first_handler) in wrapper_seed_info.items():
+        handler_key = f'0x{nt_va:X}'
+        rec = record_by_key.get((handler_key, '0x0'))
+        if rec is None:
+            rec = {
+                'handler_va': handler_key,
+                'incoming_hash': '0x0',
+                'outgoing_hash': '0x0',
+                'exit_target_va': '0x0',
+                'native_target_va': '0x0',
+                'successors': [],
+                'passed_vmexit': False,
+                'is_vmexit': False,
+                'is_error': False,
+            }
+            records.append(rec)
+            record_by_key[(handler_key, '0x0')] = rec
+
+        inbound = _best_inbound_wrapper_record(handler_key, inner_hash)
+        if inbound is not None:
+            _, inbound_rec, inbound_succs = inbound
+            rec['outgoing_hash'] = inbound_rec.get(
+                'outgoing_hash',
+                f'0x{inner_hash:X}' if inner_hash else '0x0')
+            rec['successors'] = list(dict.fromkeys(inbound_succs))
+            exit_target_va = inbound_rec.get('exit_target_va')
+            if exit_target_va not in (None, '', '0x0', '0'):
+                rec['exit_target_va'] = exit_target_va
+        else:
+            if inner_hash:
+                rec['outgoing_hash'] = f'0x{inner_hash:X}'
+            rec['successors'] = [f'0x{first_handler:X}'] if first_handler else []
+        if rec.get('dispatch_kind', 'unknown') == 'unknown':
+            rec['dispatch_kind'] = 'jmp'
+
+    return records
+
+
+def bridge_unicorn_trace_records(trace, trace_payload, resolver):
+    """Patch timed-out Unicorn records with a statically resolved continuation."""
+    if not trace or not trace_payload:
+        return trace_payload
+
+    records = trace_payload.get('records', [])
+    for step, record in zip(trace, records):
+        if record.get('is_vmexit') or not step.get('internal_resume_va'):
+            continue
+
+        internal_va = step['internal_resume_va']
+        incoming_hash = step.get('hash', 0)
+        resolved = resolver.resolve_handler(internal_va, incoming_hash)
+        if resolved is None:
+            continue
+
+        kind, const_or_caller, hash_out_or_ha, _ = resolved
+        if kind == 'exit':
+            record['outgoing_hash'] = '0x0'
+            record['exit_target_va'] = '0x0'
+            record['successors'] = []
+            record['passed_vmexit'] = True
+            record['is_vmexit'] = True
+            continue
+
+        if kind == 'dispatch':
+            target = (const_or_caller + BASE_DELTA) & 0xFFFFFFFFFFFFFFFF
+            dtype, dinfo = resolver.classify_dispatch_entry(target)
+            if dtype == 'jmp':
+                record['outgoing_hash'] = f'0x{hash_out_or_ha:X}'
+                record['exit_target_va'] = f'0x{target:X}'
+                record['successors'] = [f"0x{dinfo['handler']:X}"]
+                record['dispatch_kind'] = 'jmp'
+            elif dtype == 'native_call':
+                handler_after = dinfo.get('handler_after', 0)
+                if handler_after:
+                    record['successors'] = [f'0x{handler_after:X}']
+                if resolver._last_native_target:
+                    record['native_target_va'] = f"0x{resolver._last_native_target:X}"
+                record['dispatch_kind'] = 'native_call'
+            continue
+
+        if kind == 'native_call':
+            handler_after = hash_out_or_ha if isinstance(hash_out_or_ha, int) else 0
+            if handler_after:
+                record['successors'] = [f'0x{handler_after:X}']
+            if resolver._last_native_target:
+                record['native_target_va'] = f"0x{resolver._last_native_target:X}"
+            record['dispatch_kind'] = 'native_call'
+
+    return trace_payload
+
+
+def augment_records_with_live_snapshots(trace, trace_payload, resolver):
+    """Use captured live VM snapshots to synthesize missing exact records."""
+    if not trace or not trace_payload or resolver is None:
+        return trace_payload
+
+    records = trace_payload.get('records', [])
+    if not records:
+        return trace_payload
+
+    record_by_key = {}
+    for rec in records:
+        key = (rec.get('handler_va'), rec.get('incoming_hash'))
+        record_by_key[key] = rec
+
+    augmented = 0
+    for step in trace:
+        snapshot = step.get('_vm_snapshot')
+        if not snapshot:
+            continue
+
+        handler_va = step.get('thunk') or step.get('target', 0)
+        incoming_hash = step.get('hash', 0)
+        if not handler_va:
+            continue
+
+        key = (f'0x{handler_va:X}', f'0x{incoming_hash:X}')
+        rec = record_by_key.get(key)
+        if rec is not None:
+            if rec.get('is_vmexit') or rec.get('is_error'):
+                continue
+            if rec.get('successors'):
+                continue
+
+        telemetry = {}
+        try:
+            resolved = resolver.resolve_handler(
+                handler_va,
+                incoming_hash,
+                prev_ctx=snapshot['ctx'],
+                telemetry=telemetry,
+                max_insns=OUTLINE_LIVE_MAX_INSNS,
+            )
+        except Exception:
+            resolved = None
+        if resolved is None:
+            continue
+
+        if rec is None:
+            rec = {
+                'handler_va': f'0x{handler_va:X}',
+                'incoming_hash': f'0x{incoming_hash:X}',
+                'outgoing_hash': '0x0',
+                'exit_target_va': '0x0',
+                'native_target_va': '0x0',
+                'successors': [],
+                'passed_vmexit': False,
+                'is_vmexit': False,
+                'is_error': False,
+                'dispatch_kind': 'unknown',
+            }
+            records.append(rec)
+            record_by_key[key] = rec
+
+        kind, const_or_caller, hash_out_or_ha, _ = resolved
+        if kind == 'exit':
+            rec['outgoing_hash'] = '0x0'
+            rec['exit_target_va'] = '0x0'
+            rec['successors'] = []
+            rec['passed_vmexit'] = True
+            rec['is_vmexit'] = True
+            rec['dispatch_kind'] = 'exit'
+            augmented += 1
+            continue
+
+        if kind == 'native_call':
+            handler_after = hash_out_or_ha if isinstance(hash_out_or_ha, int) else 0
+            if handler_after:
+                rec['successors'] = [f'0x{handler_after:X}']
+            if resolver._last_native_target:
+                rec['native_target_va'] = f'0x{resolver._last_native_target:X}'
+            rec['dispatch_kind'] = 'native_call'
+            augmented += 1
+            continue
+
+        if kind != 'dispatch':
+            continue
+
+        target = (const_or_caller + BASE_DELTA) & 0xFFFFFFFFFFFFFFFF
+        dtype, dinfo = resolver.classify_dispatch_entry(target)
+        rec['exit_target_va'] = f'0x{target:X}'
+        rec['outgoing_hash'] = f'0x{hash_out_or_ha:X}' if hash_out_or_ha else '0x0'
+        if dtype == 'jmp':
+            succ = dinfo.get('handler', 0)
+            rec['successors'] = [f'0x{succ:X}'] if succ else []
+            rec['dispatch_kind'] = 'jmp'
+            augmented += 1
+        elif dtype == 'native_call':
+            handler_after = dinfo.get('handler_after', 0)
+            rec['successors'] = [f'0x{handler_after:X}'] if handler_after else []
+            if resolver._last_native_target:
+                rec['native_target_va'] = f'0x{resolver._last_native_target:X}'
+            rec['dispatch_kind'] = 'native_call'
+            augmented += 1
+        elif dtype == 'final_exit':
+            rec['successors'] = []
+            rec['passed_vmexit'] = True
+            rec['is_vmexit'] = True
+            rec['dispatch_kind'] = 'final_exit'
+            augmented += 1
+
+    if augmented:
+        print(f'  Live snapshot augmentation: repaired {augmented} VMTraceRecord(s)')
+    return trace_payload
 
 
 # =============================================================================
@@ -887,15 +2208,52 @@ class DispatchChainResolver:
         except:
             return False
 
-    def resolve_handler(self, handler_va, hash_in, prev_ctx=None):
+    def resolve_handler(self, handler_va, hash_in, prev_ctx=None, telemetry=None, max_insns=100_000):
         """Execute one handler with given hash.  Returns (kind, const, hash_out, ctx_bytes) or None.
         If prev_ctx is provided (bytes), it is used as the initial VM context
         (with hash/base_delta/rsp overwritten).  Otherwise a fresh context is used.
         """
         self._last_native_target = 0
         uc = self._make_uc()
+        if telemetry is not None:
+            telemetry.clear()
+            telemetry['events'] = []
+            telemetry['mem_read_count'] = 0
+            telemetry['mem_write_count'] = 0
+            telemetry['unmapped_count'] = 0
+            telemetry['instr_count'] = 0
+
+        def record_event(kind, address, size, value=None, rip=None):
+            if telemetry is None:
+                return
+            events = telemetry.setdefault('events', [])
+            if len(events) >= 64:
+                return
+            item = {
+                'kind': kind,
+                'addr': f'0x{address:X}',
+                'size': size,
+            }
+            if value is not None:
+                item['value'] = f'0x{value & 0xFFFFFFFFFFFFFFFF:X}'
+            if rip is not None:
+                item['rip'] = f'0x{rip:X}'
+            events.append(item)
+
         # Hook unmapped memory (data read/write auto-map; code fetch -> log+stop)
         def _unmapped_hook(uc_, access, address, size, value, user):
+            if telemetry is not None:
+                telemetry['unmapped_count'] += 1
+                try:
+                    rip = uc_.reg_read(UC_X86_REG_RIP)
+                except:
+                    rip = None
+                kind = {
+                    UC_MEM_READ_UNMAPPED: 'read_unmapped',
+                    UC_MEM_WRITE_UNMAPPED: 'write_unmapped',
+                    UC_MEM_FETCH_UNMAPPED: 'fetch_unmapped',
+                }.get(access, 'unmapped')
+                record_event(kind, address, size, value=value, rip=rip)
             if access in (UC_MEM_FETCH_UNMAPPED, ):
                 if self.verbose >= 2:
                     rip = uc_.reg_read(UC_X86_REG_RIP)
@@ -904,6 +2262,15 @@ class DispatchChainResolver:
             return self._auto_map_hook(uc_, access, address, size, value, user)
         uc.hook_add(UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED |
                     UC_HOOK_MEM_FETCH_UNMAPPED, _unmapped_hook)
+        if telemetry is not None:
+            def _mem_hook(uc_, access, address, size, value, _user):
+                if access == UC_MEM_READ:
+                    telemetry['mem_read_count'] += 1
+                    record_event('read', address, size, rip=uc_.reg_read(UC_X86_REG_RIP))
+                elif access == UC_MEM_WRITE:
+                    telemetry['mem_write_count'] += 1
+                    record_event('write', address, size, value=value, rip=uc_.reg_read(UC_X86_REG_RIP))
+            uc.hook_add(UC_HOOK_MEM_READ | UC_HOOK_MEM_WRITE, _mem_hook)
 
         ctx_base = self.CTX_STACK
         if prev_ctx is not None:
@@ -936,6 +2303,8 @@ class DispatchChainResolver:
         insn_count = [0]
         def hook_code(uc_, address, size, _):
             insn_count[0] += 1
+            if telemetry is not None:
+                telemetry['instr_count'] = insn_count[0]
             # Check for dispatch: add rax,[r12+0E0h] (match by address bytes, not size)
             try:
                 insn = bytes(uc_.mem_read(address, 8))
@@ -976,8 +2345,10 @@ class DispatchChainResolver:
         uc.hook_add(UC_HOOK_CODE, hook_code)
 
         try:
-            uc.emu_start(handler_va, 0, timeout=10_000_000, count=100_000)
+            uc.emu_start(handler_va, 0, timeout=10_000_000, count=max_insns)
         except UcError as e:
+            if telemetry is not None:
+                telemetry['error'] = str(e)
             if self.verbose >= 2:
                 rip = uc.reg_read(UC_X86_REG_RIP)
                 print(f'    UcError: {e} after {insn_count[0]} insns  rip=0x{rip:X}')
@@ -1419,10 +2790,12 @@ def main():
             h = f"0x{s['hash']:016X}" if s['hash'] else "--"
             print(f"   stub@0x{s['stub_addr']:X}  hash={h}  const=0x{s['const']:06X}")
 
+    resolver = DispatchChainResolver(str(pe_path), db, verbose=0)
+
     # 4. Run emulation trace
     print("\nLoading binary for emulation...")
-    tracer = VMTracer(str(pe_path), db, verbose=2)
-    trace = tracer.run(max_steps=300)
+    tracer = VMTracer(str(pe_path), db, verbose=2, resolver=resolver)
+    trace = tracer.run(max_steps=5000)
 
     # 5. Static hash-chain trace from observed hashes
     if trace:
@@ -1430,9 +2803,17 @@ def main():
         static_trace(db, observed)
 
     # 5b. Export omill-compatible VMTraceRecord JSON
+    unicorn_trace_payload = None
     if trace:
         trace_json = Path(r"D:\binsnake\tracer\vm_trace_records.json")
-        export_omill_trace_json(trace, db, trace_json)
+        unicorn_trace_payload = export_omill_trace_json(trace, db, trace_json)
+        unicorn_trace_payload = augment_records_with_live_snapshots(
+            trace, unicorn_trace_payload, resolver)
+        export_native_call_artifacts(trace, Path(r"D:\binsnake\tracer"))
+        concrete_out = Path(r"D:\binsnake\tracer\vm_trace_concrete.json")
+        with open(concrete_out, 'w') as f:
+            json.dump(unicorn_trace_payload, f, indent=2)
+        print(f"  Concrete export: {len(unicorn_trace_payload['records'])} VMTraceRecords -> {concrete_out}")
 
     # 6. Trace summary table
     print(f"\n{'='*70}")
@@ -1468,7 +2849,8 @@ def main():
     print(f"\n{'='*70}")
     print(f" Concolic Dispatch Graph (per-handler isolation)")
     print(f"{'='*70}")
-    resolver = DispatchChainResolver(str(pe_path), db, verbose=0)
+    if unicorn_trace_payload:
+        unicorn_trace_payload = bridge_unicorn_trace_records(trace, unicorn_trace_payload, resolver)
     # Collect (handler_va -> thunk_target) from all stubs with known handlers.
     handler_hashes = {}  # handler_va -> list of (hash, stub_addr)
     for s in db.stubs:
@@ -2098,7 +3480,7 @@ def main():
     # native call targets (e.g. 0x14014F994) that jmp-thunk into a vmenter
     # wrapper body.  The lift pipeline lifts them as sub_<va> and needs a
     # trace record to know where the inner VM chain begins.
-    wrapper_native_targets = {}  # native_va -> first_inner_handler_va
+    wrapper_native_targets = {}  # native_va -> (seed_hash, first_inner_handler_va)
     all_native_targets = set()
     for (h, hi), nt in native_target_for_edge.items():
         if nt:
@@ -2108,7 +3490,12 @@ def main():
         if entry is not None:
             inner_hash, inner_dc, first_handler = entry
             if first_handler:
-                wrapper_native_targets[nt_va] = first_handler
+                normalized_first = first_handler
+                winfo = wrapper_db.get(inner_hash)
+                if winfo:
+                    normalized_first = _first_concrete_handler_from_chain(
+                        winfo.get('chain'), fallback=first_handler)
+                wrapper_native_targets[nt_va] = (inner_hash, normalized_first)
                 # Add a record for the native target VA itself.
                 key = (f'0x{nt_va:X}', '0x0')
                 if key not in seen_keys:
@@ -2116,40 +3503,47 @@ def main():
                     graph_records.append({
                         'handler_va':       f'0x{nt_va:X}',
                         'incoming_hash':    '0x0',
-                        'outgoing_hash':    '0x0',
+                        'outgoing_hash':    f'0x{inner_hash:X}' if inner_hash else '0x0',
                         'exit_target_va':   '0x0',
                         'native_target_va': '0x0',
-                        'successors':       [f'0x{first_handler:X}'],
+                        'successors':       [f'0x{normalized_first:X}'],
                         'passed_vmexit':    False,
                         'is_vmexit':        False,
                         'is_error':         False,
                     })
     if wrapper_native_targets:
         print(f'  Added {len(wrapper_native_targets)} vmenter-wrapper native target records')
-        for nt_va, fh in sorted(wrapper_native_targets.items()):
-            print(f'    0x{nt_va:X} -> first_handler 0x{fh:X}')
+        for nt_va, (ih, fh) in sorted(wrapper_native_targets.items()):
+            htxt = f' hash=0x{ih:016X}' if ih else ''
+            print(f'    0x{nt_va:X}{htxt} -> first_handler 0x{fh:X}')
+
+    unicorn_records = unicorn_trace_payload['records'] if unicorn_trace_payload else []
+    merged_records = merge_vmtrace_records(unicorn_records, graph_records)
+    merged_records = normalize_wrapper_trace_records(
+        merged_records, wrapper_native_targets)
 
     # Merge with existing Unicorn-traced records (they have priority).
     trace_out = Path(r'D:\binsnake\tracer\vm_trace_records.json')
-    trace_data = {'vmenter_va': f'0x{VM_ENTRY:X}', 'vmexit_va': f'0x{VM_EXIT:X}', 'records': []}
-    existing_keys = set()
-    # Unicorn records first (priority)
-    for rec in graph_records:
-        key = (rec['handler_va'], rec['incoming_hash'])
-        if key not in existing_keys:
-            trace_data['records'].append(rec)
-            existing_keys.add(key)
+    trace_data = {
+        'vmenter_va': f'0x{VM_ENTRY:X}',
+        'vmexit_va': f'0x{VM_EXIT:X}',
+        'records': merged_records,
+    }
     with open(trace_out, 'w') as f:
         json.dump(trace_data, f, indent=2)
     total = len(trace_data['records'])
     print(f"  Full export: {total} VMTraceRecords -> {trace_out}")
 
     # Reachable-only export: BFS from the known entry handler.
-    entry_handler = '0x140C5416E'  # first handler from DriverEntry trace
-    # Build adjacency from graph_records (handler_va -> successor handler_vas)
+    if unicorn_records:
+        entry_handler = unicorn_records[0]['handler_va']
+    else:
+        entry_handler = '0x140C5416E'  # first handler from DriverEntry trace
+
+    # Build adjacency from merged_records (handler_va -> successor handler_vas)
     rec_adj = {}  # handler_va -> set of successor handler_va strings
     native_call_handlers = set()  # handlers that make native calls
-    for rec in graph_records:
+    for rec in merged_records:
         h = rec['handler_va']
         for s in rec.get('successors', []):
             rec_adj.setdefault(h, set()).add(s)
@@ -2178,7 +3572,7 @@ def main():
             if succ not in visited:
                 queue.append(succ)
     # Filter records to only reachable handlers
-    reachable_records = [r for r in graph_records if r['handler_va'] in visited]
+    reachable_records = [r for r in merged_records if r['handler_va'] in visited]
     reachable_out = Path(r'D:\binsnake\tracer\vm_trace_reachable.json')
     reachable_data = {
         'vmenter_va': f'0x{VM_ENTRY:X}',

@@ -26,6 +26,7 @@
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/InitLLVM.h>
 #include <llvm/Support/MemoryBuffer.h>
+#include <llvm/Support/Path.h>
 #include <llvm/Support/Process.h>
 #include <llvm/Support/ToolOutputFile.h>
 #include <llvm/Support/JSON.h>
@@ -1344,6 +1345,7 @@ int main(int argc, char **argv) {
     vm_wrapper_va = parseHexOpt(VMWrapper);
 
   bool vm_mode = (vm_entry_va != 0);
+  const bool has_external_vm_trace = VMTraceJSON.getNumOccurrences() > 0;
   if (vm_mode) {
     // Default wrapper to func_va if not explicitly specified.
     if (vm_wrapper_va == 0)
@@ -1927,6 +1929,7 @@ int main(int argc, char **argv) {
     llvm::DenseSet<uint64_t> seen_vm_trace_work;
     llvm::DenseMap<uint64_t, llvm::SmallVector<uint64_t, 2>>
         handler_trace_hashes;
+    std::optional<uint64_t> imported_entry_seed_hash;
 
     // Demerging must preserve distinct incoming hashes for the same handler VA.
     // Deduplicating only on handler_va would collapse merged ops back together
@@ -1953,6 +1956,44 @@ int main(int argc, char **argv) {
         recordTraceWorkItem(entry.handler_va, entry.incoming_hash);
     };
 
+    auto mergeSupplementalWrapperTrace = [&](StringRef primary_trace_path) {
+      if (!VMTraceJSON.getNumOccurrences())
+        return;
+
+      SmallString<260> supplemental_path(primary_trace_path);
+      sys::path::remove_filename(supplemental_path);
+      sys::path::append(supplemental_path, "vm_trace_records.json");
+      if (supplemental_path == primary_trace_path)
+        return;
+      if (!sys::fs::exists(supplemental_path))
+        return;
+
+      auto supplemental_graph = parseExternalVMTrace(supplemental_path);
+      if (!supplemental_graph)
+        return;
+
+      unsigned merged_records = 0;
+      llvm::DenseSet<uint64_t> merged_wrappers;
+      for (uint64_t native_va : native_call_vas) {
+        auto records = supplemental_graph->getTraceRecords(native_va);
+        if (records.empty())
+          continue;
+        merged_wrappers.insert(native_va);
+        for (const auto &record : records) {
+          vm_graph->recordTrace(record);
+          recordTraceWorkItem(record.handler_va, record.incoming_hash);
+          ++merged_records;
+        }
+      }
+
+      if (merged_records > 0) {
+        errs() << "VMTraceMap: merged " << merged_records
+               << " supplemental wrapper trace record(s) from "
+               << supplemental_path << " for " << merged_wrappers.size()
+               << " traced native target(s)\n";
+      }
+    };
+
     auto tagExactTraceHash = [&](llvm::Function &F, uint64_t handler_va) {
       auto it = handler_trace_hashes.find(handler_va);
       if (it == handler_trace_hashes.end() || it->second.size() != 1) {
@@ -1977,14 +2018,15 @@ int main(int argc, char **argv) {
       for (const auto &handler_va : vm_graph->handlerEntries()) {
         auto records = vm_graph->getTraceRecords(handler_va);
         for (const auto &rec : records) {
+          if (!imported_entry_seed_hash.has_value())
+            imported_entry_seed_hash = rec.incoming_hash;
           recordTraceWorkItem(rec.handler_va, rec.incoming_hash);
           if (rec.native_target_va != 0) {
             native_call_vas.push_back(rec.native_target_va);
-            // Also add as a trace work item so it gets tagged vm_handler.
-            recordTraceWorkItem(rec.native_target_va, 0);
           }
         }
       }
+      mergeSupplementalWrapperTrace(VMTraceJSON.getValue());
       events.emitInfo("vm_trace_imported", "external VM trace loaded",
                       {{"records",
                         static_cast<int64_t>(trace_work_items.size())},
@@ -2058,6 +2100,22 @@ int main(int argc, char **argv) {
                << native_call_infos[i].vmcontext_snapshot.size()
                << "\n";
       }
+    }
+
+    auto seedWrapperTraceHash = [&](uint64_t wrapper_va) {
+      if (!imported_entry_seed_hash.has_value())
+        return;
+      auto *fn = module->getFunction("sub_" + Twine::utohexstr(wrapper_va).str());
+      if (!fn || fn->isDeclaration())
+        return;
+      fn->addFnAttr("omill.vm_trace_in_hash",
+                    llvm::utohexstr(*imported_entry_seed_hash));
+    };
+
+    if (VMTraceJSON.getNumOccurrences()) {
+      seedWrapperTraceHash(vm_wrapper_va);
+      for (auto &[thunk_va, wrapper_va] : auto_detected_wrappers)
+        seedWrapperTraceHash(wrapper_va);
     }
 
     // Lift only trace-reachable handlers.
@@ -2146,11 +2204,23 @@ int main(int argc, char **argv) {
     // to resolve the constant inttoptr calls after ABI recovery.
     if (!native_call_vas.empty()) {
       unsigned native_lifted = 0;
+      auto tagTraceNativeTarget = [&](uint64_t native_va) {
+        std::string tagged_name = "sub_" + Twine::utohexstr(native_va).str();
+        if (auto *fn = module->getFunction(tagged_name)) {
+          if (!fn->isDeclaration()) {
+            fn->addFnAttr("omill.trace_native_target", "1");
+            fn->addFnAttr(llvm::Attribute::NoInline);
+          }
+        }
+      };
       for (uint64_t native_va : native_call_vas) {
         std::string name = "sub_" + Twine::utohexstr(native_va).str();
-        if (auto *existing = module->getFunction(name))
-          if (!existing->isDeclaration())
+        if (auto *existing = module->getFunction(name)) {
+          if (!existing->isDeclaration()) {
+            tagTraceNativeTarget(native_va);
             continue;
+          }
+        }
 
         // Probe decode — skip if first instruction can't be decoded.
         {
@@ -2167,6 +2237,7 @@ int main(int argc, char **argv) {
 
         if (lifter.Lift(native_va)) {
           ++native_lifted;
+          tagTraceNativeTarget(native_va);
           // If this native VA is also in the trace work items (i.e. it's
           // a vmenter wrapper for an inner VM), tag it as vm_handler +
           // vm_wrapper so VMDispatchResolution can process it and
@@ -2290,6 +2361,10 @@ int main(int argc, char **argv) {
     bool verbose_vm_demerge = (std::getenv("OMILL_VM_VERBOSE") != nullptr);
     unsigned demerged_clone_count = 0;
     for (auto &[handler_va, hashes] : handler_trace_hashes) {
+      if (verbose_vm_demerge) {
+        errs() << "VM demerge candidate 0x" << Twine::utohexstr(handler_va)
+               << " hashes=" << hashes.size() << "\n";
+      }
       if (hashes.size() <= 1)
         continue;
 
@@ -2304,12 +2379,22 @@ int main(int argc, char **argv) {
           }
         }
       }
-      if (is_vm_wrapper_handler)
+      if (is_vm_wrapper_handler) {
+        if (verbose_vm_demerge) {
+          errs() << "  skip wrapper-like handler 0x"
+                 << Twine::utohexstr(handler_va) << "\n";
+        }
         continue;
+      }
 
       auto *base_fn = module->getFunction(omill::liftedFunctionName(handler_va));
-      if (!base_fn || base_fn->isDeclaration())
+      if (!base_fn || base_fn->isDeclaration()) {
+        if (verbose_vm_demerge) {
+          errs() << "  missing lifted base for 0x"
+                 << Twine::utohexstr(handler_va) << "\n";
+        }
         continue;
+      }
 
       for (uint64_t incoming_hash : hashes) {
         std::string clone_name =
@@ -3328,6 +3413,144 @@ int main(int argc, char **argv) {
       events.emitInfo("post_abi_deobf_completed", "post-ABI deobfuscation completed");
     }
 
+    auto patchTraceNativeWrapperCalls = [&]() {
+      if (!vm_mode || !vm_graph || vm_graph->empty())
+        return;
+
+      auto parseHashAttr = [&](llvm::Function &F,
+                               llvm::StringRef attr_name)
+          -> std::optional<uint64_t> {
+        auto attr = F.getFnAttribute(attr_name);
+        if (!attr.isValid() || !attr.isStringAttribute())
+          return std::nullopt;
+        uint64_t value = 0;
+        auto text = attr.getValueAsString();
+        if (text.getAsInteger(16, value))
+          return std::nullopt;
+        return value;
+      };
+
+      auto parseNativeVA = [&](llvm::Function &F) -> std::optional<uint64_t> {
+        if (!F.getName().ends_with("_native"))
+          return std::nullopt;
+        auto base_name = F.getName().drop_back(strlen("_native"));
+        if (!base_name.starts_with("sub_"))
+          return std::nullopt;
+        uint64_t va = 0;
+        if (base_name.drop_front(4).getAsInteger(16, va) || va == 0)
+          return std::nullopt;
+        return va;
+      };
+
+      unsigned patched = 0;
+      unsigned skipped = 0;
+      for (auto &F : *module) {
+        if (F.isDeclaration() || !F.hasFnAttribute("omill.vm_wrapper"))
+          continue;
+        auto wrapper_va = parseNativeVA(F);
+        if (!wrapper_va)
+          continue;
+
+        std::optional<uint64_t> seed_hash =
+            parseHashAttr(F, "omill.vm_trace_in_hash");
+        if (!seed_hash) {
+          auto records = vm_graph->getTraceRecords(*wrapper_va);
+          if (records.size() == 1)
+            seed_hash = records.front().incoming_hash;
+        }
+        if (!seed_hash) {
+          errs() << "Trace-native patch: no seed hash for " << F.getName()
+                 << "\n";
+          continue;
+        }
+
+        auto flat = vm_graph->followFlatTrace(*wrapper_va, *seed_hash);
+        llvm::SmallVector<uint64_t, 4> trace_native_targets;
+        for (const auto &record : flat.records) {
+          if (record.native_target_va != 0)
+            trace_native_targets.push_back(record.native_target_va);
+        }
+        if (trace_native_targets.empty()) {
+          errs() << "Trace-native patch: wrapper " << F.getName()
+                 << " seed=0x" << Twine::utohexstr(*seed_hash)
+                 << " flat_records=" << flat.records.size()
+                 << " stop_reason=" << static_cast<unsigned>(flat.stop_reason)
+                 << " produced no native targets\n";
+          continue;
+        }
+
+        llvm::SmallVector<llvm::CallInst *, 4> indirect_calls;
+        for (auto &BB : F) {
+          for (auto &I : BB) {
+            auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+            if (!CI)
+              continue;
+            if (llvm::isa<llvm::Function>(
+                    CI->getCalledOperand()->stripPointerCasts()))
+              continue;
+            indirect_calls.push_back(CI);
+          }
+        }
+        if (indirect_calls.empty()) {
+          errs() << "Trace-native patch: wrapper " << F.getName()
+                 << " has no indirect calls to rewrite\n";
+          continue;
+        }
+        if (indirect_calls.size() != trace_native_targets.size()) {
+          errs() << "Trace-native patch skipped for " << F.getName()
+                 << " (indirect_calls=" << indirect_calls.size()
+                 << ", trace_native_targets=" << trace_native_targets.size()
+                 << ")\n";
+          ++skipped;
+          continue;
+        }
+
+        for (unsigned i = 0; i < indirect_calls.size(); ++i) {
+          uint64_t target_va = trace_native_targets[i];
+          std::string target_name =
+              "sub_" + llvm::Twine::utohexstr(target_va).str() + "_native";
+          auto *target_fn = module->getFunction(target_name);
+          if (!target_fn || target_fn->isDeclaration()) {
+            errs() << "Trace-native patch missing target " << target_name
+                   << " for wrapper " << F.getName() << "\n";
+            break;
+          }
+
+          auto *CI = indirect_calls[i];
+          llvm::SmallVector<llvm::Value *, 16> args;
+          for (auto &Arg : CI->args())
+            args.push_back(Arg.get());
+
+          llvm::IRBuilder<> Builder(CI);
+          llvm::Value *direct_callee = target_fn;
+          if (target_fn->getType() != CI->getCalledOperand()->getType()) {
+            direct_callee = Builder.CreateBitCast(
+                target_fn, CI->getCalledOperand()->getType(),
+                target_name + ".cast");
+          }
+          auto *new_call = Builder.CreateCall(
+              CI->getFunctionType(), direct_callee, args, CI->getName());
+          new_call->setCallingConv(CI->getCallingConv());
+          new_call->setAttributes(CI->getAttributes());
+          if (!CI->use_empty())
+            CI->replaceAllUsesWith(new_call);
+          CI->eraseFromParent();
+          ++patched;
+        }
+      }
+
+      if (patched > 0) {
+        errs() << "Patched " << patched
+               << " VM wrapper indirect call(s) from imported trace\n";
+        fixupB3DispatchArgMismatches();
+        runPostPatchCleanup("trace_native_wrapper_calls");
+      } else if (skipped > 0) {
+        errs() << "Trace-native wrapper patch skipped " << skipped
+               << " wrapper(s)\n";
+      }
+    };
+    patchTraceNativeWrapperCalls();
+
     // Per-callsite specialization of VM native call targets.
     // Clone functions like sub_1400dcbf8_native per call site, bake in
     // emulator-derived GPR constants so hash-based import resolution succeeds.
@@ -3682,7 +3905,7 @@ int main(int argc, char **argv) {
     auto collectNestedVMHelperTargets = [&]() {
       nested_vm_helper_targets.clear();
       nested_vm_helper_deltas.clear();
-      if (!vm_mode || RawBinary)
+      if (!vm_mode || RawBinary || has_external_vm_trace)
         return;
 
       auto followJmpThunks = [&](uint64_t va) {
@@ -4254,6 +4477,8 @@ int main(int argc, char **argv) {
       // whose thunks were folded.  After folding, calls go directly to
       // the wrapper so the helper VA in the map is the wrapper VA.
       for (auto &[thunk_va, wrapper_va] : auto_detected_wrappers) {
+        if (has_external_vm_trace)
+          break;
         if (nested_vm_helper_targets.count(wrapper_va))
           continue;  // already discovered
         // Trace from this wrapper to get the first handler target.
@@ -4403,6 +4628,9 @@ int main(int argc, char **argv) {
         });
         late_MAM.registerPass([&] {
           return omill::LiftedFunctionAnalysis();
+        });
+        late_MAM.registerPass([&] {
+          return omill::VirtualCalleeRegistryAnalysis();
         });
         late_MAM.registerPass([&] {
           return omill::ExceptionInfoAnalysis();

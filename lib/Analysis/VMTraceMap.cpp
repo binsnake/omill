@@ -66,6 +66,8 @@ void VMTraceMap::rebuildAggregateTargets(uint64_t handler_va) {
 }
 
 void VMTraceMap::recordTrace(VMTraceRecord trace) {
+  if (entry_handler_va_ == 0)
+    entry_handler_va_ = trace.handler_va;
   noteHandler(trace.handler_va);
   for (uint64_t succ : trace.successors)
     noteHandler(succ);

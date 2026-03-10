@@ -117,6 +117,37 @@ bool isLiftedFunction(const llvm::Function &F) {
   return name.starts_with("sub_") || name.starts_with("__lifted_");
 }
 
+bool hasUnresolvedDispatch(const llvm::Function &F) {
+  for (auto &BB : F) {
+    for (auto &I : BB) {
+      auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+      if (!CB || CB->arg_size() < 2)
+        continue;
+
+      auto *callee = CB->getCalledFunction();
+      if (!callee)
+        continue;
+
+      auto name = callee->getName();
+      if (name != "__omill_dispatch_call" && name != "__omill_dispatch_jump")
+        continue;
+
+      auto *target = CB->getArgOperand(1);
+      if (llvm::isa<llvm::ConstantInt>(target))
+        continue;
+
+      if (auto *ptoi = llvm::dyn_cast<llvm::PtrToIntOperator>(target)) {
+        if (llvm::isa<llvm::Function>(ptoi->getPointerOperand()))
+          continue;
+      }
+
+      return true;
+    }
+  }
+
+  return false;
+}
+
 /// Collect all direct call targets from a function, counting callsites.
 void collectCallTargets(
     llvm::Function &F,
@@ -206,6 +237,11 @@ llvm::SmallVector<llvm::Function *, 16> identifyHandlers(
         func->getFnAttribute("omill.vm_demerged_clone").isValid() ||
         func->getFnAttribute("omill.vm_outlined_virtual_call").isValid() ||
         (virtual_callees && virtual_callees->lookup(func->getName()).has_value()))
+      continue;
+
+    // Keep unresolved handler tails as explicit boundaries. Inlining them
+    // smears one remaining unknown dispatch into the public output root.
+    if (hasUnresolvedDispatch(*func))
       continue;
 
     handlers.push_back(func);

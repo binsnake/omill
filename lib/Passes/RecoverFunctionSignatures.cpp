@@ -14,11 +14,32 @@ namespace omill {
 
 namespace {
 
+static constexpr unsigned kWin64PublicRootParamCount = 2;
+
+bool isPublicOutputRoot(const llvm::Function *F) {
+  return F && F->hasFnAttribute("omill.output_root") &&
+         !F->hasFnAttribute("omill.vm_wrapper");
+}
+
+unsigned exportedRootGPRParamCount(const FunctionABI &abi,
+                                   bool is_public_output_root) {
+  if (!is_public_output_root)
+    return abi.numParams();
+  if (abi.cc == DetectedCC::kWin64)
+    return std::min(kWin64PublicRootParamCount, abi.numParams());
+  return abi.numParams();
+}
+
 /// Build a native function type from recovered ABI info.
 llvm::FunctionType *buildNativeType(const FunctionABI &abi,
-                                     llvm::LLVMContext &Ctx) {
+                                     llvm::LLVMContext &Ctx,
+                                     bool suppress_extra_gpr_returns = false,
+                                     unsigned gpr_param_count = 0,
+                                     bool suppress_non_standard_params = false,
+                                     bool expose_public_root_ptr_params = false) {
   auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
   auto *xmm_ty = llvm::FixedVectorType::get(i64_ty, 2);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
 
   // --- Return type ---
   // If the function clobbers callee-saved GPRs, we pack the primary return
@@ -34,7 +55,9 @@ llvm::FunctionType *buildNativeType(const FunctionABI &abi,
   }
 
   llvm::Type *ret_ty;
-  if (abi.hasStructReturn()) {
+  bool use_struct_return =
+      abi.hasStructReturn() && !suppress_extra_gpr_returns;
+  if (use_struct_return) {
     llvm::SmallVector<llvm::Type *, 10> fields;
     if (primary_ret_ty)
       fields.push_back(primary_ret_ty);
@@ -51,8 +74,16 @@ llvm::FunctionType *buildNativeType(const FunctionABI &abi,
   llvm::SmallVector<llvm::Type *, 10> param_types;
 
   // GPR params (i64).
-  for (unsigned i = 0; i < abi.numParams(); ++i)
-    param_types.push_back(i64_ty);
+  if (gpr_param_count == 0)
+    gpr_param_count = abi.numParams();
+  for (unsigned i = 0; i < gpr_param_count; ++i)
+    param_types.push_back(
+        expose_public_root_ptr_params
+            ? static_cast<llvm::Type *>(ptr_ty)
+            : static_cast<llvm::Type *>(i64_ty));
+
+  if (suppress_non_standard_params)
+    return llvm::FunctionType::get(ret_ty, param_types, false);
 
   // Stack-passed params (i64 each).
   for (unsigned i = 0; i < abi.numStackParams(); ++i)
@@ -88,7 +119,30 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
   auto &M = *lifted_fn->getParent();
   auto &Ctx = M.getContext();
 
-  auto *native_ty = buildNativeType(abi, Ctx);
+  bool is_public_output_root = isPublicOutputRoot(lifted_fn);
+  FunctionABI wrapper_abi = abi;
+  if (is_public_output_root && !wrapper_abi.ret.has_value()) {
+    if (auto rax = field_map.fieldByName("RAX"); rax.has_value()) {
+      wrapper_abi.ret = RecoveredReturn{
+          "RAX",
+          rax->offset,
+          8,
+          false,
+      };
+    } else if (auto x0 = field_map.fieldByName("X0"); x0.has_value()) {
+      wrapper_abi.ret = RecoveredReturn{
+          "X0",
+          x0->offset,
+          8,
+          false,
+      };
+    }
+  }
+  unsigned gpr_param_count =
+      exportedRootGPRParamCount(wrapper_abi, is_public_output_root);
+  auto *native_ty = buildNativeType(wrapper_abi, Ctx, is_public_output_root,
+                                    gpr_param_count, is_public_output_root,
+                                    is_public_output_root);
 
   // Name: lifted function name + "_native"
   std::string native_name = lifted_fn->getName().str() + "_native";
@@ -117,8 +171,10 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
   propagateStringAttr("omill.vm_virtual_callee_round");
   propagateStringAttr("omill.vm_handler_va");
   propagateStringAttr("omill.vm_trace_hash");
+  propagateStringAttr("omill.trace_native_target");
   if (native_fn->getFnAttribute("omill.vm_demerged_clone").isValid() ||
-      native_fn->getFnAttribute("omill.vm_outlined_virtual_call").isValid()) {
+      native_fn->getFnAttribute("omill.vm_outlined_virtual_call").isValid() ||
+      native_fn->getFnAttribute("omill.trace_native_target").isValid()) {
     native_fn->addFnAttr(llvm::Attribute::NoInline);
   }
   if (lifted_fn->hasFnAttribute("omill.vm_entry_seed"))
@@ -182,12 +238,28 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
     }
   }
 
+  if (is_public_output_root) {
+    // Hidden VM-only GPR live-ins on exported roots are internal scaffolding,
+    // not part of the public ABI. Seed them from the synthetic stack so
+    // inlined VM bookkeeping does not collapse into inttoptr(low-constant)
+    // artifacts like inttoptr(400).
+    for (unsigned off : abi.extra_gpr_live_ins) {
+      auto *field_ptr = buildStateGEP(Builder, state_alloca, off);
+      Builder.CreateStore(stack_top_i64, field_ptr);
+    }
+  }
+
   // Store GPR parameters into State fields.
-  for (unsigned i = 0; i < abi.numParams(); ++i) {
+  for (unsigned i = 0; i < gpr_param_count; ++i) {
     auto *param = native_fn->getArg(i);
+    llvm::Value *param_i64 = param;
+    if (param->getType()->isPointerTy()) {
+      param_i64 = Builder.CreatePtrToInt(param, Builder.getInt64Ty(),
+                                         param->getName() + ".i64");
+    }
     auto *field_ptr = buildStateGEP(Builder, state_alloca,
-                                     abi.params[i].state_offset);
-    Builder.CreateStore(param, field_ptr);
+                                     wrapper_abi.params[i].state_offset);
+    Builder.CreateStore(param_i64, field_ptr);
   }
 
   // Store stack-passed parameters to the caller's stack area.
@@ -196,16 +268,16 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
   auto sp_field = field_map.fieldByName("RSP");
   if (!sp_field) sp_field = field_map.fieldByName("SP");
   if (!sp_field) sp_field = field_map.fieldByName("sp");
-  if (sp_field.has_value()) {
+  if (!is_public_output_root && sp_field.has_value()) {
     auto rsp = sp_field;
-    for (unsigned i = 0; i < abi.numStackParams(); ++i) {
-      unsigned arg_idx = abi.numParams() + i;
+    for (unsigned i = 0; i < wrapper_abi.numStackParams(); ++i) {
+      unsigned arg_idx = gpr_param_count + i;
       auto *param = native_fn->getArg(arg_idx);
       // Store at RSP + stack_offset (the callee will load from there).
       auto *rsp_ptr = buildStateGEP(Builder, state_alloca, rsp->offset);
       auto *rsp_val = Builder.CreateLoad(Builder.getInt64Ty(), rsp_ptr, "rsp");
       auto *addr = Builder.CreateAdd(
-          rsp_val, Builder.getInt64(abi.stack_params[i].stack_offset));
+          rsp_val, Builder.getInt64(wrapper_abi.stack_params[i].stack_offset));
       auto *ptr = Builder.CreateIntToPtr(addr,
           llvm::PointerType::get(Builder.getContext(), 0));
       Builder.CreateStore(param, ptr);
@@ -213,21 +285,23 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
   }
 
   // Store XMM parameters into State vector register slots.
-  for (unsigned i = 0; i < abi.numXMMParams(); ++i) {
-    unsigned arg_idx = abi.numParams() + abi.numStackParams() + i;
+  for (unsigned i = 0; !is_public_output_root && i < wrapper_abi.numXMMParams();
+       ++i) {
+    unsigned arg_idx = gpr_param_count + wrapper_abi.numStackParams() + i;
     auto *param = native_fn->getArg(arg_idx);
     auto *field_ptr = buildStateGEP(Builder, state_alloca,
-                                     abi.xmm_live_ins[i]);
+                                     wrapper_abi.xmm_live_ins[i]);
     Builder.CreateStore(param, field_ptr);
   }
 
   // Store extra GPR parameters into State fields.
-  for (unsigned i = 0; i < abi.numExtraGPRParams(); ++i) {
-    unsigned arg_idx = abi.numParams() + abi.numStackParams() +
-                       abi.numXMMParams() + i;
+  for (unsigned i = 0;
+       !is_public_output_root && i < wrapper_abi.numExtraGPRParams(); ++i) {
+    unsigned arg_idx = gpr_param_count + wrapper_abi.numStackParams() +
+                       wrapper_abi.numXMMParams() + i;
     auto *param = native_fn->getArg(arg_idx);
     auto *field_ptr = buildStateGEP(Builder, state_alloca,
-                                     abi.extra_gpr_live_ins[i]);
+                                     wrapper_abi.extra_gpr_live_ins[i]);
     Builder.CreateStore(param, field_ptr);
   }
 
@@ -235,14 +309,17 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
   // can map native function params back to emulator GPR indices.
   {
     std::string offsets_str;
-    for (unsigned i = 0; i < abi.numParams(); ++i)
-      offsets_str += std::to_string(abi.params[i].state_offset) + ",";
-    for (unsigned i = 0; i < abi.numStackParams(); ++i)
+    for (unsigned i = 0; i < gpr_param_count; ++i)
+      offsets_str += std::to_string(wrapper_abi.params[i].state_offset) + ",";
+    for (unsigned i = 0; !is_public_output_root &&
+                         i < wrapper_abi.numStackParams(); ++i)
       offsets_str += "stack,";  // Stack params don't map to GPRs.
-    for (unsigned i = 0; i < abi.numXMMParams(); ++i)
+    for (unsigned i = 0; !is_public_output_root &&
+                         i < wrapper_abi.numXMMParams(); ++i)
       offsets_str += "xmm,";   // XMM params don't map to GPRs.
-    for (unsigned i = 0; i < abi.numExtraGPRParams(); ++i)
-      offsets_str += std::to_string(abi.extra_gpr_live_ins[i]) + ",";
+    for (unsigned i = 0; !is_public_output_root &&
+                         i < wrapper_abi.numExtraGPRParams(); ++i)
+      offsets_str += std::to_string(wrapper_abi.extra_gpr_live_ins[i]) + ",";
     if (!offsets_str.empty())
       offsets_str.pop_back();
     native_fn->addFnAttr("omill.param_state_offsets", offsets_str);
@@ -271,26 +348,26 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
   Builder.CreateCall(lifted_fn, call_args);
 
   // Load return value(s) from State.
-  if (abi.hasStructReturn()) {
+  if (wrapper_abi.hasStructReturn() && !is_public_output_root) {
     // Build a struct containing the primary return + clobbered callee-saved.
     auto *struct_ty = llvm::cast<llvm::StructType>(native_fn->getReturnType());
     llvm::Value *agg = llvm::PoisonValue::get(struct_ty);
     unsigned idx = 0;
 
     // Primary return value (RAX or XMM0), if present.
-    if (abi.ret.has_value()) {
-      llvm::Type *load_ty = abi.ret->is_vector
+    if (wrapper_abi.ret.has_value()) {
+      llvm::Type *load_ty = wrapper_abi.ret->is_vector
           ? static_cast<llvm::Type *>(
                 llvm::FixedVectorType::get(Builder.getInt64Ty(), 2))
           : static_cast<llvm::Type *>(Builder.getInt64Ty());
       auto *ret_ptr = buildStateGEP(Builder, state_alloca,
-                                     abi.ret->state_offset);
+                                     wrapper_abi.ret->state_offset);
       auto *primary = Builder.CreateLoad(load_ty, ret_ptr, "retval");
       agg = Builder.CreateInsertValue(agg, primary, idx++);
     }
 
     // Extra clobbered callee-saved values (i64 each).
-    for (unsigned off : abi.extra_gpr_live_outs) {
+    for (unsigned off : wrapper_abi.extra_gpr_live_outs) {
       auto *ptr = buildStateGEP(Builder, state_alloca, off);
       auto *val = Builder.CreateLoad(Builder.getInt64Ty(), ptr,
                                      "clobbered." + llvm::Twine(off));
@@ -298,11 +375,11 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
     }
 
     Builder.CreateRet(agg);
-  } else if (abi.ret.has_value()) {
+  } else if (wrapper_abi.ret.has_value()) {
     auto *ret_ptr = buildStateGEP(Builder, state_alloca,
-                                   abi.ret->state_offset);
+                                   wrapper_abi.ret->state_offset);
     llvm::Type *load_ty;
-    if (abi.ret->is_vector) {
+    if (wrapper_abi.ret->is_vector) {
       load_ty = llvm::FixedVectorType::get(Builder.getInt64Ty(), 2);
     } else {
       load_ty = Builder.getInt64Ty();
