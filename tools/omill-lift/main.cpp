@@ -2184,6 +2184,86 @@ int main(int argc, char **argv) {
              << " (from " << native_call_vas.size() << " targets)\n";
     }
 
+    // Tag native call targets that are vmenter wrappers (inner VM entry
+    // points) so VMHandlerInliner preserves them as call boundaries.
+    // Detection: follow jmp-thunks from the native VA, probe the resolved
+    // body for [lea rsp,... / sub rsp,...] + call vmentry.
+    if (!native_call_vas.empty() && vm_entry_va != 0) {
+      unsigned wrapper_tagged = 0;
+      for (uint64_t native_va : native_call_vas) {
+        std::string name = "sub_" + Twine::utohexstr(native_va).str();
+        auto *fn = module->getFunction(name);
+        if (!fn || fn->isDeclaration())
+          continue;
+        // Already tagged as wrapper (e.g. matches vm_wrapper_va)?
+        if (fn->hasFnAttribute("omill.vm_wrapper"))
+          continue;
+        // Follow jmp-thunks to the body.
+        uint64_t resolved = native_va;
+        for (int hop = 0; hop < 4; ++hop) {
+          uint8_t tbuf[16];
+          if (!pe.memory_map.read(resolved, tbuf, sizeof(tbuf)))
+            break;
+          if (tbuf[0] == 0xE9) {
+            int32_t rel;
+            std::memcpy(&rel, &tbuf[1], 4);
+            resolved = resolved + 5 + static_cast<int64_t>(rel);
+          } else if (tbuf[0] == 0xEB) {
+            int8_t rel = static_cast<int8_t>(tbuf[1]);
+            resolved = resolved + 2 + rel;
+          } else {
+            break;
+          }
+        }
+        // Probe the resolved body for the wrapper pattern:
+        //   optional lea rsp,[rsp-N] / sub rsp,N
+        //   E8 <rel32>  (call near vmentry)
+        uint8_t probe[32];
+        if (!pe.memory_map.read(resolved, probe, sizeof(probe)))
+          continue;
+        unsigned p = 0;
+        if (p + 8 <= sizeof(probe) &&
+            probe[p] == 0x48 && probe[p+1] == 0x8D &&
+            probe[p+2] == 0xA4 && probe[p+3] == 0x24) {
+          p += 8;
+        } else if (p + 5 <= sizeof(probe) &&
+                   probe[p] == 0x48 && probe[p+1] == 0x8D &&
+                   probe[p+2] == 0x64 && probe[p+3] == 0x24) {
+          p += 5;
+        } else if (p + 7 <= sizeof(probe) &&
+                   probe[p] == 0x48 && probe[p+1] == 0x81 &&
+                   probe[p+2] == 0xEC) {
+          p += 7;
+        }
+        if (p + 5 > sizeof(probe) || probe[p] != 0xE8)
+          continue;
+        int32_t crel;
+        std::memcpy(&crel, &probe[p+1], 4);
+        uint64_t ctarget = resolved + p + 5 + static_cast<int64_t>(crel);
+        // Accept if the call target is the vmentry, the vm wrapper, or
+        // within 0x1000 of either.
+        bool near_entry = (ctarget >= vm_entry_va - 0x1000 &&
+                           ctarget <= vm_entry_va + 0x1000);
+        bool near_wrapper = (vm_wrapper_va != 0 &&
+                             ctarget >= vm_wrapper_va - 0x1000 &&
+                             ctarget <= vm_wrapper_va + 0x1000);
+        if (!near_entry && !near_wrapper)
+          continue;
+        // This native target is a vmenter wrapper.  Tag it so
+        // VMHandlerInliner preserves it as a call boundary.
+        fn->addFnAttr("omill.vm_wrapper");
+        if (!fn->hasFnAttribute("omill.vm_handler"))
+          fn->addFnAttr("omill.vm_handler");
+        ++wrapper_tagged;
+        errs() << "Native target 0x" << Twine::utohexstr(native_va)
+               << " is vmenter wrapper (body 0x"
+               << Twine::utohexstr(resolved) << ")\n";
+      }
+      if (wrapper_tagged > 0)
+        errs() << "Tagged " << wrapper_tagged
+               << " native targets as vmenter wrappers\n";
+    }
+
     // Fix DeclareLiftedFunction naming collisions (sub_X.N → sub_X).
     // Must happen BEFORE setting attributes on vmentry/vmexit, because
     // the fix erases declarations (which may hold attributes from the

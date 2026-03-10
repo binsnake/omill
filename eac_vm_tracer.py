@@ -2093,6 +2093,42 @@ def main():
                 'is_error':         False,
             })
 
+    # Add records for vmenter-wrapper native targets so VMDispatchResolution
+    # can resolve their dispatch_jump to the first inner handler.  These are
+    # native call targets (e.g. 0x14014F994) that jmp-thunk into a vmenter
+    # wrapper body.  The lift pipeline lifts them as sub_<va> and needs a
+    # trace record to know where the inner VM chain begins.
+    wrapper_native_targets = {}  # native_va -> first_inner_handler_va
+    all_native_targets = set()
+    for (h, hi), nt in native_target_for_edge.items():
+        if nt:
+            all_native_targets.add(nt)
+    for nt_va in all_native_targets:
+        entry = resolver.resolve_native_as_vmenter(nt_va)
+        if entry is not None:
+            inner_hash, inner_dc, first_handler = entry
+            if first_handler:
+                wrapper_native_targets[nt_va] = first_handler
+                # Add a record for the native target VA itself.
+                key = (f'0x{nt_va:X}', '0x0')
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    graph_records.append({
+                        'handler_va':       f'0x{nt_va:X}',
+                        'incoming_hash':    '0x0',
+                        'outgoing_hash':    '0x0',
+                        'exit_target_va':   '0x0',
+                        'native_target_va': '0x0',
+                        'successors':       [f'0x{first_handler:X}'],
+                        'passed_vmexit':    False,
+                        'is_vmexit':        False,
+                        'is_error':         False,
+                    })
+    if wrapper_native_targets:
+        print(f'  Added {len(wrapper_native_targets)} vmenter-wrapper native target records')
+        for nt_va, fh in sorted(wrapper_native_targets.items()):
+            print(f'    0x{nt_va:X} -> first_handler 0x{fh:X}')
+
     # Merge with existing Unicorn-traced records (they have priority).
     trace_out = Path(r'D:\binsnake\tracer\vm_trace_records.json')
     trace_data = {'vmenter_va': f'0x{VM_ENTRY:X}', 'vmexit_va': f'0x{VM_EXIT:X}', 'records': []}
@@ -2118,9 +2154,12 @@ def main():
         for s in rec.get('successors', []):
             rec_adj.setdefault(h, set()).add(s)
         rec_adj.setdefault(h, set())  # ensure entry
-        # Track handlers that make native calls (for inner VM linking)
-        if rec.get('native_target_va', '0x0') != '0x0':
+        # Track native call targets as additional BFS edges.
+        nt = rec.get('native_target_va', '0x0')
+        if nt != '0x0':
             native_call_handlers.add(h)
+            # The native target is also a reachable function.
+            rec_adj.setdefault(h, set()).add(nt)
     # For native call handlers, add inner VM first handlers as successors.
     # At runtime, a native call may invoke a vmenter wrapper (recursive VM entry).
     # We add edges from every native-call handler to every inner VM first handler
