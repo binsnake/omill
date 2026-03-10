@@ -917,7 +917,12 @@ class DispatchChainResolver:
         # Overlay the fields that MUST be correct for dispatch resolution.
         struct.pack_into('<Q', ctx, 0x190, hash_in & 0xFFFFFFFFFFFFFFFF)
         struct.pack_into('<Q', ctx, 0xE0, BASE_DELTA)
-        struct.pack_into('<Q', ctx, 0xB8, self.HANDLER_RSP)
+        # ctx[0xB8] = "original RSP" before vmenter.  In the real VM,
+        # vmenter does `lea rsp,[rsp-1C0h]`, so original_RSP = handler_RSP + 0x1C0.
+        # The handler writes the native function pointer to [ctx[0xB8]+8].
+        # The RSP+0x1D0 extraction at EXIT_CALL reads from the same location
+        # only when ctx[0xB8] = HANDLER_RSP + 0x1C0.
+        struct.pack_into('<Q', ctx, 0xB8, self.HANDLER_RSP + 0x1C0)
         uc.mem_write(ctx_base, bytes(ctx))
 
         # Set registers
@@ -1666,6 +1671,103 @@ def main():
         print(f"  VALIDATION: handler 0x140C5416E not in edges")
     # (Graph export moved to after native call extension)
 
+    # 8a-ctx. Context-propagation pass for native call target resolution.
+    # The dispatch graph is correct (dispatch depends only on hash), but native
+    # call targets depend on ctx[0x108] (RAX) which was filler in Pass 1.
+    # Walk the graph from the entry point, propagating full context, and
+    # re-resolve native call handlers with the correct predecessor context.
+    nc_edges_set = set()  # (h_va, hash_in) keys that are native call edges
+    for (h, hi), (nh, ho, c) in edges.items():
+        if isinstance(nh, str) and 'native_call' in nh:
+            nc_edges_set.add((h, hi))
+    if nc_edges_set:
+        print(f"\n  Context-propagation pass for {len(nc_edges_set)} native call edges...")
+        # Build predecessor map: handler_va -> set of predecessor (handler_va, hash_in)
+        pred_map = {}  # handler_va -> list of (pred_handler_va, pred_hash_in)
+        for (h, hi), (nh, ho, c) in edges.items():
+            if isinstance(nh, int):
+                pred_map.setdefault(nh, []).append((h, hi))
+        # BFS from entry handler, propagating context through the graph.
+        # We re-resolve each handler with its predecessor's output context to
+        # build an accurate ctx_out chain.  Only handlers on paths leading to
+        # native call edges need full re-resolution, but for simplicity we
+        # propagate through all reachable handlers (it's fast — Unicorn runs
+        # are ~0.01s each).
+        entry_h = 0x140C5416E
+        # Find the entry handler's hash from handler_hashes.
+        entry_hash = handler_hashes.get(entry_h, [(INITIAL_HASH, 0)])[0][0]
+        # Re-resolve entry handler with a context where RAX=0 (as set by vmenter
+        # when called from DriverEntry with RAX=0).
+        import copy
+        initial_ctx = bytearray(resolver.CTX_SIZE)
+        filler = resolver.HANDLER_RSP + 0x100
+        for off in range(0, resolver.CTX_SIZE, 8):
+            struct.pack_into('<Q', initial_ctx, off, filler)
+        struct.pack_into('<Q', initial_ctx, 0x190, entry_hash & 0xFFFFFFFFFFFFFFFF)
+        struct.pack_into('<Q', initial_ctx, 0xE0, BASE_DELTA)
+        struct.pack_into('<Q', initial_ctx, 0xB8, resolver.HANDLER_RSP + 0x1C0)
+        # Set RAX (ctx[0x108]) to 0 — the value from DriverEntry via vmenter.
+        struct.pack_into('<Q', initial_ctx, 0x108, 0)
+        prop_ctx = {}  # (handler_va, hash_in) -> output context bytes
+        r = resolver.resolve_handler(entry_h, entry_hash, prev_ctx=bytes(initial_ctx))
+        if r:
+            _, _, _, out_ctx_entry = r
+            if out_ctx_entry:
+                prop_ctx[(entry_h, entry_hash)] = out_ctx_entry
+        # BFS through the graph, propagating context.
+        from collections import deque
+        ctx_queue = deque()  # (handler_va, hash_in, prev_ctx_bytes)
+        # Seed the queue with successors of the entry handler.
+        for (h, hi), (nh, ho, c) in edges.items():
+            if h == entry_h and isinstance(nh, int) and (entry_h, hi) in prop_ctx:
+                # Find the hash for the successor handler.
+                for shi, _ in handler_hashes.get(nh, []):
+                    ctx_queue.append((nh, shi, prop_ctx[(entry_h, hi)]))
+                    break  # one hash per successor is enough for context propagation
+        visited_prop = {(entry_h, entry_hash)}
+        native_resolved_ctx = 0
+        while ctx_queue:
+            h_va, hash_in, prev = ctx_queue.popleft()
+            key = (h_va, hash_in)
+            if key in visited_prop:
+                continue
+            visited_prop.add(key)
+            r = resolver.resolve_handler(h_va, hash_in, prev_ctx=prev)
+            if r is None:
+                continue
+            kind, const_or_caller, hash_out_or_ha, out_ctx_h = r
+            if out_ctx_h:
+                prop_ctx[key] = out_ctx_h
+            # If this handler dispatches to a native call, capture the target.
+            if key in nc_edges_set:
+                nt = resolver._last_native_target
+                if nt and nt not in (0, filler):
+                    # Validate: must be in PE image range.
+                    nt_rva = nt - IMAGEBASE
+                    if 0x1000 <= nt_rva < 0x266F000:
+                        native_target_for_edge[key] = nt
+                        native_resolved_ctx += 1
+            # Propagate to successors.
+            if kind == 'dispatch' and out_ctx_h:
+                target = (const_or_caller + BASE_DELTA) & 0xFFFFFFFFFFFFFFFF
+                dtype, dinfo = resolver.classify_dispatch_entry(target)
+                if dtype == 'jmp':
+                    next_h = dinfo['handler']
+                    for shi, _ in handler_hashes.get(next_h, []):
+                        if (next_h, shi) not in visited_prop:
+                            ctx_queue.append((next_h, shi, out_ctx_h))
+                        break
+            elif kind == 'native_call' and out_ctx_h:
+                # After a native call, the handler_after continues.
+                ha = hash_out_or_ha
+                if isinstance(ha, int) and ha:
+                    for shi, _ in handler_hashes.get(ha, []):
+                        if (ha, shi) not in visited_prop:
+                            ctx_queue.append((ha, shi, out_ctx_h))
+                        break
+        print(f"    Propagated context through {len(visited_prop)} handlers")
+        print(f"    Resolved {native_resolved_ctx} native call targets via context propagation")
+
     # 8b. Cross-reference e2e trace native calls into native_target_for_edge.
     # The Unicorn emulation captures the actual call [rsp+8] value for native
     # call stubs it traverses.  Use this to fill in native targets for edges
@@ -1683,14 +1785,15 @@ def main():
         # A handler makes the same native call regardless of its incoming hash.
         # Populate native_target_for_edge for ALL known hashes of each handler,
         # not just the hash observed in the e2e trace.
+        # E2E trace values are the most reliable (observed in real execution),
+        # so they OVERRIDE any existing values from Pass 1 or context propagation.
         e2e_count = 0
         for h_va, nt in e2e_handler_native.items():
             hashes = handler_hashes.get(h_va, [])
             for (h_in, _) in hashes:
                 key = (h_va, h_in)
-                if key not in native_target_for_edge:
-                    native_target_for_edge[key] = nt
-                    e2e_count += 1
+                native_target_for_edge[key] = nt
+                e2e_count += 1
         if e2e_handler_native:
             print(f"  E2E trace: {len(e2e_handler_native)} handler(s) with native targets -> {e2e_count} edge entries")
     print(f"  Total native_target_for_edge: {len(native_target_for_edge)} entries")
