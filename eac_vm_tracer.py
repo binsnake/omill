@@ -835,6 +835,7 @@ class DispatchChainResolver:
             va = self.pe.OPTIONAL_HEADER.ImageBase + sec.VirtualAddress
             data = bytes(sec.get_data())
             self._sec_map.append((va, va + len(data), data))
+        self._last_native_target = 0  # native target from most recent resolve_handler
 
     def _read_va(self, va, size):
         """Read `size` bytes at virtual address `va` from the PE sections."""
@@ -891,6 +892,7 @@ class DispatchChainResolver:
         If prev_ctx is provided (bytes), it is used as the initial VM context
         (with hash/base_delta/rsp overwritten).  Otherwise a fresh context is used.
         """
+        self._last_native_target = 0
         uc = self._make_uc()
         # Hook unmapped memory (data read/write auto-map; code fetch -> log+stop)
         def _unmapped_hook(uc_, access, address, size, value, user):
@@ -951,6 +953,15 @@ class DispatchChainResolver:
                     rsp = uc_.reg_read(UC_X86_REG_RSP)
                     ret_addr = struct.unpack('<Q', bytes(uc_.mem_read(rsp, 8)))[0]
                     result['exit_ret_addr'] = ret_addr
+                    # Extract native call target from the stack.
+                    # If this exit is via a native call stub, the stub will do:
+                    #   lea rsp,[rsp+1C0h]; call [rsp+8]
+                    # At vmexit entry, RSP has been decremented by 8 (call pushed
+                    # return addr).  So the native target is at:
+                    #   (RSP+8) + 0x1C0 + 8 = RSP + 0x1D0
+                    native_target = struct.unpack('<Q',
+                        bytes(uc_.mem_read(rsp + 0x1D0, 8)))[0]
+                    result['exit_native_target'] = native_target
                 except:
                     pass
                 result['exit'] = True
@@ -1005,8 +1016,19 @@ class DispatchChainResolver:
                 kind, info = self.classify_dispatch_entry(caller)
                 if kind == 'native_call':
                     ha = info.get('handler_after', 0)
+                    # Extract the native call target that the stub will call
+                    # via call [rsp+8].  This was captured from the stack at
+                    # vmexit entry (RSP + 0x1D0).
+                    native_target = result.get('exit_native_target', 0)
+                    # Validate: must be in PE image range to be useful.
+                    if native_target:
+                        nt_rva = native_target - IMAGEBASE
+                        if not (0x1000 <= nt_rva < 0x266F000):
+                            native_target = 0
+                    self._last_native_target = native_target
                     if self.verbose >= 2:
-                        print(f'    exit via native call stub @ 0x{caller:X} -> handler_after=0x{ha:X}')
+                        nt_str = f' native_target=0x{native_target:X}' if native_target else ''
+                        print(f'    exit via native call stub @ 0x{caller:X} -> handler_after=0x{ha:X}{nt_str}')
                     return ('native_call', caller, ha, out_ctx)
             return ('exit', 0, result.get('exit_insns', 0), out_ctx)
 
@@ -1454,6 +1476,7 @@ def main():
     resolved = 0
     failed = 0
     edges = {}  # (handler_va, hash_in) -> (next_handler_va, hash_out, const)
+    native_target_for_edge = {}  # (handler_va, hash_in) -> resolved native target VA
     exits = set()  # handlers that exit the VM
     ctx_out = {}  # handler_va -> output context bytes (for chaining)
     failed_set = set()  # handler VAs that failed first-pass resolution
@@ -1473,6 +1496,8 @@ def main():
                 ha = hash_out_or_ha
                 if ha:
                     edges[(h_va, hash_in)] = ('native_call_stub', 0, const_or_caller)
+                    if resolver._last_native_target:
+                        native_target_for_edge[(h_va, hash_in)] = resolver._last_native_target
                 resolved += 1
             elif kind == 'dispatch':
                 target = (const_or_caller + BASE_DELTA) & 0xFFFFFFFFFFFFFFFF
@@ -1496,7 +1521,7 @@ def main():
         if (i + 1) % 500 == 0:
             print(f"    [{i+1}/{len(unique_handlers)}] resolved={resolved} failed={failed}")
 
-    print(f"\n  Pass 1: {resolved} resolved, {failed} failed, {len(exits)} exits")
+    print(f"\n  Pass 1: {resolved} resolved, {failed} failed, {len(exits)} exits, {len(native_target_for_edge)} native targets")
 
     # Context chaining: retry failed handlers using predecessor's output context.
     # Build reverse map: handler_va -> list of predecessor handler_vas.
@@ -1537,6 +1562,8 @@ def main():
                     ha = hash_out_or_ha
                     if ha:
                         edges[(h_va, hash_in)] = ('native_call_stub', 0, const_or_caller)
+                        if resolver._last_native_target:
+                            native_target_for_edge[(h_va, hash_in)] = resolver._last_native_target
                     newly_resolved += 1
                 elif kind == 'dispatch':
                     target = (const_or_caller + BASE_DELTA) & 0xFFFFFFFFFFFFFFFF
@@ -1639,10 +1666,53 @@ def main():
         print(f"  VALIDATION: handler 0x140C5416E not in edges")
     # (Graph export moved to after native call extension)
 
+    # 8b. Cross-reference e2e trace native calls into native_target_for_edge.
+    # The Unicorn emulation captures the actual call [rsp+8] value for native
+    # call stubs it traverses.  Use this to fill in native targets for edges
+    # that the concolic resolver couldn't extract from its stack simulation.
+    if trace:
+        e2e_handler_native = {}  # handler_va -> native_target_va (hash-independent)
+        for step in trace:
+            # native_target_va is set on any step whose handler makes a
+            # native call, regardless of how the handler was dispatched to.
+            nt = step.get('native_target_va', 0)
+            if nt:
+                h_va = step.get('thunk') or step.get('target', 0)
+                if h_va:
+                    e2e_handler_native[h_va] = nt
+        # A handler makes the same native call regardless of its incoming hash.
+        # Populate native_target_for_edge for ALL known hashes of each handler,
+        # not just the hash observed in the e2e trace.
+        e2e_count = 0
+        for h_va, nt in e2e_handler_native.items():
+            hashes = handler_hashes.get(h_va, [])
+            for (h_in, _) in hashes:
+                key = (h_va, h_in)
+                if key not in native_target_for_edge:
+                    native_target_for_edge[key] = nt
+                    e2e_count += 1
+        if e2e_handler_native:
+            print(f"  E2E trace: {len(e2e_handler_native)} handler(s) with native targets -> {e2e_count} edge entries")
+    print(f"  Total native_target_for_edge: {len(native_target_for_edge)} entries")
+
     # 9a. Scan VM re-entry wrappers and collect unique hashes.
     wrappers = resolver.scan_all_wrappers()
     wrapper_hashes = set(w['hash'] for w in wrappers)
     print(f"  {len(wrappers)} VM re-entry wrappers parsed, {len(wrapper_hashes)} unique hashes")
+
+    # Validate native targets: check which are vmenter wrappers.
+    wrapper_addrs = set(w['addr'] for w in wrappers)
+    # Also collect thunk-resolved wrapper bodies.
+    wrapper_bodies = set()
+    for w in wrappers:
+        raw = resolver._read_va(w['addr'], 5)
+        if raw and raw[0] == 0xE9:
+            rel = struct.unpack_from('<i', raw, 1)[0]
+            body = (w['addr'] + 5 + rel) & 0xFFFFFFFFFFFFFFFF
+            wrapper_bodies.add(body)
+    all_wrapper_vas = wrapper_addrs | wrapper_bodies
+    nt_wrapper_count = sum(1 for nt in native_target_for_edge.values() if nt in all_wrapper_vas)
+    print(f"  Native targets: {len(native_target_for_edge)} total, {nt_wrapper_count} are vmenter wrappers")
 
     # 9b. For native_call_stub edges, try to resolve handler_after.
     # Cache by handler_after so we don't re-test the same continuation handler.
@@ -1889,14 +1959,15 @@ def main():
         elif isinstance(nh, str) and nh.startswith('native_call'):
             # Native call: set handler_after as successor so VMDispatchResolution
             # can resolve the dispatch_jump to the correct handler.
-            # Also: if the native call target is a vmenter wrapper, add the
-            # first inner handler as a successor for reachability.
             caller = c
             ha = stub_to_ha.get(caller, 0) if isinstance(caller, int) else 0
             successors = []
             if ha:
                 successors.append(f'0x{ha:X}')
-                rec['native_target_va'] = f'0x{caller:X}' if isinstance(caller, int) else '0x0'
+                # Use the resolved native target VA (the function called by
+                # call [rsp+8] in the stub) instead of the stub address.
+                nt = native_target_for_edge.get((h, hi), 0)
+                rec['native_target_va'] = f'0x{nt:X}' if nt else '0x0'
                 # If we resolved handler_after's continuation, also set outgoing_hash
                 if ha in ha_cache and ha_cache[ha]:
                     _, _, nc_ho, _ = ha_cache[ha]

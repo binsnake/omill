@@ -1972,10 +1972,18 @@ int main(int argc, char **argv) {
       vm_graph = std::move(ext_graph);
 
       // Populate lift work items from the imported trace records.
+      // Also collect native call targets (vmenter wrappers) that need
+      // to be lifted as separate VM functions.
       for (const auto &handler_va : vm_graph->handlerEntries()) {
         auto records = vm_graph->getTraceRecords(handler_va);
-        for (const auto &rec : records)
+        for (const auto &rec : records) {
           recordTraceWorkItem(rec.handler_va, rec.incoming_hash);
+          if (rec.native_target_va != 0) {
+            native_call_vas.push_back(rec.native_target_va);
+            // Also add as a trace work item so it gets tagged vm_handler.
+            recordTraceWorkItem(rec.native_target_va, 0);
+          }
+        }
       }
       events.emitInfo("vm_trace_imported", "external VM trace loaded",
                       {{"records",
@@ -2109,8 +2117,14 @@ int main(int argc, char **argv) {
         if (auto *fn = module->getFunction(name)) {
           fn->addFnAttr("omill.vm_handler");
           tagExactTraceHash(*fn, handler_va);
+        } else {
+          errs() << "  [WARN] Lift succeeded for 0x"
+                 << Twine::utohexstr(handler_va)
+                 << " but function " << name << " not found in module\n";
         }
       } else {
+        errs() << "  [WARN] Lift FAILED for 0x"
+               << Twine::utohexstr(handler_va) << "\n";
         ++failed_count;
       }
     }
@@ -2151,9 +2165,20 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        if (lifter.Lift(native_va))
+        if (lifter.Lift(native_va)) {
           ++native_lifted;
-        // NOT tagged as omill.vm_handler — these are regular functions.
+          // If this native VA is also in the trace work items (i.e. it's
+          // a vmenter wrapper for an inner VM), tag it as vm_handler +
+          // vm_wrapper so VMDispatchResolution can process it and
+          // VMHandlerInliner won't inline it into callers.
+          std::string name = "sub_" + Twine::utohexstr(native_va).str();
+          if (auto *fn = module->getFunction(name)) {
+            if (vm_graph && vm_graph->isVMHandler(native_va)) {
+              fn->addFnAttr("omill.vm_handler");
+              fn->addFnAttr("omill.vm_wrapper");
+            }
+          }
+        }
       }
       errs() << "VM native lift: " << native_lifted << " native functions"
              << " (from " << native_call_vas.size() << " targets)\n";

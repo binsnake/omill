@@ -107,9 +107,12 @@ llvm::PreservedAnalyses VMDispatchResolutionPass::run(
       trace_targets.push_back(trace_map.handlerEntries().front());
     }
 
+    // Resolve native call target if present (inner VM call boundary).
+    uint64_t native_call_va = 0;
     if (exact_hash) {
       if (auto exact_record = trace_map.getTraceForHash(*handler_va, *exact_hash)) {
         trace_targets = exact_record->successors;
+        native_call_va = exact_record->native_target_va;
         if (exact_record->successors.size() == 1 &&
             exact_record->outgoing_hash != 0) {
           exact_clone_target = findDemergedHandlerClone(
@@ -164,6 +167,26 @@ llvm::PreservedAnalyses VMDispatchResolutionPass::run(
         call->setArgOperand(1, llvm::ConstantInt::get(i64_ty, target_va));
       }
       ++resolved_count;
+
+      // Emit native call before the dispatch_jump if this handler has a
+      // native call target (e.g. vmenter wrapper for inner VM re-entry).
+      // The call uses the same (state, pc, mem) convention as lifted
+      // functions.  After inlining + ABI recovery, this becomes a proper
+      // function call in the output IR.
+      if (native_call_va != 0) {
+        std::string native_fn_name =
+            "sub_" + llvm::Twine::utohexstr(native_call_va).str();
+        if (auto *native_fn = M.getFunction(native_fn_name)) {
+          llvm::IRBuilder<> builder(call);
+          auto *state = call->getArgOperand(0);
+          auto *mem = call->getArgOperand(2);
+          auto *pc = llvm::ConstantInt::get(i64_ty, native_call_va);
+          builder.CreateCall(native_fn, {state, pc, mem});
+        } else {
+          // Function not yet lifted — schedule for discovery.
+          discovered_targets.insert(native_call_va);
+        }
+      }
 
       if (!exact_clone_target) {
         std::string target_name =
