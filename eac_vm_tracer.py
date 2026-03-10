@@ -63,13 +63,20 @@ BINARY_PATH  = Path(r"D:\binsnake\omill\build-remill\tools\omill-lift\EasyAntiCh
 STUBS_JSON   = Path(r"D:\binsnake\tracer\dispatch_stubs.json")
 
 IMAGEBASE    = 0x140000000
+KERNEL_IMAGEBASE = 0xFFFFF80140000000
 VM_ENTRY     = 0x14030FDD0
 DRIVER_ENTRY = 0x14019DA10
 VM_SETUP     = 0x1402A1000
 VM_EXIT      = 0x1402A112B
 BASE_DELTA   = 0x140002F09
+KERNEL_BASE_DELTA = KERNEL_IMAGEBASE + (BASE_DELTA - IMAGEBASE)
 INITIAL_HASH = 0xA26346B5C9C0B6DB
 ENTRY_CONST  = 0x2C6386
+ENABLE_KERNEL_IMAGE_ALIAS = True
+# Unicorn will map high-half aliases for data access, but instruction fetches
+# from those addresses still fault. Keep execution at the PE base and use the
+# kernel alias as a mirror for address-sensitive probes.
+EXECUTE_FROM_KERNEL_ALIAS = False
 
 DISPATCH_SIG = b'\x49\x03\x84\x24\xE0\x00\x00\x00'  # add rax,[r12+0E0h]
 # Middle of native call stub: lea rsp,[rsp+1C0h]; call [rsp+8]; lea rsp,[rsp-1C0h]
@@ -87,6 +94,24 @@ STUB_BASE    = 0xFFFF0000
 # pointer computation produces 0xFF78000000000 as the effective base.
 KUSER_SHARED_DATA = 0xFF78000000000
 KUSD_PAGE_SIZE    = 0x1000
+KPCR_BASE = 0xFFFFF80000001000
+KPCR_SIZE = 0x2000
+GDT_BASE = 0xFFFFF80000008000
+GDT_SIZE = 0x1000
+IDT_BASE = 0xFFFFF80000009000
+IDT_SIZE = 0x1000
+TSS_BASE = 0xFFFFF8000000A000
+TSS_SIZE = 0x1000
+LDT_BASE = 0xFFFFF8000000B000
+LDT_SIZE = 0x1000
+IDT_STUB_BASE = 0xFFFFF8000000C000
+IDT_STUB_SIZE = 0x1000
+KERNEL_CS = 0x10
+KERNEL_DS = 0x18
+KERNEL_SS = 0x18
+KERNEL_TR = 0x28
+KERNEL_LDT = 0x40
+DEFAULT_MXCSR = 0x1F80
 
 CTX_OFF = {
     'xmm7':0x00,  'xmm11':0x10, 'xmm9':0x20,  'rbp':0x30,
@@ -115,6 +140,12 @@ WATCHED_PAGES = {
     0x140226000,
     0x140270000,
     0x140277000,
+    KUSER_SHARED_DATA & ~0xFFF,
+    KPCR_BASE & ~0xFFF,
+    GDT_BASE & ~0xFFF,
+    IDT_BASE & ~0xFFF,
+    TSS_BASE & ~0xFFF,
+    LDT_BASE & ~0xFFF,
 }
 PRIVILEGED_MNEMONICS = {
     'cli', 'sti', 'hlt', 'swapgs',
@@ -149,6 +180,189 @@ UC_REG_BY_NAME = {
     'r14': UC_X86_REG_R14,
     'r15': UC_X86_REG_R15,
 }
+
+
+def build_kusd_page():
+    kusd = bytearray(KUSD_PAGE_SIZE)
+    filetime = 0x01DA5E9847800000
+    struct.pack_into('<I', kusd, 0x14, filetime & 0xFFFFFFFF)
+    struct.pack_into('<i', kusd, 0x18, (filetime >> 32) & 0xFFFFFFFF)
+    struct.pack_into('<i', kusd, 0x1C, (filetime >> 32) & 0xFFFFFFFF)
+    struct.pack_into('<I', kusd, 0x08, filetime & 0xFFFFFFFF)
+    struct.pack_into('<i', kusd, 0x0C, (filetime >> 32) & 0xFFFFFFFF)
+    struct.pack_into('<i', kusd, 0x10, (filetime >> 32) & 0xFFFFFFFF)
+    struct.pack_into('<I', kusd, 0x26C, 10)
+    struct.pack_into('<I', kusd, 0x270, 0)
+    return bytes(kusd)
+
+
+def build_fake_kpcr():
+    data = bytearray(KPCR_SIZE)
+    for off in range(0, KPCR_SIZE, 8):
+        struct.pack_into('<Q', data, off, KPCR_BASE + off)
+    prcb = KPCR_BASE + 0x180
+    thread = KPCR_BASE + 0x800
+    process = KPCR_BASE + 0x1000
+    struct.pack_into('<Q', data, 0x18, KPCR_BASE)     # Self
+    struct.pack_into('<Q', data, 0x20, prcb)          # CurrentPrcb
+    struct.pack_into('<Q', data, 0x188, prcb)         # Prcb
+    struct.pack_into('<Q', data, 0x800, thread)
+    struct.pack_into('<Q', data, 0x808, process)
+    return bytes(data)
+
+
+def _pack_seg_descriptor(base, limit, access, flags):
+    return struct.pack(
+        '<HHBBBB',
+        limit & 0xFFFF,
+        base & 0xFFFF,
+        (base >> 16) & 0xFF,
+        access & 0xFF,
+        ((limit >> 16) & 0x0F) | ((flags & 0x0F) << 4),
+        (base >> 24) & 0xFF,
+    )
+
+
+def _pack_system_descriptor(base, limit, access):
+    lo = struct.pack(
+        '<HHBBBB',
+        limit & 0xFFFF,
+        base & 0xFFFF,
+        (base >> 16) & 0xFF,
+        access & 0xFF,
+        ((limit >> 16) & 0x0F),
+        (base >> 24) & 0xFF,
+    )
+    hi = struct.pack('<I', (base >> 32) & 0xFFFFFFFF) + b'\x00\x00\x00\x00'
+    return lo + hi
+
+
+def _pack_idt_entry(handler, selector=KERNEL_CS, ist=0, type_attr=0x8E):
+    return struct.pack(
+        '<HHBBHII',
+        handler & 0xFFFF,
+        selector & 0xFFFF,
+        ist & 0x07,
+        type_attr & 0xFF,
+        (handler >> 16) & 0xFFFF,
+        (handler >> 32) & 0xFFFFFFFF,
+        0,
+    )
+
+
+def build_fake_gdt():
+    data = bytearray(GDT_SIZE)
+    data[0x10:0x18] = _pack_seg_descriptor(0, 0, 0x9A, 0x2)
+    data[0x18:0x20] = _pack_seg_descriptor(0, 0, 0x92, 0x0)
+    data[0x20:0x28] = _pack_seg_descriptor(0, 0, 0xFA, 0x2)
+    data[0x28:0x38] = _pack_system_descriptor(TSS_BASE, TSS_SIZE - 1, 0x89)
+    data[0x40:0x50] = _pack_system_descriptor(LDT_BASE, LDT_SIZE - 1, 0x82)
+    return bytes(data)
+
+
+def build_fake_idt():
+    data = bytearray(IDT_SIZE)
+    for idx in range(0x100):
+        handler = IDT_STUB_BASE + min(idx * 8, IDT_STUB_SIZE - 8)
+        off = idx * 16
+        if off + 16 > len(data):
+            break
+        data[off:off + 16] = _pack_idt_entry(handler)
+    return bytes(data)
+
+
+def build_fake_tss():
+    data = bytearray(TSS_SIZE)
+    struct.pack_into('<I', data, 0x0, 0)
+    struct.pack_into('<Q', data, 0x4, STACK_BASE + STACK_SIZE - 0x2000)
+    struct.pack_into('<Q', data, 0x24, STACK_BASE + STACK_SIZE - 0x4000)
+    struct.pack_into('<Q', data, 0x2C, STACK_BASE + STACK_SIZE - 0x6000)
+    struct.pack_into('<H', data, 0x66, TSS_SIZE - 1)
+    return bytes(data)
+
+
+def build_fake_ldt():
+    return bytes(LDT_SIZE)
+
+
+def build_fake_idt_stubs():
+    return b'\xCC' * IDT_STUB_SIZE
+
+
+def seed_kernel_cpu_state(mu):
+    mu.reg_write(UC_X86_REG_CS, KERNEL_CS)
+    mu.reg_write(UC_X86_REG_DS, KERNEL_DS)
+    mu.reg_write(UC_X86_REG_ES, KERNEL_DS)
+    mu.reg_write(UC_X86_REG_SS, KERNEL_SS)
+    mu.reg_write(UC_X86_REG_MXCSR, DEFAULT_MXCSR)
+    mu.reg_write(UC_X86_REG_FS_BASE, 0)
+    mu.reg_write(UC_X86_REG_GS_BASE, KPCR_BASE)
+    mu.reg_write(UC_X86_REG_GDTR, (0, GDT_BASE, GDT_SIZE - 1, 0))
+    mu.reg_write(UC_X86_REG_IDTR, (0, IDT_BASE, IDT_SIZE - 1, 0))
+    mu.reg_write(UC_X86_REG_TR, (KERNEL_TR, TSS_BASE, TSS_SIZE - 1, 0))
+    mu.reg_write(UC_X86_REG_LDTR, (KERNEL_LDT, LDT_BASE, LDT_SIZE - 1, 0))
+
+
+def map_kernel_environment(mu):
+    try:
+        mu.mem_map(KUSER_SHARED_DATA, KUSD_PAGE_SIZE)
+    except UcError:
+        pass
+    mu.mem_write(KUSER_SHARED_DATA, build_kusd_page())
+
+    try:
+        mu.mem_map(KPCR_BASE, KPCR_SIZE)
+    except UcError:
+        pass
+    mu.mem_write(KPCR_BASE, build_fake_kpcr())
+    for base, size, blob in (
+        (GDT_BASE, GDT_SIZE, build_fake_gdt()),
+        (IDT_BASE, IDT_SIZE, build_fake_idt()),
+        (TSS_BASE, TSS_SIZE, build_fake_tss()),
+        (LDT_BASE, LDT_SIZE, build_fake_ldt()),
+        (IDT_STUB_BASE, IDT_STUB_SIZE, build_fake_idt_stubs()),
+    ):
+        try:
+            mu.mem_map(base, size)
+        except UcError:
+            pass
+        mu.mem_write(base, blob)
+
+
+def map_image_views(mu, pe, primary_base=IMAGEBASE, alias_bases=None, ranges=None):
+    alias_bases = [base for base in (alias_bases or []) if base != primary_base]
+    header_size = max(int(pe.OPTIONAL_HEADER.SizeOfHeaders), 0x1000)
+    header_size = (header_size + 0xFFF) & ~0xFFF
+    header_blob = bytes(pe.__data__[:int(pe.OPTIONAL_HEADER.SizeOfHeaders)])
+
+    def map_blob(base, size, blob=b''):
+        try:
+            mu.mem_map(base, size)
+        except UcError:
+            pass
+        if blob:
+            mu.mem_write(base, blob)
+        if ranges is not None:
+            ranges.append((base, base + size))
+
+    map_blob(primary_base, header_size, header_blob)
+    for alias_base in alias_bases:
+        map_blob(alias_base, header_size, header_blob)
+
+    max_end = primary_base + header_size
+    for sec in pe.sections:
+        rva = sec.VirtualAddress
+        data = sec.get_data()
+        raw_size = min(len(data), sec.SizeOfRawData)
+        vsize = max(sec.Misc_VirtualSize, raw_size)
+        size = (vsize + 0xFFF) & ~0xFFF
+        if size == 0:
+            size = 0x1000
+        for base in [primary_base] + alias_bases:
+            va = base + rva
+            map_blob(va, size, data[:raw_size] if raw_size else b'')
+        max_end = max(max_end, primary_base + rva + size)
+    return max_end - primary_base
 
 VM_DISPATCH_LOOP = 0x1402A1318
 VM_DISPATCH_JMP  = 0x1402A1366
@@ -338,6 +552,9 @@ class VMTracer:
         self.pe = pefile.PE(pe_path)
         self.mu = Uc(UC_ARCH_X86, UC_MODE_64)
         self.cs = Cs(CS_ARCH_X86, CS_MODE_64)
+        self.kernel_exec = EXECUTE_FROM_KERNEL_ALIAS
+        self.runtime_imagebase = KERNEL_IMAGEBASE if self.kernel_exec else IMAGEBASE
+        self.image_size = 0
 
         self.step = 0
         self.max_steps = 500
@@ -371,21 +588,40 @@ class VMTracer:
         self._map_pe()
         self._setup()
 
+    def _is_image_va(self, address, base=None):
+        if address is None:
+            return False
+        image_base = self.runtime_imagebase if base is None else base
+        return image_base <= address < image_base + self.image_size
+
+    def _to_image_va(self, address):
+        if self._is_image_va(address, self.runtime_imagebase):
+            return IMAGEBASE + (address - self.runtime_imagebase)
+        if ENABLE_KERNEL_IMAGE_ALIAS and self._is_image_va(address, KERNEL_IMAGEBASE):
+            return IMAGEBASE + (address - KERNEL_IMAGEBASE)
+        return address
+
+    def _to_runtime_va(self, address):
+        if self.kernel_exec and self._is_image_va(address, IMAGEBASE):
+            return self.runtime_imagebase + (address - IMAGEBASE)
+        return address
+
     def _record_watched_mem(self, access, address, size, value, rip):
-        page = address & ~0xFFF
-        if address not in WATCHED_GLOBALS and page not in WATCHED_PAGES:
+        image_addr = self._to_image_va(address)
+        page = image_addr & ~0xFFF
+        if image_addr not in WATCHED_GLOBALS and page not in WATCHED_PAGES:
             return
-        key = (access, address, size, value, rip)
+        key = (access, image_addr, size, value, self._to_image_va(rip))
         if key in self._watched_mem_seen:
             return
         self._watched_mem_seen.add(key)
         event = {
             'access': access,
-            'address': address,
+            'address': image_addr,
             'size': size,
             'value': value,
-            'rip': rip,
-            'label': WATCHED_GLOBALS.get(address, ''),
+            'rip': self._to_image_va(rip),
+            'label': WATCHED_GLOBALS.get(image_addr, ''),
         }
         self.watched_mem_events.append(event)
         if self.verbose >= 1:
@@ -406,18 +642,18 @@ class VMTracer:
         mn = insn.mnemonic.lower()
         if mn not in PRIVILEGED_MNEMONICS and not SPECIAL_REG_TOKEN_RE.search(ops.lower()):
             return
-        key = (insn.address, mn, ops)
+        key = (self._to_image_va(insn.address), mn, ops)
         if key in self._privileged_insn_seen:
             return
         self._privileged_insn_seen.add(key)
         event = {
-            'rip': insn.address,
+            'rip': self._to_image_va(insn.address),
             'mnemonic': insn.mnemonic,
             'op_str': insn.op_str,
         }
         self.privileged_insn_events.append(event)
         if self.verbose >= 1:
-            print(f"  [cpu] 0x{insn.address:X}: {insn.mnemonic} {insn.op_str}")
+            print(f"  [cpu] 0x{self._to_image_va(insn.address):X}: {insn.mnemonic} {insn.op_str}")
 
     def _clone_runtime_regions(self, uc):
         regions = []
@@ -466,10 +702,15 @@ class VMTracer:
             stack_bytes = bytes(uc.mem_read(stack_base, stack_size))
             snapshot = {
                 'source': source,
-                'native_target_va': native_target,
-                'stub_addr': stub_addr,
-                'call_addr': call_addr,
-                'handler_after_va': handler_after,
+                'runtime_imagebase': self.runtime_imagebase,
+                'native_target_va': self._to_image_va(native_target),
+                'native_target_runtime_va': native_target,
+                'stub_addr': self._to_image_va(stub_addr),
+                'stub_runtime_addr': stub_addr,
+                'call_addr': self._to_image_va(call_addr),
+                'call_runtime_addr': call_addr,
+                'handler_after_va': self._to_image_va(handler_after),
+                'handler_after_runtime_va': handler_after,
                 'regs': regs,
                 'eflags': eflags,
                 'rsp_pre_call': rsp_pre_call,
@@ -522,10 +763,15 @@ class VMTracer:
                 struct.pack_into('<Q', stack, off, ret_sentinel)
             snapshot = {
                 'source': source,
-                'native_target_va': native_target,
-                'stub_addr': stub_addr,
+                'runtime_imagebase': self.runtime_imagebase,
+                'native_target_va': self._to_image_va(native_target),
+                'native_target_runtime_va': native_target,
+                'stub_addr': self._to_image_va(stub_addr),
+                'stub_runtime_addr': stub_addr,
                 'call_addr': 0,
-                'handler_after_va': handler_after,
+                'call_runtime_addr': 0,
+                'handler_after_va': self._to_image_va(handler_after),
+                'handler_after_runtime_va': handler_after,
                 'regs': regs,
                 'eflags': struct.unpack(
                     '<Q',
@@ -558,40 +804,23 @@ class VMTracer:
             return None
 
     def _map_pe(self):
-        for sec in self.pe.sections:
-            va = IMAGEBASE + sec.VirtualAddress
-            data = sec.get_data()
-            vsize = max(sec.Misc_VirtualSize, len(data))
-            size = (vsize + 0xFFF) & ~0xFFF
-            if size == 0:
-                size = 0x1000
-            self.mu.mem_map(va, size)
-            self.mu.mem_write(va, data[:vsize])
-            self.pe_mapped_ranges.append((va, va + size))
-
+        alias_bases = []
+        if ENABLE_KERNEL_IMAGE_ALIAS and KERNEL_IMAGEBASE != IMAGEBASE:
+            alias_bases.append(KERNEL_IMAGEBASE)
+        self.image_size = map_image_views(
+            self.mu,
+            self.pe,
+            primary_base=IMAGEBASE,
+            alias_bases=alias_bases,
+            ranges=self.pe_mapped_ranges,
+        )
         self.mu.mem_map(STACK_BASE, STACK_SIZE)
         self.mu.mem_map(DRIVER_OBJ, 0x10000)
         self.mu.mem_map(REG_PATH, 0x10000)
         self.mu.mem_map(STUB_BASE, 0x10000)
 
-        # KUSER_SHARED_DATA -- pre-map at the canonical kernel VA.
-        # Handlers read SystemTime (offset 0x14) etc. via obfuscated pointers.
-        self.mu.mem_map(KUSER_SHARED_DATA, KUSD_PAGE_SIZE)
-        kusd = bytearray(KUSD_PAGE_SIZE)
-        # SystemTime at offset 0x14 (KSYSTEM_TIME: LowPart u32, High1Time i32, High2Time i32)
-        # Use a plausible FILETIME: ~2024-01-01 00:00 UTC = 0x01DA5E9847800000
-        filetime = 0x01DA5E9847800000
-        struct.pack_into('<I', kusd, 0x14, filetime & 0xFFFFFFFF)        # LowPart
-        struct.pack_into('<i', kusd, 0x18, (filetime >> 32) & 0xFFFFFFFF)  # High1Time
-        struct.pack_into('<i', kusd, 0x1C, (filetime >> 32) & 0xFFFFFFFF)  # High2Time
-        # InterruptTime at offset 0x08 (same format)
-        struct.pack_into('<I', kusd, 0x08, filetime & 0xFFFFFFFF)
-        struct.pack_into('<i', kusd, 0x0C, (filetime >> 32) & 0xFFFFFFFF)
-        struct.pack_into('<i', kusd, 0x10, (filetime >> 32) & 0xFFFFFFFF)
-        # NtMajorVersion (0x26C) = 10, NtMinorVersion (0x270) = 0
-        struct.pack_into('<I', kusd, 0x26C, 10)
-        struct.pack_into('<I', kusd, 0x270, 0)
-        self.mu.mem_write(KUSER_SHARED_DATA, bytes(kusd))
+        # Kernel-visible shared data and a minimal KPCR/KPRCB model.
+        map_kernel_environment(self.mu)
 
         for off in range(0, 0x2000, 8):
             self.mu.mem_write(DRIVER_OBJ + off,
@@ -613,6 +842,7 @@ class VMTracer:
         rsp -= 8
         self.mu.mem_write(rsp, struct.pack('<Q', 0xDEADDEADDEADDEAD))
 
+        seed_kernel_cpu_state(self.mu)
         self.mu.reg_write(UC_X86_REG_RSP, rsp)
         self.mu.reg_write(UC_X86_REG_RCX, DRIVER_OBJ)
         self.mu.reg_write(UC_X86_REG_RDX, REG_PATH)
@@ -626,12 +856,13 @@ class VMTracer:
 
     def _hook_code(self, uc, address, size, _):
         self.insn_count += 1
+        image_addr = self._to_image_va(address)
         # Safety: stop if too many insns without dispatch (infinite loop)
         if self.insn_count > 5_000_000:
-            print(f'\n[!] Instruction limit (5M) reached @ RIP=0x{address:X}')
+            print(f'\n[!] Instruction limit (5M) reached @ RIP=0x{image_addr:X}')
             uc.emu_stop()
             return
-        if address in self.outline_loop_heads and self._try_outline_loop(uc, address):
+        if image_addr in self.outline_loop_heads and self._try_outline_loop(uc, address):
             return
         insn = None
         if size <= 15:
@@ -646,7 +877,7 @@ class VMTracer:
             if code == DISPATCH_SIG:
                 self._on_dispatch(uc, address)
                 return
-        if address == VM_DISPATCH_LOOP:
+        if image_addr == VM_DISPATCH_LOOP:
             # At entry, rax/rbx not yet loaded; read directly from context
             rsp = uc.reg_read(UC_X86_REG_RSP)
             delta_raw = struct.unpack('<Q', bytes(uc.mem_read(rsp + 0x190, 8)))[0]
@@ -655,26 +886,26 @@ class VMTracer:
             if self.verbose >= 1:
                 print(f'  [dispatch-loop] delta={delta_signed:+d} (0x{delta_raw:X})'
                       f'  target=0x{target_raw:X}')
-        if address == VM_DISPATCH_JMP:
+        if image_addr == VM_DISPATCH_JMP:
             rbx = uc.reg_read(UC_X86_REG_RBX)
             rsp = uc.reg_read(UC_X86_REG_RSP)
             r12 = uc.reg_read(UC_X86_REG_R12)
             if self.verbose >= 1:
-                print(f'  [dispatch-loop] jmp rbx = 0x{rbx:X}  rsp=0x{rsp:X}  r12=0x{r12:X}')
+                print(f'  [dispatch-loop] jmp rbx = 0x{self._to_image_va(rbx):X}  rsp=0x{rsp:X}  r12=0x{r12:X}')
             # Check if target resolves to a known stub
-            if 0x1402A1000 <= rbx < 0x14266F000:
+            if self._is_image_va(self._to_image_va(rbx), IMAGEBASE):
                 # Resolve if it's a thunk
                 try:
                     b = uc.mem_read(rbx, 1)[0]
                     if b == 0xE9:
                         rel = struct.unpack('<i', bytes(uc.mem_read(rbx + 1, 4)))[0]
                         dest = (rbx + 5 + rel) & 0xFFFFFFFFFFFFFFFF
-                        print(f'              -> 0x{dest:X} (thunk)')
+                        print(f'              -> 0x{self._to_image_va(dest):X} (thunk)')
                 except:
                     pass
         # Detect handler epilog: jmp rax/rdx/rbx (FF E0/E2/E3)
         # in the seg006 region
-        if size == 2 and 0x1402A1000 <= address < 0x14266F000:
+        if size == 2 and 0x1402A1000 <= image_addr < 0x14266F000:
             code = bytes(uc.mem_read(address, 2))
             if code[0] == 0xFF and code[1] in (0xE0, 0xE2, 0xE3):
                 JMP_REG = {0xE0: (UC_X86_REG_RAX, 'rax'),
@@ -682,9 +913,10 @@ class VMTracer:
                            0xE3: (UC_X86_REG_RBX, 'rbx')}
                 uc_reg, regname = JMP_REG[code[1]]
                 reg = uc.reg_read(uc_reg)
-                target_rva = reg - IMAGEBASE if reg > IMAGEBASE else 0
+                image_reg = self._to_image_va(reg)
+                target_rva = image_reg - IMAGEBASE if image_reg > IMAGEBASE else 0
                 in_binary = 0x1000 <= target_rva < 0x266F000
-                if in_binary and address != VM_DISPATCH_JMP:
+                if in_binary and image_addr != VM_DISPATCH_JMP:
                     thunk_dest = None
                     try:
                         b = uc.mem_read(reg, 1)[0]
@@ -696,21 +928,22 @@ class VMTracer:
                             thunk_dest = (reg + 5 + rel) & 0xFFFFFFFFFFFFFFFF
                     except:
                         pass
-                    dest_str = f' -> 0x{thunk_dest:X}' if thunk_dest else ''
-                    vm_exit = thunk_dest == VM_EXIT if thunk_dest else False
+                    dest_str = f' -> 0x{self._to_image_va(thunk_dest):X}' if thunk_dest else ''
+                    vm_exit = self._to_image_va(thunk_dest) == VM_EXIT if thunk_dest else False
                     tag = ' [VM EXIT path]' if vm_exit else ''
                     if thunk_dest and not vm_exit:
-                        self.post_dispatch_targets.append(thunk_dest)
+                        self.post_dispatch_targets.append(self._to_image_va(thunk_dest))
                     if self.verbose >= 1:
-                        print(f'  [epilog] jmp {regname} = 0x{reg:X}{dest_str}{tag}')
+                        print(f'  [epilog] jmp {regname} = 0x{image_reg:X}{dest_str}{tag}')
         # Detect native call: call [rsp+8] (FF 54 24 08) inside a native stub
         if self.in_native_stub and address == self.native_call_addr and size == 4:
             rsp = uc.reg_read(UC_X86_REG_RSP)
             try:
-                native_target = struct.unpack('<Q', bytes(uc.mem_read(rsp + 8, 8)))[0]
+                native_target_runtime = struct.unpack('<Q', bytes(uc.mem_read(rsp + 8, 8)))[0]
             except:
-                native_target = 0
-            self.pending_native_target = native_target
+                native_target_runtime = 0
+            native_target = self._to_image_va(native_target_runtime)
+            self.pending_native_target = native_target_runtime
             if self.verbose >= 1:
                 print(f'  [NATIVE CALL] call [rsp+8] = 0x{native_target:X}')
             # Record in the last trace entry
@@ -720,7 +953,7 @@ class VMTracer:
                 self.trace[-1]['native_stub_va'] = self.native_stub_addr
                 native_snapshot = self._capture_native_call_snapshot(
                     uc,
-                    native_target,
+                    native_target_runtime,
                     stub_addr=self.native_stub_addr,
                     call_addr=address,
                     source='live_stub',
@@ -728,15 +961,15 @@ class VMTracer:
                 )
                 if native_snapshot is not None:
                     self.trace[-1]['_native_snapshot'] = native_snapshot
-            self.native_calls.append({
-                'step': self.step,
-                'native_target_va': native_target,
-                'stub_addr': self.native_stub_addr,
-            })
+                self.native_calls.append({
+                    'step': self.step,
+                    'native_target_va': native_target,
+                    'stub_addr': self._to_image_va(self.native_stub_addr),
+                })
 
         # Track VM nesting. A vmenter call at the tail of a native-call stub
         # is only a re-entry into the current VM level, not a nested VM.
-        if address == VM_SETUP:
+        if image_addr == VM_SETUP:
             if self._is_native_stub_reentry(uc):
                 if self.verbose >= 1:
                     print(f'  [vmenter reentry] depth still {self.vm_depth}')
@@ -745,7 +978,7 @@ class VMTracer:
                 if self.verbose >= 1:
                     print(f'  [vmenter] depth now {self.vm_depth}')
 
-        if address == VM_EXIT:
+        if image_addr == VM_EXIT:
             self._on_vm_exit(uc)
         elif address == 0xDEADDEADDEADDEAD:
             print(f"\n[!] Hit sentinel return")
@@ -983,7 +1216,7 @@ class VMTracer:
                 if entry is not None:
                     entry['outlined_resume_handler_va'] = next_handler
                     entry['outlined_resume_kind'] = 'jmp'
-                uc.reg_write(UC_X86_REG_RIP, next_handler)
+                uc.reg_write(UC_X86_REG_RIP, self._to_runtime_va(next_handler))
                 return True
             if dtype == 'native_call':
                 handler_after = dinfo.get('handler_after', 0)
@@ -997,9 +1230,9 @@ class VMTracer:
                         entry['native_target_va'] = self.resolver._last_native_target
                         native_snapshot = self._synthesize_native_call_snapshot(
                             snapshot_ctx,
-                            self.resolver._last_native_target,
-                            stub_addr=target,
-                            handler_after=handler_after,
+                            self._to_runtime_va(self.resolver._last_native_target),
+                            stub_addr=self._to_runtime_va(target),
+                            handler_after=self._to_runtime_va(handler_after),
                             source='outlined_dispatch',
                             runtime_regions=self._clone_native_probe_pages(
                                 uc, self.resolver._last_native_target),
@@ -1012,7 +1245,7 @@ class VMTracer:
                         'stub_addr': target,
                     })
                 if handler_after:
-                    uc.reg_write(UC_X86_REG_RIP, handler_after)
+                    uc.reg_write(UC_X86_REG_RIP, self._to_runtime_va(handler_after))
                     return True
             if dtype == 'final_exit':
                 if entry is not None:
@@ -1035,9 +1268,9 @@ class VMTracer:
                     entry['native_target_va'] = self.resolver._last_native_target
                     native_snapshot = self._synthesize_native_call_snapshot(
                         snapshot_ctx,
-                        self.resolver._last_native_target,
-                        stub_addr=const_or_caller,
-                        handler_after=handler_after,
+                        self._to_runtime_va(self.resolver._last_native_target),
+                        stub_addr=self._to_runtime_va(const_or_caller),
+                        handler_after=self._to_runtime_va(handler_after),
                         source='outlined_native_call',
                         runtime_regions=self._clone_native_probe_pages(
                             uc, self.resolver._last_native_target),
@@ -1050,7 +1283,7 @@ class VMTracer:
                     'stub_addr': const_or_caller,
                 })
             if handler_after:
-                uc.reg_write(UC_X86_REG_RIP, handler_after)
+                uc.reg_write(UC_X86_REG_RIP, self._to_runtime_va(handler_after))
                 return True
 
         self.outline_failures += 1
@@ -1095,7 +1328,8 @@ class VMTracer:
         base     = self._ctx_qword(uc, 'base')
         vm_hash  = self._ctx_qword(uc, 'hash')
         vm_extra = self._ctx_qword(uc, 'extra')
-        target   = (rax_const + base) & 0xFFFFFFFFFFFFFFFF
+        runtime_target = (rax_const + base) & 0xFFFFFFFFFFFFFFFF
+        target   = self._to_image_va(runtime_target)
         rva      = target - IMAGEBASE
 
         self.step += 1
@@ -1107,14 +1341,16 @@ class VMTracer:
             self.native_stub_addr = 0
             self.native_call_addr = 0
 
-        kind, thunk_dest, handler_after = self._classify_dispatch_target(uc, target)
+        kind, thunk_dest_runtime, handler_after_runtime = self._classify_dispatch_target(uc, runtime_target)
+        thunk_dest = self._to_image_va(thunk_dest_runtime) if thunk_dest_runtime else 0
+        handler_after = self._to_image_va(handler_after_runtime) if handler_after_runtime else 0
 
         # For native call stubs, set up tracking so _hook_code can capture
         # the native function pointer when call [rsp+8] executes.
         if kind == 'native_call':
             self.in_native_stub = True
-            self.native_stub_addr = target
-            self.native_call_addr = target + 13  # offset of call [rsp+8]
+            self.native_stub_addr = runtime_target
+            self.native_call_addr = runtime_target + 13  # offset of call [rsp+8]
             self.pending_native_target = 0
 
         db_stub = self.db.lookup_hash(vm_hash)
@@ -1126,16 +1362,17 @@ class VMTracer:
 
         entry = {
             'step': self.step,
-            'at': address,
+            'at': self._to_image_va(address),
             'const': rax_const,
             'target': target,
             'rva': rva,
-            'thunk': thunk_dest,
+            'thunk': thunk_dest or None,
             'hash': vm_hash,
             'extra': vm_extra,
             'dispatch_kind': kind,
-            'handler_after_native': handler_after,
+            'handler_after_native': handler_after or None,
             'vm_depth': self.vm_depth,
+            'runtime_target': runtime_target,
         }
         snapshot = self._capture_vm_snapshot(uc)
         if snapshot is not None:
@@ -1153,7 +1390,7 @@ class VMTracer:
             dest_str = ''
 
         if self.verbose >= 1:
-            print(f"[{self.step:4d}] DISPATCH @ 0x{address:X}{kind_tag}")
+            print(f"[{self.step:4d}] DISPATCH @ 0x{self._to_image_va(address):X}{kind_tag}")
             print(f"       const=0x{rax_const:08X}  target=0x{target:X}{dest_str}")
             print(f"       hash=0x{vm_hash:016X}  extra=0x{vm_extra:016X}{db_info}")
 
@@ -1203,7 +1440,7 @@ class VMTracer:
 
         if is_transient:
             if self.verbose >= 1:
-                print(f'  [VM EXIT transient] ret -> 0x{ret_addr:X} (native call stub @ 0x{stub_addr:X})')
+                print(f'  [VM EXIT transient] ret -> 0x{self._to_image_va(ret_addr):X} (native call stub @ 0x{self._to_image_va(stub_addr):X})')
             return  # let emulation continue through the stub
 
         # Inner VM exit: if we're nested (depth > 1), this is not the outer
@@ -1213,7 +1450,7 @@ class VMTracer:
         if self.vm_depth > 1:
             self.vm_depth -= 1
             if self.verbose >= 1:
-                print(f'  [VM EXIT inner] depth now {self.vm_depth}  ret -> 0x{ret_addr:X}')
+                print(f'  [VM EXIT inner] depth now {self.vm_depth}  ret -> 0x{self._to_image_va(ret_addr):X}')
             return  # let emulation continue out of the inner VM
 
         # Final vmexit — the outermost VM is done.
@@ -1234,6 +1471,7 @@ class VMTracer:
     def run(self, max_steps=300, start=None):
         self.max_steps = max_steps
         entry = start or DRIVER_ENTRY
+        runtime_entry = self._to_runtime_va(entry)
         self.final_vmexit_seen = False
         self.post_dispatch_targets = []
         self.outline_attempted.clear()
@@ -1248,19 +1486,22 @@ class VMTracer:
 
         print(f"\n{'='*70}")
         print(f" VM Emulation Trace")
-        print(f" Entry: 0x{entry:X}   Max steps: {max_steps}")
+        if runtime_entry != entry:
+            print(f" Entry: 0x{entry:X} (runtime 0x{runtime_entry:X})   Max steps: {max_steps}")
+        else:
+            print(f" Entry: 0x{entry:X}   Max steps: {max_steps}")
         print(f"{'='*70}\n")
 
         t0 = time.time()
         try:
-            self.mu.emu_start(entry, 0, timeout=300_000_000)
+            self.mu.emu_start(runtime_entry, 0, timeout=300_000_000)
         except UcError as e:
             rip = self.mu.reg_read(UC_X86_REG_RIP)
-            print(f"\n[!] UcError at RIP=0x{rip:X}: {e}")
+            print(f"\n[!] UcError at RIP=0x{self._to_image_va(rip):X}: {e}")
             try:
                 code = bytes(self.mu.mem_read(rip, 32))
                 for insn in self.cs.disasm(code, rip):
-                    print(f"     0x{insn.address:X}: {insn.mnemonic} {insn.op_str}")
+                    print(f"     0x{self._to_image_va(insn.address):X}: {insn.mnemonic} {insn.op_str}")
                     if insn.address > rip + 20:
                         break
             except:
@@ -1511,18 +1752,22 @@ def replay_native_snapshot(snapshot, max_insns=200000):
         except (TypeError, ValueError):
             return default
 
+    def runtime_to_image(address):
+        if runtime_imagebase != IMAGEBASE and runtime_imagebase <= address < runtime_imagebase + image_size:
+            return IMAGEBASE + (address - runtime_imagebase)
+        if ENABLE_KERNEL_IMAGE_ALIAS and KERNEL_IMAGEBASE <= address < KERNEL_IMAGEBASE + image_size:
+            return IMAGEBASE + (address - KERNEL_IMAGEBASE)
+        return address
+
     mu = Uc(UC_ARCH_X86, UC_MODE_64)
     pe = pefile.PE(str(BINARY_PATH))
-
-    for sec in pe.sections:
-        va = IMAGEBASE + sec.VirtualAddress
-        data = sec.get_data()
-        vsize = max(sec.Misc_VirtualSize, len(data))
-        size = (vsize + 0xFFF) & ~0xFFF
-        if size == 0:
-            size = 0x1000
-        mu.mem_map(va, size)
-        mu.mem_write(va, data[:vsize])
+    runtime_imagebase = maybe_int(snapshot.get('runtime_imagebase', IMAGEBASE), IMAGEBASE)
+    alias_bases = []
+    if ENABLE_KERNEL_IMAGE_ALIAS and KERNEL_IMAGEBASE != IMAGEBASE:
+        alias_bases.append(KERNEL_IMAGEBASE)
+    if runtime_imagebase not in (IMAGEBASE, KERNEL_IMAGEBASE):
+        alias_bases.append(runtime_imagebase)
+    image_size = map_image_views(mu, pe, primary_base=IMAGEBASE, alias_bases=alias_bases)
 
     auto_mapped = set()
 
@@ -1544,7 +1789,6 @@ def replay_native_snapshot(snapshot, max_insns=200000):
         (DRIVER_OBJ, 0x10000),
         (REG_PATH, 0x10000),
         (STUB_BASE, 0x10000),
-        (KUSER_SHARED_DATA, KUSD_PAGE_SIZE),
     ):
         map_region(base, size)
 
@@ -1560,18 +1804,7 @@ def replay_native_snapshot(snapshot, max_insns=200000):
         if size == 0x1000:
             auto_mapped.add(base)
 
-    # Mirror the tracer's deterministic synthetic runtime setup.
-    kusd = bytearray(KUSD_PAGE_SIZE)
-    filetime = 0x01DA5E9847800000
-    struct.pack_into('<I', kusd, 0x14, filetime & 0xFFFFFFFF)
-    struct.pack_into('<i', kusd, 0x18, (filetime >> 32) & 0xFFFFFFFF)
-    struct.pack_into('<i', kusd, 0x1C, (filetime >> 32) & 0xFFFFFFFF)
-    struct.pack_into('<I', kusd, 0x08, filetime & 0xFFFFFFFF)
-    struct.pack_into('<i', kusd, 0x0C, (filetime >> 32) & 0xFFFFFFFF)
-    struct.pack_into('<i', kusd, 0x10, (filetime >> 32) & 0xFFFFFFFF)
-    struct.pack_into('<I', kusd, 0x26C, 10)
-    struct.pack_into('<I', kusd, 0x270, 0)
-    mu.mem_write(KUSER_SHARED_DATA, bytes(kusd))
+    map_kernel_environment(mu)
 
     for off in range(0, 0x2000, 8):
         mu.mem_write(DRIVER_OBJ + off, struct.pack('<Q', 0xDEAD000000000000 | off))
@@ -1593,6 +1826,7 @@ def replay_native_snapshot(snapshot, max_insns=200000):
             pass
 
     regs = snapshot.get('regs', {})
+    seed_kernel_cpu_state(mu)
     for name, reg in UC_REG_BY_NAME.items():
         if name in regs:
             mu.reg_write(reg, maybe_int(regs[name]))
@@ -1620,18 +1854,19 @@ def replay_native_snapshot(snapshot, max_insns=200000):
 
     def hook_mem(uc, access, address, size, value, _):
         rip = uc.reg_read(UC_X86_REG_RIP)
-        page = address & ~0xFFF
-        if address in WATCHED_GLOBALS or page in WATCHED_PAGES:
-            key = (access, address, size, value, rip)
+        image_addr = runtime_to_image(address)
+        page = image_addr & ~0xFFF
+        if image_addr in WATCHED_GLOBALS or page in WATCHED_PAGES:
+            key = (access, image_addr, size, value, runtime_to_image(rip))
             if key not in watched_mem_seen:
                 watched_mem_seen.add(key)
                 watched_mem_events.append({
                     'access': int(access),
-                    'address': address,
+                    'address': image_addr,
                     'size': size,
                     'value': value,
-                    'rip': rip,
-                    'label': WATCHED_GLOBALS.get(address, ''),
+                    'rip': runtime_to_image(rip),
+                    'label': WATCHED_GLOBALS.get(image_addr, ''),
                 })
         mem_events.append({
             'access': int(access),
@@ -1671,11 +1906,11 @@ def replay_native_snapshot(snapshot, max_insns=200000):
         if insn:
             mn = insn.mnemonic.lower()
             if mn in PRIVILEGED_MNEMONICS or SPECIAL_REG_TOKEN_RE.search((insn.op_str or '').lower()):
-                key = (insn.address, mn, insn.op_str)
+                key = (runtime_to_image(insn.address), mn, insn.op_str)
                 if key not in privileged_seen:
                     privileged_seen.add(key)
                     privileged_events.append({
-                        'rip': insn.address,
+                        'rip': runtime_to_image(insn.address),
                         'mnemonic': insn.mnemonic,
                         'op_str': insn.op_str,
                     })
@@ -1700,7 +1935,8 @@ def replay_native_snapshot(snapshot, max_insns=200000):
     stop_reason = 'limit'
     exception_state = {}
     try:
-        mu.emu_start(maybe_int(snapshot.get('native_target_va', 0)), sentinel, count=max_insns)
+        start_pc = maybe_int(snapshot.get('native_target_runtime_va', snapshot.get('native_target_va', 0)))
+        mu.emu_start(start_pc, sentinel, count=max_insns)
         stop_reason = 'returned'
     except UcError as e:
         stop_reason = f'uc_error:{e}'
@@ -1756,7 +1992,8 @@ def export_native_call_artifacts(trace, out_dir):
         for key in (
             'native_target_va', 'stub_addr', 'call_addr', 'handler_after_va',
             'rsp_pre_call', 'entry_rsp', 'stack_base', 'dispatch_hash',
-            'dispatch_target_va',
+            'dispatch_target_va', 'runtime_imagebase', 'native_target_runtime_va',
+            'stub_runtime_addr', 'call_runtime_addr', 'handler_after_runtime_va',
         ):
             if key in item:
                 item[key] = maybe_hex(item[key])
@@ -1786,7 +2023,8 @@ def export_native_call_artifacts(trace, out_dir):
     serializable_results = []
     for result in probe_results:
         item = dict(result)
-        for key in ('native_target_va', 'dispatch_hash', 'stub_addr', 'handler_after_va', 'entry_rsp'):
+        for key in ('native_target_va', 'dispatch_hash', 'stub_addr', 'handler_after_va',
+                    'entry_rsp', 'runtime_imagebase', 'native_target_runtime_va'):
             item[key] = maybe_hex(item.get(key, 0))
         converted_calls = []
         for call in item.get('indirect_calls', []):
@@ -2167,28 +2405,16 @@ class DispatchChainResolver:
         return None
 
     def _make_uc(self):
-        """Create a Unicorn instance with PE + KUSD mapped."""
+        """Create a Unicorn instance with PE + kernel-visible state mapped."""
         uc = Uc(UC_ARCH_X86, UC_MODE_64)
-        for sec in self.pe.sections:
-            va = self.pe.OPTIONAL_HEADER.ImageBase + sec.VirtualAddress
-            data = sec.get_data()
-            vsize = max(sec.Misc_VirtualSize, len(data))
-            size = (vsize + 0xFFF) & ~0xFFF
-            if size == 0:
-                size = 0x1000
-            uc.mem_map(va, size)
-            uc.mem_write(va, data[:vsize])
-            self._pe_ranges.append((va, va + size))
+        alias_bases = []
+        if ENABLE_KERNEL_IMAGE_ALIAS and KERNEL_IMAGEBASE != IMAGEBASE:
+            alias_bases.append(KERNEL_IMAGEBASE)
+        map_image_views(uc, self.pe, primary_base=IMAGEBASE, alias_bases=alias_bases, ranges=self._pe_ranges)
         # Stack region (covers CTX_STACK and HANDLER_RSP)
         uc.mem_map(STACK_BASE, STACK_SIZE)
-        # KUSER_SHARED_DATA
-        uc.mem_map(KUSER_SHARED_DATA, KUSD_PAGE_SIZE)
-        kusd = bytearray(KUSD_PAGE_SIZE)
-        ft = 0x01DA5E9847800000
-        struct.pack_into('<I', kusd, 0x14, ft & 0xFFFFFFFF)
-        struct.pack_into('<i', kusd, 0x18, (ft >> 32) & 0xFFFFFFFF)
-        struct.pack_into('<i', kusd, 0x1C, (ft >> 32) & 0xFFFFFFFF)
-        uc.mem_write(KUSER_SHARED_DATA, bytes(kusd))
+        map_kernel_environment(uc)
+        seed_kernel_cpu_state(uc)
         return uc
 
     def _auto_map_hook(self, uc, access, address, size, value, _):
