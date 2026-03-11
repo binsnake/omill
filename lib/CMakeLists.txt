@@ -12,6 +12,7 @@ add_library(omill STATIC
   Analysis/TargetArchAnalysis.cpp
   Analysis/CallGraphAnalysis.cpp
   Analysis/LiftedFunctionMap.cpp
+  Analysis/IterativeLiftingSession.cpp
   Analysis/RemillIntrinsicAnalysis.cpp
   Analysis/StateFieldAccessAnalysis.cpp
   Analysis/ExceptionInfo.cpp

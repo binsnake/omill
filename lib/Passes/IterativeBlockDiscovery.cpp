@@ -11,6 +11,7 @@
 #include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
 
+#include "omill/Analysis/IterativeLiftingSession.h"
 #include "omill/Passes/ConstantMemoryFolding.h"
 #include "omill/BC/BlockLifterAnalysis.h"
 
@@ -24,6 +25,71 @@ static constexpr const char *kBlockPrefix = "blk_";
 /// Check if a function is a block-function.
 bool isBlockFunction(const llvm::Function &F) {
   return F.getName().starts_with(kBlockPrefix) && !F.isDeclaration();
+}
+
+std::optional<uint64_t> parseBlockAddr(const llvm::Function &F) {
+  auto name = F.getName();
+  if (!name.starts_with(kBlockPrefix))
+    return std::nullopt;
+
+  uint64_t addr = 0;
+  if (name.drop_front(4).getAsInteger(16, addr))
+    return std::nullopt;
+  return addr;
+}
+
+void recordBlockGraphState(llvm::Module &M, IterativeLiftingSession &session) {
+  for (auto &F : M) {
+    if (!isBlockFunction(F))
+      continue;
+
+    auto source_pc = parseBlockAddr(F);
+    if (!source_pc)
+      continue;
+
+    session.noteLiftedTarget(*source_pc);
+
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+        if (!call)
+          continue;
+
+        auto *callee = call->getCalledFunction();
+        if (!callee)
+          continue;
+
+        LiftEdge edge;
+        edge.source_pc = *source_pc;
+
+        if (callee->getName() == "__omill_dispatch_jump" ||
+            callee->getName() == "__omill_dispatch_call") {
+          edge.kind = (callee->getName() == "__omill_dispatch_call")
+                          ? LiftEdgeKind::kIndirectCall
+                          : LiftEdgeKind::kIndirectBranch;
+          if (call->arg_size() >= 2) {
+            if (auto *pc_arg =
+                    llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1))) {
+              edge.target_pc = pc_arg->getZExtValue();
+            }
+          }
+          edge.resolved = false;
+          session.graph().addOrUpdateEdge(edge);
+          if (edge.target_pc != 0)
+            session.queueTarget(edge.target_pc);
+          continue;
+        }
+
+        if (auto target_pc = parseBlockAddr(*callee)) {
+          edge.kind = LiftEdgeKind::kDirectBranch;
+          edge.target_pc = *target_pc;
+          edge.resolved = true;
+          session.noteLiftedTarget(*target_pc);
+          session.graph().addOrUpdateEdge(edge);
+        }
+      }
+    }
+  }
 }
 
 /// Collect all constant dispatch target PCs from block-functions.
@@ -176,6 +242,8 @@ bool resolveConstantDispatches(llvm::Module &M) {
 
 llvm::PreservedAnalyses IterativeBlockDiscoveryPass::run(
     llvm::Module &M, llvm::ModuleAnalysisManager &MAM) {
+  auto &session_result = MAM.getResult<IterativeLiftingSessionAnalysis>(M);
+  auto session = session_result.session;
 
   // Check if there are any block-functions to process.
   bool has_block_fns = false;
@@ -187,6 +255,9 @@ llvm::PreservedAnalyses IterativeBlockDiscoveryPass::run(
   }
   if (!has_block_fns)
     return llvm::PreservedAnalyses::all();
+
+  if (session)
+    recordBlockGraphState(M, *session);
 
   unsigned prev_unresolved = countUnresolvedBlockDispatches(M);
   if (prev_unresolved == 0)
@@ -222,8 +293,13 @@ llvm::PreservedAnalyses IterativeBlockDiscoveryPass::run(
     if (lift_block) {
       auto new_pcs = collectNewTargetPCs(M);
       for (uint64_t pc : new_pcs) {
-        if (lift_block(pc))
+        if (session)
+          session->queueTarget(pc);
+        if (lift_block(pc)) {
+          if (session)
+            session->noteLiftedTarget(pc);
           ever_changed = true;
+        }
       }
     }
 
@@ -231,6 +307,9 @@ llvm::PreservedAnalyses IterativeBlockDiscoveryPass::run(
     bool resolved = resolveConstantDispatches(M);
     if (resolved)
       ever_changed = true;
+
+    if (session)
+      recordBlockGraphState(M, *session);
 
     unsigned curr_unresolved = countUnresolvedBlockDispatches(M);
     if (curr_unresolved < prev_unresolved)

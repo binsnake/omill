@@ -20,12 +20,15 @@
 #include <llvm/Transforms/Utils/LoopSimplify.h>
 
 #include "omill/Analysis/BinaryMemoryMap.h"
+#include "omill/Analysis/CallGraphAnalysis.h"
+#include "omill/Analysis/IterativeLiftingSession.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
 #include "omill/BC/BlockLifterAnalysis.h"
 #include "omill/BC/TraceLiftAnalysis.h"
 #include "omill/Passes/ConstantMemoryFolding.h"
 #include "omill/Passes/EliminateDeadPaths.h"
 #include "omill/Passes/IndirectCallResolver.h"
+#include "omill/Passes/InterProceduralConstProp.h"
 #include "omill/Passes/LowerRemillIntrinsics.h"
 #include "omill/Passes/RecoverAllocaPointers.h"
 #include "omill/Passes/CollapseRemillSHRSwitch.h"
@@ -91,6 +94,113 @@ unsigned countUnresolvedDispatches(llvm::Module &M) {
               ++count;
           }
   return count;
+}
+
+std::optional<uint64_t> extractFunctionPC(const llvm::Function &F) {
+  if (F.getName().starts_with("sub_")) {
+    uint64_t va = extractEntryVA(F.getName());
+    if (va != 0)
+      return va;
+  }
+  if (F.getName().starts_with("blk_")) {
+    uint64_t va = 0;
+    if (!F.getName().drop_front(4).getAsInteger(16, va))
+      return va;
+  }
+  return std::nullopt;
+}
+
+void recordResolutionState(llvm::Module &M, IterativeLiftingSession &session) {
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+
+    auto source_pc = extractFunctionPC(F);
+    if (!source_pc)
+      continue;
+
+    session.noteLiftedTarget(*source_pc);
+
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+        if (!call)
+          continue;
+
+        auto *callee = call->getCalledFunction();
+        if (!callee)
+          continue;
+
+        LiftEdge edge;
+        edge.source_pc = *source_pc;
+
+        auto callee_name = callee->getName();
+        if (callee_name == "__omill_dispatch_call" ||
+            callee_name == "__omill_dispatch_jump") {
+          edge.kind = (callee_name == "__omill_dispatch_call")
+                          ? LiftEdgeKind::kIndirectCall
+                          : LiftEdgeKind::kIndirectBranch;
+          if (call->arg_size() >= 2) {
+            if (auto *pc_arg =
+                    llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1))) {
+              edge.target_pc = pc_arg->getZExtValue();
+            }
+          }
+          edge.resolved = false;
+          session.graph().addOrUpdateEdge(edge);
+          if (edge.target_pc != 0)
+            session.queueTarget(edge.target_pc);
+          continue;
+        }
+
+        auto target_pc = extractFunctionPC(*callee);
+        if (!target_pc)
+          continue;
+
+        edge.kind = LiftEdgeKind::kDirectCall;
+        edge.target_pc = *target_pc;
+        edge.resolved = true;
+        session.noteLiftedTarget(*target_pc);
+        session.graph().addOrUpdateEdge(edge);
+      }
+    }
+  }
+}
+
+bool runInterproceduralResolutionRound(
+    llvm::Module &M, llvm::ModuleAnalysisManager &MAM,
+    llvm::ArrayRef<llvm::Function *> affected) {
+  if (affected.empty())
+    return false;
+
+  auto pa = InterProceduralConstPropPass().run(M, MAM);
+  bool changed = !pa.areAllPreserved();
+
+  llvm::FunctionPassManager FPM;
+  buildCleanupPipeline(FPM, CleanupProfile::kLightScalar);
+  FPM.addPass(ConstantMemoryFoldingPass());
+  FPM.addPass(llvm::GVNPass());
+  FPM.addPass(llvm::InstCombinePass());
+  FPM.addPass(IndirectCallResolverPass());
+#if OMILL_ENABLE_Z3
+  FPM.addPass(Z3DispatchSolverPass());
+#endif
+  FPM.addPass(
+      ResolveAndLowerControlFlowPass(ResolvePhases::ResolveTargets));
+
+  auto &FAM =
+      MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M).getManager();
+  for (auto *F : affected) {
+    if (!F || F->isDeclaration())
+      continue;
+    auto fpa = FPM.run(*F, FAM);
+    if (!fpa.areAllPreserved()) {
+      changed = true;
+      FAM.invalidate(*F, fpa);
+    }
+  }
+
+  return changed;
 }
 
 /// Run a FunctionPassManager on a specific set of functions.
@@ -512,6 +622,7 @@ llvm::PreservedAnalyses immutablePreserved() {
   PA.preserve<BinaryMemoryAnalysis>();
   PA.preserve<TraceLiftAnalysis>();
   PA.preserve<BlockLiftAnalysis>();
+  PA.preserve<IterativeLiftingSessionAnalysis>();
   return PA;
 }
 
@@ -755,6 +866,8 @@ void processDeferredFunctions(llvm::ArrayRef<llvm::Function *> deferred,
 
 llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
     llvm::Module &M, llvm::ModuleAnalysisManager &MAM) {
+  auto &session_result = MAM.getResult<IterativeLiftingSessionAnalysis>(M);
+  auto session = session_result.session;
   unsigned iteration = 0;
   unsigned prev_count = 0;
 
@@ -776,12 +889,19 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
 
   auto *lifted = MAM.getCachedResult<LiftedFunctionAnalysis>(M);
 
+  if (run_ipcp_inside_resolution_)
+    (void)MAM.getResult<CallGraphAnalysis>(M);
+
   // Cache the dispatch semantic set — stable across the ITR loop since
   // semantic functions don't change structure during resolution.
   auto dispatch_set = buildDispatchSemanticSet(M);
 
+  if (session)
+    recordResolutionState(M, *session);
+
   do {
     lifted_new_funcs = false;  // Reset each iteration.
+    bool ipcp_changed = false;
 
     // Collect dispatch info: both the count and the affected functions
     // in a single module scan.
@@ -864,6 +984,17 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
       }
     }
 
+    // Step 2a.5: Interprocedural propagation inside the same convergence
+    // epoch so caller-provided constants can unlock more dispatch targets
+    // before we decide whether this iteration made progress.
+    if (run_ipcp_inside_resolution_) {
+      ipcp_changed = runInterproceduralResolutionRound(M, MAM, affected);
+      if (ipcp_changed) {
+        for (auto *F : affected)
+          already_resolved.erase(F);
+      }
+    }
+
     // Step 2b: If we have a lift callback, discover constant dispatch targets
     // that don't map to any existing lifted function and lift them.
     // This runs BETWEEN resolution and lowering so we can see newly-resolved
@@ -877,6 +1008,8 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
         // Lift the discovered functions.
         llvm::SmallVector<llvm::Function *, 4> new_funcs;
         for (uint64_t pc : new_pcs) {
+          if (session)
+            session->queueTarget(pc);
           lift_trace(pc);
           already_lifted_pcs.insert(pc);
         }
@@ -888,6 +1021,8 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
             std::string prefix = omill::liftedFunctionName(pc);
             if (F.getName().starts_with(prefix)) {
               new_funcs.push_back(&F);
+              if (session)
+                session->noteLiftedTarget(pc);
               // Register in the LiftedFunctionMap so downstream
               // resolution passes (Phase 3.7, Phase 4) can find it.
               if (lifted)
@@ -1023,9 +1158,12 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
     }
 
     unsigned curr_count = countUnresolvedDispatches(M);
-    bool made_progress = curr_count < prev_count || lifted_new_funcs;
+    bool made_progress = curr_count < prev_count || lifted_new_funcs ||
+                         ipcp_changed;
     if (made_progress) {
       ever_changed = true;
+      if (session)
+        recordResolutionState(M, *session);
       // Lowering changed IR in some affected functions — they need
       // re-resolution on the next iteration to discover further targets.
       for (auto *F : affected)
@@ -1092,6 +1230,8 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
 
           prev_count = curr_count;
           ++iteration;
+          if (session)
+            recordResolutionState(M, *session);
           continue;  // Re-run optimization + resolution with inlined bodies.
         }
       }
@@ -1204,6 +1344,8 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
           // have resolved some.  Use post-cleanup count as baseline.
           prev_count = countUnresolvedDispatches(M);
           ++iteration;
+          if (session)
+            recordResolutionState(M, *session);
           continue;
         }
       }
@@ -1229,6 +1371,9 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
     processDeferredFunctions(all_deferred, M, MAM);
     llvm::errs() << "ITR: deferred processing complete\n";
   }
+
+  if (session)
+    recordResolutionState(M, *session);
 
   return ever_changed ? llvm::PreservedAnalyses::none()
                       : llvm::PreservedAnalyses::all();

@@ -8,7 +8,6 @@
 #include <llvm/BinaryFormat/COFF.h>
 #include <llvm/BinaryFormat/Magic.h>
 #include <llvm/BinaryFormat/MachO.h>
-#include <llvm/Linker/Linker.h>
 #include <llvm/Object/COFF.h>
 #include <llvm/Object/MachO.h>
 #include <llvm/Object/MachOUniversal.h>
@@ -52,6 +51,7 @@
 #include "omill/Analysis/CallingConventionAnalysis.h"
 #include "omill/Analysis/CallGraphAnalysis.h"
 #include "omill/Analysis/ExceptionInfo.h"
+#include "omill/Analysis/IterativeLiftingSession.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
 #include "omill/Analysis/VMTraceEmulator.h"
 #include "omill/Analysis/VMTraceMap.h"
@@ -1572,6 +1572,15 @@ int main(int argc, char **argv) {
 
   // Lift
   omill::TraceLifter lifter(arch.get(), manager);
+  auto iterative_session =
+      std::make_shared<omill::IterativeLiftingSession>("omill-lift");
+  iterative_session->setBlockLiftingEnabled(BlockLift);
+  if (!batch_vas.empty()) {
+    for (uint64_t va : batch_vas)
+      iterative_session->queueTarget(va);
+  } else if (func_va != 0) {
+    iterative_session->queueTarget(func_va);
+  }
   events.emitInfo("lifting_started", "lifting started");
 
   auto tagOutputRoot = [&](uint64_t va) {
@@ -1602,10 +1611,12 @@ int main(int argc, char **argv) {
         events.emitInfo("lift_target_started", "lifting target",
                         {{"va", ("0x" + Twine::utohexstr(va)).str()}});
       }
-      if (lifter.Lift(va))
+      if (lifter.Lift(va)) {
+        iterative_session->noteLiftedTarget(va);
         ++lifted;
-      else
+      } else {
         ++failed;
+      }
     }
     errs() << "Batch lift: " << lifted << " succeeded, "
            << failed << " failed\n";
@@ -1640,6 +1651,8 @@ int main(int argc, char **argv) {
                << Twine::utohexstr(auto_handler_va) << "\n";
         events.emitWarn("lift_handler_failed", "failed to lift exception handler",
                         {{"va", ("0x" + Twine::utohexstr(auto_handler_va)).str()}});
+      } else {
+        iterative_session->noteLiftedTarget(auto_handler_va);
       }
     }
 
@@ -1647,6 +1660,7 @@ int main(int argc, char **argv) {
       errs() << "TraceLifter::Lift() failed\n";
       return fail(1, "trace lifter failed");
     }
+    iterative_session->noteLiftedTarget(func_va);
     tagOutputRoot(func_va);
 
     // Auto-detect VM wrappers when --vm-wrapper is not specified.
@@ -2781,6 +2795,9 @@ int main(int argc, char **argv) {
   MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
   MAM.registerPass([&] { return omill::CallGraphAnalysis(); });
   MAM.registerPass([&] { return omill::LiftedFunctionAnalysis(); });
+  MAM.registerPass([iterative_session] {
+    return omill::IterativeLiftingSessionAnalysis(iterative_session);
+  });
   MAM.registerPass([&] { return omill::VirtualCalleeRegistryAnalysis(); });
   if (!ResolveExceptions) {
     MAM.registerPass([&] { return omill::ExceptionInfoAnalysis(); });
@@ -2800,10 +2817,14 @@ int main(int argc, char **argv) {
   {
     omill::TraceLiftCallback trace_cb;
     if (ResolveTargets) {
-      trace_cb = [&lifter](uint64_t pc) -> bool {
-        return lifter.Lift(pc);
+      trace_cb = [&lifter, iterative_session](uint64_t pc) -> bool {
+        bool ok = lifter.Lift(pc);
+        if (ok)
+          iterative_session->noteLiftedTarget(pc);
+        return ok;
       };
     }
+    iterative_session->setTraceLiftCallback(trace_cb);
     MAM.registerPass([trace_cb] {
       return omill::TraceLiftAnalysis(trace_cb);
     });
@@ -2829,15 +2850,19 @@ int main(int argc, char **argv) {
 
     // Do initial block-lifting for the entry function.
     block_lifter->LiftReachable(func_va);
+    iterative_session->noteLiftedTarget(func_va);
     errs() << "Block-lifting initial reachable blocks complete\n";
 
     // Register the lift callback so the discovery pass can lift more.
     omill::BlockLiftCallback lift_cb =
-        [&](uint64_t pc) -> bool {
+        [&, iterative_session](uint64_t pc) -> bool {
           llvm::SmallVector<uint64_t, 4> targets;
           auto *fn = block_lifter->LiftBlock(pc, targets);
+          if (fn)
+            iterative_session->noteLiftedTarget(pc);
           return fn != nullptr;
         };
+    iterative_session->setBlockLiftCallback(lift_cb);
     MAM.registerPass([lift_cb] {
       return omill::BlockLiftAnalysis(lift_cb);
     });
@@ -2845,16 +2870,7 @@ int main(int argc, char **argv) {
 
   auto runPostPatchCleanup = [&](StringRef reason) {
     ModulePassManager MPM;
-    llvm::InlineParams params = llvm::getInlineParams(80);
-    MPM.addPass(llvm::ModuleInlinerWrapperPass(params));
-
-    llvm::FunctionPassManager FPM;
-    FPM.addPass(llvm::InstCombinePass());
-    FPM.addPass(llvm::GVNPass());
-    FPM.addPass(llvm::ADCEPass());
-    FPM.addPass(llvm::SimplifyCFGPass());
-    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
-    MPM.addPass(llvm::GlobalDCEPass());
+    omill::buildPostPatchCleanupPipeline(MPM, 80);
     MPM.run(*module, MAM);
 
     if (events.detailed()) {
@@ -2918,6 +2934,71 @@ int main(int argc, char **argv) {
   opts.interprocedural_const_prop = IPCP;
   opts.use_block_lifting = BlockLift;
   opts.vm_devirtualize = vm_mode;
+  const bool preserve_lift_infrastructure = ResolveTargets && !NoABI;
+  opts.preserve_lifted_semantics = preserve_lift_infrastructure;
+
+  auto fixLiftedFunctionNamingCollisions = [&]() {
+    for (auto &F : llvm::make_early_inc_range(*module)) {
+      if (!F.isDeclaration())
+        continue;
+      auto name = F.getName();
+      if (!name.starts_with("sub_"))
+        continue;
+      for (int i = 1; i <= 20; ++i) {
+        std::string def_name = (name + "." + llvm::Twine(i)).str();
+        if (auto *def = module->getFunction(def_name)) {
+          if (!def->isDeclaration()) {
+            F.replaceAllUsesWith(def);
+            F.eraseFromParent();
+            def->setName(name);
+            break;
+          }
+        }
+      }
+    }
+  };
+
+  auto tagNewlyLiftedFunctions =
+      [&](llvm::StringRef attr_name,
+          const llvm::DenseSet<llvm::Function *> &pre_lift_funcs) {
+        for (auto &F : *module) {
+          if (!pre_lift_funcs.count(&F) && !F.isDeclaration())
+            F.addFnAttr(attr_name, "1");
+        }
+      };
+
+  auto clearLiftRoundAttr = [&](llvm::StringRef attr_name) {
+    for (auto &F : *module) {
+      if (F.getFnAttribute(attr_name).isValid())
+        F.removeFnAttr(attr_name);
+    }
+  };
+
+  auto rerunLateDiscoveryPipeline = [&](llvm::StringRef attr_name) {
+    MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+
+    omill::PipelineOptions late_opts = opts;
+    late_opts.resolve_indirect_targets = false;
+    late_opts.scope_predicate = [attr_name = attr_name.str()](
+                                    llvm::Function &F) {
+      return F.getFnAttribute(attr_name).isValid();
+    };
+    late_opts.preserve_lifted_semantics = preserve_lift_infrastructure;
+
+    {
+      ModulePassManager MPM;
+      omill::buildPipeline(MPM, late_opts);
+      MPM.run(*module, MAM);
+    }
+    {
+      ModulePassManager MPM;
+      omill::buildABIRecoveryPipeline(MPM, late_opts);
+      MPM.run(*module, MAM);
+    }
+
+    clearLiftRoundAttr(attr_name);
+  };
+
   events.emitInfo("pipeline_started", "main pipeline started");
   {
     ModulePassManager MPM;
@@ -3771,24 +3852,12 @@ int main(int argc, char **argv) {
     }
   }
 
-  // Pre-scan cleanup: run late cleanup pipeline before late discovery
-  // to enable SplitLargeAllocaPass + SROA + InstCombine to fold the
-  // 69KB native_stack alloca into SSA constants.  Without this, the
-  // inttoptr call targets remain as dynamic loads from the alloca and
-  // the late discovery scan can't find them.
-  if (ResolveTargets && !NoABI) {
-    ModulePassManager PreScanMPM;
-    omill::buildLateCleanupPipeline(PreScanMPM);
-    PreScanMPM.run(*module, MAM);
-    errs() << "Pre-scan cleanup complete\n";
-  }
-
   // Late target discovery: after ABI recovery folds MBA chains (via
   // EliminateStateStruct + RecoverStackFrame + SROA + GVN), scan for
   // constant inttoptr call targets that point to unlifted code addresses.
-  // Lift them into a FRESH semantics module (the main module's remill
-  // state was destroyed by the pipeline), run the pipeline + ABI on it,
-  // then link the resulting _native functions back into the main module.
+  // Lift them directly into the current module/session, rerun the pipeline
+  // + ABI on just the newly-lifted slice, and keep cleanup of Remill
+  // infrastructure deferred until iterative discovery is fully closed.
   if (ResolveTargets && !NoABI) {
     llvm::DenseMap<uint64_t, uint64_t> nested_vm_helper_targets;
     llvm::DenseMap<uint64_t, uint64_t> nested_vm_helper_deltas;
@@ -4537,159 +4606,65 @@ int main(int argc, char **argv) {
                       {{"round", static_cast<int64_t>(round + 1)},
                        {"targets", static_cast<int64_t>(late_targets.size())}});
 
-      // Load fresh arch + semantics for lifting (the main module's
-      // remill ISEL stubs and intrinsics were deleted by the pipeline).
-      auto late_arch =
-          remill::Arch::Get(ctx, detected_os, detected_arch);
-      auto late_module = remill::LoadArchSemantics(late_arch.get());
+      // Lift late targets directly into the current session/module and rerun
+      // the normal pipeline on just the newly-added functions. This avoids
+      // a second Arch/semantics/module world and keeps discovery iterative.
+      llvm::DenseSet<llvm::Function *> pre_lift_funcs;
+      for (auto &F : *module)
+        pre_lift_funcs.insert(&F);
 
-      BufferTraceManager late_manager;
-      late_manager.setModuleAndArch(late_module.get(), late_arch.get());
-      if (RawBinary) {
-        late_manager.setCode(raw_code.data(), raw_code.size(), BaseAddress);
-      } else {
-        for (const auto &cs : pe.code_sections) {
-          auto &stored = pe.section_storage[cs.storage_index];
-          late_manager.setCode(stored.data(), stored.size(), cs.va);
-        }
-      }
-
-      omill::TraceLifter late_lifter(late_arch.get(), late_manager);
-
-      // Lift the target functions and their full callee graphs.
       unsigned late_patched = 0;
+      unsigned late_lifted = 0;
+      unsigned late_failed = 0;
+      auto trace_cb = iterative_session->traceLiftCallback();
       for (uint64_t pc : late_targets) {
-        late_lifter.Lift(pc);
-      }
-
-      // Fix up DeclareLiftedFunction naming collisions.  When the
-      // TraceLifter creates a declaration for a callee reference and
-      // later defines it, LLVM appends ".N" to the definition because
-      // the declaration already occupies the name.  Replace uses of
-      // the empty declaration with the actual definition, then rename.
-      for (auto &F : llvm::make_early_inc_range(*late_module)) {
-        if (!F.isDeclaration())
-          continue;
-        auto name = F.getName();
-        if (!name.starts_with("sub_"))
-          continue;
-        for (int i = 1; i <= 20; ++i) {
-          std::string def_name =
-              (name + "." + llvm::Twine(i)).str();
-          if (auto *def = late_module->getFunction(def_name)) {
-            if (!def->isDeclaration()) {
-              F.replaceAllUsesWith(def);
-              F.eraseFromParent();
-              def->setName(name);
-              break;
-            }
-          }
+        iterative_session->queueTarget(pc);
+        bool lifted_ok = false;
+        if (trace_cb) {
+          lifted_ok = trace_cb(pc);
+        } else {
+          lifted_ok = lifter.Lift(pc);
+          if (lifted_ok)
+            iterative_session->noteLiftedTarget(pc);
+        }
+        if (lifted_ok) {
+          ++late_lifted;
+        } else {
+          ++late_failed;
         }
       }
+      fixLiftedFunctionNamingCollisions();
+
+      if (late_lifted == 0) {
+        errs() << "Late discovery round " << (round + 1)
+               << ": lift failed for all targets\n";
+        events.emitWarn("late_discovery_lift_failed",
+                        "late discovery lifting produced no new functions",
+                        {{"round", static_cast<int64_t>(round + 1)},
+                         {"failed", static_cast<int64_t>(late_failed)}});
+        break;
+      }
+
+      tagNewlyLiftedFunctions("omill.late_newly_lifted", pre_lift_funcs);
 
       if (DumpIR) {
         std::error_code ec;
         raw_fd_ostream os("late_after_lift.ll", ec, sys::fs::OF_Text);
-        late_module->print(os, nullptr);
+        module->print(os, nullptr);
       }
 
-      // Run the pipeline on the fresh module.
-      {
-        PassBuilder late_PB;
-        LoopAnalysisManager late_LAM;
-        FunctionAnalysisManager late_FAM;
-        CGSCCAnalysisManager late_CGAM;
-        ModuleAnalysisManager late_MAM;
+      rerunLateDiscoveryPipeline("omill.late_newly_lifted");
 
-        late_FAM.registerPass([&late_PB] {
-          auto AAM = late_PB.buildDefaultAAPipeline();
-          omill::registerAAWithManager(AAM);
-          return AAM;
-        });
-        late_PB.registerModuleAnalyses(late_MAM);
-        late_PB.registerCGSCCAnalyses(late_CGAM);
-        late_PB.registerFunctionAnalyses(late_FAM);
-        late_PB.registerLoopAnalyses(late_LAM);
-        late_PB.crossRegisterProxies(late_LAM, late_FAM, late_CGAM,
-                                     late_MAM);
-        omill::registerAnalyses(late_FAM);
-
-        late_MAM.registerPass([memory_map_holder] {
-          return omill::BinaryMemoryAnalysis(*memory_map_holder);
-        });
-        late_MAM.registerPass([&] {
-          return omill::TargetArchAnalysis();
-        });
-        late_MAM.registerPass([&] {
-          return omill::CallingConventionAnalysis();
-        });
-        late_MAM.registerPass([&] {
-          return omill::CallGraphAnalysis();
-        });
-        late_MAM.registerPass([&] {
-          return omill::LiftedFunctionAnalysis();
-        });
-        late_MAM.registerPass([&] {
-          return omill::VirtualCalleeRegistryAnalysis();
-        });
-        late_MAM.registerPass([&] {
-          return omill::ExceptionInfoAnalysis();
-        });
-        late_MAM.registerPass([] {
-          return omill::TraceLiftAnalysis(omill::TraceLiftCallback{});
-        });
-        late_MAM.registerPass([&] {
-          return omill::VMTraceMapAnalysis();
-        });
-
-        omill::PipelineOptions late_opts = opts;
-        late_opts.resolve_indirect_targets = false;
-        {
-          ModulePassManager MPM;
-          omill::buildPipeline(MPM, late_opts);
-          MPM.run(*late_module, late_MAM);
-        }
-        if (DumpIR) {
-          std::error_code ec;
-          raw_fd_ostream os("late_after_pipeline.ll", ec,
-                            sys::fs::OF_Text);
-          late_module->print(os, nullptr);
-        }
-        {
-          ModulePassManager MPM;
-    omill::buildABIRecoveryPipeline(MPM, late_opts);
-          MPM.run(*late_module, late_MAM);
-        }
+      if (DumpIR) {
+        std::error_code ec;
+        raw_fd_ostream os("late_after_pipeline.ll", ec, sys::fs::OF_Text);
+        module->print(os, nullptr);
       }
 
       if (DumpIR) {
         std::error_code ec;
         raw_fd_ostream os("late_after_abi.ll", ec, sys::fs::OF_Text);
-        late_module->print(os, nullptr);
-      }
-
-      // Remove conflicting definitions from the late module.  The main
-      // module's initial callee graph may already contain some of the
-      // same functions; keep those and let the linker resolve the late
-      // module's references to the existing definitions.
-      for (auto &F : llvm::make_early_inc_range(*late_module)) {
-        if (F.isDeclaration())
-          continue;
-        if (auto *existing = module->getFunction(F.getName())) {
-          if (!existing->isDeclaration()) {
-            F.deleteBody();
-            F.setLinkage(llvm::GlobalValue::ExternalLinkage);
-          }
-        }
-      }
-
-      // Link the late module into the main module.  Linker replaces
-      // declarations with definitions and handles type merging.
-      if (llvm::Linker::linkModules(*module, std::move(late_module))) {
-        errs() << "WARNING: linking late module failed\n";
-        events.emitWarn("late_discovery_link_failed", "late module link failed",
-                        {{"round", static_cast<int64_t>(round + 1)}});
-        break;
+        module->print(os, nullptr);
       }
 
       // Patch call sites: replace inttoptr(i64 <const>) → @sub_<hex>_native
@@ -5118,6 +5093,12 @@ int main(int argc, char **argv) {
 
   if (OmillTimePasses)
     TimingHandler.print();
+
+  if (preserve_lift_infrastructure) {
+    ModulePassManager MPM;
+    omill::buildLiftInfrastructureCleanupPipeline(MPM);
+    MPM.run(*module, MAM);
+  }
 
   // Verify (use nullptr to avoid crash in SlotTracker on corrupted modules)
   if (verifyModule(*module, nullptr)) {

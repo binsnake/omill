@@ -637,4 +637,57 @@ TEST_F(PipelineTest, GlobalDCERemovesDeadInternalized) {
   EXPECT_EQ(M->getFunction("dead_helper"), nullptr);
 }
 
+TEST_F(PipelineTest, CleanupProfilesSmokeTest) {
+  const omill::CleanupProfile profiles[] = {
+      omill::CleanupProfile::kLightScalar,
+      omill::CleanupProfile::kStateToSSA,
+      omill::CleanupProfile::kPostInline,
+      omill::CleanupProfile::kBoundary,
+      omill::CleanupProfile::kFinal,
+  };
+
+  for (auto profile : profiles) {
+    auto M = createModule();
+    auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+    auto *fn_ty =
+        llvm::FunctionType::get(ptr_ty, {ptr_ty, llvm::Type::getInt64Ty(Ctx), ptr_ty},
+                                false);
+    auto *F = llvm::Function::Create(
+        fn_ty, llvm::GlobalValue::ExternalLinkage, "sub_140001000", *M);
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+    llvm::IRBuilder<> B(entry);
+    auto *tmp = B.CreateAdd(B.getInt64(1), B.getInt64(2));
+    auto *stack = B.CreateAlloca(llvm::ArrayType::get(B.getInt8Ty(), 8192),
+                                 nullptr, "native_stack");
+    auto *slot = B.CreateConstGEP1_64(B.getInt8Ty(), stack, 16);
+    B.CreateStore(tmp, slot);
+    auto *loaded = B.CreateLoad(B.getInt64Ty(), slot);
+    B.CreateStore(loaded, B.CreateConstGEP1_64(B.getInt8Ty(), F->getArg(0), 0));
+    B.CreateRet(F->getArg(2));
+
+    llvm::ModulePassManager MPM;
+    omill::buildCleanupPipeline(MPM, profile);
+    runMPM(MPM, *M);
+    EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+  }
+}
+
+TEST_F(PipelineTest, PostPatchCleanupPipelineSmokeTest) {
+  auto M = createModule();
+  auto *helper = createDefinedFunction(*M, "helper",
+                                       llvm::GlobalValue::InternalLinkage);
+  auto *caller = createDefinedFunction(*M, "sub_140001000");
+  caller->deleteBody();
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", caller);
+  llvm::IRBuilder<> B(entry);
+  B.CreateCall(helper);
+  B.CreateRetVoid();
+
+  llvm::ModulePassManager MPM;
+  omill::buildPostPatchCleanupPipeline(MPM, 20);
+  runMPM(MPM, *M);
+
+  EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+}
+
 }  // namespace

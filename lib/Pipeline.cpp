@@ -47,6 +47,7 @@
 #include "omill/Passes/OptimizeState.h"
 #include "omill/Passes/LowerRemillIntrinsics.h"
 #include "omill/Analysis/ExceptionInfo.h"
+#include "omill/Analysis/IterativeLiftingSession.h"
 #include "omill/Passes/ResolveForcedExceptions.h"
 #include "omill/Passes/MemoryPointerElimination.h"
 #include "omill/Passes/RecoverFunctionSignatures.h"
@@ -549,10 +550,57 @@ ScopedFunctionPassAdaptor<Pred> createScopedFPM(llvm::FunctionPassManager FPM,
 
 }  // namespace
 
-static void addCleanupPasses(llvm::FunctionPassManager &FPM) {
-  FPM.addPass(llvm::InstCombinePass());
-  FPM.addPass(llvm::DCEPass());
-  FPM.addPass(llvm::SimplifyCFGPass());
+void buildCleanupPipeline(llvm::FunctionPassManager &FPM,
+                          CleanupProfile profile) {
+  switch (profile) {
+    case CleanupProfile::kLightScalar:
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::DCEPass());
+      FPM.addPass(llvm::SimplifyCFGPass());
+      break;
+    case CleanupProfile::kStateToSSA:
+      FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::GVNPass());
+      FPM.addPass(llvm::SimplifyCFGPass());
+      break;
+    case CleanupProfile::kPostInline:
+      FPM.addPass(RecoverAllocaPointersPass());
+      FPM.addPass(llvm::GVNPass());
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::SimplifyCFGPass());
+      FPM.addPass(llvm::GVNPass());
+      FPM.addPass(llvm::ADCEPass());
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::SimplifyCFGPass());
+      break;
+    case CleanupProfile::kBoundary:
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::GVNPass());
+      FPM.addPass(llvm::ADCEPass());
+      FPM.addPass(llvm::SimplifyCFGPass());
+      break;
+    case CleanupProfile::kFinal:
+      FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+      FPM.addPass(llvm::AggressiveInstCombinePass());
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::GVNPass());
+      FPM.addPass(llvm::SimplifyCFGPass());
+      FPM.addPass(llvm::ADCEPass());
+      FPM.addPass(llvm::DSEPass());
+      break;
+  }
+}
+
+void buildCleanupPipeline(llvm::ModulePassManager &MPM,
+                          CleanupProfile profile) {
+  llvm::FunctionPassManager FPM;
+  buildCleanupPipeline(FPM, profile);
+  MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+  if (profile == CleanupProfile::kFinal)
+    MPM.addPass(llvm::GlobalDCEPass());
 }
 
 void buildIntrinsicLoweringPipeline(llvm::FunctionPassManager &FPM) {
@@ -561,7 +609,7 @@ void buildIntrinsicLoweringPipeline(llvm::FunctionPassManager &FPM) {
   FPM.addPass(LowerRemillIntrinsicsPass(LowerCategories::Phase1));
 
   // Cleanup
-  addCleanupPasses(FPM);
+  buildCleanupPipeline(FPM, CleanupProfile::kLightScalar);
 }
 
 void buildStateOptimizationPipeline(llvm::FunctionPassManager &FPM,
@@ -1149,16 +1197,7 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
               MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M)
                   .getManager();
           llvm::FunctionPassManager FPM;
-          FPM.addPass(RecoverAllocaPointersPass());
-          FPM.addPass(llvm::GVNPass());
-          FPM.addPass(llvm::InstCombinePass());
-          FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
-          FPM.addPass(llvm::InstCombinePass());
-          FPM.addPass(llvm::SimplifyCFGPass());
-          FPM.addPass(llvm::GVNPass());
-          FPM.addPass(llvm::ADCEPass());
-          FPM.addPass(llvm::InstCombinePass());
-          FPM.addPass(llvm::SimplifyCFGPass());
+          buildCleanupPipeline(FPM, CleanupProfile::kPostInline);
           llvm::DenseSet<llvm::Function *> seen;
           for (const auto &name : caller_names) {
             auto *F = M.getFunction(name);
@@ -1200,6 +1239,245 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
   if (!envDisabled("OMILL_SKIP_STRIP_COMPILER_USED")) {
     MPM.addPass(StripCompilerUsedPass());
     MPM.addPass(llvm::GlobalDCEPass());
+  }
+
+  addPhaseMarker(MPM, "ABI: synthetic stack cleanup");
+  if (!envDisabled("OMILL_SKIP_ABI_SYNTHETIC_STACK_CLEANUP")) {
+    struct SentinelMemoryEliminationPass
+        : llvm::PassInfoMixin<SentinelMemoryEliminationPass> {
+      llvm::PreservedAnalyses run(llvm::Function &F,
+                                   llvm::FunctionAnalysisManager &) {
+        if (F.isDeclaration())
+          return llvm::PreservedAnalyses::all();
+
+        auto isSentinel = [](uint64_t v) -> bool {
+          return v == 0xCCCCCCCCCCCCCCCCULL ||
+                 v == 0xCDCDCDCDCDCDCDCDULL ||
+                 v == 0xCCCCCCCCULL ||
+                 v == 0xCDCDCDCDULL;
+        };
+
+        auto isSentinelPtr = [&](llvm::Value *ptr) -> bool {
+          if (auto *i2p = llvm::dyn_cast<llvm::IntToPtrInst>(ptr)) {
+            auto *ci = llvm::dyn_cast<llvm::ConstantInt>(i2p->getOperand(0));
+            return ci && isSentinel(ci->getZExtValue());
+          }
+          auto *ce = llvm::dyn_cast<llvm::ConstantExpr>(ptr);
+          if (!ce || ce->getOpcode() != llvm::Instruction::IntToPtr)
+            return false;
+          auto *ci = llvm::dyn_cast<llvm::ConstantInt>(ce->getOperand(0));
+          return ci && isSentinel(ci->getZExtValue());
+        };
+
+        bool changed = false;
+        llvm::SmallVector<llvm::Instruction *, 8> to_erase;
+        for (auto &BB : F) {
+          for (auto &I : BB) {
+            if (auto *ms = llvm::dyn_cast<llvm::MemSetInst>(&I)) {
+              if (auto *fill = llvm::dyn_cast<llvm::ConstantInt>(ms->getValue())) {
+                uint8_t v = static_cast<uint8_t>(fill->getZExtValue());
+                if (v == 0xCC || v == 0xCD) {
+                  ms->setValue(llvm::ConstantInt::get(fill->getType(), 0));
+                  changed = true;
+                }
+              }
+              continue;
+            }
+            if (auto *cx = llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&I)) {
+              if (isSentinelPtr(cx->getPointerOperand())) {
+                cx->replaceAllUsesWith(llvm::PoisonValue::get(cx->getType()));
+                to_erase.push_back(cx);
+                changed = true;
+              }
+              continue;
+            }
+            if (auto *ld = llvm::dyn_cast<llvm::LoadInst>(&I)) {
+              if (isSentinelPtr(ld->getPointerOperand())) {
+                ld->replaceAllUsesWith(llvm::PoisonValue::get(ld->getType()));
+                to_erase.push_back(ld);
+                changed = true;
+              }
+              continue;
+            }
+            if (auto *st = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+              if (isSentinelPtr(st->getPointerOperand())) {
+                to_erase.push_back(st);
+                changed = true;
+              }
+            }
+          }
+        }
+        for (auto *I : to_erase)
+          I->eraseFromParent();
+        return changed ? llvm::PreservedAnalyses::none()
+                       : llvm::PreservedAnalyses::all();
+      }
+      static bool isRequired() { return true; }
+    };
+
+    struct ResolveIntToPtrCallsPass
+        : llvm::PassInfoMixin<ResolveIntToPtrCallsPass> {
+      llvm::PreservedAnalyses run(llvm::Module &M,
+                                   llvm::ModuleAnalysisManager &MAM) {
+        auto *lifted = MAM.getCachedResult<LiftedFunctionAnalysis>(M);
+        if (!lifted)
+          return llvm::PreservedAnalyses::all();
+
+        bool changed = false;
+        for (auto &F : M) {
+          for (auto &BB : F) {
+            for (auto &I : llvm::make_early_inc_range(BB)) {
+              auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+              if (!call || call->getCalledFunction())
+                continue;
+
+              auto *callee_val = call->getCalledOperand()->stripPointerCasts();
+              llvm::ConstantInt *addr_ci = nullptr;
+              if (auto *ce = llvm::dyn_cast<llvm::ConstantExpr>(callee_val)) {
+                if (ce->getOpcode() == llvm::Instruction::IntToPtr)
+                  addr_ci = llvm::dyn_cast<llvm::ConstantInt>(ce->getOperand(0));
+              }
+              if (!addr_ci) {
+                if (auto *itp = llvm::dyn_cast<llvm::IntToPtrInst>(callee_val))
+                  addr_ci = llvm::dyn_cast<llvm::ConstantInt>(itp->getOperand(0));
+              }
+              if (!addr_ci)
+                continue;
+
+              auto *target_fn = lifted->lookup(addr_ci->getZExtValue());
+              if (!target_fn)
+                continue;
+              auto *native_fn =
+                  M.getFunction((target_fn->getName() + "_native").str());
+              if (!native_fn)
+                continue;
+
+              auto *native_ty = native_fn->getFunctionType();
+              unsigned n = std::min<unsigned>(native_ty->getNumParams(),
+                                              call->arg_size());
+              llvm::SmallVector<llvm::Value *, 8> args;
+              llvm::IRBuilder<> B(call);
+              for (unsigned i = 0; i < n; ++i) {
+                auto *arg = call->getArgOperand(i);
+                auto *expected = native_ty->getParamType(i);
+                if (arg->getType() != expected) {
+                  if (arg->getType()->isIntegerTy() && expected->isIntegerTy())
+                    arg = B.CreateIntCast(arg, expected, false);
+                  else if (arg->getType()->isPointerTy() && expected->isIntegerTy())
+                    arg = B.CreatePtrToInt(arg, expected);
+                  else if (arg->getType()->isIntegerTy() && expected->isPointerTy())
+                    arg = B.CreateIntToPtr(arg, expected);
+                  else
+                    arg = B.CreateBitCast(arg, expected);
+                }
+                args.push_back(arg);
+              }
+              for (unsigned i = n; i < native_ty->getNumParams(); ++i)
+                args.push_back(llvm::PoisonValue::get(native_ty->getParamType(i)));
+
+              auto *new_call = B.CreateCall(native_fn, args);
+              new_call->setCallingConv(native_fn->getCallingConv());
+              if (call->getType() == new_call->getType()) {
+                call->replaceAllUsesWith(new_call);
+              } else if (!call->getType()->isVoidTy()) {
+                llvm::Value *result = new_call;
+                if (new_call->getType()->isVoidTy()) {
+                  result = llvm::PoisonValue::get(call->getType());
+                } else if (call->getType()->isIntegerTy() &&
+                           new_call->getType()->isIntegerTy()) {
+                  result = B.CreateIntCast(new_call, call->getType(), false);
+                } else if (call->getType()->isPointerTy() &&
+                           new_call->getType()->isIntegerTy()) {
+                  result = B.CreateIntToPtr(new_call, call->getType());
+                } else if (call->getType()->isIntegerTy() &&
+                           new_call->getType()->isPointerTy()) {
+                  result = B.CreatePtrToInt(new_call, call->getType());
+                } else {
+                  result = B.CreateBitCast(new_call, call->getType());
+                }
+                call->replaceAllUsesWith(result);
+              }
+              call->eraseFromParent();
+              changed = true;
+            }
+          }
+        }
+        return changed ? llvm::PreservedAnalyses::none()
+                       : llvm::PreservedAnalyses::all();
+      }
+      static bool isRequired() { return true; }
+    };
+
+    {
+      llvm::FunctionPassManager FPM;
+      FPM.addPass(SentinelMemoryEliminationPass{});
+      MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    }
+
+    if (!envDisabled("OMILL_SKIP_CONCRETIZE_ALLOCA_PTRS")) {
+      llvm::FunctionPassManager FPM;
+      FPM.addPass(RecoverAllocaPointersPass());
+      FPM.addPass(llvm::DSEPass());
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::GVNPass());
+      MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    }
+
+    if (!envDisabled("OMILL_SKIP_POST_ABI_INLINE")) {
+      struct PreserveOutlinedWrappersPass
+          : llvm::PassInfoMixin<PreserveOutlinedWrappersPass> {
+        llvm::PreservedAnalyses run(llvm::Module &M,
+                                     llvm::ModuleAnalysisManager &MAM) {
+          bool changed = false;
+          auto &virtual_callees =
+              MAM.getResult<VirtualCalleeRegistryAnalysis>(M);
+          for (auto &F : M) {
+            if (F.isDeclaration())
+              continue;
+            if (F.hasFnAttribute("omill.vm_wrapper") ||
+                F.getFnAttribute("omill.vm_demerged_clone").isValid() ||
+                F.getFnAttribute("omill.vm_outlined_virtual_call").isValid() ||
+                virtual_callees.lookup(F.getName()).has_value()) {
+              if (!F.hasFnAttribute(llvm::Attribute::NoInline)) {
+                F.addFnAttr(llvm::Attribute::NoInline);
+                changed = true;
+              }
+            }
+          }
+          return changed ? llvm::PreservedAnalyses::none()
+                         : llvm::PreservedAnalyses::all();
+        }
+        static bool isRequired() { return true; }
+      };
+
+      MPM.addPass(PreserveOutlinedWrappersPass{});
+      llvm::InlineParams params = llvm::getInlineParams(50);
+      MPM.addPass(llvm::ModuleInlinerWrapperPass(params));
+      {
+        llvm::FunctionPassManager FPM;
+        FPM.addPass(llvm::InstCombinePass());
+        FPM.addPass(llvm::GVNPass());
+        MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+      }
+      if (!envDisabled("OMILL_SKIP_SPLIT_LARGE_ALLOCA")) {
+        llvm::FunctionPassManager FPM;
+        FPM.addPass(SplitLargeAllocaPass{});
+        MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+      }
+      {
+        llvm::FunctionPassManager FPM;
+        FPM.addPass(RecoverStackFramePass{});
+        buildCleanupPipeline(FPM, CleanupProfile::kBoundary);
+        MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+      }
+      MPM.addPass(llvm::GlobalDCEPass());
+    }
+
+    if (!envDisabled("OMILL_SKIP_RESOLVE_INTTOPTR_CALLS")) {
+      MPM.addPass(llvm::RequireAnalysisPass<LiftedFunctionAnalysis,
+                                            llvm::Module>());
+      MPM.addPass(ResolveIntToPtrCallsPass{});
+    }
   }
 }
 
@@ -1761,7 +2039,8 @@ struct ConcretizeAllocaPtrsPass
 
 }  // namespace
 
-void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
+static void buildPreResolutionPipeline(llvm::ModulePassManager &MPM,
+                                       const PipelineOptions &opts) {
   // Reset the phase timer origin on each pipeline build.
   PhaseMarkerPass::origin() = PhaseMarkerPass::Clock::now();
   addPhaseMarker(MPM, "Phase 0: start");
@@ -1869,6 +2148,8 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   // partially-lowered IR.  Internalize + DCE semantics since the late
   // internalize (Phase 3.6→3.7 boundary) won't run.
   if (opts.stop_after_state_optimization) {
+    if (opts.preserve_lifted_semantics)
+      return;
     MPM.addPass(InternalizeRemillSemanticsPass());
     MPM.addPass(llvm::GlobalDCEPass());
     return;
@@ -2008,101 +2289,85 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     addVMVerboseMarker(MPM, "vm.post-dead-merged-elimination");
   }
 
-  addPhaseMarker(MPM, "Phase 3.6: iterative target resolution");
-  // Phase 3.6: Iterative indirect target resolution.
-  if (opts.use_block_lifting) {
-    // Block-lifting mode: optimize block-functions, resolve constant
-    // dispatch targets, and convert them to direct musttail calls.
-    MPM.addPass(
-        IterativeBlockDiscoveryPass(opts.max_resolution_iterations));
-    // Merge block-functions back into multi-block trace functions.
-    MPM.addPass(MergeBlockFunctionsPass());
-    MPM.addPass(llvm::GlobalDCEPass());
-  } else if (opts.resolve_indirect_targets) {
-    MPM.addPass(
-        IterativeTargetResolutionPass(opts.max_resolution_iterations));
-  }
+}
 
-  // Phase 0 deferred: now that IterativeTargetResolution has discovered all
-  // late functions and inlined semantic bodies into them, internalize and
-  // remove dead semantic functions that have no remaining callers.
-  MPM.addPass(InternalizeRemillSemanticsPass());
-  MPM.addPass(llvm::GlobalDCEPass());
-
+static void buildStandaloneInterproceduralResolutionEpoch(
+    llvm::ModulePassManager &MPM) {
   addPhaseMarker(MPM, "Phase 3.7: IPCP");
-  // Phase 3.7: Inter-procedural constant propagation.
-  // After InterProceduralConstProp propagates R9 (DISPATCHER_CONTEXT* from
-  // SEH resolution) to handler/resolver functions, ConstantMemoryFolding
-  // resolves [R9+0x38] → HandlerData from the synthetic binary region.
-  if (opts.interprocedural_const_prop || opts.resolve_indirect_targets) {
-    MPM.addPass(llvm::RequireAnalysisPass<CallGraphAnalysis, llvm::Module>());
-    MPM.addPass(InterProceduralConstPropPass());
-    llvm::FunctionPassManager FPM;
-    FPM.addPass(llvm::InstCombinePass());
-    FPM.addPass(ConstantMemoryFoldingPass());
-    FPM.addPass(llvm::GVNPass());
-    FPM.addPass(llvm::InstCombinePass());
-    FPM.addPass(IndirectCallResolverPass());
+  MPM.addPass(llvm::RequireAnalysisPass<CallGraphAnalysis, llvm::Module>());
+  MPM.addPass(InterProceduralConstPropPass());
+  llvm::FunctionPassManager FPM;
+  FPM.addPass(llvm::InstCombinePass());
+  FPM.addPass(ConstantMemoryFoldingPass());
+  FPM.addPass(llvm::GVNPass());
+  FPM.addPass(llvm::InstCombinePass());
+  FPM.addPass(IndirectCallResolverPass());
 #if OMILL_ENABLE_Z3
-    FPM.addPass(Z3DispatchSolverPass());
+  FPM.addPass(Z3DispatchSolverPass());
 #endif
-    FPM.addPass(ResolveAndLowerControlFlowPass(ResolvePhases::ResolveTargets));
-    FPM.addPass(LowerRemillIntrinsicsPass(LowerCategories::ResolvedDispatch));
-    // Scope to functions that have unresolved dispatch calls/jumps.
-    // Running ConstantMemoryFolding on all functions is unsound: it folds
-    // loads from writable .data globals (e.g. __security_cookie) whose
-    // static values differ from runtime, destroying control flow.
-    MPM.addPass(createScopedFPM(std::move(FPM), [](llvm::Function &F) {
-      for (auto &BB : F)
-        for (auto &I : BB)
-          if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
-            if (auto *Callee = CI->getCalledFunction()) {
-              auto name = Callee->getName();
-              if (name == "__omill_dispatch_call" ||
-                  name == "__omill_dispatch_jump")
-                return true;
-            }
-      return false;
-    }));
+  FPM.addPass(ResolveAndLowerControlFlowPass(ResolvePhases::ResolveTargets));
+  FPM.addPass(LowerRemillIntrinsicsPass(LowerCategories::ResolvedDispatch));
+  MPM.addPass(createScopedFPM(std::move(FPM), [](llvm::Function &F) {
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
+          if (auto *Callee = CI->getCalledFunction()) {
+            auto name = Callee->getName();
+            if (name == "__omill_dispatch_call" ||
+                name == "__omill_dispatch_jump")
+              return true;
+          }
+    return false;
+  }));
+}
+
+static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
+                                          const PipelineOptions &opts) {
+  addPhaseMarker(MPM, "Phase 3.6: iterative target resolution");
+  if (opts.use_block_lifting) {
+    MPM.addPass(IterativeBlockDiscoveryPass(opts.max_resolution_iterations));
+    if (opts.merge_block_functions_after_fixpoint) {
+      MPM.addPass(MergeBlockFunctionsPass());
+      MPM.addPass(llvm::GlobalDCEPass());
+    }
+  } else if (opts.resolve_indirect_targets) {
+    MPM.addPass(IterativeTargetResolutionPass(
+        opts.max_resolution_iterations, opts.run_ipcp_inside_resolution));
   }
 
+  if (opts.interprocedural_const_prop &&
+      (!opts.resolve_indirect_targets || !opts.run_ipcp_inside_resolution)) {
+    buildStandaloneInterproceduralResolutionEpoch(MPM);
+  }
+}
+
+static void buildBoundaryLoweringPipeline(llvm::ModulePassManager &MPM,
+                                          const PipelineOptions &opts) {
   addPhaseMarker(MPM, "Phase 4: ABI recovery");
-  // Phase 4: ABI Recovery
   if (opts.recover_abi) {
     buildABIRecoveryPipeline(MPM, opts);
-
-    // Phase 4 (late): Refine _native function parameter types.
-    if (opts.refine_signatures) {
+    if (opts.refine_signatures)
       MPM.addPass(RefineFunctionSignaturesPass());
-    }
   }
+}
 
+static void buildFinalCleanupPipeline(llvm::ModulePassManager &MPM,
+                                      const PipelineOptions &opts) {
   addPhaseMarker(MPM, "Phase 5: deobfuscation");
-  // Phase 5: Deobfuscation (after ABI recovery for max constant visibility)
   if (opts.deobfuscate) {
-    // Ensure BinaryMemoryAnalysis is cached before function passes need it.
     MPM.addPass(llvm::RequireAnalysisPass<BinaryMemoryAnalysis, llvm::Module>());
     llvm::FunctionPassManager FPM;
     buildDeobfuscationPipeline(FPM, opts);
-    // Deobfuscation only applies to _native wrappers post-ABI.
     MPM.addPass(createScopedFPM(std::move(FPM), [](llvm::Function &F) {
       return F.getName().ends_with("_native");
     }));
   }
 
-  // Inline VM handler functions identified by callsite frequency analysis.
-  // After deobfuscation has simplified individual functions, small functions
-  // called from multiple dispatch sites are likely VM handlers.  Inlining
-  // exposes their bodies to further optimization.
   if (opts.vm_devirtualize && opts.deobfuscate &&
       !envDisabled("OMILL_SKIP_VM_HANDLER_INLINE")) {
     MPM.addPass(VMHandlerInlinerPass());
-    // Re-run cleanup only on functions that had handlers inlined.
     llvm::FunctionPassManager FPM;
-    FPM.addPass(llvm::InstCombinePass());
-    FPM.addPass(llvm::GVNPass());
-    FPM.addPass(llvm::ADCEPass());
-    FPM.addPass(llvm::SimplifyCFGPass());
+    buildCleanupPipeline(FPM, CleanupProfile::kBoundary);
     MPM.addPass(createScopedFPM(std::move(FPM), [](llvm::Function &F) {
       if (!F.hasFnAttribute("omill.needs_cleanup"))
         return false;
@@ -2111,292 +2376,6 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     }));
   }
 
-  // Eliminate memory accesses to sentinel addresses (0xCCCCCCCCCCCCCCCC)
-  // produced by stack fill.  These are dead cmpxchg/load/store ops that
-  // survived through ABI recovery.
-  if (!envDisabled("OMILL_SKIP_SENTINEL_MEMORY_ELIM")) {
-    struct SentinelMemoryEliminationPass
-        : llvm::PassInfoMixin<SentinelMemoryEliminationPass> {
-      llvm::PreservedAnalyses run(llvm::Function &F,
-                                   llvm::FunctionAnalysisManager &) {
-        if (F.isDeclaration())
-          return llvm::PreservedAnalyses::all();
-
-        // Known sentinel constants (stack fill patterns).
-        auto isSentinel = [](uint64_t v) -> bool {
-          return v == 0xCCCCCCCCCCCCCCCCULL ||
-                 v == 0xCDCDCDCDCDCDCDCDULL ||
-                 v == 0xCCCCCCCCULL ||
-                 v == 0xCDCDCDCDULL;
-        };
-
-        // Check if a pointer operand is inttoptr(sentinel_constant).
-        auto isSentinelPtr = [&](llvm::Value *ptr) -> bool {
-          auto *i2p = llvm::dyn_cast<llvm::IntToPtrInst>(ptr);
-          if (!i2p) {
-            // Check ConstantExpr inttoptr.
-            auto *ce = llvm::dyn_cast<llvm::ConstantExpr>(ptr);
-            if (!ce || ce->getOpcode() != llvm::Instruction::IntToPtr)
-              return false;
-            auto *ci = llvm::dyn_cast<llvm::ConstantInt>(ce->getOperand(0));
-            return ci && isSentinel(ci->getZExtValue());
-          }
-          auto *ci = llvm::dyn_cast<llvm::ConstantInt>(i2p->getOperand(0));
-          return ci && isSentinel(ci->getZExtValue());
-        };
-
-        bool changed = false;
-        llvm::SmallVector<llvm::Instruction *, 8> to_erase;
-
-        for (auto &BB : F) {
-          for (auto &I : BB) {
-            // memset with sentinel fill byte → zero-fill.
-            // Converts vmcontext / stack init from 0xCC/0xCD debug
-            // patterns to zero-initialization for cleaner output.
-            if (auto *ms = llvm::dyn_cast<llvm::MemSetInst>(&I)) {
-              auto *fill =
-                  llvm::dyn_cast<llvm::ConstantInt>(ms->getValue());
-              if (fill) {
-                uint8_t v = static_cast<uint8_t>(fill->getZExtValue());
-                if (v == 0xCC || v == 0xCD) {
-                  ms->setValue(
-                      llvm::ConstantInt::get(fill->getType(), 0));
-                  changed = true;
-                }
-              }
-              continue;
-            }
-            // cmpxchg to sentinel → replace with {undef, false}.
-            if (auto *cx = llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&I)) {
-              if (isSentinelPtr(cx->getPointerOperand())) {
-                auto *res_ty = cx->getType();  // {T, i1}
-                llvm::Value *res = llvm::PoisonValue::get(res_ty);
-                cx->replaceAllUsesWith(res);
-                to_erase.push_back(cx);
-                changed = true;
-              }
-              continue;
-            }
-            // load from sentinel → replace with poison.
-            if (auto *ld = llvm::dyn_cast<llvm::LoadInst>(&I)) {
-              if (isSentinelPtr(ld->getPointerOperand())) {
-                ld->replaceAllUsesWith(
-                    llvm::PoisonValue::get(ld->getType()));
-                to_erase.push_back(ld);
-                changed = true;
-              }
-              continue;
-            }
-            // store to sentinel → erase.
-            if (auto *st = llvm::dyn_cast<llvm::StoreInst>(&I)) {
-              if (isSentinelPtr(st->getPointerOperand())) {
-                to_erase.push_back(st);
-                changed = true;
-              }
-              continue;
-            }
-          }
-        }
-        for (auto *I : to_erase)
-          I->eraseFromParent();
-
-        return changed ? llvm::PreservedAnalyses::none()
-                       : llvm::PreservedAnalyses::all();
-      }
-      static bool isRequired() { return true; }
-    };
-    llvm::FunctionPassManager FPM;
-    FPM.addPass(SentinelMemoryEliminationPass{});
-    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
-  }
-
-  if (!envDisabled("OMILL_SKIP_CONCRETIZE_ALLOCA_PTRS")) {
-    llvm::FunctionPassManager FPM;
-    FPM.addPass(ConcretizeAllocaPtrsPass{});
-    FPM.addPass(llvm::DSEPass());
-    FPM.addPass(llvm::InstCombinePass());
-    FPM.addPass(llvm::GVNPass());
-    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
-  }
-
-  // Inline tiny _native helper functions (e.g., VM context allocator called
-  // ~3000 times).  After ABI recovery these are ~5 instructions.  Inlining
-  // exposes their stack offset arithmetic to GVN/InstCombine in callers.
-  if (opts.recover_abi && !envDisabled("OMILL_SKIP_POST_ABI_INLINE")) {
-    llvm::InlineParams params = llvm::getInlineParams(50);
-    MPM.addPass(llvm::ModuleInlinerWrapperPass(params));
-
-    // Phase 1: fold arithmetic from inlined code so GEP offsets become constant.
-    {
-      llvm::FunctionPassManager FPM;
-      FPM.addPass(llvm::InstCombinePass());
-      FPM.addPass(llvm::GVNPass());
-      MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
-    }
-
-    // Phase 2: split large allocas exposed by inlining (e.g., vmenter's
-    // [69632 x i8] stack).  SROA won't decompose these — too large, too many
-    // GEPs.  We collect constant-offset GEPs, group into contiguous regions,
-    // create per-region allocas, and rewrite.
-    if (!envDisabled("OMILL_SKIP_SPLIT_LARGE_ALLOCA")) {
-      llvm::FunctionPassManager FPM;
-      FPM.addPass(SplitLargeAllocaPass{});
-      MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
-    }
-
-    // Phase 3: recover stack frames from param-derived bases (VM context) and
-    // run SROA to decompose the split regions into SSA.
-    {
-      llvm::FunctionPassManager FPM;
-      FPM.addPass(RecoverStackFramePass{});
-      FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
-      FPM.addPass(llvm::InstCombinePass());
-      FPM.addPass(llvm::GVNPass());
-      FPM.addPass(llvm::ADCEPass());
-      FPM.addPass(llvm::SimplifyCFGPass());
-      MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
-    }
-
-    MPM.addPass(llvm::GlobalDCEPass());
-  }
-
-  // Resolve call inttoptr(i64 CONST to ptr)(...) to direct calls when the
-  // constant address corresponds to a lifted function.
-  if (opts.recover_abi && !envDisabled("OMILL_SKIP_RESOLVE_INTTOPTR_CALLS")) {
-    struct ResolveIntToPtrCallsPass
-        : llvm::PassInfoMixin<ResolveIntToPtrCallsPass> {
-      llvm::PreservedAnalyses run(llvm::Module &M,
-                                   llvm::ModuleAnalysisManager &MAM) {
-        auto *lifted = MAM.getCachedResult<LiftedFunctionAnalysis>(M);
-        if (!lifted)
-          return llvm::PreservedAnalyses::all();
-
-        bool changed = false;
-        unsigned resolved_count = 0;
-
-        for (auto &F : M) {
-          for (auto &BB : F) {
-            for (auto &I : llvm::make_early_inc_range(BB)) {
-              auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
-              if (!call)
-                continue;
-              if (call->getCalledFunction())
-                continue;
-
-              // Match: call ... inttoptr(i64 CONST to ptr)(...)
-              auto *callee_val = call->getCalledOperand()->stripPointerCasts();
-              llvm::ConstantInt *addr_ci = nullptr;
-
-              // ConstantExpr inttoptr.
-              if (auto *ce = llvm::dyn_cast<llvm::ConstantExpr>(callee_val)) {
-                if (ce->getOpcode() == llvm::Instruction::IntToPtr)
-                  addr_ci = llvm::dyn_cast<llvm::ConstantInt>(ce->getOperand(0));
-              }
-              // IntToPtrInst inttoptr(CONST).
-              if (!addr_ci) {
-                if (auto *itp = llvm::dyn_cast<llvm::IntToPtrInst>(callee_val)) {
-                  addr_ci = llvm::dyn_cast<llvm::ConstantInt>(itp->getOperand(0));
-                }
-              }
-              if (!addr_ci)
-                continue;
-
-              uint64_t addr = addr_ci->getZExtValue();
-
-              // Look up the native wrapper for this VA.
-              auto *target_fn = lifted->lookup(addr);
-              if (!target_fn)
-                continue;
-
-              // Find or create the _native version.
-              std::string native_name =
-                  (target_fn->getName() + "_native").str();
-              auto *native_fn = M.getFunction(native_name);
-              if (!native_fn)
-                continue;
-
-              // Build argument list, adapting types as needed.
-              auto *native_ty = native_fn->getFunctionType();
-              unsigned n_params = native_ty->getNumParams();
-              unsigned n_args = call->arg_size();
-              unsigned n = std::min(n_params, n_args);
-
-              llvm::SmallVector<llvm::Value *, 8> args;
-              llvm::IRBuilder<> B(call);
-              for (unsigned i = 0; i < n; ++i) {
-                auto *arg = call->getArgOperand(i);
-                auto *expected = native_ty->getParamType(i);
-                if (arg->getType() != expected) {
-                  if (arg->getType()->isIntegerTy() &&
-                      expected->isIntegerTy())
-                    arg = B.CreateIntCast(arg, expected, /*isSigned=*/false);
-                  else if (arg->getType()->isPointerTy() &&
-                           expected->isIntegerTy())
-                    arg = B.CreatePtrToInt(arg, expected);
-                  else if (arg->getType()->isIntegerTy() &&
-                           expected->isPointerTy())
-                    arg = B.CreateIntToPtr(arg, expected);
-                  else
-                    arg = B.CreateBitCast(arg, expected);
-                }
-                args.push_back(arg);
-              }
-              // Pad with poison if callee expects more args.
-              for (unsigned i = n; i < n_params; ++i)
-                args.push_back(
-                    llvm::PoisonValue::get(native_ty->getParamType(i)));
-
-              auto *new_call = B.CreateCall(native_fn, args);
-              new_call->setCallingConv(native_fn->getCallingConv());
-
-              // Adapt return type.
-              if (call->getType() != new_call->getType()) {
-                llvm::Value *result = new_call;
-                if (call->getType()->isVoidTy()) {
-                  // Original call returned void, nothing to replace.
-                } else if (new_call->getType()->isVoidTy()) {
-                  result = llvm::PoisonValue::get(call->getType());
-                } else if (call->getType()->isIntegerTy() &&
-                           new_call->getType()->isIntegerTy()) {
-                  result =
-                      B.CreateIntCast(new_call, call->getType(), false);
-                } else if (call->getType()->isPointerTy() &&
-                           new_call->getType()->isIntegerTy()) {
-                  result = B.CreateIntToPtr(new_call, call->getType());
-                } else if (call->getType()->isIntegerTy() &&
-                           new_call->getType()->isPointerTy()) {
-                  result = B.CreatePtrToInt(new_call, call->getType());
-                } else {
-                  result = B.CreateBitCast(new_call, call->getType());
-                }
-                call->replaceAllUsesWith(result);
-              } else {
-                call->replaceAllUsesWith(new_call);
-              }
-              call->eraseFromParent();
-              changed = true;
-              ++resolved_count;
-            }
-          }
-        }
-
-        if (resolved_count > 0) {
-          llvm::errs() << "ResolveIntToPtrCalls: resolved "
-                       << resolved_count
-                       << " inttoptr(const) calls to direct calls\n";
-        }
-
-        return changed ? llvm::PreservedAnalyses::none()
-                       : llvm::PreservedAnalyses::all();
-      }
-      static bool isRequired() { return true; }
-    };
-    MPM.addPass(llvm::RequireAnalysisPass<LiftedFunctionAnalysis,
-                                           llvm::Module>());
-    MPM.addPass(ResolveIntToPtrCallsPass{});
-  }
-
-  // Late lowering: undefined values (after DCE removed most of them)
   {
     llvm::FunctionPassManager FPM;
     if (!envDisabled("OMILL_SKIP_UNDEFINED_LOWER")) {
@@ -2410,9 +2389,20 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
+  if (!opts.preserve_lifted_semantics)
+    buildLiftInfrastructureCleanupPipeline(MPM);
+
   addPhaseMarker(MPM, "Final: cleanup");
-  // Global cleanup
   MPM.addPass(llvm::GlobalDCEPass());
+}
+
+void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
+  buildPreResolutionPipeline(MPM, opts);
+  if (opts.stop_after_state_optimization)
+    return;
+  buildIterativeResolutionEpoch(MPM, opts);
+  buildBoundaryLoweringPipeline(MPM, opts);
+  buildFinalCleanupPipeline(MPM, opts);
 }
 
 void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
@@ -3618,12 +3608,26 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
   MPM.addPass(llvm::GlobalDCEPass());
 }
 
+void buildPostPatchCleanupPipeline(llvm::ModulePassManager &MPM,
+                                   unsigned inline_threshold) {
+  llvm::InlineParams params = llvm::getInlineParams(inline_threshold);
+  MPM.addPass(llvm::ModuleInlinerWrapperPass(params));
+  buildCleanupPipeline(MPM, CleanupProfile::kBoundary);
+  MPM.addPass(llvm::GlobalDCEPass());
+}
+
+void buildLiftInfrastructureCleanupPipeline(llvm::ModulePassManager &MPM) {
+  MPM.addPass(InternalizeRemillSemanticsPass());
+  MPM.addPass(llvm::GlobalDCEPass());
+}
+
 void registerModuleAnalyses(llvm::ModuleAnalysisManager &MAM) {
   MAM.registerPass([&] { return TargetArchAnalysis(); });
   MAM.registerPass([&] { return CallGraphAnalysis(); });
   MAM.registerPass([&] { return CallingConventionAnalysis(); });
   MAM.registerPass([&] { return BinaryMemoryAnalysis(); });
   MAM.registerPass([&] { return LiftedFunctionAnalysis(); });
+  MAM.registerPass([&] { return IterativeLiftingSessionAnalysis(); });
   MAM.registerPass([&] { return ExceptionInfoAnalysis(); });
   MAM.registerPass([&] { return BlockLiftAnalysis(); });
   MAM.registerPass([&] { return VMTraceMapAnalysis(); });

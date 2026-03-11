@@ -285,5 +285,68 @@ TEST_F(RecoverFunctionSignaturesTest, PropagatesDemergedVmAttributesToNativeWrap
   EXPECT_EQ(trace_hash_attr.getValueAsString(), "abcdef");
 }
 
+TEST_F(RecoverFunctionSignaturesTest, SkipsFunctionsWithExistingNativeWrapper) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *state_ty = llvm::StructType::create(Ctx, "struct.State");
+  auto *arr_ty = llvm::ArrayType::get(llvm::Type::getInt8Ty(Ctx), 3504);
+  state_ty->setBody({arr_ty});
+
+  auto *bb_fn_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *bb_fn = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "__remill_basic_block", *M);
+  auto *bb_entry = llvm::BasicBlock::Create(Ctx, "entry", bb_fn);
+  llvm::IRBuilder<> BBB(bb_entry);
+  auto *bb_state = bb_fn->getArg(0);
+  BBB.CreateConstGEP1_64(BBB.getInt8Ty(), bb_state, 0, "RAX");
+  BBB.CreateConstGEP1_64(BBB.getInt8Ty(), bb_state, 16, "RCX");
+  BBB.CreateRet(bb_fn->getArg(2));
+
+  auto *fn_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *lifted_fn = llvm::Function::Create(
+      fn_ty, llvm::Function::ExternalLinkage, "sub_401000", *M);
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", lifted_fn);
+  llvm::IRBuilder<> B(entry);
+  auto *rcx_gep = B.CreateConstGEP1_64(B.getInt8Ty(), lifted_fn->getArg(0), 16);
+  auto *rcx_val = B.CreateLoad(i64_ty, rcx_gep, "rcx_val");
+  auto *rax_gep = B.CreateConstGEP1_64(B.getInt8Ty(), lifted_fn->getArg(0), 0);
+  B.CreateStore(rcx_val, rax_gep);
+  B.CreateRet(lifted_fn->getArg(2));
+
+  auto *existing_native = llvm::Function::Create(
+      llvm::FunctionType::get(i64_ty, {i64_ty}, false),
+      llvm::Function::ExternalLinkage, "sub_401000_native", *M);
+  auto *native_entry = llvm::BasicBlock::Create(Ctx, "entry", existing_native);
+  llvm::IRBuilder<> NB(native_entry);
+  NB.CreateRet(existing_native->getArg(0));
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+
+  llvm::ModulePassManager MPM;
+  MPM.addPass(omill::RecoverFunctionSignaturesPass());
+  MPM.run(*M, MAM);
+
+  EXPECT_EQ(M->getFunction("sub_401000_native"), existing_native);
+  EXPECT_EQ(M->getFunction("sub_401000_native.1"), nullptr);
+}
+
 
 }  // namespace

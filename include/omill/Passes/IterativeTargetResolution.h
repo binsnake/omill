@@ -18,8 +18,10 @@ namespace omill {
 class IterativeTargetResolutionPass
     : public llvm::PassInfoMixin<IterativeTargetResolutionPass> {
  public:
-  explicit IterativeTargetResolutionPass(unsigned max_iterations = 32)
-      : max_iterations_(max_iterations) {}
+  explicit IterativeTargetResolutionPass(unsigned max_iterations = 32,
+                                         bool run_ipcp_inside_resolution = true)
+      : max_iterations_(max_iterations),
+        run_ipcp_inside_resolution_(run_ipcp_inside_resolution) {}
 
   llvm::PreservedAnalyses run(llvm::Module &M,
                               llvm::ModuleAnalysisManager &AM);
@@ -28,6 +30,7 @@ class IterativeTargetResolutionPass
 
  private:
   unsigned max_iterations_;
+  bool run_ipcp_inside_resolution_;
 };
 
 }  // namespace omill

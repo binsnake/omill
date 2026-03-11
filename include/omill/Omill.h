@@ -10,6 +10,14 @@
 
 namespace omill {
 
+enum class CleanupProfile {
+  kLightScalar,
+  kStateToSSA,
+  kPostInline,
+  kBoundary,
+  kFinal,
+};
+
 /// Configuration for the omill optimization pipeline.
 struct PipelineOptions {
   /// Target architecture (default: x86_64).
@@ -76,6 +84,20 @@ struct PipelineOptions {
 
   /// Run standard LLVM cleanup passes between stages.
   bool run_cleanup_passes = true;
+
+  /// Keep Remill semantic bodies and lifting support alive across pipeline
+  /// boundaries so the driver can lift additional targets into the same
+  /// module later. The driver is responsible for final cleanup once
+  /// iterative discovery is closed.
+  bool preserve_lifted_semantics = false;
+
+  /// Merge block functions only after the discovery epoch converges.
+  bool merge_block_functions_after_fixpoint = true;
+
+  /// Run interprocedural constant propagation inside the iterative
+  /// resolution epoch so newly propagated constants can participate in
+  /// the same discovery round.
+  bool run_ipcp_inside_resolution = true;
 };
 
 /// Builds the omill optimization pipeline.
@@ -112,6 +134,16 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM,
 /// Build the late cleanup pipeline (sentinel data elimination + DCE).
 /// Run after ABI recovery and post-ABI deobfuscation, before output.
 void buildLateCleanupPipeline(llvm::ModulePassManager &MPM);
+
+/// Build a shared cleanup bundle using one of the canonical cleanup profiles.
+void buildCleanupPipeline(llvm::FunctionPassManager &FPM,
+                          CleanupProfile profile);
+void buildCleanupPipeline(llvm::ModulePassManager &MPM,
+                          CleanupProfile profile);
+
+/// Internalize and remove now-dead Remill lifting infrastructure once no
+/// further iterative lifting rounds will run.
+void buildLiftInfrastructureCleanupPipeline(llvm::ModulePassManager &MPM);
 
 /// Resolve constant inttoptr call targets to direct _native calls and run
 /// bounded post-rewrite inline/cleanup rounds until convergence.

@@ -16,6 +16,10 @@ namespace {
 
 static constexpr unsigned kWin64PublicRootParamCount = 2;
 
+std::string nativeWrapperName(const llvm::Function &F) {
+  return F.getName().str() + "_native";
+}
+
 bool isPublicOutputRoot(const llvm::Function *F) {
   return F && F->hasFnAttribute("omill.output_root") &&
          !F->hasFnAttribute("omill.vm_wrapper");
@@ -145,7 +149,7 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
                                     is_public_output_root);
 
   // Name: lifted function name + "_native"
-  std::string native_name = lifted_fn->getName().str() + "_native";
+  std::string native_name = nativeWrapperName(*lifted_fn);
   auto *native_fn = llvm::Function::Create(
       native_ty, llvm::Function::ExternalLinkage, native_name, M);
   native_fn->addFnAttr(llvm::Attribute::MustProgress);
@@ -415,6 +419,10 @@ llvm::PreservedAnalyses RecoverFunctionSignaturesPass::run(
       M.getContext(), "struct.State");
 
   for (auto *F : functions) {
+    if (auto *existing = M.getFunction(nativeWrapperName(*F));
+        existing && !existing->isDeclaration()) {
+      continue;
+    }
     auto *abi = cc_info.getABI(F);
     if (!abi) {
       if (getenv("OMILL_DEBUG_REWRITE"))
