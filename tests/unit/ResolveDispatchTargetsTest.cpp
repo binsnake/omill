@@ -13,6 +13,8 @@
 
 #include "omill/Omill.h"
 #include "omill/Analysis/BinaryMemoryMap.h"
+#include "omill/Analysis/CallGraphAnalysis.h"
+#include "omill/Analysis/IterativeLiftingSession.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
 #include "omill/BC/TraceLiftAnalysis.h"
 #include "omill/Passes/ConstantMemoryFolding.h"
@@ -61,20 +63,25 @@ class ResolveDispatchTargetsTest : public ::testing::Test {
     llvm::CGSCCAnalysisManager CGAM;
     llvm::ModuleAnalysisManager MAM;
 
+    MAM.registerPass(
+        [&]() { return omill::BinaryMemoryAnalysis(std::move(map)); });
+    MAM.registerPass([] { return omill::LiftedFunctionAnalysis(); });
+    MAM.registerPass([] { return omill::TraceLiftAnalysis(); });
+
     PB.registerModuleAnalyses(MAM);
     PB.registerCGSCCAnalyses(CGAM);
     PB.registerFunctionAnalyses(FAM);
     PB.registerLoopAnalyses(LAM);
     PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
-    omill::registerModuleAnalyses(MAM);
-    MAM.registerPass(
-        [&]() { return omill::BinaryMemoryAnalysis(std::move(map)); });
-
     (void)MAM.getResult<omill::BinaryMemoryAnalysis>(*M);
     (void)MAM.getResult<omill::LiftedFunctionAnalysis>(*M);
 
     llvm::ModulePassManager MPM;
+    MPM.addPass(
+        llvm::RequireAnalysisPass<omill::BinaryMemoryAnalysis, llvm::Module>());
+    MPM.addPass(
+        llvm::RequireAnalysisPass<omill::LiftedFunctionAnalysis, llvm::Module>());
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(
         omill::ResolveAndLowerControlFlowPass(omill::ResolvePhases::ResolveTargets)));
     MPM.run(*M, MAM);
@@ -88,20 +95,31 @@ class ResolveDispatchTargetsTest : public ::testing::Test {
     llvm::CGSCCAnalysisManager CGAM;
     llvm::ModuleAnalysisManager MAM;
 
+    MAM.registerPass(
+        [&]() { return omill::BinaryMemoryAnalysis(std::move(map)); });
+    MAM.registerPass([] { return omill::CallGraphAnalysis(); });
+    MAM.registerPass([] { return omill::LiftedFunctionAnalysis(); });
+    MAM.registerPass([] { return omill::TraceLiftAnalysis(); });
+    auto session =
+        std::make_shared<omill::IterativeLiftingSession>("resolve-test");
+    MAM.registerPass([session] {
+      return omill::IterativeLiftingSessionAnalysis(session);
+    });
+
     PB.registerModuleAnalyses(MAM);
     PB.registerCGSCCAnalyses(CGAM);
     PB.registerFunctionAnalyses(FAM);
     PB.registerLoopAnalyses(LAM);
     PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
-    omill::registerModuleAnalyses(MAM);
-    MAM.registerPass(
-        [&]() { return omill::BinaryMemoryAnalysis(std::move(map)); });
-
     (void)MAM.getResult<omill::BinaryMemoryAnalysis>(*M);
     (void)MAM.getResult<omill::LiftedFunctionAnalysis>(*M);
 
     llvm::ModulePassManager MPM;
+    MPM.addPass(
+        llvm::RequireAnalysisPass<omill::BinaryMemoryAnalysis, llvm::Module>());
+    MPM.addPass(
+        llvm::RequireAnalysisPass<omill::LiftedFunctionAnalysis, llvm::Module>());
     MPM.addPass(omill::IterativeTargetResolutionPass(max_iter));
     MPM.run(*M, MAM);
   }

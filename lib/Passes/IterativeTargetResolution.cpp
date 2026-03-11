@@ -866,6 +866,7 @@ void processDeferredFunctions(llvm::ArrayRef<llvm::Function *> deferred,
 
 llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
     llvm::Module &M, llvm::ModuleAnalysisManager &MAM) {
+  (void)MAM.getResult<BinaryMemoryAnalysis>(M);
   auto &session_result = MAM.getResult<IterativeLiftingSessionAnalysis>(M);
   auto session = session_result.session;
   unsigned iteration = 0;
@@ -887,7 +888,7 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
     lift_trace = lift_result.lift_trace;
   }
 
-  auto *lifted = MAM.getCachedResult<LiftedFunctionAnalysis>(M);
+  auto *lifted = &MAM.getResult<LiftedFunctionAnalysis>(M);
 
   if (run_ipcp_inside_resolution_)
     (void)MAM.getResult<CallGraphAnalysis>(M);
