@@ -11,6 +11,7 @@
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 
+#include "omill/Omill.h"
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
 #include "omill/BC/TraceLiftAnalysis.h"
@@ -60,16 +61,15 @@ class ResolveDispatchTargetsTest : public ::testing::Test {
     llvm::CGSCCAnalysisManager CGAM;
     llvm::ModuleAnalysisManager MAM;
 
-    MAM.registerPass(
-        [&]() { return omill::BinaryMemoryAnalysis(std::move(map)); });
-    MAM.registerPass([] { return omill::LiftedFunctionAnalysis(); });
-    MAM.registerPass([] { return omill::TraceLiftAnalysis(); });
-
     PB.registerModuleAnalyses(MAM);
     PB.registerCGSCCAnalyses(CGAM);
     PB.registerFunctionAnalyses(FAM);
     PB.registerLoopAnalyses(LAM);
     PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+    omill::registerModuleAnalyses(MAM);
+    MAM.registerPass(
+        [&]() { return omill::BinaryMemoryAnalysis(std::move(map)); });
 
     (void)MAM.getResult<omill::BinaryMemoryAnalysis>(*M);
     (void)MAM.getResult<omill::LiftedFunctionAnalysis>(*M);
@@ -88,16 +88,15 @@ class ResolveDispatchTargetsTest : public ::testing::Test {
     llvm::CGSCCAnalysisManager CGAM;
     llvm::ModuleAnalysisManager MAM;
 
-    MAM.registerPass(
-        [&]() { return omill::BinaryMemoryAnalysis(std::move(map)); });
-    MAM.registerPass([] { return omill::LiftedFunctionAnalysis(); });
-    MAM.registerPass([] { return omill::TraceLiftAnalysis(); });
-
     PB.registerModuleAnalyses(MAM);
     PB.registerCGSCCAnalyses(CGAM);
     PB.registerFunctionAnalyses(FAM);
     PB.registerLoopAnalyses(LAM);
     PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+    omill::registerModuleAnalyses(MAM);
+    MAM.registerPass(
+        [&]() { return omill::BinaryMemoryAnalysis(std::move(map)); });
 
     (void)MAM.getResult<omill::BinaryMemoryAnalysis>(*M);
     (void)MAM.getResult<omill::LiftedFunctionAnalysis>(*M);

@@ -72,6 +72,7 @@
 #include "omill/Passes/IterativeTargetResolution.h"
 #include "omill/Passes/EliminateDeadPaths.h"
 #include "omill/Passes/InlineJumpTargets.h"
+#include "omill/BC/TraceLiftAnalysis.h"
 #include "omill/BC/BlockLifterAnalysis.h"
 #include "omill/Passes/IterativeBlockDiscovery.h"
 #include "omill/Passes/MergeBlockFunctions.h"
@@ -3623,6 +3624,7 @@ void buildLiftInfrastructureCleanupPipeline(llvm::ModulePassManager &MPM) {
 
 void registerModuleAnalyses(llvm::ModuleAnalysisManager &MAM) {
   MAM.registerPass([&] { return TargetArchAnalysis(); });
+  MAM.registerPass([&] { return TraceLiftAnalysis(); });
   MAM.registerPass([&] { return CallGraphAnalysis(); });
   MAM.registerPass([&] { return CallingConventionAnalysis(); });
   MAM.registerPass([&] { return BinaryMemoryAnalysis(); });

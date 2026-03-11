@@ -242,12 +242,11 @@ void LiftAndOptFixture::optimizeWithMemoryMap(const PipelineOptions &opts,
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
   omill::registerAnalyses(FAM);
-  // Note: don't call registerModuleAnalyses() — we already registered
-  // BinaryMemoryAnalysis with our custom map above. Register the rest manually.
-  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
-  MAM.registerPass([&] { return omill::CallGraphAnalysis(); });
-  MAM.registerPass([&] { return omill::LiftedFunctionAnalysis(); });
-  MAM.registerPass([&] { return omill::ExceptionInfoAnalysis(); });
+  omill::registerModuleAnalyses(MAM);
+  // Override the default empty analyses with the test-specific fixtures.
+  MAM.registerPass([memory_map_holder] {
+    return omill::BinaryMemoryAnalysis(*memory_map_holder);
+  });
 
   dumpIR("before");
 
@@ -318,11 +317,14 @@ void LiftAndOptFixture::optimizeWithExceptions(
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
   omill::registerAnalyses(FAM);
-  // Register remaining module analyses (skip BinaryMemoryAnalysis and
-  // ExceptionInfoAnalysis since we already registered them above).
-  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
-  MAM.registerPass([&] { return omill::CallGraphAnalysis(); });
-  MAM.registerPass([&] { return omill::LiftedFunctionAnalysis(); });
+  omill::registerModuleAnalyses(MAM);
+  // Override the default empty analyses with the test-specific fixtures.
+  MAM.registerPass([memory_map_holder] {
+    return omill::BinaryMemoryAnalysis(*memory_map_holder);
+  });
+  MAM.registerPass([exc_info_holder] {
+    return omill::ExceptionInfoAnalysis(*exc_info_holder);
+  });
 
   dumpIR("before");
 
