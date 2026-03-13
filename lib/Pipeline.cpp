@@ -700,6 +700,19 @@ bool shouldRunClosedRootSliceNativePass(llvm::Function &F) {
   return isClosedRootSliceFunction(F);
 }
 
+bool moduleFlagEnabled(const llvm::Module &M, llvm::StringRef flag_name) {
+  auto *md = M.getModuleFlag(flag_name);
+  auto *constant_md = llvm::dyn_cast_or_null<llvm::ConstantAsMetadata>(md);
+  auto *constant_int =
+      constant_md ? llvm::dyn_cast<llvm::ConstantInt>(constant_md->getValue())
+                  : nullptr;
+  return constant_int && constant_int->isOne();
+}
+
+bool isNoABIModeModule(const llvm::Module &M) {
+  return moduleFlagEnabled(M, "omill.no_abi_mode");
+}
+
 bool isSyntheticBlockLikeFunctionName(llvm::StringRef name) {
   return name.starts_with("blk_") || name.starts_with("block_");
 }
@@ -969,6 +982,117 @@ struct MarkClosedRootSliceNativeHelpersForInliningPass
     return changed ? llvm::PreservedAnalyses::none()
                    : llvm::PreservedAnalyses::all();
   }
+};
+
+struct CollapseSyntheticBlockContinuationCallsPass
+    : llvm::PassInfoMixin<CollapseSyntheticBlockContinuationCallsPass> {
+  bool rewrite_to_missing_block;
+  bool only_when_noabi_mode;
+
+  explicit CollapseSyntheticBlockContinuationCallsPass(
+      bool rewrite_to_missing_block = false,
+      bool only_when_noabi_mode = false)
+      : rewrite_to_missing_block(rewrite_to_missing_block),
+        only_when_noabi_mode(only_when_noabi_mode) {}
+
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &) {
+    if (only_when_noabi_mode && !isNoABIModeModule(M))
+      return llvm::PreservedAnalyses::all();
+
+    bool changed = false;
+    llvm::SmallVector<llvm::CallInst *, 16> calls_to_erase;
+    const bool scoped = isClosedRootSliceScopedModule(M);
+    const bool allow_missing_block_rewrite =
+        rewrite_to_missing_block && isNoABIModeModule(M);
+    auto getOrCreateMissingBlock = [&](llvm::FunctionType *FT)
+        -> llvm::Function * {
+      if (auto *F = M.getFunction("__remill_missing_block")) {
+        if (F->getFunctionType() == FT)
+          return F;
+        return nullptr;
+      }
+      return llvm::Function::Create(FT, llvm::GlobalValue::ExternalLinkage,
+                                    "__remill_missing_block", M);
+    };
+
+    for (auto &F : M) {
+      if (F.isDeclaration())
+        continue;
+      if (scoped && !isClosedRootSliceFunction(F))
+        continue;
+
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+          if (!call)
+            continue;
+
+          auto *callee = call->getCalledFunction();
+          if (!callee || !callee->isDeclaration())
+            continue;
+
+          auto continuation_pc = parseSyntheticBlockLikePC(callee->getName());
+          if (!continuation_pc || call->arg_size() < 3)
+            continue;
+
+          auto *pc_arg =
+              llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+          if (!pc_arg || pc_arg->getZExtValue() != *continuation_pc)
+            continue;
+
+          // A declaration-only synthetic continuation call of the form
+          //   call @blk_<pc>(state, <same pc>, null)
+          // is a no-op on the memory value.
+          if (!call->isMustTailCall()) {
+            auto *mem_arg_const =
+                llvm::dyn_cast<llvm::Constant>(call->getArgOperand(2));
+            if (mem_arg_const && mem_arg_const->isNullValue() &&
+                !call->getType()->isVoidTy() &&
+                call->getType() == call->getArgOperand(2)->getType()) {
+              call->replaceAllUsesWith(call->getArgOperand(2));
+              calls_to_erase.push_back(call);
+              changed = true;
+              continue;
+            }
+          }
+
+          // Otherwise, if the shape is compatible, retarget the unresolved
+          // synthetic continuation call to the explicit Remill fallback.
+          if (!allow_missing_block_rewrite)
+            continue;
+
+          auto *missing_block = getOrCreateMissingBlock(call->getFunctionType());
+          if (!missing_block) {
+            continue;
+          }
+
+          call->setCalledFunction(missing_block);
+          changed = true;
+        }
+      }
+    }
+
+    for (auto *call : calls_to_erase)
+      call->eraseFromParent();
+
+    llvm::SmallVector<llvm::Function *, 16> dead_decls;
+    for (auto &F : M) {
+      if (!F.isDeclaration())
+        continue;
+      if (!parseSyntheticBlockLikePC(F.getName()))
+        continue;
+      if (F.use_empty())
+        dead_decls.push_back(&F);
+    }
+    for (auto *F : dead_decls)
+      F->eraseFromParent();
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+
+  static bool isRequired() { return true; }
 };
 
 }  // namespace
@@ -1833,79 +1957,7 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
   }
   addClosedSliceShapeProbe(MPM, "abi-post-inline-vm-handlers");
   addPhaseMarker(MPM, "ABI: collapse null-memory blk continuations");
-  // Late ABI cleanup can leave declaration-only blk_* continuation calls where
-  // the continuation PC is explicit and the memory argument has already
-  // collapsed to null. Treat this shape as a no-op continuation and erase it.
-  struct CollapseNullMemoryBlockContinuationCallsPass
-      : llvm::PassInfoMixin<CollapseNullMemoryBlockContinuationCallsPass> {
-    llvm::PreservedAnalyses run(llvm::Module &M,
-                                 llvm::ModuleAnalysisManager &) {
-      bool changed = false;
-      llvm::SmallVector<llvm::CallInst *, 16> calls_to_erase;
-
-      bool scoped = isClosedRootSliceScopedModule(M);
-      for (auto &F : M) {
-        if (F.isDeclaration())
-          continue;
-        if (scoped && !isClosedRootSliceFunction(F))
-          continue;
-
-        for (auto &BB : F) {
-          for (auto &I : BB) {
-            auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
-            if (!call || call->isMustTailCall())
-              continue;
-
-            auto *callee = call->getCalledFunction();
-            if (!callee || !callee->isDeclaration())
-              continue;
-
-            auto continuation_pc = parseSyntheticBlockLikePC(callee->getName());
-            if (!continuation_pc)
-              continue;
-
-            if (call->arg_size() < 3)
-              continue;
-            auto *pc_arg = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
-            if (!pc_arg || pc_arg->getZExtValue() != *continuation_pc)
-              continue;
-
-            auto *mem_arg = llvm::dyn_cast<llvm::Constant>(call->getArgOperand(2));
-            if (!mem_arg || !mem_arg->isNullValue())
-              continue;
-
-            if (call->getType()->isVoidTy() ||
-                call->getType() != call->getArgOperand(2)->getType())
-              continue;
-
-            call->replaceAllUsesWith(call->getArgOperand(2));
-            calls_to_erase.push_back(call);
-            changed = true;
-          }
-        }
-      }
-
-      for (auto *call : calls_to_erase)
-        call->eraseFromParent();
-
-      llvm::SmallVector<llvm::Function *, 16> dead_decls;
-      for (auto &F : M) {
-        if (!F.isDeclaration())
-          continue;
-        if (!parseSyntheticBlockLikePC(F.getName()))
-          continue;
-        if (F.use_empty())
-          dead_decls.push_back(&F);
-      }
-      for (auto *F : dead_decls)
-        F->eraseFromParent();
-
-      return changed ? llvm::PreservedAnalyses::none()
-                     : llvm::PreservedAnalyses::all();
-    }
-    static bool isRequired() { return true; }
-  };
-  MPM.addPass(CollapseNullMemoryBlockContinuationCallsPass{});
+  MPM.addPass(CollapseSyntheticBlockContinuationCallsPass(false));
 
   addPhaseMarker(MPM, "ABI: final cleanup");
   // Strip @llvm.compiler.used and run GlobalDCE to remove dead ISEL stubs.
@@ -2153,7 +2205,7 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
       MPM.addPass(ResolveIntToPtrCallsPass{});
     }
     addPhaseMarker(MPM, "ABI: collapse null-memory blk continuations (late)");
-    MPM.addPass(CollapseNullMemoryBlockContinuationCallsPass{});
+    MPM.addPass(CollapseSyntheticBlockContinuationCallsPass(false));
     addClosedSliceShapeProbe(MPM, "abi-final");
   }
 }
@@ -3046,6 +3098,10 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
       buildCleanupPipeline(FPM, CleanupProfile::kBoundary);
       MPM.addPass(createScopedFPM(std::move(FPM),
                                   shouldRunClosedRootSliceScopedPass));
+      MPM.addPass(CollapseSyntheticBlockContinuationCallsPass(
+          /*rewrite_to_missing_block=*/true,
+          /*only_when_noabi_mode=*/true));
+      MPM.addPass(llvm::GlobalDCEPass());
     };
 
     addPhaseMarker(MPM, "Phase 3.8: generic static devirtualization");

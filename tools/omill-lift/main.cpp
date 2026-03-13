@@ -3520,6 +3520,10 @@ int main(int argc, char **argv) {
     clearLiftRoundAttr(attr_name);
   };
 
+  if (NoABI) {
+    module->addModuleFlag(llvm::Module::Override, "omill.no_abi_mode", 1u);
+  }
+
   events.emitInfo("pipeline_started", "main pipeline started");
   {
     ModulePassManager MPM;
