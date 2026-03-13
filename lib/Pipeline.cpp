@@ -771,6 +771,15 @@ bool maybeMarkClosedRootSliceHelperForInlining(
     else if (F.getNumUses() <= 2)
       inline_budget = std::max(inline_budget, 96u);
   }
+  if (!native_helper && isNoABIModeModule(*F.getParent())) {
+    // No-ABI readability mode can keep one remaining internal blk_* call
+    // solely due conservative inline budgeting. Allow a larger budget for
+    // single-use closed-slice helpers in this mode.
+    if (F.hasOneUse())
+      inline_budget = std::max(inline_budget, 512u);
+    else if (F.getNumUses() <= 2)
+      inline_budget = std::max(inline_budget, 256u);
+  }
   if (countNonDebugInstructions(F) > inline_budget)
     return false;
 
@@ -982,6 +991,42 @@ struct MarkClosedRootSliceNativeHelpersForInliningPass
     return changed ? llvm::PreservedAnalyses::none()
                    : llvm::PreservedAnalyses::all();
   }
+};
+
+struct RelaxClosedSliceMustTailMissingBlockPass
+    : llvm::PassInfoMixin<RelaxClosedSliceMustTailMissingBlockPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &) {
+    if (!isClosedRootSliceScopedModule(M) || !isNoABIModeModule(M))
+      return llvm::PreservedAnalyses::all();
+
+    bool changed = false;
+    for (auto &F : M) {
+      if (F.isDeclaration() || !isClosedRootSliceFunction(F) ||
+          !isSyntheticBlockLikeFunctionName(F.getName())) {
+        continue;
+      }
+
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+          if (!call || !call->isMustTailCall())
+            continue;
+
+          auto *callee = call->getCalledFunction();
+          if (!callee || callee->getName() != "__remill_missing_block")
+            continue;
+
+          call->setTailCallKind(llvm::CallInst::TCK_Tail);
+          changed = true;
+        }
+      }
+    }
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+
+  static bool isRequired() { return true; }
 };
 
 struct CollapseSyntheticBlockContinuationCallsPass
@@ -3090,6 +3135,9 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
   if (opts.generic_static_devirtualize) {
     auto add_closed_root_slice_cleanup = [&](llvm::StringRef phase_name) {
       addPhaseMarker(MPM, phase_name);
+      if (!opts.recover_abi) {
+        MPM.addPass(RelaxClosedSliceMustTailMissingBlockPass{});
+      }
       MPM.addPass(MarkClosedRootSliceHelpersForInliningPass());
       MPM.addPass(RepairBeforeInlinePass{});
       MPM.addPass(llvm::AlwaysInlinerPass());

@@ -1177,3 +1177,40 @@ concrete traces, VM-specific emulators, or hardcoded handler semantics.
     - `dispatch_call=0`, `dispatch_jump=0`, `vm_entry=0`
     - `declare_blk=0`, `call_blk=0`, `musttail_blk=0`
     - `missing_block=0`, `missing_block_handler=0`
+
+## March 13, 2026: No-ABI Final `blk_*` Call Collapse
+
+- Implemented an additional no-ABI closed-slice cleanup refinement in
+  `Pipeline.cpp`:
+  - `RelaxClosedSliceMustTailMissingBlockPass`:
+    downgrades `musttail` calls to `__remill_missing_block` in closed-slice
+    `blk_*` helpers during no-ABI cleanup so they can be inlined
+  - widened no-ABI one/two-use inline budgets for closed-slice non-native
+    helpers in `maybeMarkClosedRootSliceHelperForInlining`
+
+- Added focused regression coverage:
+  - `PipelineTest.ClosedSliceNoAbiCleanupCollapsesSingleUseBlkMustTailFallback`
+    validates that a single-use closed-slice `blk_*` helper ending in
+    `musttail __remill_missing_block` gets collapsed (helper call removed)
+
+- Verification:
+  - `cmake --build build-remill --target omill-unit-tests omill-lift --config RelWithDebInfo`
+  - `omill-unit-tests.exe --gtest_filter=PipelineTest.ClosedSliceNoAbiCleanupCollapsesSingleUseBlkMustTailFallback:PipelineTest.AbiPipelineCollapsesNullMemoryBlockContinuationCalls`
+  - `omill-unit-tests.exe --gtest_filter=PipelineTest.*:VirtualMachineModelTest.*:VirtualCFGMaterializationTest.*`
+
+- Compact rerun impact (`omill_current.noabi`):
+  - root slice unchanged and still closed:
+    `reachable=170 frontier=0 closed=true`
+  - still `0` dispatch helpers
+  - still `0` `vm_entry_*`
+  - no-ABI continuation calls now fully collapsed:
+    - `declare_blk=0`
+    - `call_blk=0` (down from `1`)
+    - `musttail_blk=0`
+  - explicit terminal fallbacks remain as expected in no-ABI readability mode:
+    `missing_block=3`, `missing_block_handler=0`
+
+- ABI verification remains clean (`omill_current.verifyabi`):
+  - `dispatch_call=0`, `dispatch_jump=0`, `vm_entry=0`
+  - `declare_blk=0`, `call_blk=0`, `musttail_blk=0`
+  - `missing_block=0`, `missing_block_handler=0`
