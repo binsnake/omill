@@ -209,6 +209,8 @@ static bool isBoundaryFunction(const llvm::Function &F) {
 static bool isLiftedOrHelperSeedFunction(const llvm::Function &F) {
   if (F.isDeclaration())
     return false;
+  if (F.hasFnAttribute("omill.localized_continuation_shim"))
+    return false;
   auto name = F.getName();
   if (name.starts_with("sub_") || name.starts_with("blk_") ||
       name.starts_with("block_")) {
@@ -7297,8 +7299,10 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
         if (!call)
           continue;
         auto *callee = call->getCalledFunction();
-        if (!callee || callee->isDeclaration())
+        if (!callee || callee->isDeclaration() ||
+            callee->hasFnAttribute("omill.localized_continuation_shim")) {
           continue;
+        }
         if (!llvm::is_contained(callees, callee->getName().str()))
           callees.push_back(callee->getName().str());
       }
@@ -7329,6 +7333,8 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
 
   for (auto &F : M) {
     if (F.isDeclaration())
+      continue;
+    if (F.hasFnAttribute("omill.localized_continuation_shim"))
       continue;
     if (!interesting_handlers.empty() &&
         !interesting_handlers.count(F.getName().str())) {

@@ -1101,3 +1101,43 @@ concrete traces, VM-specific emulators, or hardcoded handler semantics.
   - compare the current `localreplayfix1.verifyabi` pipeline shape against the
     earlier `calllocalsame6.verifyabi` shape and isolate which post-closure
     cleanup is no longer collapsing the final `blk_*` chain
+
+## March 13, 2026: ABI Late Continuation-Call Collapse For Null-Memory `blk_*` Stubs
+
+- Implemented a dedicated late ABI cleanup in `Pipeline.cpp`:
+  `CollapseNullMemoryBlockContinuationCallsPass`.
+  It runs in closed-slice scope and rewrites declaration-only synthetic
+  continuation calls of the exact form:
+  `call @blk_<pc>(state, <same pc>, null)`
+  by replacing the call result with the null memory argument and erasing the
+  now-dead call/declaration.
+
+- Placement:
+  - kept one early ABI invocation (after VM-handler inlining)
+  - added a second late invocation after `ResolveIntToPtrCallsPass`, which is
+    where the compact residuals finally stabilize to the null-memory shape
+
+- Added focused coverage:
+  - `PipelineTest.AbiPipelineCollapsesNullMemoryBlockContinuationCalls`
+  - existing continuation-shim tests remain green in
+    `VirtualCFGMaterializationTest`
+
+- Verification:
+  - `cmake --build build-remill --target omill-unit-tests omill-lift --config RelWithDebInfo`
+  - `omill-unit-tests.exe --gtest_filter=PipelineTest.AbiPipelineCollapsesNullMemoryBlockContinuationCalls`
+  - `omill-unit-tests.exe --gtest_filter=PipelineTest.*:VirtualMachineModelTest.*:VirtualCFGMaterializationTest.*`
+
+- Compact rerun (fresh linked binary):
+  - model:
+    `compact_vm_generic_model.contshim11.verifyabi.txt`
+  - IR:
+    `CorpusVMP.compact.vm.block.generic-on.contshim11.verifyabi.ll`
+  - status:
+    - root slice unchanged and still closed:
+      `reachable=170 frontier=0 closed=true`
+    - still `0` `__omill_dispatch_call`
+    - still `0` `__omill_dispatch_jump`
+    - still `0` `vm_entry_*`
+    - now `0` declaration-only `blk_*` continuations
+    - now `0` direct/musttail `blk_*` continuation calls
+    - still `0` `__omill_missing_block_handler`

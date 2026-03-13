@@ -2,6 +2,7 @@
 
 #include <llvm/IR/CFG.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Passes/PassBuilder.h>
@@ -1569,7 +1570,8 @@ TEST_F(VirtualCFGMaterializationTest,
   omill::BinaryMemoryMap map;
   map.setImageBase(0x180000000ULL);
   map.setImageSize(image.size());
-  map.addRegion(0x180000000ULL, image.data(), image.size(), false);
+  map.addRegion(0x180000000ULL, image.data(), image.size(),
+                /*read_only=*/false, /*executable=*/false);
 
   runPass(*M, std::move(map));
 
@@ -2913,6 +2915,176 @@ TEST_F(VirtualCFGMaterializationTest,
 
   EXPECT_EQ(dispatch_calls, 0u);
   EXPECT_EQ(direct_calls, 1u);
+}
+
+TEST_F(VirtualCFGMaterializationTest,
+       SynthesizesLocalizedContinuationShimForSameHandlerLocalizedCallSite) {
+  auto M = createModule();
+  auto *i8_ty = llvm::Type::getInt8Ty(Ctx);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+  auto *calli_ty = llvm::FunctionType::get(
+      ptr_ty, {ptr_ty, ptr_ty, i64_ty, ptr_ty, i64_ty, ptr_ty}, false);
+
+  auto *calli = llvm::Function::Create(
+      calli_ty, llvm::Function::ExternalLinkage,
+      "_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_", *M);
+  auto *continuation = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "blk_18000f013", *M);
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::Function::ExternalLinkage,
+                                      "sub_18000f000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *next_pc = B.CreateAlloca(i64_ty, nullptr, "NEXT_PC");
+    auto *return_pc = B.CreateAlloca(i64_ty, nullptr, "RETURN_PC");
+    B.CreateCall(calli, {root->getArg(2), root->getArg(0),
+                         B.getInt64(0x18000F100ULL), next_pc,
+                         B.getInt64(0x18000F013ULL), return_pc});
+    auto *saved_return_pc = B.CreateLoad(i64_ty, return_pc);
+    auto *state_slot = B.CreateGEP(i8_ty, root->getArg(0), B.getInt64(0x8A8));
+    B.CreateStore(saved_return_pc, state_slot);
+    auto *tail = B.CreateCall(continuation, {root->getArg(0),
+                                             B.getInt64(0x18000F013ULL),
+                                             root->getArg(2)});
+    tail->setTailCallKind(llvm::CallInst::TCK_MustTail);
+    B.CreateRet(tail);
+  }
+
+  std::vector<uint8_t> image(0x2000, 0x90);
+  omill::BinaryMemoryMap map;
+  map.setImageBase(0x18000F000ULL);
+  map.setImageSize(image.size());
+  map.addRegion(0x18000F000ULL, image.data(), image.size(), false,
+                /*executable=*/false);
+
+  runPass(*M, std::move(map));
+
+  auto *continuation_after = M->getFunction("blk_18000f013");
+  ASSERT_NE(continuation_after, nullptr);
+  EXPECT_FALSE(continuation_after->isDeclaration());
+  EXPECT_EQ(continuation_after->getLinkage(),
+            llvm::GlobalValue::InternalLinkage);
+  EXPECT_TRUE(continuation_after->hasFnAttribute("omill.localized_continuation_shim"));
+  EXPECT_TRUE(continuation_after->hasFnAttribute(llvm::Attribute::AlwaysInline));
+
+  auto &entry = continuation_after->getEntryBlock();
+  auto *ret = llvm::dyn_cast<llvm::ReturnInst>(entry.getTerminator());
+  ASSERT_NE(ret, nullptr);
+  ASSERT_NE(ret->getReturnValue(), nullptr);
+  EXPECT_TRUE(llvm::isa<llvm::FreezeInst>(ret->getReturnValue()) ||
+              ret->getReturnValue() == continuation_after->getArg(2));
+}
+
+TEST_F(VirtualCFGMaterializationTest,
+       LeavesContinuationDeclarationForOpenResolvedCallSite) {
+  auto M = createModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+  auto *calli_ty = llvm::FunctionType::get(
+      ptr_ty, {ptr_ty, ptr_ty, i64_ty, ptr_ty, i64_ty, ptr_ty}, false);
+
+  auto *calli = llvm::Function::Create(
+      calli_ty, llvm::Function::ExternalLinkage,
+      "_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_", *M);
+
+  auto *call_target = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "sub_180010080", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", call_target);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(call_target->getArg(0));
+  }
+
+  auto *continuation = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "blk_180010013", *M);
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::Function::ExternalLinkage,
+                                      "sub_180010000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *next_pc = B.CreateAlloca(i64_ty, nullptr, "NEXT_PC");
+    auto *return_pc = B.CreateAlloca(i64_ty, nullptr, "RETURN_PC");
+    auto *seeded_return_pc = B.CreateLoad(i64_ty, return_pc);
+    auto *seeded_target = B.CreateAdd(seeded_return_pc, B.getInt64(0x6D));
+    B.CreateStore(seeded_target, next_pc);
+    auto *target_pc = B.CreateLoad(i64_ty, next_pc);
+    auto *helper_return_pc = B.CreateLoad(i64_ty, return_pc);
+    B.CreateCall(calli, {root->getArg(2), root->getArg(0), target_pc, next_pc,
+                         helper_return_pc, return_pc});
+    auto *call_result = B.CreateCall(
+        call_target,
+        {root->getArg(0), B.getInt64(0x180010080ULL), root->getArg(2)});
+    auto *tail = B.CreateCall(
+        continuation,
+        {root->getArg(0), B.getInt64(0x180010013ULL), call_result});
+    tail->setTailCallKind(llvm::CallInst::TCK_MustTail);
+    B.CreateRet(tail);
+  }
+
+  std::vector<uint8_t> image(0x40000, 0x90);
+  omill::BinaryMemoryMap map;
+  map.setImageBase(0x180000000ULL);
+  map.setImageSize(image.size());
+  map.addRegion(0x180000000ULL, image.data(), image.size(), false);
+
+  runPass(*M, std::move(map));
+
+  auto *continuation_after = M->getFunction("blk_180010013");
+  ASSERT_NE(continuation_after, nullptr);
+  EXPECT_TRUE(continuation_after->isDeclaration());
+  EXPECT_FALSE(
+      continuation_after->hasFnAttribute("omill.localized_continuation_shim"));
+  EXPECT_FALSE(
+      continuation_after->hasFnAttribute(llvm::Attribute::AlwaysInline));
+}
+
+TEST_F(VirtualCFGMaterializationTest,
+       SynthesizesContinuationShimForNullMemoryContinuationCall) {
+  auto M = createModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+
+  auto *continuation = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "blk_18000f005", *M);
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::Function::ExternalLinkage,
+                                      "sub_18000f000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *tail = B.CreateCall(
+        continuation,
+        {root->getArg(0), B.getInt64(0x18000F005ULL),
+         llvm::ConstantPointerNull::get(ptr_ty)});
+    B.CreateRet(tail);
+  }
+
+  runPass(*M);
+
+  auto *continuation_after = M->getFunction("blk_18000f005");
+  ASSERT_NE(continuation_after, nullptr);
+  EXPECT_FALSE(continuation_after->isDeclaration());
+  EXPECT_EQ(continuation_after->getLinkage(),
+            llvm::GlobalValue::InternalLinkage);
+  EXPECT_TRUE(
+      continuation_after->hasFnAttribute("omill.localized_continuation_shim"));
+  EXPECT_TRUE(
+      continuation_after->hasFnAttribute(llvm::Attribute::AlwaysInline));
 }
 
 TEST_F(VirtualCFGMaterializationTest,

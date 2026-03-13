@@ -896,6 +896,73 @@ TEST_F(PipelineTest,
   EXPECT_EQ(M->getFunction("blk_401030_native"), nullptr);
 }
 
+TEST_F(PipelineTest, AbiPipelineCollapsesNullMemoryBlockContinuationCalls) {
+  auto M = createModule();
+  M->addModuleFlag(llvm::Module::Override, "omill.closed_root_slice_scope", 1u);
+
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *lifted_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+
+  auto *continuation = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage, "blk_401005", *M);
+
+  auto *root = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage, "sub_401000_native", *M);
+  root->addFnAttr("omill.closed_root_slice", "1");
+  root->addFnAttr("omill.closed_root_slice_root", "1");
+  root->deleteBody();
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *call = B.CreateCall(
+        continuation,
+        {root->getArg(0), B.getInt64(0x401005ULL),
+         llvm::ConstantPointerNull::get(ptr_ty)});
+    B.CreateRet(call);
+  }
+
+  setEnv("OMILL_SKIP_ABI_RECOVER_SIGNATURES", "1");
+  setEnv("OMILL_SKIP_ABI_ALWAYS_INLINE", "1");
+  setEnv("OMILL_SKIP_ABI_REWRITE_LIFTED_LATE", "1");
+  setEnv("OMILL_SKIP_ABI_DEAD_STATE_STORE_DSE", "1");
+  setEnv("OMILL_SKIP_ABI_SROA", "1");
+  setEnv("OMILL_SKIP_ABI_FINAL_OPT", "1");
+  setEnv("OMILL_SKIP_ABI_INLINE_VM_HANDLERS", "1");
+  setEnv("OMILL_SKIP_POST_ABI_INLINE", "1");
+
+  llvm::ModulePassManager MPM;
+  omill::PipelineOptions opts;
+  omill::buildABIRecoveryPipeline(MPM, opts);
+  runMPM(MPM, *M);
+
+  unsetEnv("OMILL_SKIP_ABI_RECOVER_SIGNATURES");
+  unsetEnv("OMILL_SKIP_ABI_ALWAYS_INLINE");
+  unsetEnv("OMILL_SKIP_ABI_REWRITE_LIFTED_LATE");
+  unsetEnv("OMILL_SKIP_ABI_DEAD_STATE_STORE_DSE");
+  unsetEnv("OMILL_SKIP_ABI_SROA");
+  unsetEnv("OMILL_SKIP_ABI_FINAL_OPT");
+  unsetEnv("OMILL_SKIP_ABI_INLINE_VM_HANDLERS");
+  unsetEnv("OMILL_SKIP_POST_ABI_INLINE");
+
+  auto *root_after = M->getFunction("sub_401000_native");
+  ASSERT_NE(root_after, nullptr);
+  bool still_calls_continuation = false;
+  for (auto &BB : *root_after) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *callee = CI->getCalledFunction();
+      if (callee && callee->getName() == "blk_401005")
+        still_calls_continuation = true;
+    }
+  }
+  EXPECT_FALSE(still_calls_continuation);
+  EXPECT_EQ(M->getFunction("blk_401005"), nullptr);
+}
+
 // ===----------------------------------------------------------------------===
 // GlobalDCE removes dead internalized functions
 // ===----------------------------------------------------------------------===

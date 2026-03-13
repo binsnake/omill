@@ -72,6 +72,69 @@ static bool isBoundaryFunctionName(llvm::StringRef name) {
   return name.starts_with("vm_entry_");
 }
 
+static bool exprReferencesNamedSlot(const VirtualMachineModel &model,
+                                    const VirtualValueExpr &expr,
+                                    llvm::StringRef slot_name) {
+  if (expr.kind == VirtualExprKind::kStateSlot) {
+    if (expr.state_base_name.has_value() && *expr.state_base_name == slot_name)
+      return true;
+    if (expr.slot_id.has_value()) {
+      if (const auto *slot = model.lookupSlot(*expr.slot_id);
+          slot && slot->base_name == slot_name) {
+        return true;
+      }
+    }
+  }
+  if (expr.kind == VirtualExprKind::kStackCell &&
+      expr.state_base_name.has_value() &&
+      *expr.state_base_name == slot_name) {
+    return true;
+  }
+  return llvm::any_of(expr.operands, [&](const VirtualValueExpr &operand) {
+    return exprReferencesNamedSlot(model, operand, slot_name);
+  });
+}
+
+static bool isSemanticallyLocalizedCallsite(
+    const VirtualMachineModel &model, const VirtualHandlerSummary &handler,
+    const VirtualCallSiteSummary &callsite,
+    const std::map<std::string, const VirtualHandlerSummary *> &handler_by_name) {
+  if (!callsite.continuation_pc.has_value())
+    return false;
+
+  bool has_lifted_direct_callee = llvm::any_of(
+      handler.direct_callees, [&](const std::string &callee_name) {
+        auto it = handler_by_name.find(callee_name);
+        return it != handler_by_name.end() && it->second->entry_va.has_value();
+      });
+
+  bool has_same_handler_localized_continuation = false;
+  if (handler.dispatches.empty()) {
+    auto is_localized_expr = [&](const VirtualValueExpr &expr) {
+      return exprReferencesNamedSlot(model, expr, "RETURN_PC") ||
+             (expr.kind == VirtualExprKind::kConstant &&
+              expr.constant.has_value() &&
+              *expr.constant == *callsite.continuation_pc);
+    };
+
+    has_same_handler_localized_continuation =
+        llvm::any_of(handler.outgoing_facts, [&](const VirtualSlotFact &fact) {
+          return is_localized_expr(fact.value);
+        }) ||
+        llvm::any_of(handler.outgoing_stack_facts,
+                     [&](const VirtualStackFact &fact) {
+                       return is_localized_expr(fact.value);
+                     });
+  }
+
+  if (!has_lifted_direct_callee && !has_same_handler_localized_continuation)
+    return false;
+
+  return callsite.unresolved_reason == "call_target_not_executable" ||
+         callsite.unresolved_reason == "call_target_undecodable" ||
+         callsite.unresolved_reason == "call_target_mid_instruction";
+}
+
 static const VirtualHandlerSummary *lookupHandlerByVA(const VirtualMachineModel &model,
                                                       uint64_t entry_va) {
   for (const auto &handler : model.handlers()) {
@@ -118,6 +181,20 @@ static bool isTerminalMissingBlockStub(const llvm::Function &F) {
 
 static bool isSyntheticBlockLikeFunctionName(llvm::StringRef name) {
   return name.starts_with("blk_") || name.starts_with("block_");
+}
+
+static uint64_t extractSyntheticBlockLikePC(llvm::StringRef name) {
+  if (name.starts_with("blk_"))
+    name = name.drop_front(4);
+  else if (name.starts_with("block_"))
+    name = name.drop_front(6);
+  else
+    return 0;
+
+  uint64_t pc = 0;
+  if (name.getAsInteger(16, pc))
+    return 0;
+  return pc;
 }
 
 static std::optional<unsigned> lookupProgramCounterOffset(llvm::Module &M) {
@@ -1223,6 +1300,138 @@ static bool shouldAttemptLiftFrontier(
   return false;
 }
 
+static bool synthesizeLocalizedContinuationShims(
+    llvm::Module &M, const VirtualMachineModel &model,
+    llvm::SmallVectorImpl<std::string> *diagnostics,
+    llvm::SmallPtrSetImpl<llvm::Function *> &changed_functions) {
+  std::map<std::string, const VirtualHandlerSummary *> handler_by_name;
+  for (const auto &handler : model.handlers())
+    handler_by_name.emplace(handler.function_name, &handler);
+
+  std::set<std::string> closed_handlers;
+  for (const auto &slice : model.rootSlices()) {
+    if (!slice.is_closed)
+      continue;
+    closed_handlers.insert(slice.reachable_handler_names.begin(),
+                           slice.reachable_handler_names.end());
+  }
+  if (closed_handlers.empty())
+    return false;
+
+  bool changed = false;
+
+  auto materialize_shim_body = [&](llvm::Function &continuation,
+                                   llvm::StringRef reason) {
+    continuation.setLinkage(llvm::GlobalValue::InternalLinkage);
+    continuation.addFnAttr(llvm::Attribute::AlwaysInline);
+    continuation.addFnAttr("omill.localized_continuation_shim", "1");
+
+    auto *entry =
+        llvm::BasicBlock::Create(M.getContext(), "entry", &continuation);
+    llvm::IRBuilder<> B(entry);
+
+    if (continuation.getReturnType()->isVoidTy()) {
+      B.CreateRetVoid();
+    } else {
+      llvm::Value *result = nullptr;
+      if (continuation.arg_size() >= 3) {
+        auto arg_it = continuation.arg_begin();
+        std::advance(arg_it, 2);
+        result = &*arg_it;
+      }
+      if (!result || result->getType() != continuation.getReturnType()) {
+        result = llvm::UndefValue::get(continuation.getReturnType());
+      } else if (result->getType()->isFirstClassType()) {
+        result = B.CreateFreeze(result);
+      }
+      B.CreateRet(result);
+    }
+
+    changed_functions.insert(&continuation);
+    changed = true;
+    if (diagnostics) {
+      diagnostics->push_back("localized-continuation-shim fn=" +
+                             continuation.getName().str() +
+                             " reason=" + reason.str());
+    }
+  };
+  for (const auto &handler : model.handlers()) {
+    if (closed_handlers.find(handler.function_name) == closed_handlers.end())
+      continue;
+
+    for (const auto &callsite : handler.callsites) {
+      if (!callsite.continuation_pc.has_value())
+        continue;
+
+      auto *continuation =
+          lookupLiftedTargetByPC(M, *callsite.continuation_pc);
+      if (!continuation || !continuation->isDeclaration())
+        continue;
+
+      bool should_synthesize =
+          isSemanticallyLocalizedCallsite(model, handler, callsite,
+                                         handler_by_name) ||
+          ((callsite.resolved_target_pc.has_value() ||
+            callsite.target_function_name.has_value() ||
+            callsite.recovered_target_function_name.has_value()) &&
+           (!callsite.return_slot_facts.empty() ||
+            !callsite.return_stack_facts.empty()));
+      if (!should_synthesize)
+        continue;
+
+      materialize_shim_body(*continuation, "callsite");
+    }
+  }
+
+  auto isNullMemoryContinuationCall = [&](const llvm::CallInst &call,
+                                          uint64_t continuation_pc) {
+    if (call.arg_size() < 3)
+      return false;
+
+    auto *pc_arg = llvm::dyn_cast<llvm::ConstantInt>(call.getArgOperand(1));
+    if (!pc_arg || pc_arg->getZExtValue() != continuation_pc)
+      return false;
+
+    auto *memory_arg = call.getArgOperand(2);
+    auto *memory_const = llvm::dyn_cast<llvm::Constant>(memory_arg);
+    return memory_const && memory_const->isNullValue();
+  };
+
+  for (auto &caller : M) {
+    if (caller.isDeclaration())
+      continue;
+    if (closed_handlers.find(caller.getName().str()) == closed_handlers.end())
+      continue;
+
+    for (auto &BB : caller) {
+      for (auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+        if (!call)
+          continue;
+
+        auto *callee = call->getCalledFunction();
+        if (!callee || !callee->isDeclaration())
+          continue;
+
+        auto callee_name = callee->getName();
+        if (!isSyntheticBlockLikeFunctionName(callee_name))
+          continue;
+
+        uint64_t continuation_pc = extractSyntheticBlockLikePC(callee_name);
+        if (!continuation_pc)
+          continue;
+
+        if (!isNullMemoryContinuationCall(*call, continuation_pc))
+          continue;
+
+        materialize_shim_body(*callee, "null-memory-continuation-call");
+      }
+    }
+  }
+
+  return changed;
+}
+
 static void annotateClosedRootSlices(llvm::Module &M,
                                      const VirtualMachineModel &model) {
   for (auto &F : M) {
@@ -1311,6 +1520,14 @@ static MaterializationResult runMaterialization(llvm::Module &M,
                                      result.changed_functions)) {
       genericDebugLog("iteration " + llvm::Twine(iteration).str() +
                       " specialize-changed");
+      result.changed = true;
+      continue;
+    }
+
+    if (synthesizeLocalizedContinuationShims(
+            M, final_model, &result.diagnostics, result.changed_functions)) {
+      genericDebugLog("iteration " + llvm::Twine(iteration).str() +
+                      " localized-continuation-shims");
       result.changed = true;
       continue;
     }
