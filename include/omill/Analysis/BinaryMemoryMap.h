@@ -46,8 +46,10 @@ class BinaryMemoryMap {
   /// Add a memory region from the original binary.
   /// `read_only` marks regions whose bytes are immutable at runtime and are
   /// therefore safe sources for absolute-address constant folding.
+  /// `executable` marks regions that can legitimately contain instruction
+  /// entry points for control-transfer recovery.
   void addRegion(uint64_t base, const uint8_t *data, size_t size,
-                 bool read_only);
+                 bool read_only, bool executable = true);
 
   /// Remove a previously-added region by its base address.
   /// Used to swap per-clone vmcontext snapshots during sequential processing.
@@ -69,6 +71,10 @@ class BinaryMemoryMap {
   /// Return true when the byte range [addr, addr+size) lies within a region
   /// that is immutable at runtime.
   bool isReadOnly(uint64_t addr, unsigned size) const;
+
+  /// Return true when the byte range [addr, addr+size) lies within a region
+  /// that is executable at runtime.
+  bool isExecutable(uint64_t addr, unsigned size) const;
 
   /// Register a base relocation entry from the PE .reloc section.
   void addRelocation(uint64_t va, uint8_t size);
@@ -121,6 +127,7 @@ class BinaryMemoryMap {
     const uint8_t *data;
     size_t size;
     bool read_only;
+    bool executable;
   };
 
   llvm::SmallVector<Region, 4> regions_;

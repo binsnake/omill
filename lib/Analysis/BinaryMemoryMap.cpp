@@ -8,8 +8,9 @@ namespace omill {
 llvm::AnalysisKey BinaryMemoryAnalysis::Key;
 
 void BinaryMemoryMap::addRegion(uint64_t base, const uint8_t *data,
-                                size_t size, bool read_only) {
-  Region r{base, data, size, read_only};
+                                size_t size, bool read_only,
+                                bool executable) {
+  Region r{base, data, size, read_only, executable};
   auto it = std::lower_bound(
       regions_.begin(), regions_.end(), r,
       [](const Region &a, const Region &b) { return a.base < b.base; });
@@ -79,6 +80,22 @@ bool BinaryMemoryMap::isReadOnly(uint64_t addr, unsigned size) const {
     return false;
 
   return it->read_only;
+}
+
+bool BinaryMemoryMap::isExecutable(uint64_t addr, unsigned size) const {
+  auto it = std::upper_bound(
+      regions_.begin(), regions_.end(), addr,
+      [](uint64_t a, const Region &r) { return a < r.base; });
+
+  if (it == regions_.begin())
+    return false;
+  --it;
+
+  uint64_t offset = addr - it->base;
+  if (offset + size > it->size)
+    return false;
+
+  return it->executable;
 }
 
 void BinaryMemoryMap::addRelocation(uint64_t va, uint8_t size) {

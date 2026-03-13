@@ -5,6 +5,7 @@ add_library(omill STATIC
   # Utils
   Utils/IntrinsicTable.cpp
   Utils/LiftedNames.cpp
+  Utils/ProtectedBoundaryUtils.cpp
   Utils/StateFieldMap.cpp
   Tools/LiftRunContract.cpp
 
@@ -12,8 +13,10 @@ add_library(omill STATIC
   Analysis/TargetArchAnalysis.cpp
   Analysis/CallGraphAnalysis.cpp
   Analysis/LiftedFunctionMap.cpp
+  Analysis/IterativeLiftingSession.cpp
   Analysis/RemillIntrinsicAnalysis.cpp
   Analysis/StateFieldAccessAnalysis.cpp
+  Analysis/VirtualMachineModel.cpp
   Analysis/ExceptionInfo.cpp
   Analysis/SegmentsAA.cpp
   Analysis/VirtualCalleeRegistry.cpp
@@ -78,6 +81,7 @@ add_library(omill STATIC
   Passes/CollapseRemillSHRSwitch.cpp
   Passes/RecoverAllocaPointers.cpp
   Passes/TypeRecovery.cpp
+  Passes/VirtualCFGMaterialization.cpp
   Passes/VMHandlerInliner.cpp
   Passes/IterativeBlockDiscovery.cpp
   Passes/MergeBlockFunctions.cpp

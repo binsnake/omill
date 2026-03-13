@@ -76,6 +76,15 @@ bool collectDynamicDispatchOffsets(
   return ret_offset.has_value();
 }
 
+std::optional<uint64_t> parseBlockAddrFromName(llvm::StringRef name) {
+  if (!name.starts_with("blk_"))
+    return std::nullopt;
+  uint64_t addr = 0;
+  if (name.drop_front(4).getAsInteger(16, addr))
+    return std::nullopt;
+  return addr;
+}
+
 ArchABI getModuleArchABI(llvm::Module &M) {
   TargetArch arch = TargetArch::kX86_64;
   std::string os = "windows";
@@ -92,6 +101,12 @@ ArchABI getModuleArchABI(llvm::Module &M) {
   }
 
   return ArchABI::get(arch, os);
+}
+
+bool shouldRewriteClosedRootSliceFunction(const llvm::Function &F) {
+  if (!isClosedRootSliceScopedModule(*F.getParent()))
+    return true;
+  return isClosedRootSliceFunction(F);
 }
 
 llvm::Value *normalizeJumpTargetPC(llvm::IRBuilder<> &Builder,
@@ -215,6 +230,16 @@ llvm::Function *resolveToDefinition(llvm::Function *callee,
       return lifted.lookup(va);
   }
 
+  if (auto va = parseBlockAddrFromName(callee->getName())) {
+    if (auto *merged = lifted.lookup(*va))
+      return merged;
+    std::string merged_name = "sub_" + llvm::Twine::utohexstr(*va).str();
+    if (auto *merged = callee->getParent()->getFunction(merged_name)) {
+      if (isLiftedFunction(*merged))
+        return merged;
+    }
+  }
+
   return nullptr;
 }
 
@@ -241,7 +266,9 @@ void collectCandidates(llvm::Function &F, const LiftedFunctionMap &lifted,
       if (!callee) continue;
 
       // Pattern A: direct call to lifted function (defined or declaration).
-      if (call->arg_size() >= 1 && callee->getName().starts_with("sub_")) {
+      if (call->arg_size() >= 1 &&
+          (callee->getName().starts_with("sub_") ||
+           callee->getName().starts_with("blk_"))) {
         auto *def = resolveToDefinition(callee, lifted);
         if (def) {
           // Leaf functions: don't rewrite — let AlwaysInlinerPass inline them
@@ -345,6 +372,8 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
 
   for (auto &F : M) {
     if (F.isDeclaration()) continue;
+    if (!shouldRewriteClosedRootSliceFunction(F))
+      continue;
 
     llvm::SmallVector<RewriteCandidate, 8> candidates;
     collectCandidates(F, lifted, non_leaf_set, candidates);

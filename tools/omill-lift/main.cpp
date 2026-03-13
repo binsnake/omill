@@ -8,7 +8,6 @@
 #include <llvm/BinaryFormat/COFF.h>
 #include <llvm/BinaryFormat/Magic.h>
 #include <llvm/BinaryFormat/MachO.h>
-#include <llvm/Linker/Linker.h>
 #include <llvm/Object/COFF.h>
 #include <llvm/Object/MachO.h>
 #include <llvm/Object/MachOUniversal.h>
@@ -52,22 +51,33 @@
 #include "omill/Analysis/CallingConventionAnalysis.h"
 #include "omill/Analysis/CallGraphAnalysis.h"
 #include "omill/Analysis/ExceptionInfo.h"
+#include "omill/Analysis/IterativeLiftingSession.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
+#include "omill/Analysis/VirtualMachineModel.h"
 #include "omill/Analysis/VMTraceEmulator.h"
 #include "omill/Analysis/VMTraceMap.h"
 #include "omill/Analysis/VirtualCalleeRegistry.h"
 #include "omill/Omill.h"
 #include "omill/Tools/LiftRunContract.h"
 #include "omill/Utils/LiftedNames.h"
+#include "omill/Utils/ProtectedBoundaryUtils.h"
 #include "omill/Utils/StateFieldMap.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <optional>
 #include <vector>
+
+#if __has_include(<glog/logging.h>)
+#include <glog/logging.h>
+#define OMILL_LIFT_HAS_GLOG 1
+#else
+#define OMILL_LIFT_HAS_GLOG 0
+#endif
 
 using namespace llvm;
 
@@ -117,6 +127,84 @@ static void repairMalformedPHIs(Module &M) {
           phi->eraseFromParent();
         }
       }
+    }
+  }
+}
+
+static bool wantIterativeSessionReport() {
+  const char *env = std::getenv("OMILL_REPORT_ITERATIVE_SESSION");
+  if (!env || env[0] == '\0')
+    return false;
+  return !(env[0] == '0' && env[1] == '\0');
+}
+
+static const char *edgeKindName(omill::LiftEdgeKind kind) {
+  switch (kind) {
+    case omill::LiftEdgeKind::kDirectBranch:
+      return "direct-branch";
+    case omill::LiftEdgeKind::kDirectCall:
+      return "direct-call";
+    case omill::LiftEdgeKind::kIndirectBranch:
+      return "indirect-branch";
+    case omill::LiftEdgeKind::kIndirectCall:
+      return "indirect-call";
+    case omill::LiftEdgeKind::kReturn:
+      return "return";
+    case omill::LiftEdgeKind::kVmTrace:
+      return "vm-trace";
+  }
+  return "unknown";
+}
+
+static void emitIterativeSessionReport(
+    const std::shared_ptr<omill::IterativeLiftingSession> &session) {
+  if (!session || !wantIterativeSessionReport())
+    return;
+
+  errs() << "Iterative session report [" << session->name() << "]\n";
+  errs() << "  nodes=" << session->graph().nodeCount()
+         << " edges=" << session->graph().edgeCount()
+         << " unresolved_edges=" << session->graph().unresolvedEdgeCount()
+         << " dirty_nodes=" << session->graph().dirtyNodes().size() << "\n";
+
+  for (const auto &round : session->roundSummaries()) {
+    errs() << "  round[" << round.pipeline << "#" << round.iteration << "] "
+           << "dirty=" << round.dirty_functions
+           << "->" << round.dirty_functions_after
+           << " affected=" << round.affected_functions
+           << " optimized=" << round.optimized_functions
+           << " unresolved=" << round.unresolved_before << "->"
+           << round.unresolved_after
+           << " new_targets=" << round.new_targets
+           << " pending=" << round.pending_targets
+           << " total=" << round.total_ms << "ms"
+           << " opt=" << round.optimize_ms << "ms"
+           << " resolve=" << round.resolve_ms << "ms"
+           << " ipcp=" << round.ipcp_ms << "ms"
+           << " lift=" << round.lift_ms << "ms"
+           << " lower=" << round.lower_ms << "ms"
+           << " inline=" << round.inline_ms << "ms"
+           << " reverse_inline=" << round.reverse_inline_ms << "ms"
+           << " ipcp=" << (round.ipcp_changed ? "yes" : "no")
+           << " lifted=" << (round.lifted_new ? "yes" : "no");
+    if (round.stalled) {
+      errs() << " stalled(dynamic=" << round.dynamic_unresolved
+             << ", missing=" << round.missing_targets
+             << ", blocked=" << round.blocked_unresolved << ")";
+    }
+    errs() << "\n";
+  }
+
+  auto unresolved = session->graph().unresolvedEdges();
+  if (!unresolved.empty()) {
+    errs() << "  unresolved edges:\n";
+    for (const auto *edge : unresolved) {
+      errs() << "    0x" << Twine::utohexstr(edge->source_pc) << " -> ";
+      if (edge->target_pc != 0)
+        errs() << "0x" << Twine::utohexstr(edge->target_pc);
+      else
+        errs() << "<dynamic>";
+      errs() << " [" << edgeKindName(edge->kind) << "]\n";
     }
   }
 }
@@ -268,7 +356,85 @@ static cl::opt<std::string> EventDetail(
     cl::desc("Event granularity: basic|detailed"),
     cl::init("basic"));
 
+static cl::opt<bool> VerboseRemillLogs(
+    "verbose-remill-logs",
+    cl::desc("Keep verbose Remill/GLOG startup diagnostics enabled"),
+    cl::init(false));
+
+static cl::opt<bool> GenericStaticDevirtualize(
+    "generic-static-devirtualize",
+    cl::desc("Enable generic static devirtualization materialization"),
+    cl::init(false));
+
+static cl::opt<bool> VerifyGenericStaticDevirtualization(
+    "verify-generic-static-devirtualization",
+    cl::desc("Validate generic static devirtualization rewrites when supported"),
+    cl::init(false));
+
+static cl::opt<std::string> DumpVirtualModel(
+    "dump-virtual-model",
+    cl::desc("Dump generic virtual-machine model/materialization diagnostics"),
+    cl::init(""));
+
 namespace {
+
+std::optional<bool> parseBoolEnv(const char *name) {
+  const char *v = std::getenv(name);
+  if (!v || v[0] == '\0')
+    return std::nullopt;
+  if ((v[0] == '1' && v[1] == '\0') ||
+      (v[0] == 't' && v[1] == '\0') ||
+      (v[0] == 'T' && v[1] == '\0'))
+    return true;
+  if ((v[0] == '0' && v[1] == '\0') ||
+      (v[0] == 'f' && v[1] == '\0') ||
+      (v[0] == 'F' && v[1] == '\0'))
+    return false;
+  return std::nullopt;
+}
+
+void setEnvIfUnset(const char *name, const char *value) {
+  const char *cur = std::getenv(name);
+  if (cur && cur[0] != '\0')
+    return;
+#if defined(_WIN32)
+  _putenv_s(name, value);
+#else
+  setenv(name, value, 0);
+#endif
+}
+
+bool wantVerboseDriverLogs() {
+  if (VerboseRemillLogs)
+    return true;
+  if (auto v = parseBoolEnv("OMILL_VERBOSE_LOGS"); v.has_value())
+    return *v;
+  if (auto v = parseBoolEnv("OMILL_VERBOSE_REMILL_LOGS"); v.has_value())
+    return *v;
+  return false;
+}
+
+void configureDriverLogging(const char *argv0) {
+#if OMILL_LIFT_HAS_GLOG
+  static bool glog_inited = false;
+  if (!glog_inited) {
+    google::InitGoogleLogging(argv0);
+    glog_inited = true;
+  }
+#endif
+
+  if (wantVerboseDriverLogs())
+    return;
+
+  setEnvIfUnset("GLOG_minloglevel", "2");
+  setEnvIfUnset("GLOG_stderrthreshold", "3");
+#if OMILL_LIFT_HAS_GLOG
+  if (FLAGS_minloglevel < 2)
+    FLAGS_minloglevel = 2;
+  if (FLAGS_stderrthreshold < 3)
+    FLAGS_stderrthreshold = 3;
+#endif
+}
 
 class LiftEventLogger {
  public:
@@ -396,6 +562,49 @@ class LiftEventLogger {
   std::unique_ptr<raw_fd_ostream> file_;
 };
 
+static void emitIterativeSessionEvents(
+    LiftEventLogger &events,
+    const std::shared_ptr<omill::IterativeLiftingSession> &session,
+    llvm::StringRef stage) {
+  if (!events.enabled() || !events.detailed() || !session)
+    return;
+
+  for (const auto &round : session->roundSummaries()) {
+    events.emitInfo(
+        "iterative_round", "iterative resolution round",
+        {{"stage", stage.str()},
+         {"pipeline", round.pipeline},
+         {"iteration", static_cast<int64_t>(round.iteration)},
+         {"dirty_before", static_cast<int64_t>(round.dirty_functions)},
+         {"dirty_after", static_cast<int64_t>(round.dirty_functions_after)},
+         {"affected_functions",
+          static_cast<int64_t>(round.affected_functions)},
+         {"optimized_functions",
+          static_cast<int64_t>(round.optimized_functions)},
+         {"unresolved_before",
+          static_cast<int64_t>(round.unresolved_before)},
+         {"unresolved_after", static_cast<int64_t>(round.unresolved_after)},
+         {"new_targets", static_cast<int64_t>(round.new_targets)},
+         {"pending_targets", static_cast<int64_t>(round.pending_targets)},
+         {"dynamic_unresolved",
+          static_cast<int64_t>(round.dynamic_unresolved)},
+         {"missing_targets", static_cast<int64_t>(round.missing_targets)},
+         {"blocked_unresolved", static_cast<int64_t>(round.blocked_unresolved)},
+         {"total_ms", static_cast<int64_t>(round.total_ms)},
+         {"optimize_ms", static_cast<int64_t>(round.optimize_ms)},
+         {"resolve_ms", static_cast<int64_t>(round.resolve_ms)},
+         {"ipcp_ms", static_cast<int64_t>(round.ipcp_ms)},
+         {"lift_ms", static_cast<int64_t>(round.lift_ms)},
+         {"lower_ms", static_cast<int64_t>(round.lower_ms)},
+         {"inline_ms", static_cast<int64_t>(round.inline_ms)},
+         {"reverse_inline_ms",
+          static_cast<int64_t>(round.reverse_inline_ms)},
+         {"ipcp_changed", round.ipcp_changed},
+         {"lifted_new", round.lifted_new},
+         {"stalled", round.stalled}});
+  }
+}
+
 /// In-memory trace manager for remill lifting.
 class BufferTraceManager : public omill::TraceManager {
  public:
@@ -480,6 +689,8 @@ class BufferTraceManager : public omill::TraceManager {
 /// In-memory block manager for block-lifting mode.
 class BufferBlockManager : public omill::BlockManager {
  public:
+  void setModule(llvm::Module *module) { module_ = module; }
+
   void setCode(const uint8_t *data, size_t size, uint64_t base) {
     code_[base] = {data, data + size};
   }
@@ -508,9 +719,12 @@ class BufferBlockManager : public omill::BlockManager {
     return false;
   }
 
+  llvm::Module *GetLiftedBlockModule() override { return module_; }
+
  private:
   std::map<uint64_t, std::vector<uint8_t>> code_;
   std::map<uint64_t, llvm::Function *> blocks_;
+  llvm::Module *module_ = nullptr;
 };
 
 struct SectionInfo {
@@ -751,7 +965,12 @@ bool loadPE(StringRef path, PEInfo &out) {
     bool read_only = true;
     if (coff_sec && (coff_sec->Characteristics & COFF::IMAGE_SCN_MEM_WRITE))
       read_only = false;
-    out.memory_map.addRegion(va, stored.data(), stored.size(), read_only);
+    bool executable = coff_sec &&
+                      (coff_sec->Characteristics &
+                       (COFF::IMAGE_SCN_CNT_CODE |
+                        COFF::IMAGE_SCN_MEM_EXECUTE));
+    out.memory_map.addRegion(va, stored.data(), stored.size(), read_only,
+                             executable);
 
     // Track all executable sections for the trace manager.
     Expected<StringRef> name_or = sec.getName();
@@ -862,8 +1081,10 @@ static void parseMachOContents(object::MachOObjectFile &macho,
     std::string seg_name =
         macho.getSectionFinalSegmentName(sec.getRawDataRefImpl()).str();
     bool read_only = !llvm::StringRef(seg_name).starts_with("__DATA");
-    out.memory_map.addRegion(va, stored.data(), stored.size(), read_only);
-    if (sec.isText() || section_name == "__stubs") {
+    bool executable = sec.isText() || section_name == "__stubs";
+    out.memory_map.addRegion(va, stored.data(), stored.size(), read_only,
+                             executable);
+    if (executable) {
       out.code_sections.push_back(
           {va, stored.size(), idx, seg_name, section_name});
     }
@@ -1283,6 +1504,7 @@ int main(int argc, char **argv) {
   InitLLVM X(argc, argv);
   cl::ParseCommandLineOptions(argc, argv,
       "omill-lift: Lift a function from a PE/Mach-O binary and optimize\n");
+  configureDriverLogging(argv[0]);
 
   LiftEventLogger events;
   if (!events.init(EventJSONL, EventDetail, InputFilename))
@@ -1572,6 +1794,33 @@ int main(int argc, char **argv) {
 
   // Lift
   omill::TraceLifter lifter(arch.get(), manager);
+  auto iterative_session =
+      std::make_shared<omill::IterativeLiftingSession>("omill-lift");
+  iterative_session->setBlockLiftingEnabled(BlockLift);
+
+  std::unique_ptr<BufferBlockManager> block_manager;
+  std::unique_ptr<omill::BlockLifter> block_lifter;
+  if (BlockLift) {
+    block_manager = std::make_unique<BufferBlockManager>();
+    block_manager->setModule(module.get());
+    if (RawBinary) {
+      block_manager->setCode(raw_code.data(), raw_code.size(), BaseAddress);
+    } else {
+      for (auto &sec : pe.code_sections) {
+        auto &data = pe.section_storage[sec.storage_index];
+        block_manager->setCode(data.data(), data.size(), sec.va);
+      }
+    }
+    block_lifter =
+        std::make_unique<omill::BlockLifter>(arch.get(), *block_manager);
+  }
+
+  if (!batch_vas.empty()) {
+    for (uint64_t va : batch_vas)
+      iterative_session->queueTarget(va);
+  } else if (func_va != 0) {
+    iterative_session->queueTarget(func_va);
+  }
   events.emitInfo("lifting_started", "lifting started");
 
   auto tagOutputRoot = [&](uint64_t va) {
@@ -1589,6 +1838,11 @@ int main(int argc, char **argv) {
         }
       }
     }
+    std::string block_name = "blk_" + llvm::Twine::utohexstr(va).str();
+    if (auto *fn = module->getFunction(block_name)) {
+      if (!fn->isDeclaration())
+        fn->addFnAttr("omill.output_root");
+    }
   };
 
   // Wrapper VAs detected during auto-detection (thunk_va, wrapper_va).
@@ -1602,10 +1856,18 @@ int main(int argc, char **argv) {
         events.emitInfo("lift_target_started", "lifting target",
                         {{"va", ("0x" + Twine::utohexstr(va)).str()}});
       }
-      if (lifter.Lift(va))
+      bool ok = false;
+      if (BlockLift && !vm_mode && block_lifter) {
+        ok = block_lifter->LiftReachable(va) > 0;
+      } else {
+        ok = lifter.Lift(va);
+      }
+      if (ok) {
+        iterative_session->noteLiftedTarget(va);
         ++lifted;
-      else
+      } else {
         ++failed;
+      }
     }
     errs() << "Batch lift: " << lifted << " succeeded, "
            << failed << " failed\n";
@@ -1620,6 +1882,15 @@ int main(int argc, char **argv) {
       tagOutputRoot(va);
   } else {
     // Single-function lifting mode.
+    if (BlockLift && !vm_mode && block_lifter) {
+      if (block_lifter->LiftReachable(func_va) == 0) {
+        errs() << "BlockLifter::LiftReachable() failed\n";
+        return fail(1, "block lifter failed");
+      }
+      iterative_session->noteLiftedTarget(func_va);
+      tagOutputRoot(func_va);
+      errs() << "Block-lifting initial reachable blocks complete\n";
+    } else {
     // If available, lift the handler first so Remill reuses a canonical
     // sub_<va> function instead of creating a late duplicate (sub_<va>.1).
     uint64_t auto_handler_va = 0;
@@ -1640,6 +1911,8 @@ int main(int argc, char **argv) {
                << Twine::utohexstr(auto_handler_va) << "\n";
         events.emitWarn("lift_handler_failed", "failed to lift exception handler",
                         {{"va", ("0x" + Twine::utohexstr(auto_handler_va)).str()}});
+      } else {
+        iterative_session->noteLiftedTarget(auto_handler_va);
       }
     }
 
@@ -1647,7 +1920,9 @@ int main(int argc, char **argv) {
       errs() << "TraceLifter::Lift() failed\n";
       return fail(1, "trace lifter failed");
     }
+    iterative_session->noteLiftedTarget(func_va);
     tagOutputRoot(func_va);
+    }
 
     // Auto-detect VM wrappers when --vm-wrapper is not specified.
     // DriverEntry (or similar outer function) calls thunks (E9 jmp) that
@@ -2530,6 +2805,58 @@ int main(int argc, char **argv) {
   TimePassesHandler TimingHandler(OmillTimePasses);
   TimingHandler.registerCallbacks(PIC);
 
+  struct PassTimingFrame {
+    std::string pass_name;
+    std::string ir_kind;
+    std::string ir_name;
+    const void *ir_ptr = nullptr;
+    std::chrono::steady_clock::time_point started_at;
+  };
+  llvm::SmallVector<PassTimingFrame, 32> pass_timing_stack;
+
+  auto describeIRUnit = [](Any IR) {
+    std::pair<std::string, std::string> desc{"unknown", ""};
+    if (const auto **F = any_cast<const Function *>(&IR)) {
+      desc.first = "function";
+      desc.second = (*F)->getName().str();
+    } else if (const auto **MPtr = any_cast<const Module *>(&IR)) {
+      desc.first = "module";
+      desc.second = (*MPtr)->getModuleIdentifier();
+    } else if (const auto **L = any_cast<const Loop *>(&IR)) {
+      desc.first = "loop";
+      desc.second = (*L)->getHeader()->getParent()->getName().str();
+    }
+    return desc;
+  };
+
+  auto irPointer = [](Any IR) -> const void * {
+    if (const auto **F = any_cast<const Function *>(&IR))
+      return *F;
+    if (const auto **MPtr = any_cast<const Module *>(&IR))
+      return *MPtr;
+    if (const auto **L = any_cast<const Loop *>(&IR))
+      return *L;
+    return nullptr;
+  };
+
+  auto shouldEmitPassTiming = [&](StringRef PassName) {
+    if (!events.enabled() || !events.detailed())
+      return false;
+    if (PassName.starts_with("PassManager") || PassName.contains("Adaptor"))
+      return false;
+    return true;
+  };
+
+  PIC.registerBeforeNonSkippedPassCallback(
+      [&](StringRef PassName, Any IR) {
+        if (!shouldEmitPassTiming(PassName))
+          return;
+        auto [ir_kind, ir_name] = describeIRUnit(IR);
+        pass_timing_stack.push_back(
+            {PassName.str(), std::move(ir_kind), std::move(ir_name),
+             irPointer(IR), std::chrono::steady_clock::now()});
+      });
+
   if (events.enabled()) {
     PIC.registerAfterPassCallback([&events](StringRef PassName, Any,
                                             const PreservedAnalyses &) {
@@ -2541,6 +2868,52 @@ int main(int argc, char **argv) {
                         {{"pass", PassName.str()}});
       }
     });
+    PIC.registerAfterPassCallback(
+        [&](StringRef PassName, Any IR, const PreservedAnalyses &) {
+          if (!shouldEmitPassTiming(PassName) || pass_timing_stack.empty())
+            return;
+          auto ir_ptr = irPointer(IR);
+          for (auto it = pass_timing_stack.end(); it != pass_timing_stack.begin();) {
+            --it;
+            if (it->pass_name != PassName.str() || it->ir_ptr != ir_ptr)
+              continue;
+            auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now() -
+                                   it->started_at)
+                                   .count();
+            events.emitInfo("pipeline_pass_timing", "pass timing",
+                            {{"pass", it->pass_name},
+                             {"ir_kind", it->ir_kind},
+                             {"ir_name", it->ir_name},
+                             {"duration_ms",
+                              static_cast<int64_t>(duration_ms)}});
+            pass_timing_stack.erase(it);
+            break;
+          }
+        });
+    PIC.registerAfterPassInvalidatedCallback(
+        [&](StringRef PassName, const PreservedAnalyses &) {
+          if (!shouldEmitPassTiming(PassName) || pass_timing_stack.empty())
+            return;
+          for (auto it = pass_timing_stack.end(); it != pass_timing_stack.begin();) {
+            --it;
+            if (it->pass_name != PassName.str())
+              continue;
+            auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now() -
+                                   it->started_at)
+                                   .count();
+            events.emitInfo("pipeline_pass_timing", "pass timing",
+                            {{"pass", it->pass_name},
+                             {"ir_kind", it->ir_kind},
+                             {"ir_name", it->ir_name},
+                             {"duration_ms",
+                              static_cast<int64_t>(duration_ms)},
+                             {"invalidated_ir", true}});
+            pass_timing_stack.erase(it);
+            break;
+          }
+        });
   }
 
   // Set up pass infrastructure
@@ -2741,7 +3114,7 @@ int main(int argc, char **argv) {
   omill::BinaryMemoryMap raw_memory_map;
   if (RawBinary) {
     raw_memory_map.addRegion(BaseAddress, raw_code.data(), raw_code.size(),
-                             true);
+                             true, /*executable=*/true);
     raw_memory_map.setImageBase(BaseAddress);
     raw_memory_map.setImageSize(raw_code.size());
   }
@@ -2781,7 +3154,11 @@ int main(int argc, char **argv) {
   MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
   MAM.registerPass([&] { return omill::CallGraphAnalysis(); });
   MAM.registerPass([&] { return omill::LiftedFunctionAnalysis(); });
+  MAM.registerPass([iterative_session] {
+    return omill::IterativeLiftingSessionAnalysis(iterative_session);
+  });
   MAM.registerPass([&] { return omill::VirtualCalleeRegistryAnalysis(); });
+  MAM.registerPass([&] { return omill::VirtualMachineModelAnalysis(); });
   if (!ResolveExceptions) {
     MAM.registerPass([&] { return omill::ExceptionInfoAnalysis(); });
   }
@@ -2800,44 +3177,32 @@ int main(int argc, char **argv) {
   {
     omill::TraceLiftCallback trace_cb;
     if (ResolveTargets) {
-      trace_cb = [&lifter](uint64_t pc) -> bool {
-        return lifter.Lift(pc);
+      trace_cb = [&lifter, iterative_session](uint64_t pc) -> bool {
+        bool ok = lifter.Lift(pc);
+        if (ok)
+          iterative_session->noteLiftedTarget(pc);
+        return ok;
       };
     }
+    iterative_session->setTraceLiftCallback(trace_cb);
     MAM.registerPass([trace_cb] {
       return omill::TraceLiftAnalysis(trace_cb);
     });
   }
 
-  // Block-lifting mode: set up BlockLifter and register the analysis
-  // so IterativeBlockDiscoveryPass can lift new blocks on the fly.
-  std::unique_ptr<BufferBlockManager> block_manager;
-  std::unique_ptr<omill::BlockLifter> block_lifter;
+  // Block-lifting mode: register the analysis so IterativeBlockDiscoveryPass
+  // can lift new blocks on the fly.
   if (BlockLift) {
-    block_manager = std::make_unique<BufferBlockManager>();
-    // Share code with the block manager.
-    if (RawBinary) {
-      block_manager->setCode(raw_code.data(), raw_code.size(), BaseAddress);
-    } else {
-      for (auto &sec : pe.code_sections) {
-        auto &data = pe.section_storage[sec.storage_index];
-        block_manager->setCode(data.data(), data.size(), sec.va);
-      }
-    }
-    block_lifter = std::make_unique<omill::BlockLifter>(
-        arch.get(), *block_manager);
-
-    // Do initial block-lifting for the entry function.
-    block_lifter->LiftReachable(func_va);
-    errs() << "Block-lifting initial reachable blocks complete\n";
-
     // Register the lift callback so the discovery pass can lift more.
     omill::BlockLiftCallback lift_cb =
-        [&](uint64_t pc) -> bool {
+        [&, iterative_session](uint64_t pc) -> bool {
           llvm::SmallVector<uint64_t, 4> targets;
           auto *fn = block_lifter->LiftBlock(pc, targets);
+          if (fn)
+            iterative_session->noteLiftedTarget(pc);
           return fn != nullptr;
         };
+    iterative_session->setBlockLiftCallback(lift_cb);
     MAM.registerPass([lift_cb] {
       return omill::BlockLiftAnalysis(lift_cb);
     });
@@ -2845,16 +3210,7 @@ int main(int argc, char **argv) {
 
   auto runPostPatchCleanup = [&](StringRef reason) {
     ModulePassManager MPM;
-    llvm::InlineParams params = llvm::getInlineParams(80);
-    MPM.addPass(llvm::ModuleInlinerWrapperPass(params));
-
-    llvm::FunctionPassManager FPM;
-    FPM.addPass(llvm::InstCombinePass());
-    FPM.addPass(llvm::GVNPass());
-    FPM.addPass(llvm::ADCEPass());
-    FPM.addPass(llvm::SimplifyCFGPass());
-    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
-    MPM.addPass(llvm::GlobalDCEPass());
+    omill::buildPostPatchCleanupPipeline(MPM, 80);
     MPM.run(*module, MAM);
 
     if (events.detailed()) {
@@ -2918,12 +3274,259 @@ int main(int argc, char **argv) {
   opts.interprocedural_const_prop = IPCP;
   opts.use_block_lifting = BlockLift;
   opts.vm_devirtualize = vm_mode;
+  opts.generic_static_devirtualize =
+      GenericStaticDevirtualize ||
+      parseBoolEnv("OMILL_GENERIC_STATIC_DEVIRT").value_or(false);
+  opts.verify_generic_static_devirtualization =
+      VerifyGenericStaticDevirtualization ||
+      parseBoolEnv("OMILL_VERIFY_GENERIC_STATIC_DEVIRT").value_or(false);
+  if (!DumpVirtualModel.empty())
+    setEnvIfUnset("OMILL_DUMP_VIRTUAL_MODEL", DumpVirtualModel.c_str());
+  if (auto v = parseBoolEnv("OMILL_SKIP_BLOCK_MERGE"); v.value_or(false)) {
+    opts.merge_block_functions_after_fixpoint = false;
+  }
+  const bool preserve_lift_infrastructure = ResolveTargets && !NoABI;
+  opts.preserve_lifted_semantics = preserve_lift_infrastructure;
+  if (opts.generic_static_devirtualize) {
+    errs() << "Generic static devirtualization enabled\n";
+    events.emitInfo("generic_static_devirtualization_enabled",
+                    "generic static devirtualization enabled",
+                    {{"verify", opts.verify_generic_static_devirtualization}});
+  }
+
+  auto fixLiftedFunctionNamingCollisions = [&]() {
+    for (auto &F : llvm::make_early_inc_range(*module)) {
+      if (!F.isDeclaration())
+        continue;
+      auto name = F.getName();
+      if (!name.starts_with("sub_"))
+        continue;
+      for (int i = 1; i <= 20; ++i) {
+        std::string def_name = (name + "." + llvm::Twine(i)).str();
+        if (auto *def = module->getFunction(def_name)) {
+          if (!def->isDeclaration()) {
+            F.replaceAllUsesWith(def);
+            F.eraseFromParent();
+            def->setName(name);
+            break;
+          }
+        }
+      }
+    }
+  };
+
+  auto tagNewlyLiftedFunctions =
+      [&](llvm::StringRef attr_name,
+          const llvm::DenseSet<llvm::Function *> &pre_lift_funcs) {
+        for (auto &F : *module) {
+          if (!pre_lift_funcs.count(&F) && !F.isDeclaration())
+            F.addFnAttr(attr_name, "1");
+        }
+      };
+
+  auto clearLiftRoundAttr = [&](llvm::StringRef attr_name) {
+    for (auto &F : *module) {
+      if (F.getFnAttribute(attr_name).isValid())
+        F.removeFnAttr(attr_name);
+    }
+  };
+
+  auto liftedNameFor = [&](uint64_t pc, bool native) {
+    std::string name = "sub_" + llvm::Twine::utohexstr(pc).str();
+    if (native)
+      name += "_native";
+    return name;
+  };
+
+  auto blockNameFor = [&](uint64_t pc, bool native) {
+    std::string name = "blk_" + llvm::Twine::utohexstr(pc).str();
+    if (native)
+      name += "_native";
+    return name;
+  };
+
+  auto findLiftedOrBlockFunction = [&](uint64_t pc, bool native)
+      -> llvm::Function * {
+    if (auto *fn = module->getFunction(liftedNameFor(pc, native)))
+      return fn;
+    return module->getFunction(blockNameFor(pc, native));
+  };
+
+  auto collectConstantCodeCallTargets =
+      [&](llvm::function_ref<bool(const llvm::Function &)> include_function) {
+        llvm::DenseSet<uint64_t> targets;
+        for (auto &F : *module) {
+          if (!include_function(F))
+            continue;
+          for (auto &BB : F) {
+            for (auto &I : BB) {
+              auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+              if (!call || call->getCalledFunction())
+                continue;
+              auto *callee_op = call->getCalledOperand();
+              llvm::ConstantInt *ci = nullptr;
+              if (auto *ce = llvm::dyn_cast<llvm::ConstantExpr>(callee_op)) {
+                if (ce->getOpcode() == llvm::Instruction::IntToPtr)
+                  ci = llvm::dyn_cast<llvm::ConstantInt>(ce->getOperand(0));
+              }
+              if (!ci) {
+                if (auto *itp = llvm::dyn_cast<llvm::IntToPtrInst>(callee_op))
+                  ci = llvm::dyn_cast<llvm::ConstantInt>(itp->getOperand(0));
+              }
+              if (!ci)
+                continue;
+              uint64_t target = ci->getZExtValue();
+              if (target == 0)
+                continue;
+
+              bool in_code = false;
+              if (RawBinary) {
+                in_code = (target >= BaseAddress &&
+                           target < BaseAddress + raw_code.size());
+              } else {
+                for (auto &sec : pe.code_sections) {
+                  if (target >= sec.va && target < sec.va + sec.size) {
+                    in_code = true;
+                    break;
+                  }
+                }
+              }
+              if (!in_code)
+                continue;
+
+              targets.insert(target);
+            }
+          }
+        }
+        return targets;
+      };
+
+  auto patchConstantIntToPtrCallsToNative =
+      [&](llvm::ArrayRef<uint64_t> targets, llvm::StringRef event_name,
+          llvm::StringRef event_message) {
+        llvm::DenseSet<uint64_t> target_set(targets.begin(), targets.end());
+        unsigned patched_native = 0;
+        unsigned patched_boundary = 0;
+
+        auto maybeGetConstantCodeTarget =
+            [&](llvm::CallBase &call) -> std::optional<uint64_t> {
+          if (call.getCalledFunction())
+            return std::nullopt;
+
+          auto *callee_op = call.getCalledOperand();
+          llvm::ConstantInt *ci = nullptr;
+          if (auto *ce = llvm::dyn_cast<llvm::ConstantExpr>(callee_op)) {
+            if (ce->getOpcode() == llvm::Instruction::IntToPtr)
+              ci = llvm::dyn_cast<llvm::ConstantInt>(ce->getOperand(0));
+          }
+          if (!ci) {
+            if (auto *itp = llvm::dyn_cast<llvm::IntToPtrInst>(callee_op))
+              ci = llvm::dyn_cast<llvm::ConstantInt>(itp->getOperand(0));
+          }
+          if (!ci)
+            return std::nullopt;
+          return ci->getZExtValue();
+        };
+
+        auto rewriteCallTarget = [&](llvm::CallBase &call, llvm::Value *callee) {
+          auto *old_callee = call.getCalledOperand();
+          call.setCalledOperand(callee);
+          if (auto *inst = llvm::dyn_cast<llvm::Instruction>(old_callee)) {
+            if (inst->use_empty())
+              inst->eraseFromParent();
+          }
+        };
+
+        for (auto &F : *module) {
+          for (auto &BB : F) {
+            for (auto &I : llvm::make_early_inc_range(BB)) {
+              auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+              if (!call)
+                continue;
+
+              auto pc = maybeGetConstantCodeTarget(*call);
+              if (!pc || !target_set.contains(*pc) || *pc == 0)
+                continue;
+
+              if (auto *target_fn =
+                      findLiftedOrBlockFunction(*pc, /*native=*/true)) {
+                rewriteCallTarget(*call, target_fn);
+                ++patched_native;
+                continue;
+              }
+
+              if (RawBinary)
+                continue;
+
+              auto boundary =
+                  omill::classifyProtectedBoundary(pe.memory_map, *pc);
+              if (!boundary)
+                continue;
+
+              auto callee =
+                  omill::getOrInsertProtectedBoundaryDecl(*module,
+                                                          call->getFunctionType(),
+                                                          *boundary);
+              rewriteCallTarget(*call, callee.getCallee());
+              ++patched_boundary;
+            }
+          }
+        }
+
+        const unsigned patched = patched_native + patched_boundary;
+        if (patched > 0) {
+          errs() << "Patched " << patched
+                 << " inttoptr call sites to direct calls";
+          if (patched_boundary > 0)
+            errs() << " (" << patched_native << " native, "
+                   << patched_boundary << " protected-boundary)";
+          errs() << "\n";
+          if (events.detailed()) {
+            events.emitInfo(event_name, event_message,
+                            {{"patched_uses", static_cast<int64_t>(patched)},
+                             {"patched_native",
+                              static_cast<int64_t>(patched_native)},
+                             {"patched_boundaries",
+                              static_cast<int64_t>(patched_boundary)}});
+          }
+          runPostPatchCleanup(event_name);
+        }
+      };
+
+  auto rerunLateDiscoveryPipeline = [&](llvm::StringRef attr_name) {
+    MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+
+    omill::PipelineOptions late_opts = opts;
+    late_opts.resolve_indirect_targets = false;
+    late_opts.scope_predicate = [attr_name = attr_name.str()](
+                                    llvm::Function &F) {
+      return F.getFnAttribute(attr_name).isValid();
+    };
+    late_opts.preserve_lifted_semantics = preserve_lift_infrastructure;
+
+    {
+      ModulePassManager MPM;
+      omill::buildPipeline(MPM, late_opts);
+      MPM.run(*module, MAM);
+      emitIterativeSessionEvents(events, iterative_session,
+                                 "late-discovery-rerun");
+    }
+    {
+      ModulePassManager MPM;
+      omill::buildABIRecoveryPipeline(MPM, late_opts);
+      MPM.run(*module, MAM);
+    }
+
+    clearLiftRoundAttr(attr_name);
+  };
+
   events.emitInfo("pipeline_started", "main pipeline started");
   {
     ModulePassManager MPM;
     omill::buildPipeline(MPM, opts);
     MPM.run(*module, MAM);
   }
+  emitIterativeSessionEvents(events, iterative_session, "main-pipeline");
   errs() << "Main pipeline complete\n";
   events.emitInfo("pipeline_completed", "main pipeline completed");
 
@@ -3120,6 +3723,8 @@ int main(int argc, char **argv) {
         ModulePassManager MPM;
         omill::buildPipeline(MPM, vm_opts);
         MPM.run(*module, MAM);
+        emitIterativeSessionEvents(events, iterative_session,
+                                   "vm-discovery-rerun");
       }
 
       // Clear the newly-lifted tags so next round starts fresh.
@@ -3186,72 +3791,15 @@ int main(int argc, char **argv) {
     // but couldn't be resolved at the time (the target wasn't lifted yet
     // when RewriteLiftedCallsToNative ran).
     {
-      unsigned patched = 0;
-      // Collect all constant-integer values used as inttoptr call targets.
-      llvm::DenseSet<uint64_t> targets_to_patch;
-      for (auto &F : *module) {
-        for (auto &BB : F) {
-          for (auto &I : BB) {
-            auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
-            if (!call || call->getCalledFunction())
-              continue;
-            auto *callee_op = call->getCalledOperand();
-            llvm::ConstantInt *ci = nullptr;
-            if (auto *ce =
-                    llvm::dyn_cast<llvm::ConstantExpr>(callee_op)) {
-              if (ce->getOpcode() == llvm::Instruction::IntToPtr)
-                ci = llvm::dyn_cast<llvm::ConstantInt>(
-                    ce->getOperand(0));
-            }
-            if (!ci) {
-              if (auto *itp =
-                      llvm::dyn_cast<llvm::IntToPtrInst>(callee_op))
-                ci = llvm::dyn_cast<llvm::ConstantInt>(
-                    itp->getOperand(0));
-            }
-            if (ci && ci->getZExtValue() != 0)
-              targets_to_patch.insert(ci->getZExtValue());
-          }
-        }
-      }
-      for (uint64_t pc : targets_to_patch) {
-        std::string native_name =
-            "sub_" + llvm::Twine::utohexstr(pc).str() + "_native";
-        auto *target_fn = module->getFunction(native_name);
-        if (!target_fn)
-          continue;
-        auto *pc_ci =
-            llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), pc);
-        // ConstantExpr inttoptr — RAUW replaces all uses globally.
-        auto *itp_ce = llvm::ConstantExpr::getIntToPtr(
-            pc_ci, llvm::PointerType::getUnqual(ctx));
-        if (itp_ce->getNumUses() > 0) {
-          patched += itp_ce->getNumUses();
-          itp_ce->replaceAllUsesWith(target_fn);
-        }
-        // IntToPtrInst with constant operand.
-        // ConstantInt is a ConstantData — it may not have a use list in LLVM 21.
-        if (!pc_ci->hasUseList())
-          continue;
-        for (auto *user : llvm::make_early_inc_range(pc_ci->users())) {
-          auto *inst = llvm::dyn_cast<llvm::IntToPtrInst>(user);
-          if (!inst)
-            continue;
-          patched += inst->getNumUses();
-          inst->replaceAllUsesWith(target_fn);
-          if (inst->use_empty())
-            inst->eraseFromParent();
-        }
-      }
-      if (patched > 0)
-        errs() << "Patched " << patched
-               << " inttoptr call sites to direct calls\n";
-      if (patched > 0 && events.detailed()) {
-        events.emitInfo("abi_patch_callsites", "patched inttoptr callsites",
-                        {{"patched_uses", static_cast<int64_t>(patched)}});
-      }
-      if (patched > 0)
-        runPostPatchCleanup("abi_patch_callsites");
+      auto targets_to_patch =
+          collectConstantCodeCallTargets([](const llvm::Function &) {
+            return true;
+          });
+      llvm::SmallVector<uint64_t, 32> ordered_targets(targets_to_patch.begin(),
+                                                      targets_to_patch.end());
+      patchConstantIntToPtrCallsToNative(
+          ordered_targets, "abi_patch_callsites",
+          "patched inttoptr callsites");
     }
 
     auto fixupB3DispatchArgMismatches = [&]() {
@@ -3700,7 +4248,8 @@ int main(int argc, char **argv) {
               pe.memory_map.addRegion(info.r12_base,
                                       info.vmcontext_snapshot.data(),
                                       info.vmcontext_snapshot.size(),
-                                      /*read_only=*/true);
+                                      /*read_only=*/true,
+                                      /*executable=*/false);
               injected_vmctx = true;
             }
 
@@ -3771,25 +4320,16 @@ int main(int argc, char **argv) {
     }
   }
 
-  // Pre-scan cleanup: run late cleanup pipeline before late discovery
-  // to enable SplitLargeAllocaPass + SROA + InstCombine to fold the
-  // 69KB native_stack alloca into SSA constants.  Without this, the
-  // inttoptr call targets remain as dynamic loads from the alloca and
-  // the late discovery scan can't find them.
-  if (ResolveTargets && !NoABI) {
-    ModulePassManager PreScanMPM;
-    omill::buildLateCleanupPipeline(PreScanMPM);
-    PreScanMPM.run(*module, MAM);
-    errs() << "Pre-scan cleanup complete\n";
-  }
-
   // Late target discovery: after ABI recovery folds MBA chains (via
   // EliminateStateStruct + RecoverStackFrame + SROA + GVN), scan for
   // constant inttoptr call targets that point to unlifted code addresses.
-  // Lift them into a FRESH semantics module (the main module's remill
-  // state was destroyed by the pipeline), run the pipeline + ABI on it,
-  // then link the resulting _native functions back into the main module.
-  if (ResolveTargets && !NoABI) {
+  // Lift them directly into the current module/session, rerun the pipeline
+  // + ABI on just the newly-lifted slice, and keep cleanup of Remill
+  // infrastructure deferred until iterative discovery is fully closed.
+  const bool run_post_abi_late_discovery =
+      opts.resolve_indirect_targets && !NoABI &&
+      !(opts.use_block_lifting && !opts.vm_devirtualize);
+  if (run_post_abi_late_discovery) {
     llvm::DenseMap<uint64_t, uint64_t> nested_vm_helper_targets;
     llvm::DenseMap<uint64_t, uint64_t> nested_vm_helper_deltas;
     struct NestedHelperCallsite {
@@ -4537,159 +5077,99 @@ int main(int argc, char **argv) {
                       {{"round", static_cast<int64_t>(round + 1)},
                        {"targets", static_cast<int64_t>(late_targets.size())}});
 
-      // Load fresh arch + semantics for lifting (the main module's
-      // remill ISEL stubs and intrinsics were deleted by the pipeline).
-      auto late_arch =
-          remill::Arch::Get(ctx, detected_os, detected_arch);
-      auto late_module = remill::LoadArchSemantics(late_arch.get());
+      // Lift late targets directly into the current session/module and rerun
+      // the normal pipeline on just the newly-added functions. This avoids
+      // a second Arch/semantics/module world and keeps discovery iterative.
+      llvm::DenseSet<llvm::Function *> pre_lift_funcs;
+      for (auto &F : *module)
+        pre_lift_funcs.insert(&F);
 
-      BufferTraceManager late_manager;
-      late_manager.setModuleAndArch(late_module.get(), late_arch.get());
-      if (RawBinary) {
-        late_manager.setCode(raw_code.data(), raw_code.size(), BaseAddress);
-      } else {
-        for (const auto &cs : pe.code_sections) {
-          auto &stored = pe.section_storage[cs.storage_index];
-          late_manager.setCode(stored.data(), stored.size(), cs.va);
-        }
-      }
-
-      omill::TraceLifter late_lifter(late_arch.get(), late_manager);
-
-      // Lift the target functions and their full callee graphs.
       unsigned late_patched = 0;
+      unsigned late_lifted = 0;
+      unsigned late_failed = 0;
+      auto trace_cb = iterative_session->traceLiftCallback();
+      auto block_cb = iterative_session->blockLiftCallback();
       for (uint64_t pc : late_targets) {
-        late_lifter.Lift(pc);
+        if (events.detailed()) {
+          events.emitInfo("late_discovery_lift_started",
+                          "late discovery target lift started",
+                          {{"round", static_cast<int64_t>(round + 1)},
+                           {"target", ("0x" + llvm::Twine::utohexstr(pc)).str()},
+                           {"pipeline", BlockLift ? "block" : "trace"}});
+        }
+        iterative_session->queueTarget(pc);
+        bool lifted_ok = false;
+        if (BlockLift && !vm_mode && block_cb) {
+          lifted_ok = block_cb(pc);
+        } else if (trace_cb) {
+          lifted_ok = trace_cb(pc);
+        } else {
+          lifted_ok = lifter.Lift(pc);
+          if (lifted_ok)
+            iterative_session->noteLiftedTarget(pc);
+        }
+        if (lifted_ok) {
+          ++late_lifted;
+        } else {
+          ++late_failed;
+        }
+        if (events.detailed()) {
+          events.emitInfo("late_discovery_lift_completed",
+                          "late discovery target lift completed",
+                          {{"round", static_cast<int64_t>(round + 1)},
+                           {"target", ("0x" + llvm::Twine::utohexstr(pc)).str()},
+                           {"lifted", lifted_ok}});
+        }
+      }
+      if (events.detailed()) {
+        events.emitInfo("late_discovery_lift_batch_completed",
+                        "late discovery target batch completed",
+                        {{"round", static_cast<int64_t>(round + 1)},
+                         {"lifted", static_cast<int64_t>(late_lifted)},
+                         {"failed", static_cast<int64_t>(late_failed)}});
+      }
+      fixLiftedFunctionNamingCollisions();
+      if (events.detailed()) {
+        events.emitInfo("late_discovery_collision_fix_completed",
+                        "late discovery collision fix completed",
+                        {{"round", static_cast<int64_t>(round + 1)}});
       }
 
-      // Fix up DeclareLiftedFunction naming collisions.  When the
-      // TraceLifter creates a declaration for a callee reference and
-      // later defines it, LLVM appends ".N" to the definition because
-      // the declaration already occupies the name.  Replace uses of
-      // the empty declaration with the actual definition, then rename.
-      for (auto &F : llvm::make_early_inc_range(*late_module)) {
-        if (!F.isDeclaration())
-          continue;
-        auto name = F.getName();
-        if (!name.starts_with("sub_"))
-          continue;
-        for (int i = 1; i <= 20; ++i) {
-          std::string def_name =
-              (name + "." + llvm::Twine(i)).str();
-          if (auto *def = late_module->getFunction(def_name)) {
-            if (!def->isDeclaration()) {
-              F.replaceAllUsesWith(def);
-              F.eraseFromParent();
-              def->setName(name);
-              break;
-            }
-          }
-        }
+      if (late_lifted == 0) {
+        errs() << "Late discovery round " << (round + 1)
+               << ": lift failed for all targets\n";
+        events.emitWarn("late_discovery_lift_failed",
+                        "late discovery lifting produced no new functions",
+                        {{"round", static_cast<int64_t>(round + 1)},
+                         {"failed", static_cast<int64_t>(late_failed)}});
+        break;
+      }
+
+      tagNewlyLiftedFunctions("omill.late_newly_lifted", pre_lift_funcs);
+      if (events.detailed()) {
+        events.emitInfo("late_discovery_tagging_completed",
+                        "late discovery new function tagging completed",
+                        {{"round", static_cast<int64_t>(round + 1)}});
       }
 
       if (DumpIR) {
         std::error_code ec;
         raw_fd_ostream os("late_after_lift.ll", ec, sys::fs::OF_Text);
-        late_module->print(os, nullptr);
+        module->print(os, nullptr);
       }
 
-      // Run the pipeline on the fresh module.
-      {
-        PassBuilder late_PB;
-        LoopAnalysisManager late_LAM;
-        FunctionAnalysisManager late_FAM;
-        CGSCCAnalysisManager late_CGAM;
-        ModuleAnalysisManager late_MAM;
+      rerunLateDiscoveryPipeline("omill.late_newly_lifted");
 
-        late_FAM.registerPass([&late_PB] {
-          auto AAM = late_PB.buildDefaultAAPipeline();
-          omill::registerAAWithManager(AAM);
-          return AAM;
-        });
-        late_PB.registerModuleAnalyses(late_MAM);
-        late_PB.registerCGSCCAnalyses(late_CGAM);
-        late_PB.registerFunctionAnalyses(late_FAM);
-        late_PB.registerLoopAnalyses(late_LAM);
-        late_PB.crossRegisterProxies(late_LAM, late_FAM, late_CGAM,
-                                     late_MAM);
-        omill::registerAnalyses(late_FAM);
-
-        late_MAM.registerPass([memory_map_holder] {
-          return omill::BinaryMemoryAnalysis(*memory_map_holder);
-        });
-        late_MAM.registerPass([&] {
-          return omill::TargetArchAnalysis();
-        });
-        late_MAM.registerPass([&] {
-          return omill::CallingConventionAnalysis();
-        });
-        late_MAM.registerPass([&] {
-          return omill::CallGraphAnalysis();
-        });
-        late_MAM.registerPass([&] {
-          return omill::LiftedFunctionAnalysis();
-        });
-        late_MAM.registerPass([&] {
-          return omill::VirtualCalleeRegistryAnalysis();
-        });
-        late_MAM.registerPass([&] {
-          return omill::ExceptionInfoAnalysis();
-        });
-        late_MAM.registerPass([] {
-          return omill::TraceLiftAnalysis(omill::TraceLiftCallback{});
-        });
-        late_MAM.registerPass([&] {
-          return omill::VMTraceMapAnalysis();
-        });
-
-        omill::PipelineOptions late_opts = opts;
-        late_opts.resolve_indirect_targets = false;
-        {
-          ModulePassManager MPM;
-          omill::buildPipeline(MPM, late_opts);
-          MPM.run(*late_module, late_MAM);
-        }
-        if (DumpIR) {
-          std::error_code ec;
-          raw_fd_ostream os("late_after_pipeline.ll", ec,
-                            sys::fs::OF_Text);
-          late_module->print(os, nullptr);
-        }
-        {
-          ModulePassManager MPM;
-    omill::buildABIRecoveryPipeline(MPM, late_opts);
-          MPM.run(*late_module, late_MAM);
-        }
+      if (DumpIR) {
+        std::error_code ec;
+        raw_fd_ostream os("late_after_pipeline.ll", ec, sys::fs::OF_Text);
+        module->print(os, nullptr);
       }
 
       if (DumpIR) {
         std::error_code ec;
         raw_fd_ostream os("late_after_abi.ll", ec, sys::fs::OF_Text);
-        late_module->print(os, nullptr);
-      }
-
-      // Remove conflicting definitions from the late module.  The main
-      // module's initial callee graph may already contain some of the
-      // same functions; keep those and let the linker resolve the late
-      // module's references to the existing definitions.
-      for (auto &F : llvm::make_early_inc_range(*late_module)) {
-        if (F.isDeclaration())
-          continue;
-        if (auto *existing = module->getFunction(F.getName())) {
-          if (!existing->isDeclaration()) {
-            F.deleteBody();
-            F.setLinkage(llvm::GlobalValue::ExternalLinkage);
-          }
-        }
-      }
-
-      // Link the late module into the main module.  Linker replaces
-      // declarations with definitions and handles type merging.
-      if (llvm::Linker::linkModules(*module, std::move(late_module))) {
-        errs() << "WARNING: linking late module failed\n";
-        events.emitWarn("late_discovery_link_failed", "late module link failed",
-                        {{"round", static_cast<int64_t>(round + 1)}});
-        break;
+        module->print(os, nullptr);
       }
 
       // Patch call sites: replace inttoptr(i64 <const>) → @sub_<hex>_native
@@ -5119,6 +5599,12 @@ int main(int argc, char **argv) {
   if (OmillTimePasses)
     TimingHandler.print();
 
+  if (preserve_lift_infrastructure) {
+    ModulePassManager MPM;
+    omill::buildLiftInfrastructureCleanupPipeline(MPM);
+    MPM.run(*module, MAM);
+  }
+
   // Verify (use nullptr to avoid crash in SlotTracker on corrupted modules)
   if (verifyModule(*module, nullptr)) {
     errs() << "WARNING: module verification failed (use --verify-each to "
@@ -5157,6 +5643,7 @@ int main(int argc, char **argv) {
     }
   }
 
+  emitIterativeSessionReport(iterative_session);
   errs() << "Done.\n";
   events.emitTerminalSuccess(OutputFilename);
   return 0;

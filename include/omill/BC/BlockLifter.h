@@ -68,6 +68,10 @@ class BlockManager {
   /// Try to read an executable byte at \p addr.
   virtual bool TryReadExecutableByte(uint64_t addr, uint8_t *byte) = 0;
 
+  /// Optional destination module for lifted block functions.
+  /// If null, BlockLifter falls back to the Remill intrinsic module.
+  virtual llvm::Module *GetLiftedBlockModule();
+
   /// Provide devirtualized targets for an indirect jump/call.
   /// Default: no-op (no targets).
   virtual void ForEachDevirtualizedTarget(

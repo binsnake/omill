@@ -35,7 +35,7 @@ class LowerErrorAndMissingTest : public ::testing::Test {
   }
 
   std::unique_ptr<llvm::Module> createModuleWithIntrinsic(
-      llvm::StringRef intrinsic_name) {
+      llvm::StringRef intrinsic_name, bool void_return = false) {
     auto M = std::make_unique<llvm::Module>("test", Ctx);
     M->setDataLayout(
         "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
@@ -50,8 +50,9 @@ class LowerErrorAndMissingTest : public ::testing::Test {
     M->getOrInsertFunction(intrinsic_name, intr_ty);
 
     // Create lifted function
-    auto *fn_ty =
-        llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+    auto *fn_ty = llvm::FunctionType::get(
+        void_return ? llvm::Type::getVoidTy(Ctx) : ptr_ty,
+        {ptr_ty, i64_ty, ptr_ty}, false);
     auto *test_fn = llvm::Function::Create(
         fn_ty, llvm::Function::ExternalLinkage, "test_func", *M);
 
@@ -64,7 +65,10 @@ class LowerErrorAndMissingTest : public ::testing::Test {
 
     auto *intr_fn = M->getFunction(intrinsic_name);
     auto *result = B.CreateCall(intr_fn, {state, pc, mem});
-    B.CreateRet(result);
+    if (void_return)
+      B.CreateRetVoid();
+    else
+      B.CreateRet(result);
 
     return M;
   }
@@ -131,6 +135,31 @@ TEST_F(LowerErrorAndMissingTest, MissingBlockHandled) {
   }
   EXPECT_TRUE(has_handler_call);
   EXPECT_TRUE(has_ret);
+}
+
+TEST_F(LowerErrorAndMissingTest, MissingBlockHandledInVoidFunction) {
+  auto M = createModuleWithIntrinsic("__remill_missing_block", true);
+  auto *F = M->getFunction("test_func");
+  ASSERT_NE(F, nullptr);
+
+  runPass(F);
+
+  bool has_handler_call = false;
+  auto *ret = llvm::dyn_cast<llvm::ReturnInst>(F->back().getTerminator());
+  ASSERT_NE(ret, nullptr);
+  EXPECT_EQ(ret->getNumOperands(), 0u);
+  for (auto &BB : *F) {
+    for (auto &I : BB) {
+      if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I)) {
+        if (CI->getCalledFunction() &&
+            CI->getCalledFunction()->getName() ==
+                "__omill_missing_block_handler")
+          has_handler_call = true;
+      }
+    }
+  }
+  EXPECT_TRUE(has_handler_call);
+  EXPECT_TRUE(llvm::verifyFunction(*F, &llvm::errs()) == false);
 }
 
 }  // namespace

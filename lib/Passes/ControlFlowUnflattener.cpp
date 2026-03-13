@@ -13,6 +13,51 @@ namespace omill {
 
 namespace {
 
+void canonicalizePhiIncomingEdges(llvm::Function &F) {
+  for (auto &BB : F) {
+    llvm::DenseMap<llvm::BasicBlock *, unsigned> pred_edge_count;
+    for (auto *pred : llvm::predecessors(&BB))
+      ++pred_edge_count[pred];
+
+    for (auto &I : llvm::make_early_inc_range(BB)) {
+      auto *phi = llvm::dyn_cast<llvm::PHINode>(&I);
+      if (!phi)
+        break;
+
+      for (unsigned i = phi->getNumIncomingValues(); i-- > 0;) {
+        if (!pred_edge_count.count(phi->getIncomingBlock(i))) {
+          phi->removeIncomingValue(i, /*DeletePHIIfEmpty=*/false);
+        }
+      }
+
+      llvm::DenseMap<llvm::BasicBlock *, unsigned> phi_count;
+      for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i)
+        ++phi_count[phi->getIncomingBlock(i)];
+
+      for (auto &[pred, needed] : pred_edge_count) {
+        unsigned have = phi_count.lookup(pred);
+        if (have == 0)
+          continue;
+        while (have > needed) {
+          int idx = phi->getBasicBlockIndex(pred);
+          if (idx < 0)
+            break;
+          phi->removeIncomingValue(static_cast<unsigned>(idx),
+                                   /*DeletePHIIfEmpty=*/false);
+          --have;
+        }
+        for (unsigned j = have; j < needed; ++j)
+          phi->addIncoming(phi->getIncomingValueForBlock(pred), pred);
+      }
+
+      if (phi->getNumIncomingValues() == 0) {
+        phi->replaceAllUsesWith(llvm::PoisonValue::get(phi->getType()));
+        phi->eraseFromParent();
+      }
+    }
+  }
+}
+
 /// Describes a switch-based dispatcher block used in CFF.
 struct DispatcherInfo {
   llvm::BasicBlock *block;
@@ -295,6 +340,8 @@ llvm::PreservedAnalyses ControlFlowUnflattenerPass::run(
 
   if (!changed)
     return llvm::PreservedAnalyses::all();
+
+  canonicalizePhiIncomingEdges(F);
 
   return llvm::PreservedAnalyses::none();
 }

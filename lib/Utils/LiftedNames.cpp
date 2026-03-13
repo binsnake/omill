@@ -7,6 +7,7 @@
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/Module.h>
 #include <llvm/Support/FormatVariadic.h>
 
 namespace {
@@ -343,6 +344,23 @@ uint64_t extractBlockPC(llvm::StringRef name) {
   if (hex.getAsInteger(16, pc))
     return 0;
   return pc;
+}
+
+bool isClosedRootSliceScopedModule(const llvm::Module &M) {
+  auto *flag = M.getModuleFlag("omill.closed_root_slice_scope");
+  if (!flag)
+    return false;
+  if (auto *ci = llvm::mdconst::dyn_extract<llvm::ConstantInt>(flag))
+    return ci->getZExtValue() != 0;
+  return false;
+}
+
+bool isClosedRootSliceFunction(const llvm::Function &F) {
+  return F.hasFnAttribute("omill.closed_root_slice");
+}
+
+bool isClosedRootSliceRoot(const llvm::Function &F) {
+  return F.hasFnAttribute("omill.closed_root_slice_root");
 }
 
 }  // namespace omill

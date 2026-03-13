@@ -150,6 +150,19 @@ TEST_F(BinaryMemoryMapTest, MultipleRegions) {
   EXPECT_FALSE(map.read(0x5000, gap, 1));
 }
 
+TEST_F(BinaryMemoryMapTest, ExecutableRegionClassification) {
+  auto *code = allocBuf({0x90, 0xC3});
+  auto *data = allocBuf({0x41, 0x42});
+  map.addRegion(0x1000, code, 2, /*read_only=*/true, /*executable=*/true);
+  map.addRegion(0x2000, data, 2, /*read_only=*/true, /*executable=*/false);
+
+  EXPECT_TRUE(map.isExecutable(0x1000, 1));
+  EXPECT_TRUE(map.isExecutable(0x1000, 2));
+  EXPECT_FALSE(map.isExecutable(0x1001, 2));
+  EXPECT_FALSE(map.isExecutable(0x2000, 1));
+  EXPECT_FALSE(map.isExecutable(0x3000, 1));
+}
+
 // ===----------------------------------------------------------------------===
 // Test 7: Import lookup returns correct entry
 // ===----------------------------------------------------------------------===

@@ -10,6 +10,7 @@
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Transforms/Utils/Cloning.h>
+#include <llvm/Transforms/Utils/ValueMapper.h>
 
 #include "omill/Utils/LiftedNames.h"
 
@@ -118,7 +119,7 @@ llvm::Function *mergeBlockGroup(
         break;
       }
     }
-    if (!has_self_call)
+    if (!has_self_call && !entry_fn->hasFnAttribute("omill.output_root"))
       return entry_fn;
   }
 
@@ -133,6 +134,12 @@ llvm::Function *mergeBlockGroup(
       llvm::Function::Create(fn_type, llvm::GlobalValue::ExternalLinkage,
                              name_buf, &M);
   merged_fn->setCallingConv(entry_fn->getCallingConv());
+  if (entry_fn->hasFnAttribute("omill.output_root"))
+    merged_fn->addFnAttr("omill.output_root");
+  if (entry_fn->hasFnAttribute("omill.closed_root_slice"))
+    merged_fn->addFnAttr("omill.closed_root_slice", "1");
+  if (entry_fn->hasFnAttribute("omill.closed_root_slice_root"))
+    merged_fn->addFnAttr("omill.closed_root_slice_root", "1");
 
   // Map: block addr -> BasicBlock in the merged function.
   llvm::DenseMap<uint64_t, llvm::BasicBlock *> block_map;
@@ -160,74 +167,40 @@ llvm::Function *mergeBlockGroup(
       VMap[block_fn->getArg(i)] = merged_fn->getArg(i);
     }
 
-    // Clone the block-function's instructions into the target BB.
-    // Block-functions may have multiple BBs (from conditional branches
-    // within the block's lifted code); we need to handle this.
-    if (block_fn->size() == 1) {
-      // Simple case: single BB block-function.
-      llvm::IRBuilder<> builder(target_bb);
-      for (auto &I : block_fn->getEntryBlock()) {
+    // Clone the block-function's IR in two phases so internal self-loops and
+    // forward references in PHIs are remapped after every local value exists.
+    llvm::DenseMap<llvm::BasicBlock *, llvm::BasicBlock *> bb_map;
+    bb_map[&block_fn->getEntryBlock()] = target_bb;
+    VMap[&block_fn->getEntryBlock()] = target_bb;
+
+    for (auto &BB : *block_fn) {
+      if (&BB == &block_fn->getEntryBlock())
+        continue;
+      char internal_name[128];
+      snprintf(internal_name, sizeof(internal_name), "block_%llx.%s",
+               (unsigned long long)addr, BB.getName().str().c_str());
+      auto *new_bb = llvm::BasicBlock::Create(Ctx, internal_name, merged_fn);
+      bb_map[&BB] = new_bb;
+      VMap[&BB] = new_bb;
+    }
+
+    for (auto &BB : *block_fn) {
+      auto *dest_bb = bb_map[&BB];
+      llvm::IRBuilder<> builder(dest_bb);
+      for (auto &I : BB) {
         if (llvm::isa<llvm::ReturnInst>(&I))
           continue;
         auto *new_inst = I.clone();
-        for (unsigned op = 0; op < new_inst->getNumOperands(); ++op) {
-          auto vmap_it = VMap.find(new_inst->getOperand(op));
-          if (vmap_it != VMap.end())
-            new_inst->setOperand(op, vmap_it->second);
-        }
         builder.Insert(new_inst);
         VMap[&I] = new_inst;
       }
-    } else {
-      // Multi-BB block-function: clone all BBs.
-      // First, create BBs for internal blocks (not the entry).
-      llvm::DenseMap<llvm::BasicBlock *, llvm::BasicBlock *> bb_map;
-      bb_map[&block_fn->getEntryBlock()] = target_bb;
+    }
 
-      for (auto &BB : *block_fn) {
-        if (&BB == &block_fn->getEntryBlock())
-          continue;
-        char internal_name[128];
-        snprintf(internal_name, sizeof(internal_name), "block_%llx.%s",
-                 (unsigned long long)addr, BB.getName().str().c_str());
-        auto *new_bb = llvm::BasicBlock::Create(Ctx, internal_name, merged_fn);
-        bb_map[&BB] = new_bb;
-        VMap[&BB] = new_bb;
-      }
-
-      // Clone instructions into each BB.
-      for (auto &BB : *block_fn) {
-        auto *dest_bb = bb_map[&BB];
-        llvm::IRBuilder<> builder(dest_bb);
-        for (auto &I : BB) {
-          if (llvm::isa<llvm::ReturnInst>(&I))
-            continue;
-          auto *new_inst = I.clone();
-          // Remap operands.
-          for (unsigned op = 0; op < new_inst->getNumOperands(); ++op) {
-            auto vmap_it = VMap.find(new_inst->getOperand(op));
-            if (vmap_it != VMap.end())
-              new_inst->setOperand(op, vmap_it->second);
-          }
-          builder.Insert(new_inst);
-          VMap[&I] = new_inst;
-        }
-      }
-
-      // Fix up PHI nodes to use remapped BBs.
-      for (auto &BB : *block_fn) {
-        auto *dest_bb = bb_map[&BB];
-        for (auto &I : *dest_bb) {
-          auto *phi = llvm::dyn_cast<llvm::PHINode>(&I);
-          if (!phi)
-            break;
-          for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i) {
-            auto *inc_bb = phi->getIncomingBlock(i);
-            auto remap_it = bb_map.find(inc_bb);
-            if (remap_it != bb_map.end())
-              phi->setIncomingBlock(i, remap_it->second);
-          }
-        }
+    for (auto &BB : *block_fn) {
+      auto *dest_bb = bb_map[&BB];
+      for (auto &I : *dest_bb) {
+        llvm::RemapInstruction(
+            &I, VMap, llvm::RF_NoModuleLevelChanges);
       }
     }
   }
@@ -336,10 +309,19 @@ llvm::PreservedAnalyses MergeBlockFunctionsPass::run(
   }
 
   llvm::SmallVector<uint64_t, 16> entry_addrs;
+  llvm::SmallVector<uint64_t, 8> rooted_entry_addrs;
   for (auto &[addr, fn] : addr_to_fn) {
+    if (fn->hasFnAttribute("omill.output_root"))
+      rooted_entry_addrs.push_back(addr);
     if (!called_addrs.contains(addr))
       entry_addrs.push_back(addr);
   }
+
+  // Explicit output roots take priority in flattened/loop-heavy CFGs where
+  // the function entry may be back-edge reachable and therefore look like a
+  // non-entry structurally.
+  if (!rooted_entry_addrs.empty())
+    entry_addrs = std::move(rooted_entry_addrs);
 
   // If no clear entry points, all blocks call each other (degenerate).
   // Use the lowest address as entry.
@@ -351,6 +333,8 @@ llvm::PreservedAnalyses MergeBlockFunctionsPass::run(
     }
     entry_addrs.push_back(min_addr);
   }
+
+  llvm::sort(entry_addrs);
 
   bool changed = false;
 
@@ -379,6 +363,8 @@ llvm::PreservedAnalyses MergeBlockFunctionsPass::run(
     for (uint64_t addr : group) {
       auto it = addr_to_fn.find(addr);
       if (it != addr_to_fn.end()) {
+        if (it->second == merged)
+          continue;
         it->second->setLinkage(llvm::GlobalValue::InternalLinkage);
         it->second->removeDeadConstantUsers();
       }

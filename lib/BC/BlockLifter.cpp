@@ -47,6 +47,10 @@ llvm::Function *BlockManager::GetLiftedBlockDefinition(uint64_t) {
   return nullptr;
 }
 
+llvm::Module *BlockManager::GetLiftedBlockModule() {
+  return nullptr;
+}
+
 void BlockManager::ForEachDevirtualizedTarget(
     const remill::Instruction &,
     std::function<void(uint64_t, DevirtualizedTargetKind)>) {
@@ -111,7 +115,9 @@ BlockLifter::Impl::Impl(const remill::Arch *arch_, BlockManager &manager_)
       intrinsics(arch->GetInstrinsicTable()),
       word_type(arch->AddressType()),
       context(word_type->getContext()),
-      module(intrinsics->async_hyper_call->getParent()),
+      module(manager_.GetLiftedBlockModule()
+                 ? manager_.GetLiftedBlockModule()
+                 : intrinsics->async_hyper_call->getParent()),
       addr_mask(arch->address_size >= 64 ? ~0ULL
                                          : (~0ULL >> arch->address_size)),
       manager(manager_),
@@ -149,15 +155,6 @@ llvm::Function *BlockLifter::Impl::DeclareBlockFunction(uint64_t addr) {
 }
 
 llvm::Function *BlockLifter::Impl::GetOrDeclareBlockFunction(uint64_t addr) {
-  // Check if already defined.
-  if (auto *fn = manager.GetLiftedBlockDefinition(addr)) {
-    return fn;
-  }
-  // Check if already declared.
-  if (auto *fn = manager.GetLiftedBlockDeclaration(addr)) {
-    return fn;
-  }
-  // Check module for existing declaration by name.
   auto name = manager.BlockName(addr);
   if (auto *fn = module->getFunction(name)) {
     return fn;
@@ -240,7 +237,9 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
     llvm::SmallVectorImpl<uint64_t> &discovered_targets) {
 
   // Already lifted?
-  if (auto *existing = manager.GetLiftedBlockDefinition(addr)) {
+  auto name = manager.BlockName(addr);
+  if (auto *existing = module->getFunction(name);
+      existing && !existing->isDeclaration()) {
     return existing;
   }
 

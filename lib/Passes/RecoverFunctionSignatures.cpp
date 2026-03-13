@@ -16,9 +16,41 @@ namespace {
 
 static constexpr unsigned kWin64PublicRootParamCount = 2;
 
+std::string nativeWrapperName(const llvm::Function &F) {
+  return F.getName().str() + "_native";
+}
+
 bool isPublicOutputRoot(const llvm::Function *F) {
   return F && F->hasFnAttribute("omill.output_root") &&
          !F->hasFnAttribute("omill.vm_wrapper");
+}
+
+bool shouldRecoverClosedRootSliceFunction(const llvm::Function &F) {
+  if (!isClosedRootSliceScopedModule(*F.getParent()))
+    return true;
+  return isClosedRootSliceFunction(F);
+}
+
+bool isTerminalMissingBlockStub(const llvm::Function &F) {
+  const llvm::Function *missing_block = nullptr;
+  unsigned direct_calls = 0;
+
+  for (const auto &BB : F) {
+    for (const auto &I : BB) {
+      const auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+      if (!CB)
+        continue;
+      auto *callee = CB->getCalledFunction();
+      if (!callee)
+        return false;
+      ++direct_calls;
+      if (callee->getName() != "__remill_missing_block")
+        return false;
+      missing_block = callee;
+    }
+  }
+
+  return missing_block != nullptr && direct_calls == 1;
 }
 
 unsigned exportedRootGPRParamCount(const FunctionABI &abi,
@@ -145,7 +177,7 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
                                     is_public_output_root);
 
   // Name: lifted function name + "_native"
-  std::string native_name = lifted_fn->getName().str() + "_native";
+  std::string native_name = nativeWrapperName(*lifted_fn);
   auto *native_fn = llvm::Function::Create(
       native_ty, llvm::Function::ExternalLinkage, native_name, M);
   native_fn->addFnAttr(llvm::Attribute::MustProgress);
@@ -181,6 +213,10 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
     native_fn->addFnAttr("omill.vm_entry_seed");
   if (lifted_fn->hasFnAttribute("omill.output_root"))
     native_fn->addFnAttr("omill.output_root");
+  if (lifted_fn->hasFnAttribute("omill.closed_root_slice"))
+    native_fn->addFnAttr("omill.closed_root_slice", "1");
+  if (lifted_fn->hasFnAttribute("omill.closed_root_slice_root"))
+    native_fn->addFnAttr("omill.closed_root_slice_root", "1");
 
   auto *entry = llvm::BasicBlock::Create(Ctx, "entry", native_fn);
   llvm::IRBuilder<> Builder(entry);
@@ -407,6 +443,10 @@ llvm::PreservedAnalyses RecoverFunctionSignaturesPass::run(
   llvm::SmallVector<llvm::Function *, 16> functions;
   for (auto &F : M) {
     if (!isLiftedFunction(F)) continue;
+    if (!shouldRecoverClosedRootSliceFunction(F))
+      continue;
+    if (isTerminalMissingBlockStub(F))
+      continue;
     functions.push_back(&F);
   }
 
@@ -415,6 +455,10 @@ llvm::PreservedAnalyses RecoverFunctionSignaturesPass::run(
       M.getContext(), "struct.State");
 
   for (auto *F : functions) {
+    if (auto *existing = M.getFunction(nativeWrapperName(*F));
+        existing && !existing->isDeclaration()) {
+      continue;
+    }
     auto *abi = cc_info.getABI(F);
     if (!abi) {
       if (getenv("OMILL_DEBUG_REWRITE"))

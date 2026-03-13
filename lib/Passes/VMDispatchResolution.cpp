@@ -156,7 +156,21 @@ llvm::PreservedAnalyses VMDispatchResolutionPass::run(
   auto &ctx = M.getContext();
   auto *i64_ty = llvm::Type::getInt64Ty(ctx);
 
-  for (auto &F : M) {
+  llvm::SmallVector<llvm::Function *, 32> worklist;
+  llvm::DenseSet<llvm::Function *> queued_handlers;
+
+  auto enqueue_handler = [&](llvm::Function *Fn) {
+    if (!Fn || Fn->isDeclaration() || !Fn->hasFnAttribute("omill.vm_handler"))
+      return;
+    if (queued_handlers.insert(Fn).second)
+      worklist.push_back(Fn);
+  };
+
+  for (auto &F : M)
+    enqueue_handler(&F);
+
+  while (!worklist.empty()) {
+    llvm::Function &F = *worklist.pop_back_val();
     if (F.isDeclaration() || !F.hasFnAttribute("omill.vm_handler"))
       continue;
 
@@ -186,6 +200,7 @@ llvm::PreservedAnalyses VMDispatchResolutionPass::run(
       if (exact_hash) {
         exact_clone_target = getOrCreateDemergedHandlerClone(
             M, entry_handler_va, *exact_hash);
+        enqueue_handler(exact_clone_target);
       }
     }
 
@@ -199,6 +214,7 @@ llvm::PreservedAnalyses VMDispatchResolutionPass::run(
             exact_record->outgoing_hash != 0) {
           exact_clone_target = getOrCreateDemergedHandlerClone(
               M, exact_record->successors.front(), exact_record->outgoing_hash);
+          enqueue_handler(exact_clone_target);
         }
       }
     } else {
@@ -210,6 +226,7 @@ llvm::PreservedAnalyses VMDispatchResolutionPass::run(
         if (record.successors.size() == 1 && record.outgoing_hash != 0) {
           exact_clone_target = getOrCreateDemergedHandlerClone(
               M, record.successors.front(), record.outgoing_hash);
+          enqueue_handler(exact_clone_target);
         }
       }
     }
@@ -219,6 +236,7 @@ llvm::PreservedAnalyses VMDispatchResolutionPass::run(
       trace_targets.push_back(*forced_successor);
       exact_clone_target = getOrCreateDemergedHandlerClone(
           M, *forced_successor, *forced_out_hash);
+      enqueue_handler(exact_clone_target);
     }
 
     llvm::SmallVector<llvm::CallInst *, 4> dispatch_jumps;
@@ -316,6 +334,7 @@ llvm::PreservedAnalyses VMDispatchResolutionPass::run(
                     M, native_call_va, specialized_successor,
                     specialized_out_hash)) {
               native_fn = specialized;
+              enqueue_handler(specialized);
             }
           }
         }

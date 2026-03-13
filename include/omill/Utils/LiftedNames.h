@@ -11,6 +11,7 @@
 namespace llvm {
 class BasicBlock;
 class Function;
+class Module;
 class Value;
 }  // namespace llvm
 
@@ -56,5 +57,16 @@ bool hasLiftedSignature(const llvm::Function &F);
 /// Ignores trailing non-hex suffixes added by LLVM (e.g. ".i", ".123").
 /// Returns 0 on failure.
 uint64_t extractBlockPC(llvm::StringRef name);
+
+/// True when the module has enabled post-closure cleanup/recovery scoping for
+/// a closed generic devirtualization root slice.
+bool isClosedRootSliceScopedModule(const llvm::Module &M);
+
+/// True when a function is part of the currently selected closed root slice.
+bool isClosedRootSliceFunction(const llvm::Function &F);
+
+/// True when a function is the root entry of the currently selected closed
+/// root slice.
+bool isClosedRootSliceRoot(const llvm::Function &F);
 
 }  // namespace omill

@@ -9,6 +9,7 @@
 #include <llvm/IR/Verifier.h>
 #include <llvm/Passes/PassBuilder.h>
 
+#include "omill/Analysis/IterativeLiftingSession.h"
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Passes/ConstantMemoryFolding.h"
 #include "omill/Omill.h"
@@ -24,6 +25,7 @@ static const char *kDataLayout =
 class IterativeBlockDiscoveryTest : public ::testing::Test {
  protected:
   llvm::LLVMContext Ctx;
+  std::shared_ptr<omill::IterativeLiftingSession> Session;
 
   std::unique_ptr<llvm::Module> createModule() {
     auto M = std::make_unique<llvm::Module>("test", Ctx);
@@ -46,6 +48,11 @@ class IterativeBlockDiscoveryTest : public ::testing::Test {
     PB.registerLoopAnalyses(LAM);
     PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
     omill::registerModuleAnalyses(MAM);
+    Session = std::make_shared<omill::IterativeLiftingSession>("block-test");
+    MAM.registerPass([this] {
+      return omill::IterativeLiftingSessionAnalysis(Session);
+    });
+    Session = MAM.getResult<omill::IterativeLiftingSessionAnalysis>(M).session;
 
     MPM.run(M, MAM);
   }
@@ -151,6 +158,18 @@ TEST_F(IterativeBlockDiscoveryTest, ConstantDispatchResolved) {
   }
   EXPECT_TRUE(found_direct_call);
   EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+  ASSERT_TRUE(Session);
+  ASSERT_NE(Session->graph().lookupNode(0x1000), nullptr);
+  ASSERT_NE(Session->graph().lookupNode(0x2000), nullptr);
+  bool found_edge = false;
+  for (auto *edge : Session->graph().outgoingEdges(0x1000)) {
+    if (edge->target_pc == 0x2000 &&
+        edge->kind == omill::LiftEdgeKind::kDirectBranch &&
+        edge->resolved) {
+      found_edge = true;
+    }
+  }
+  EXPECT_TRUE(found_edge);
 }
 
 // Test: dispatch_jump with non-constant target is left unresolved.
@@ -221,6 +240,15 @@ TEST_F(IterativeBlockDiscoveryTest, ConstantDispatchToMissingBlock) {
   // The target block doesn't exist, so dispatch remains.
   EXPECT_EQ(countDispatches(*M), 1u);
   EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+  ASSERT_TRUE(Session);
+  bool found_unresolved = false;
+  for (auto *edge : Session->graph().outgoingEdges(0x4000)) {
+    if (edge->kind == omill::LiftEdgeKind::kIndirectBranch &&
+        edge->target_pc == 0x9999 && !edge->resolved) {
+      found_unresolved = true;
+    }
+  }
+  EXPECT_TRUE(found_unresolved);
 }
 
 // Test: dispatch_call with constant target gets resolved similarly.

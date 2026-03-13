@@ -27,6 +27,10 @@ struct NativeCallInfo {
 
 class BinaryMemoryMap;
 
+/// Cheap x86-64 entry probe used by generic static devirtualization to
+/// distinguish "mapped byte range" from "first instruction decodes".
+bool canDecodeX86InstructionAt(const BinaryMemoryMap &mem, uint64_t pc);
+
 /// Concrete x86-64 emulator for the EasyAntiCheat hash-dispatch VM.
 ///
 /// The architecture is flat and trace-driven: a wrapper seeds [r12+0x190] with

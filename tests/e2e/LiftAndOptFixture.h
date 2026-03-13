@@ -15,6 +15,7 @@
 
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/ExceptionInfo.h"
+#include "omill/Analysis/IterativeLiftingSession.h"
 #include "omill/Omill.h"
 #include "omill/Support/JumpTableDiscovery.h"
 
@@ -164,6 +165,11 @@ class LiftAndOptFixture : public ::testing::Test {
   /// Access the trace manager.
   BufferTraceManager &traceManager() { return manager_; }
 
+  /// Access the iterative session captured for the last optimize run.
+  const std::shared_ptr<IterativeLiftingSession> &iterativeSession() const {
+    return iterative_session_;
+  }
+
  private:
   /// Returns the dump directory from OMILL_DUMP_IR, or empty if not set.
   static std::string getDumpDir();
@@ -175,6 +181,7 @@ class LiftAndOptFixture : public ::testing::Test {
   std::unique_ptr<const remill::Arch> arch_;
   std::unique_ptr<llvm::Module> module_;
   BufferTraceManager manager_;
+  std::shared_ptr<IterativeLiftingSession> iterative_session_;
 };
 
 }  // namespace omill::e2e

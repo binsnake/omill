@@ -313,4 +313,179 @@ TEST_F(MergeBlockFunctionsTest, SelfLoop) {
   EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
 }
 
+TEST_F(MergeBlockFunctionsTest, PreservesOutputRootFromEntryBlock) {
+  auto M = createModule();
+
+  auto *entry_fn = declareBlockFn(*M, 0x7000);
+  auto *next_fn = declareBlockFn(*M, 0x7010);
+  entry_fn->addFnAttr("omill.output_root");
+
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", entry_fn);
+    llvm::IRBuilder<> B(entry);
+    auto *call = B.CreateCall(next_fn, {entry_fn->getArg(0), entry_fn->getArg(1),
+                                        entry_fn->getArg(2)});
+    call->setTailCallKind(llvm::CallInst::TCK_MustTail);
+    B.CreateRet(call);
+  }
+
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", next_fn);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(next_fn->getArg(2));
+  }
+
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+
+  runPass(*M);
+
+  auto *merged = M->getFunction("sub_7000");
+  ASSERT_NE(merged, nullptr);
+  EXPECT_TRUE(merged->hasFnAttribute("omill.output_root"));
+  EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+}
+
+TEST_F(MergeBlockFunctionsTest, PreservesClosedRootSliceAttrsFromEntryBlock) {
+  auto M = createModule();
+
+  auto *entry_fn = declareBlockFn(*M, 0x7100);
+  auto *next_fn = declareBlockFn(*M, 0x7110);
+  entry_fn->addFnAttr("omill.closed_root_slice", "1");
+  entry_fn->addFnAttr("omill.closed_root_slice_root", "1");
+
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", entry_fn);
+    llvm::IRBuilder<> B(entry);
+    auto *call = B.CreateCall(next_fn, {entry_fn->getArg(0), entry_fn->getArg(1),
+                                        entry_fn->getArg(2)});
+    call->setTailCallKind(llvm::CallInst::TCK_MustTail);
+    B.CreateRet(call);
+  }
+
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", next_fn);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(next_fn->getArg(2));
+  }
+
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+
+  runPass(*M);
+
+  auto *merged = M->getFunction("sub_7100");
+  ASSERT_NE(merged, nullptr);
+  EXPECT_TRUE(merged->hasFnAttribute("omill.closed_root_slice"));
+  EXPECT_TRUE(merged->hasFnAttribute("omill.closed_root_slice_root"));
+  EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+}
+
+TEST_F(MergeBlockFunctionsTest, OutputRootDrivesEntrySelectionInLoop) {
+  auto M = createModule();
+
+  auto *entry_fn = declareBlockFn(*M, 0x2000);
+  auto *loop_fn = declareBlockFn(*M, 0x2010);
+  entry_fn->addFnAttr("omill.output_root");
+
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", entry_fn);
+    llvm::IRBuilder<> B(entry);
+    auto *call = B.CreateCall(loop_fn, {entry_fn->getArg(0), entry_fn->getArg(1),
+                                        entry_fn->getArg(2)});
+    call->setTailCallKind(llvm::CallInst::TCK_MustTail);
+    B.CreateRet(call);
+  }
+
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", loop_fn);
+    llvm::IRBuilder<> B(entry);
+    auto *call = B.CreateCall(entry_fn, {loop_fn->getArg(0), loop_fn->getArg(1),
+                                         loop_fn->getArg(2)});
+    call->setTailCallKind(llvm::CallInst::TCK_MustTail);
+    B.CreateRet(call);
+  }
+
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+
+  runPass(*M);
+
+  auto *merged = M->getFunction("sub_2000");
+  ASSERT_NE(merged, nullptr);
+  EXPECT_TRUE(merged->hasFnAttribute("omill.output_root"));
+  EXPECT_EQ(M->getFunction("sub_2010"), nullptr);
+  EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+}
+
+TEST_F(MergeBlockFunctionsTest, RootedSingleBlockProducesMergedTrace) {
+  auto M = createModule();
+
+  auto *entry_fn = declareBlockFn(*M, 0x3000);
+  entry_fn->addFnAttr("omill.output_root");
+
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", entry_fn);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(entry_fn->getArg(2));
+  }
+
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+
+  runPass(*M);
+
+  auto *merged = M->getFunction("sub_3000");
+  ASSERT_NE(merged, nullptr);
+  EXPECT_TRUE(merged->hasFnAttribute("omill.output_root"));
+  EXPECT_TRUE(entry_fn->hasInternalLinkage());
+  EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+}
+
+TEST_F(MergeBlockFunctionsTest, RootedSingleBlockWithInternalLoopPhis) {
+  auto M = createModule();
+
+  auto *entry_fn = declareBlockFn(*M, 0x8000);
+  entry_fn->addFnAttr("omill.output_root");
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", entry_fn);
+  auto *loop = llvm::BasicBlock::Create(Ctx, "loop", entry_fn);
+  auto *exit = llvm::BasicBlock::Create(Ctx, "exit", entry_fn);
+
+  {
+    llvm::IRBuilder<> B(entry);
+    B.CreateBr(loop);
+  }
+
+  {
+    llvm::IRBuilder<> B(loop);
+    auto *acc = B.CreatePHI(llvm::Type::getInt64Ty(Ctx), 2);
+    auto *iters = B.CreatePHI(llvm::Type::getInt64Ty(Ctx), 2);
+    acc->addIncoming(entry_fn->getArg(1), entry);
+    iters->addIncoming(llvm::ConstantInt::get(llvm::Type::getInt64Ty(Ctx), 0),
+                       entry);
+
+    auto *next_acc = B.CreateAdd(
+        acc, llvm::ConstantInt::get(llvm::Type::getInt64Ty(Ctx), 3));
+    auto *next_iters = B.CreateAdd(
+        iters, llvm::ConstantInt::get(llvm::Type::getInt64Ty(Ctx), 1));
+    auto *keep_looping = B.CreateICmpULT(
+        next_iters, llvm::ConstantInt::get(llvm::Type::getInt64Ty(Ctx), 4));
+
+    acc->addIncoming(next_acc, loop);
+    iters->addIncoming(next_iters, loop);
+    B.CreateCondBr(keep_looping, loop, exit);
+  }
+
+  {
+    llvm::IRBuilder<> B(exit);
+    B.CreateRet(entry_fn->getArg(2));
+  }
+
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+
+  runPass(*M);
+
+  auto *merged = M->getFunction("sub_8000");
+  ASSERT_NE(merged, nullptr);
+  EXPECT_TRUE(merged->hasFnAttribute("omill.output_root"));
+  EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+}
+
 }  // namespace

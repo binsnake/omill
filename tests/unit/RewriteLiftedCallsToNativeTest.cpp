@@ -219,6 +219,70 @@ TEST_F(RewriteLiftedCallsToNativeTest, DynamicDispatchEmitsIndirectCall) {
   EXPECT_TRUE(has_indirect_call);
 }
 
+TEST_F(RewriteLiftedCallsToNativeTest,
+       ClosedRootSliceScopeSkipsUnmarkedCallers) {
+  auto M = createBaseModule();
+  M->addModuleFlag(llvm::Module::Override, "omill.closed_root_slice_scope", 1u);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+
+  auto *callee = llvm::Function::Create(
+      liftedFnTy(), llvm::Function::ExternalLinkage, "sub_402000", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", callee);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(callee->getArg(2));
+  }
+  auto *native_ty = llvm::FunctionType::get(i64_ty, {i64_ty}, false);
+  auto *native_fn = llvm::Function::Create(
+      native_ty, llvm::Function::ExternalLinkage, "sub_402000_native", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", native_fn);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(native_fn->getArg(0));
+  }
+
+  auto *closed_caller = llvm::Function::Create(
+      liftedFnTy(), llvm::Function::ExternalLinkage, "sub_401000", *M);
+  closed_caller->addFnAttr("omill.closed_root_slice", "1");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", closed_caller);
+    llvm::IRBuilder<> B(entry);
+    auto *result = B.CreateCall(
+        callee, {closed_caller->getArg(0), closed_caller->getArg(1),
+                 closed_caller->getArg(2)});
+    B.CreateRet(result);
+  }
+
+  auto *other_caller = llvm::Function::Create(
+      liftedFnTy(), llvm::Function::ExternalLinkage, "sub_401100", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", other_caller);
+    llvm::IRBuilder<> B(entry);
+    auto *result = B.CreateCall(
+        callee, {other_caller->getArg(0), other_caller->getArg(1),
+                 other_caller->getArg(2)});
+    B.CreateRet(result);
+  }
+
+  runPass(*M);
+
+  bool closed_calls_native = false;
+  bool other_calls_native = false;
+  for (auto &BB : *closed_caller)
+    for (auto &I : BB)
+      if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
+        if (CI->getCalledFunction() == native_fn)
+          closed_calls_native = true;
+  for (auto &BB : *other_caller)
+    for (auto &I : BB)
+      if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
+        if (CI->getCalledFunction() == native_fn)
+          other_calls_native = true;
+
+  EXPECT_TRUE(closed_calls_native);
+  EXPECT_FALSE(other_calls_native);
+}
+
 TEST_F(RewriteLiftedCallsToNativeTest, LeafWithNativeRewrittenToNative) {
   auto M = createBaseModule();
   auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
@@ -317,6 +381,73 @@ TEST_F(RewriteLiftedCallsToNativeTest, LeafWithoutNativeNotRewritten) {
           calls_leaf = true;
 
   EXPECT_TRUE(calls_leaf);
+}
+
+TEST_F(RewriteLiftedCallsToNativeTest,
+       DISABLED_BlockCallRewrittenViaMergedLiftedTarget) {
+  auto M = createBaseModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+
+  auto *merged = llvm::Function::Create(
+      liftedFnTy(), llvm::Function::ExternalLinkage, "sub_402000", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", merged);
+    llvm::IRBuilder<> B(entry);
+    auto *state = merged->getArg(0);
+    auto *rcx_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 2248);
+    auto *val = B.CreateLoad(i64_ty, rcx_gep, "rcx_val");
+    auto *rax_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 2216);
+    B.CreateStore(val, rax_gep);
+    auto *dispatch = M->getOrInsertFunction(
+        "__omill_dispatch_call", liftedFnTy()).getCallee();
+    auto *result = B.CreateCall(liftedFnTy(), dispatch,
+                                {state, B.getInt64(0x999000),
+                                 merged->getArg(2)});
+    B.CreateRet(result);
+  }
+
+  auto *native_ty = llvm::FunctionType::get(i64_ty, {i64_ty}, false);
+  auto *native_fn = llvm::Function::Create(
+      native_ty, llvm::Function::ExternalLinkage, "sub_402000_native", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", native_fn);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(native_fn->getArg(0));
+  }
+
+  auto *blk = llvm::Function::Create(
+      liftedFnTy(), llvm::Function::InternalLinkage, "blk_402000", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", blk);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(blk->getArg(2));
+  }
+
+  auto *caller = llvm::Function::Create(
+      liftedFnTy(), llvm::Function::ExternalLinkage, "sub_401000", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", caller);
+    llvm::IRBuilder<> B(entry);
+    auto *result = B.CreateCall(blk,
+        {caller->getArg(0), caller->getArg(1), caller->getArg(2)});
+    B.CreateRet(result);
+  }
+
+  runPass(*M);
+
+  bool calls_block = false;
+  bool calls_native = false;
+  for (auto &BB : *caller)
+    for (auto &I : BB)
+      if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I)) {
+        if (CI->getCalledFunction() == blk)
+          calls_block = true;
+        if (CI->getCalledFunction() == native_fn)
+          calls_native = true;
+      }
+
+  EXPECT_FALSE(calls_block);
+  EXPECT_TRUE(calls_native);
 }
 
 TEST_F(RewriteLiftedCallsToNativeTest, NativeDispatchJumpMaterializesRAX) {

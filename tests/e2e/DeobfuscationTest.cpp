@@ -78,6 +78,25 @@ class DeobfuscationTest : public LiftAndOptFixture {
     return true;
   }
 
+  bool liftAndOptimize(const std::string &export_name,
+                       const omill::PipelineOptions &opts) {
+    uint64_t va = getExportVA(export_name);
+    if (va == 0) return false;
+
+    current_export_va_ = va;
+    expected_native_prefix_.clear();
+
+    auto *M = liftExport(va);
+    if (!M) return false;
+    auto trace_it = traceManager().traces().find(va);
+    if (trace_it != traceManager().traces().end() && trace_it->second) {
+      expected_native_prefix_ = trace_it->second->getName().str();
+    }
+
+    optimizeWithMemoryMap(opts, pe_.memory_map);
+    return true;
+  }
+
   // -----------------------------------------------------------------------
   // Assertion helpers
   // -----------------------------------------------------------------------
@@ -725,6 +744,22 @@ TEST_F(DeobfuscationTest, CloakworkCombinedConstStackPromotion) {
   // constant stack data (PE header offsets, lookup tables, etc.).
   EXPECT_GT(countConstStackGlobals(), 0u)
       << "Expected OutlineConstantStackData to promote cloakwork allocas";
+}
+
+TEST_F(DeobfuscationTest, CloakworkCombinedIterativePipelineSanity) {
+  omill::PipelineOptions opts;
+  opts.recover_abi = true;
+  opts.deobfuscate = true;
+  opts.resolve_indirect_targets = true;
+  opts.interprocedural_const_prop = true;
+  opts.max_resolution_iterations = 12;
+
+  ASSERT_TRUE(liftAndOptimize("cw_combined", opts));
+  EXPECT_TRUE(verifyModule()) << "Module invalid after iterative pipeline";
+  EXPECT_GT(countNativeFunctions(), 1u);
+
+  ASSERT_TRUE(iterativeSession());
+  EXPECT_GT(iterativeSession()->graph().nodeCount(), 0u);
 }
 
 // =============================================================================

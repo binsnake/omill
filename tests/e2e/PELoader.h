@@ -79,7 +79,12 @@ inline bool loadPE(llvm::StringRef path, PEInfo &out) {
     bool read_only = !coff_sec ||
                      !(coff_sec->Characteristics &
                        llvm::COFF::IMAGE_SCN_MEM_WRITE);
-    out.memory_map.addRegion(va, stored.data(), stored.size(), read_only);
+    bool executable = coff_sec &&
+                      (coff_sec->Characteristics &
+                       (llvm::COFF::IMAGE_SCN_CNT_CODE |
+                        llvm::COFF::IMAGE_SCN_MEM_EXECUTE));
+    out.memory_map.addRegion(va, stored.data(), stored.size(), read_only,
+                             executable);
 
     if (name == ".text") {
       out.text_base = va;

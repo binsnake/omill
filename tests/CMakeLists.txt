@@ -25,6 +25,7 @@ llvm_map_components_to_libnames(_llvm_object_lib Object)
 
 add_executable(omill-unit-tests
   unit/CallGraphAnalysisTest.cpp
+  unit/IterativeLiftingSessionTest.cpp
   unit/InterProceduralConstPropTest.cpp
   unit/IntrinsicTableTest.cpp
   unit/LowerFlagIntrinsicsTest.cpp
@@ -96,7 +97,10 @@ add_executable(omill-unit-tests
   unit/ResolveAndLowerControlFlowTest.cpp
   unit/InlineJumpTargetsTest.cpp
   unit/LiftedNamesTest.cpp
+  unit/ProtectedBoundaryUtilsTest.cpp
   unit/LiftedFunctionMapTest.cpp
+  unit/VirtualMachineModelTest.cpp
+  unit/VirtualCFGMaterializationTest.cpp
   unit/BinaryMemoryMapTest.cpp
   unit/VMDispatchResolutionTest.cpp
   unit/VMTraceMapTest.cpp

@@ -1,8 +1,10 @@
+#include "omill/Omill.h"
 #include "omill/Utils/TranslationValidator.h"
 
 #include "omill/Passes/OptimizeState.h"
 #include "omill/Passes/OutlineConstantStackData.h"
 #include "omill/Passes/SimplifyVectorReassembly.h"
+#include "omill/Passes/VirtualCFGMaterialization.h"
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
@@ -647,6 +649,183 @@ TEST_F(SemanticVerificationTest, OutlineConstantStack_NonConstPreserved) {
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
   auto res = validator.verify(*F);
   EXPECT_TRUE(res.equivalent) << "Counterexample: " << res.counterexample;
+}
+
+TEST_F(SemanticVerificationTest,
+       VirtualCFGMaterialization_DirectCallPreservesSemantics) {
+  auto M = makeModule();
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *i8_ty = llvm::Type::getInt8Ty(Ctx);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+
+  auto *dispatch = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "__omill_dispatch_call", *M);
+
+  auto *target = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "sub_180006100", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target->getArg(0));
+  }
+
+  auto *caller = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "sub_180006000", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", caller);
+    llvm::IRBuilder<> B(entry);
+    auto *slot = B.CreateGEP(i8_ty, caller->getArg(0), B.getInt64(0x190));
+    B.CreateStore(B.getInt64(0x180006100ULL), slot);
+    auto *loaded = B.CreateLoad(i64_ty, slot);
+    auto *call =
+        B.CreateCall(dispatch, {caller->getArg(0), loaded, caller->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  omill::TranslationValidator validator(Z3Ctx);
+  validator.snapshotBefore(*caller);
+
+  llvm::ModulePassManager MPM;
+  MPM.addPass(omill::VirtualCFGMaterializationPass());
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  setupAnalyses(PB, LAM, FAM, CGAM, MAM);
+  omill::registerAnalyses(FAM);
+  omill::registerModuleAnalyses(MAM);
+  MPM.run(*M, MAM);
+
+  EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+  auto res = validator.verify(*caller);
+  EXPECT_TRUE(res.equivalent) << "Counterexample: " << res.counterexample;
+}
+
+TEST_F(SemanticVerificationTest,
+       VirtualCFGMaterialization_MustTailPreservesSemantics) {
+  auto M = makeModule();
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *i8_ty = llvm::Type::getInt8Ty(Ctx);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+
+  auto *dispatch = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "__omill_dispatch_jump", *M);
+
+  auto *target = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "sub_180006300", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target->getArg(0));
+  }
+
+  auto *caller = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "sub_180006200", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", caller);
+    llvm::IRBuilder<> B(entry);
+    auto *slot = B.CreateGEP(i8_ty, caller->getArg(0), B.getInt64(0x108));
+    B.CreateStore(B.getInt64(0x180006300ULL), slot);
+    auto *loaded = B.CreateLoad(i64_ty, slot);
+    B.CreateCall(dispatch, {caller->getArg(0), loaded, caller->getArg(2)});
+    B.CreateRet(caller->getArg(0));
+  }
+
+  omill::TranslationValidator validator(Z3Ctx);
+  validator.snapshotBefore(*caller);
+
+  llvm::ModulePassManager MPM;
+  MPM.addPass(omill::VerifiedVirtualCFGMaterializationPass());
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  setupAnalyses(PB, LAM, FAM, CGAM, MAM);
+  omill::registerAnalyses(FAM);
+  omill::registerModuleAnalyses(MAM);
+  MPM.run(*M, MAM);
+
+  EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+  auto res = validator.verify(*caller);
+  EXPECT_TRUE(res.equivalent) << "Counterexample: " << res.counterexample;
+}
+
+TEST_F(SemanticVerificationTest,
+       VerifiedVirtualCFGMaterialization_RestoresOriginalOnValidationFailure) {
+  auto M = makeModule();
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *i8_ty = llvm::Type::getInt8Ty(Ctx);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+
+  auto *dispatch = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "__omill_dispatch_call", *M);
+
+  auto *target = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "sub_180006600", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target->getArg(0));
+  }
+
+  auto *caller = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "sub_180006500", *M);
+  caller->addFnAttr("omill.force_virtual_materialization_validation_fail", "1");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", caller);
+    llvm::IRBuilder<> B(entry);
+    auto *slot = B.CreateGEP(i8_ty, caller->getArg(0), B.getInt64(0x190));
+    B.CreateStore(B.getInt64(0x180006600ULL), slot);
+    auto *loaded = B.CreateLoad(i64_ty, slot);
+    auto *call =
+        B.CreateCall(dispatch, {caller->getArg(0), loaded, caller->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  llvm::ModulePassManager MPM;
+  MPM.addPass(omill::VerifiedVirtualCFGMaterializationPass());
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  setupAnalyses(PB, LAM, FAM, CGAM, MAM);
+  omill::registerAnalyses(FAM);
+  omill::registerModuleAnalyses(MAM);
+  MPM.run(*M, MAM);
+
+  EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+
+  unsigned dispatch_calls = 0;
+  unsigned direct_calls = 0;
+  for (auto &BB : *caller) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *callee = CI->getCalledFunction();
+      if (!callee)
+        continue;
+      if (callee->getName() == "__omill_dispatch_call")
+        ++dispatch_calls;
+      if (callee == target)
+        ++direct_calls;
+    }
+  }
+
+  EXPECT_EQ(dispatch_calls, 1u);
+  EXPECT_EQ(direct_calls, 0u);
 }
 
 }  // namespace

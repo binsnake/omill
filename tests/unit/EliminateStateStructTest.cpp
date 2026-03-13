@@ -98,6 +98,55 @@ TEST_F(EliminateStateStructTest, InternalizesLiftedFunction) {
   EXPECT_EQ(native_fn->getLinkage(), llvm::GlobalValue::ExternalLinkage);
 }
 
+TEST_F(EliminateStateStructTest, ClosedRootSliceScopeSkipsUnmarkedFunctions) {
+  auto M = createTestModule();
+  M->addModuleFlag(llvm::Module::Override, "omill.closed_root_slice_scope", 1u);
+
+  auto *lifted_fn = M->getFunction("sub_401000");
+  ASSERT_NE(lifted_fn, nullptr);
+  lifted_fn->addFnAttr("omill.closed_root_slice", "1");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_fn_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *other_lifted = llvm::Function::Create(
+      lifted_fn_ty, llvm::Function::ExternalLinkage, "sub_402000", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", other_lifted);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(other_lifted->getArg(2));
+  }
+  auto *other_native_ty =
+      llvm::FunctionType::get(i64_ty, {i64_ty, i64_ty}, false);
+  auto *other_native = llvm::Function::Create(
+      other_native_ty, llvm::Function::ExternalLinkage, "sub_402000_native",
+      *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", other_native);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(B.getInt64(0));
+  }
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+  llvm::ModulePassManager MPM;
+  MPM.addPass(omill::EliminateStateStructPass());
+  MPM.run(*M, MAM);
+
+  EXPECT_EQ(lifted_fn->getLinkage(), llvm::GlobalValue::InternalLinkage);
+  EXPECT_EQ(other_lifted->getLinkage(), llvm::GlobalValue::ExternalLinkage);
+}
+
 TEST_F(EliminateStateStructTest, RemovesUnusedRemillDecls) {
   auto M = createTestModule();
 

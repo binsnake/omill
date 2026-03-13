@@ -5,6 +5,7 @@
 #include <llvm/Analysis/LoopAnalysisManager.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/PassInstrumentation.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
@@ -13,6 +14,9 @@
 
 #include <gtest/gtest.h>
 #include <cstdlib>
+#include <string>
+#include <utility>
+#include <vector>
 
 #ifdef _WIN32
 #include <stdlib.h>  // _putenv_s
@@ -40,6 +44,40 @@ class PipelineTest : public ::testing::Test {
     llvm::ModulePassManager MPM;
     omill::buildPipeline(MPM, opts);
     runMPM(MPM, M);
+  }
+
+  std::vector<std::pair<std::string, std::string>> collectFunctionPassRuns(
+      llvm::Module &M, const omill::PipelineOptions &opts) {
+    llvm::PassInstrumentationCallbacks PIC;
+    std::vector<std::pair<std::string, std::string>> runs;
+    PIC.registerBeforeNonSkippedPassCallback([&](llvm::StringRef PassName,
+                                                 llvm::Any IR) {
+      if (const auto **F = llvm::any_cast<const llvm::Function *>(&IR)) {
+        runs.emplace_back(PassName.str(), (*F)->getName().str());
+      }
+    });
+
+    llvm::ModulePassManager MPM;
+    omill::buildPipeline(MPM, opts);
+
+    llvm::PassBuilder PB(nullptr, llvm::PipelineTuningOptions(),
+                         std::nullopt, &PIC);
+    llvm::LoopAnalysisManager LAM;
+    llvm::FunctionAnalysisManager FAM;
+    llvm::CGSCCAnalysisManager CGAM;
+    llvm::ModuleAnalysisManager MAM;
+
+    PB.registerModuleAnalyses(MAM);
+    PB.registerCGSCCAnalyses(CGAM);
+    PB.registerFunctionAnalyses(FAM);
+    PB.registerLoopAnalyses(LAM);
+    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+    omill::registerAnalyses(FAM);
+    omill::registerModuleAnalyses(MAM);
+
+    MPM.run(M, MAM);
+    return runs;
   }
 
   /// Run a module pass manager with all required analyses registered.
@@ -416,6 +454,48 @@ TEST_F(PipelineTest, LowerIntrinsicsPhaseRuns) {
   SUCCEED();
 }
 
+TEST_F(PipelineTest, EarlyLiftPassesSkipProtectedSemanticHelpers) {
+  auto M = createModule();
+  auto *fnTy = liftedFnTy();
+
+  auto *lifted = llvm::Function::Create(
+      fnTy, llvm::GlobalValue::ExternalLinkage, "sub_140001000", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", lifted);
+    llvm::IRBuilder<> B(entry);
+    auto *slot = B.CreateAlloca(llvm::Type::getInt64Ty(Ctx));
+    B.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(Ctx), 7), slot);
+    B.CreateRet(lifted->getArg(0));
+  }
+
+  auto *semantic = llvm::Function::Create(
+      fnTy, llvm::GlobalValue::InternalLinkage, "semantic_helper", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", semantic);
+    llvm::IRBuilder<> B(entry);
+    auto *slot = B.CreateAlloca(llvm::Type::getInt64Ty(Ctx));
+    B.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(Ctx), 9), slot);
+    B.CreateRet(semantic->getArg(0));
+  }
+
+  omill::PipelineOptions opts = minimalOpts();
+  opts.lower_intrinsics = true;
+  opts.optimize_state = true;
+
+  auto runs = collectFunctionPassRuns(*M, opts);
+
+  auto sawRunOn = [&](llvm::StringRef pass_name, llvm::StringRef fn_name) {
+    return llvm::any_of(runs, [&](const auto &run) {
+      return run.first == pass_name && run.second == fn_name;
+    });
+  };
+
+  EXPECT_TRUE(sawRunOn("LowerRemillIntrinsicsPass", "sub_140001000"));
+  EXPECT_TRUE(sawRunOn("OptimizeStatePass", "sub_140001000"));
+  EXPECT_FALSE(sawRunOn("LowerRemillIntrinsicsPass", "semantic_helper"));
+  EXPECT_FALSE(sawRunOn("OptimizeStatePass", "semantic_helper"));
+}
+
 // ===----------------------------------------------------------------------===
 // Env var disabling
 // ===----------------------------------------------------------------------===
@@ -620,6 +700,201 @@ TEST_F(PipelineTest, AbiPipelineKeepsDemergedWrapperOutlined) {
   EXPECT_TRUE(stillCallsWrapper);
 }
 
+TEST_F(PipelineTest, AbiPipelineInlinesClosedSliceNativeBlockHelpers) {
+  auto M = createModule();
+  M->addModuleFlag(llvm::Module::Override, "omill.closed_root_slice_scope", 1u);
+
+  auto *helper = createDefinedFunction(*M, "blk_401010_native");
+  helper->addFnAttr("omill.closed_root_slice", "1");
+  helper->addFnAttr(llvm::Attribute::NoInline);
+
+  auto *root = createDefinedFunction(*M, "sub_401000_native");
+  root->addFnAttr("omill.closed_root_slice", "1");
+  root->addFnAttr("omill.closed_root_slice_root", "1");
+  root->deleteBody();
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateCall(helper);
+    B.CreateRetVoid();
+  }
+
+  unsetEnv("OMILL_SKIP_ABI_ALWAYS_INLINE");
+  unsetEnv("OMILL_SKIP_POST_ABI_INLINE");
+  setEnv("OMILL_SKIP_ABI_RECOVER_SIGNATURES", "1");
+  setEnv("OMILL_SKIP_ABI_REWRITE_LIFTED_LATE", "1");
+  setEnv("OMILL_SKIP_ABI_DEAD_STATE_STORE_DSE", "1");
+  setEnv("OMILL_SKIP_ABI_FINAL_OPT", "1");
+
+  llvm::ModulePassManager MPM;
+  omill::PipelineOptions opts;
+  omill::buildABIRecoveryPipeline(MPM, opts);
+  runMPM(MPM, *M);
+
+  unsetEnv("OMILL_SKIP_ABI_RECOVER_SIGNATURES");
+  unsetEnv("OMILL_SKIP_ABI_REWRITE_LIFTED_LATE");
+  unsetEnv("OMILL_SKIP_ABI_DEAD_STATE_STORE_DSE");
+  unsetEnv("OMILL_SKIP_ABI_FINAL_OPT");
+
+  auto *root_after = M->getFunction("sub_401000_native");
+  ASSERT_NE(root_after, nullptr);
+  bool still_calls_helper = false;
+  for (auto &BB : *root_after) {
+    for (auto &I : BB) {
+      if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I)) {
+        auto *callee = CI->getCalledFunction();
+        if (callee && callee->getName() == "blk_401010_native")
+          still_calls_helper = true;
+      }
+    }
+  }
+  EXPECT_FALSE(still_calls_helper);
+  EXPECT_EQ(M->getFunction("blk_401010_native"), nullptr);
+}
+
+TEST_F(PipelineTest,
+       AbiPipelineInlinesSingleUseLargeClosedSliceNativeBlockHelpers) {
+  auto M = createModule();
+  M->addModuleFlag(llvm::Module::Override, "omill.closed_root_slice_scope", 1u);
+
+  auto *helper = createDefinedFunction(*M, "blk_401020_native");
+  helper->addFnAttr("omill.closed_root_slice", "1");
+  helper->addFnAttr(llvm::Attribute::NoInline);
+  helper->deleteBody();
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", helper);
+    llvm::IRBuilder<> B(entry);
+    auto *slot = B.CreateAlloca(llvm::Type::getInt64Ty(Ctx));
+    llvm::Value *acc = B.getInt64(0);
+    for (unsigned i = 0; i < 128; ++i) {
+      acc = B.CreateAdd(acc, B.getInt64(i + 1));
+    }
+    B.CreateStore(acc, slot);
+    B.CreateRetVoid();
+  }
+
+  auto *root = createDefinedFunction(*M, "sub_401000_native");
+  root->addFnAttr("omill.closed_root_slice", "1");
+  root->addFnAttr("omill.closed_root_slice_root", "1");
+  root->deleteBody();
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateCall(helper);
+    B.CreateRetVoid();
+  }
+
+  unsetEnv("OMILL_SKIP_ABI_ALWAYS_INLINE");
+  unsetEnv("OMILL_SKIP_POST_ABI_INLINE");
+  setEnv("OMILL_SKIP_ABI_RECOVER_SIGNATURES", "1");
+  setEnv("OMILL_SKIP_ABI_REWRITE_LIFTED_LATE", "1");
+  setEnv("OMILL_SKIP_ABI_DEAD_STATE_STORE_DSE", "1");
+  setEnv("OMILL_SKIP_ABI_FINAL_OPT", "1");
+
+  llvm::ModulePassManager MPM;
+  omill::PipelineOptions opts;
+  omill::buildABIRecoveryPipeline(MPM, opts);
+  runMPM(MPM, *M);
+
+  unsetEnv("OMILL_SKIP_ABI_RECOVER_SIGNATURES");
+  unsetEnv("OMILL_SKIP_ABI_REWRITE_LIFTED_LATE");
+  unsetEnv("OMILL_SKIP_ABI_DEAD_STATE_STORE_DSE");
+  unsetEnv("OMILL_SKIP_ABI_FINAL_OPT");
+
+  auto *root_after = M->getFunction("sub_401000_native");
+  ASSERT_NE(root_after, nullptr);
+  bool still_calls_helper = false;
+  for (auto &BB : *root_after) {
+    for (auto &I : BB) {
+      if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I)) {
+        auto *callee = CI->getCalledFunction();
+        if (callee && callee->getName() == "blk_401020_native")
+          still_calls_helper = true;
+      }
+    }
+  }
+  EXPECT_FALSE(still_calls_helper);
+  EXPECT_EQ(M->getFunction("blk_401020_native"), nullptr);
+}
+
+TEST_F(PipelineTest,
+       AbiPipelineRemovesClosedSliceNativeBlockChainAndPreservesRootAttrs) {
+  auto M = createModule();
+  M->addModuleFlag(llvm::Module::Override, "omill.closed_root_slice_scope", 1u);
+
+  auto *leaf = createDefinedFunction(*M, "blk_401030_native");
+  leaf->addFnAttr("omill.closed_root_slice", "1");
+  leaf->addFnAttr(llvm::Attribute::NoInline);
+
+  auto *mid = createDefinedFunction(*M, "blk_401020_native");
+  mid->addFnAttr("omill.closed_root_slice", "1");
+  mid->addFnAttr(llvm::Attribute::NoInline);
+  mid->deleteBody();
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", mid);
+    llvm::IRBuilder<> B(entry);
+    B.CreateCall(leaf);
+    B.CreateRetVoid();
+  }
+
+  auto *head = createDefinedFunction(*M, "blk_401010_native");
+  head->addFnAttr("omill.closed_root_slice", "1");
+  head->addFnAttr(llvm::Attribute::NoInline);
+  head->deleteBody();
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", head);
+    llvm::IRBuilder<> B(entry);
+    B.CreateCall(mid);
+    B.CreateRetVoid();
+  }
+
+  auto *root = createDefinedFunction(*M, "sub_401000_native");
+  root->addFnAttr("omill.closed_root_slice", "1");
+  root->addFnAttr("omill.closed_root_slice_root", "1");
+  root->deleteBody();
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateCall(head);
+    B.CreateRetVoid();
+  }
+
+  unsetEnv("OMILL_SKIP_ABI_RECOVER_SIGNATURES");
+  unsetEnv("OMILL_SKIP_ABI_ALWAYS_INLINE");
+  unsetEnv("OMILL_SKIP_ABI_REWRITE_LIFTED_LATE");
+  unsetEnv("OMILL_SKIP_ABI_DEAD_STATE_STORE_DSE");
+  unsetEnv("OMILL_SKIP_ABI_GLOBAL_DCE");
+  unsetEnv("OMILL_SKIP_ABI_FINAL_OPT");
+  unsetEnv("OMILL_SKIP_ABI_INLINE_VM_HANDLERS");
+  unsetEnv("OMILL_SKIP_POST_ABI_INLINE");
+
+  llvm::ModulePassManager MPM;
+  omill::PipelineOptions opts;
+  omill::buildABIRecoveryPipeline(MPM, opts);
+  runMPM(MPM, *M);
+
+  auto *root_after = M->getFunction("sub_401000_native");
+  ASSERT_NE(root_after, nullptr);
+  EXPECT_TRUE(root_after->hasFnAttribute("omill.closed_root_slice"));
+  EXPECT_TRUE(root_after->hasFnAttribute("omill.closed_root_slice_root"));
+  EXPECT_NE(M->getModuleFlag("omill.closed_root_slice_scope"), nullptr);
+
+  bool still_calls_blk = false;
+  for (auto &BB : *root_after) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *callee = CI->getCalledFunction();
+      if (callee && callee->getName().starts_with("blk_"))
+        still_calls_blk = true;
+    }
+  }
+  EXPECT_FALSE(still_calls_blk);
+  EXPECT_EQ(M->getFunction("blk_401010_native"), nullptr);
+  EXPECT_EQ(M->getFunction("blk_401020_native"), nullptr);
+  EXPECT_EQ(M->getFunction("blk_401030_native"), nullptr);
+}
 
 // ===----------------------------------------------------------------------===
 // GlobalDCE removes dead internalized functions
@@ -635,6 +910,126 @@ TEST_F(PipelineTest, GlobalDCERemovesDeadInternalized) {
 
   // The function should be gone — internalized (no callers) + DCE.
   EXPECT_EQ(M->getFunction("dead_helper"), nullptr);
+}
+
+TEST_F(PipelineTest, CleanupProfilesSmokeTest) {
+  const omill::CleanupProfile profiles[] = {
+      omill::CleanupProfile::kLightScalar,
+      omill::CleanupProfile::kLightScalarNoInstCombine,
+      omill::CleanupProfile::kStateToSSA,
+      omill::CleanupProfile::kPostInline,
+      omill::CleanupProfile::kBoundary,
+      omill::CleanupProfile::kFinal,
+  };
+
+  for (auto profile : profiles) {
+    auto M = createModule();
+    auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+    auto *fn_ty =
+        llvm::FunctionType::get(ptr_ty, {ptr_ty, llvm::Type::getInt64Ty(Ctx), ptr_ty},
+                                false);
+    auto *F = llvm::Function::Create(
+        fn_ty, llvm::GlobalValue::ExternalLinkage, "sub_140001000", *M);
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+    llvm::IRBuilder<> B(entry);
+    auto *tmp = B.CreateAdd(B.getInt64(1), B.getInt64(2));
+    auto *stack = B.CreateAlloca(llvm::ArrayType::get(B.getInt8Ty(), 8192),
+                                 nullptr, "native_stack");
+    auto *slot = B.CreateConstGEP1_64(B.getInt8Ty(), stack, 16);
+    B.CreateStore(tmp, slot);
+    auto *loaded = B.CreateLoad(B.getInt64Ty(), slot);
+    B.CreateStore(loaded, B.CreateConstGEP1_64(B.getInt8Ty(), F->getArg(0), 0));
+    B.CreateRet(F->getArg(2));
+
+    llvm::ModulePassManager MPM;
+    omill::buildCleanupPipeline(MPM, profile);
+    runMPM(MPM, *M);
+    EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+  }
+}
+
+TEST_F(PipelineTest, PostPatchCleanupPipelineSmokeTest) {
+  auto M = createModule();
+  auto *helper = createDefinedFunction(*M, "helper",
+                                       llvm::GlobalValue::InternalLinkage);
+  auto *caller = createDefinedFunction(*M, "sub_140001000");
+  caller->deleteBody();
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", caller);
+  llvm::IRBuilder<> B(entry);
+  B.CreateCall(helper);
+  B.CreateRetVoid();
+
+  llvm::ModulePassManager MPM;
+  omill::buildPostPatchCleanupPipeline(MPM, 20);
+  runMPM(MPM, *M);
+
+  EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+}
+
+TEST_F(PipelineTest, GenericStaticDevirtualizationMaterializesKnownEdge) {
+  auto M = createModule();
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *i8_ty = llvm::Type::getInt8Ty(Ctx);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+
+  auto *dispatch = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage, "__omill_dispatch_call", *M);
+
+  auto *target = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage, "sub_180005100", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target->getArg(0));
+  }
+
+  auto *caller = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage, "sub_180005000", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", caller);
+    llvm::IRBuilder<> B(entry);
+    auto *slot = B.CreateGEP(i8_ty, caller->getArg(0), B.getInt64(0x190));
+    B.CreateStore(B.getInt64(0x180005100ULL), slot);
+    auto *loaded = B.CreateLoad(i64_ty, slot);
+    auto *call =
+        B.CreateCall(dispatch, {caller->getArg(0), loaded, caller->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  omill::PipelineOptions opts;
+  opts.lower_intrinsics = false;
+  opts.optimize_state = false;
+  opts.lower_control_flow = false;
+  opts.recover_abi = false;
+  opts.deobfuscate = false;
+  opts.resolve_indirect_targets = false;
+  opts.interprocedural_const_prop = false;
+  opts.generic_static_devirtualize = true;
+  opts.run_cleanup_passes = false;
+
+  runPipeline(*M, opts);
+
+  unsigned dispatch_calls = 0;
+  unsigned direct_calls = 0;
+  for (auto &BB : *caller) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *callee = CI->getCalledFunction();
+      if (!callee)
+        continue;
+      if (callee->getName() == "__omill_dispatch_call")
+        ++dispatch_calls;
+      if (callee == target)
+        ++direct_calls;
+    }
+  }
+
+  EXPECT_EQ(dispatch_calls, 0u);
+  EXPECT_EQ(direct_calls, 1u);
 }
 
 }  // namespace

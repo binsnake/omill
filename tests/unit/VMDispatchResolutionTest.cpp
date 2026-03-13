@@ -69,6 +69,43 @@ class VMDispatchResolutionTest : public ::testing::Test {
     return F;
   }
 
+  llvm::CallInst *findDispatchJump(llvm::Function &F) {
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+        if (!call)
+          continue;
+        auto *callee = call->getCalledFunction();
+        if (callee && callee->getName() == "__omill_dispatch_jump")
+          return call;
+      }
+    }
+    return nullptr;
+  }
+
+  llvm::Function *extractDispatchTargetFunction(llvm::Value *V) {
+    if (auto *ptoi = llvm::dyn_cast<llvm::PtrToIntInst>(V))
+      return llvm::dyn_cast<llvm::Function>(ptoi->getPointerOperand());
+    auto *ptoi = llvm::dyn_cast<llvm::PtrToIntOperator>(V);
+    if (!ptoi)
+      return nullptr;
+    return llvm::dyn_cast<llvm::Function>(ptoi->getPointerOperand());
+  }
+
+  llvm::CallInst *findDirectCall(llvm::Function &F, llvm::StringRef callee_name) {
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+        if (!call)
+          continue;
+        auto *callee = call->getCalledFunction();
+        if (callee && callee->getName() == callee_name)
+          return call;
+      }
+    }
+    return nullptr;
+  }
+
   void runPass(llvm::Module &M, omill::VMTraceMap trace_map = {}) {
     llvm::PassBuilder PB;
     llvm::LoopAnalysisManager LAM;
@@ -527,6 +564,143 @@ TEST_F(VMDispatchResolutionTest, NativeCallRecordWithNoSuccessorIsSkipped) {
 
   // The dispatch_jump arg should NOT be a ConstantInt (left unresolved).
   EXPECT_FALSE(llvm::isa<llvm::ConstantInt>(jump->getArgOperand(1)));
+}
+
+TEST_F(VMDispatchResolutionTest,
+       NewlyCreatedDemergedCloneIsResolvedInSamePass) {
+  auto M = createModule();
+
+  auto *root = createHandler(*M, "sub_100060000");
+  root->addFnAttr("omill.vm_trace_in_hash", "aaaa");
+  auto *root_entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+  llvm::IRBuilder<> root_builder(root_entry);
+  auto *dispatch = declareDispatchJump(*M);
+  auto *root_base = root_builder.CreateCall(declareOpaqueBase(*M));
+  auto *root_target = root_builder.CreateAdd(root_base, root_builder.getInt64(0x6000));
+  auto *root_jump = root_builder.CreateCall(
+      dispatch, {root->getArg(0), root_target, root->getArg(2)});
+  root_builder.CreateRet(root_jump);
+
+  auto *succ = createHandler(*M, "sub_100061000");
+  auto *succ_entry = llvm::BasicBlock::Create(Ctx, "entry", succ);
+  llvm::IRBuilder<> succ_builder(succ_entry);
+  auto *succ_base = succ_builder.CreateCall(declareOpaqueBase(*M));
+  auto *succ_target = succ_builder.CreateAdd(succ_base, succ_builder.getInt64(0x6100));
+  auto *succ_jump = succ_builder.CreateCall(
+      dispatch, {succ->getArg(0), succ_target, succ->getArg(2)});
+  succ_builder.CreateRet(succ_jump);
+
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+
+  omill::VMTraceMap trace_map(0, 0);
+  omill::VMTraceRecord root_rec;
+  root_rec.handler_va = 0x100060000ULL;
+  root_rec.incoming_hash = 0xAAAAULL;
+  root_rec.outgoing_hash = 0xBBBBULL;
+  root_rec.successors = {0x100061000ULL};
+  trace_map.recordTrace(std::move(root_rec));
+
+  omill::VMTraceRecord succ_rec;
+  succ_rec.handler_va = 0x100061000ULL;
+  succ_rec.incoming_hash = 0xBBBBULL;
+  succ_rec.outgoing_hash = 0xCCCCULL;
+  succ_rec.successors = {0x100062000ULL};
+  trace_map.recordTrace(std::move(succ_rec));
+
+  runPass(*M, std::move(trace_map));
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+
+  auto *root_target_fn = extractDispatchTargetFunction(root_jump->getArgOperand(1));
+  ASSERT_NE(root_target_fn, nullptr);
+  EXPECT_EQ(root_target_fn->getName(), "sub_100061000__vm_bbbb");
+
+  auto *clone = M->getFunction("sub_100061000__vm_bbbb");
+  ASSERT_NE(clone, nullptr);
+  auto *clone_jump = findDispatchJump(*clone);
+  ASSERT_NE(clone_jump, nullptr);
+  auto *resolved = llvm::dyn_cast<llvm::ConstantInt>(clone_jump->getArgOperand(1));
+  ASSERT_NE(resolved, nullptr);
+  EXPECT_EQ(resolved->getZExtValue(), 0x100062000ULL);
+
+  auto *md = M->getNamedMetadata("omill.vm_discovered_targets");
+  ASSERT_NE(md, nullptr);
+  ASSERT_EQ(md->getNumOperands(), 1u);
+}
+
+TEST_F(VMDispatchResolutionTest,
+       SpecializedWrapperCloneIsResolvedInSamePass) {
+  auto M = createModule();
+
+  auto *root = createHandler(*M, "sub_100070000");
+  auto *root_entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+  llvm::IRBuilder<> root_builder(root_entry);
+  auto *dispatch = declareDispatchJump(*M);
+  auto *root_base = root_builder.CreateCall(declareOpaqueBase(*M));
+  auto *root_target = root_builder.CreateAdd(root_base, root_builder.getInt64(0x7000));
+  auto *root_jump = root_builder.CreateCall(
+      dispatch, {root->getArg(0), root_target, root->getArg(2)});
+  root_builder.CreateRet(root_jump);
+
+  auto *wrapper = createHandler(*M, "sub_100080000");
+  wrapper->addFnAttr("omill.vm_wrapper");
+  auto *wrapper_entry = llvm::BasicBlock::Create(Ctx, "entry", wrapper);
+  llvm::IRBuilder<> wrapper_builder(wrapper_entry);
+  auto *wrapper_base = wrapper_builder.CreateCall(declareOpaqueBase(*M));
+  auto *wrapper_target =
+      wrapper_builder.CreateAdd(wrapper_base, wrapper_builder.getInt64(0x8000));
+  auto *wrapper_jump = wrapper_builder.CreateCall(
+      dispatch, {wrapper->getArg(0), wrapper_target, wrapper->getArg(2)});
+  wrapper_builder.CreateRet(wrapper_jump);
+
+  auto *succ = createHandler(*M, "sub_100071000");
+  auto *succ_entry = llvm::BasicBlock::Create(Ctx, "entry", succ);
+  llvm::IRBuilder<> succ_builder(succ_entry);
+  auto *succ_base = succ_builder.CreateCall(declareOpaqueBase(*M));
+  auto *succ_target = succ_builder.CreateAdd(succ_base, succ_builder.getInt64(0x7100));
+  auto *succ_jump = succ_builder.CreateCall(
+      dispatch, {succ->getArg(0), succ_target, succ->getArg(2)});
+  succ_builder.CreateRet(succ_jump);
+
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+
+  omill::VMTraceMap trace_map(0, 0);
+  omill::VMTraceRecord root_rec;
+  root_rec.handler_va = 0x100070000ULL;
+  root_rec.incoming_hash = 0xAAAAULL;
+  root_rec.outgoing_hash = 0xBBBBULL;
+  root_rec.native_target_va = 0x100080000ULL;
+  root_rec.successors = {0x100071000ULL};
+  trace_map.recordTrace(std::move(root_rec));
+
+  omill::VMTraceRecord succ_rec;
+  succ_rec.handler_va = 0x100071000ULL;
+  succ_rec.incoming_hash = 0xBBBBULL;
+  succ_rec.outgoing_hash = 0xCCCCULL;
+  succ_rec.successors = {0x100072000ULL};
+  trace_map.recordTrace(std::move(succ_rec));
+
+  runPass(*M, std::move(trace_map));
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+
+  auto *specialized = M->getFunction("sub_100080000__vmwrap_100071000_bbbb");
+  ASSERT_NE(specialized, nullptr);
+  auto *root_call =
+      findDirectCall(*root, "sub_100080000__vmwrap_100071000_bbbb");
+  ASSERT_NE(root_call, nullptr);
+
+  auto *specialized_jump = findDispatchJump(*specialized);
+  ASSERT_NE(specialized_jump, nullptr);
+  auto *specialized_target = specialized_jump->getArgOperand(1);
+  EXPECT_TRUE(llvm::isa<llvm::ConstantInt>(specialized_target) ||
+              extractDispatchTargetFunction(specialized_target) != nullptr);
+
+  auto *succ_clone = M->getFunction("sub_100071000__vm_bbbb");
+  ASSERT_NE(succ_clone, nullptr);
+  auto *succ_clone_jump = findDispatchJump(*succ_clone);
+  ASSERT_NE(succ_clone_jump, nullptr);
+  auto *resolved = llvm::dyn_cast<llvm::ConstantInt>(succ_clone_jump->getArgOperand(1));
+  ASSERT_NE(resolved, nullptr);
+  EXPECT_EQ(resolved->getZExtValue(), 0x100072000ULL);
 }
 
 }  // namespace

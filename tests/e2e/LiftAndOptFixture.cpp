@@ -175,6 +175,7 @@ llvm::Module *LiftAndOptFixture::liftMultiple(llvm::ArrayRef<uint64_t> addrs) {
 
 void LiftAndOptFixture::optimize(const PipelineOptions &opts) {
   ASSERT_NE(module_, nullptr) << "Must call lift() before optimize()";
+  iterative_session_ = std::make_shared<IterativeLiftingSession>("e2e");
 
   bool timing = wantTimePasses();
   llvm::PassInstrumentationCallbacks PIC;
@@ -200,10 +201,15 @@ void LiftAndOptFixture::optimize(const PipelineOptions &opts) {
   // Register omill-specific analyses.
   omill::registerAnalyses(FAM);
   omill::registerModuleAnalyses(MAM);
+  MAM.registerPass([this] {
+    return omill::IterativeLiftingSessionAnalysis(iterative_session_);
+  });
 
   llvm::ModulePassManager MPM;
   omill::buildPipeline(MPM, opts);
   MPM.run(*module_, MAM);
+  iterative_session_ =
+      MAM.getResult<omill::IterativeLiftingSessionAnalysis>(*module_).session;
 
   dumpIR("after");
   if (timing)
@@ -213,6 +219,7 @@ void LiftAndOptFixture::optimize(const PipelineOptions &opts) {
 void LiftAndOptFixture::optimizeWithMemoryMap(const PipelineOptions &opts,
                                                BinaryMemoryMap memory_map) {
   ASSERT_NE(module_, nullptr) << "Must call lift() before optimizeWithMemoryMap()";
+  iterative_session_ = std::make_shared<IterativeLiftingSession>("e2e");
 
   bool timing = wantTimePasses();
   llvm::PassInstrumentationCallbacks PIC;
@@ -242,12 +249,14 @@ void LiftAndOptFixture::optimizeWithMemoryMap(const PipelineOptions &opts,
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
   omill::registerAnalyses(FAM);
-  // Note: don't call registerModuleAnalyses() — we already registered
-  // BinaryMemoryAnalysis with our custom map above. Register the rest manually.
-  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
-  MAM.registerPass([&] { return omill::CallGraphAnalysis(); });
-  MAM.registerPass([&] { return omill::LiftedFunctionAnalysis(); });
-  MAM.registerPass([&] { return omill::ExceptionInfoAnalysis(); });
+  omill::registerModuleAnalyses(MAM);
+  // Override the default empty analyses with the test-specific fixtures.
+  MAM.registerPass([memory_map_holder] {
+    return omill::BinaryMemoryAnalysis(*memory_map_holder);
+  });
+  MAM.registerPass([this] {
+    return omill::IterativeLiftingSessionAnalysis(iterative_session_);
+  });
 
   dumpIR("before");
 
@@ -262,6 +271,8 @@ void LiftAndOptFixture::optimizeWithMemoryMap(const PipelineOptions &opts,
     omill::buildPipeline(MPM, requested_opts);
     MPM.run(*module_, MAM);
   }
+  iterative_session_ =
+      MAM.getResult<omill::IterativeLiftingSessionAnalysis>(*module_).session;
 
   // Keep these snapshot labels for compatibility with existing IR dump tooling.
   dumpIR("after_state");
@@ -279,6 +290,7 @@ void LiftAndOptFixture::optimizeWithExceptions(
     BinaryMemoryMap memory_map) {
   ASSERT_NE(module_, nullptr)
       << "Must call lift()/liftMultiple() before optimizeWithExceptions()";
+  iterative_session_ = std::make_shared<IterativeLiftingSession>("e2e");
 
   // Build synthetic DCs in the memory map.
   // Storage must outlive the pipeline run (deque is stable across push_back).
@@ -318,11 +330,17 @@ void LiftAndOptFixture::optimizeWithExceptions(
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
   omill::registerAnalyses(FAM);
-  // Register remaining module analyses (skip BinaryMemoryAnalysis and
-  // ExceptionInfoAnalysis since we already registered them above).
-  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
-  MAM.registerPass([&] { return omill::CallGraphAnalysis(); });
-  MAM.registerPass([&] { return omill::LiftedFunctionAnalysis(); });
+  omill::registerModuleAnalyses(MAM);
+  // Override the default empty analyses with the test-specific fixtures.
+  MAM.registerPass([memory_map_holder] {
+    return omill::BinaryMemoryAnalysis(*memory_map_holder);
+  });
+  MAM.registerPass([exc_info_holder] {
+    return omill::ExceptionInfoAnalysis(*exc_info_holder);
+  });
+  MAM.registerPass([this] {
+    return omill::IterativeLiftingSessionAnalysis(iterative_session_);
+  });
 
   dumpIR("before");
 
@@ -331,6 +349,8 @@ void LiftAndOptFixture::optimizeWithExceptions(
     omill::buildPipeline(MPM, opts);
     MPM.run(*module_, MAM);
   }
+  iterative_session_ =
+      MAM.getResult<omill::IterativeLiftingSessionAnalysis>(*module_).session;
 
   dumpIR("after");
   if (timing)

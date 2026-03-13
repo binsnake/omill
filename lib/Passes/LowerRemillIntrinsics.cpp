@@ -1176,8 +1176,11 @@ bool lowerErrorAndMissing(llvm::Function &F, IntrinsicTable &table) {
     else
       Builder.CreateCall(missing_handler, {pc});
 
-    auto *new_term =
-        Builder.CreateRet(llvm::PoisonValue::get(F.getReturnType()));
+    llvm::Instruction *new_term;
+    if (F.getReturnType()->isVoidTy())
+      new_term = Builder.CreateRetVoid();
+    else
+      new_term = Builder.CreateRet(llvm::PoisonValue::get(F.getReturnType()));
 
     // Preserve the threaded Memory* token instead of introducing poison.
     // Some lifted traces still feed this value into fallback dispatch paths.

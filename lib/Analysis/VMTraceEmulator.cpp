@@ -397,16 +397,23 @@ static ExecResult stepInstruction(EmuState &state,
   uint8_t rex = 0;
   bool has_66 = false;  // operand size override
 
-  // Check for 66h prefix.
-  if (buf[pos] == 0x66) {
-    has_66 = true;
-    pos++;
-  }
-
-  // Check for REX prefix (40h-4Fh).
-  if ((buf[pos] & 0xF0) == 0x40) {
-    has_rex = true;
-    rex = buf[pos++];
+  while (pos < sizeof(buf)) {
+    if (buf[pos] == 0x66) {
+      has_66 = true;
+      ++pos;
+      continue;
+    }
+    if (buf[pos] == 0xF0 || buf[pos] == 0xF2 || buf[pos] == 0xF3 ||
+        buf[pos] == 0x67) {
+      ++pos;
+      continue;
+    }
+    if ((buf[pos] & 0xF0) == 0x40) {
+      has_rex = true;
+      rex = buf[pos++];
+      continue;
+    }
+    break;
   }
 
   bool rex_w = has_rex && (rex & 0x08);
@@ -551,6 +558,42 @@ static ExecResult stepInstruction(EmuState &state,
       return ExecResult::Continue;
     }
 
+    // BT/BTS/BTR/BTC r/m, r: 0F A3/AB/B3/BB
+    if (opcode2 == 0xA3 || opcode2 == 0xAB || opcode2 == 0xB3 ||
+        opcode2 == 0xBB) {
+      uint8_t reg_field;
+      Operand rm;
+      unsigned n = decodeModRM(&buf[pos], 15 - pos, has_rex, rex,
+                               default_op_size, rm, reg_field);
+      if (n == 0) return ExecResult::Unsupported;
+      pos += n;
+      state.rip = inst_start + pos;
+
+      uint64_t value = readOp(state, mem, rm);
+      uint64_t bit_count = std::max<uint64_t>(1, static_cast<uint64_t>(rm.size) * 8);
+      uint64_t bit_index = state.regs[reg_field] & (bit_count - 1);
+      uint64_t mask = 1ULL << bit_index;
+      state.flags.CF = (value & mask) != 0;
+
+      switch (opcode2) {
+        case 0xAB:
+          value |= mask;
+          writeOp(state, rm, maskToSize(value, rm.size));
+          break;
+        case 0xB3:
+          value &= ~mask;
+          writeOp(state, rm, maskToSize(value, rm.size));
+          break;
+        case 0xBB:
+          value ^= mask;
+          writeOp(state, rm, maskToSize(value, rm.size));
+          break;
+        default:
+          break;
+      }
+      return ExecResult::Continue;
+    }
+
     // Jcc rel32: 0F 8x
     if ((opcode2 & 0xF0) == 0x80) {
       if (pos + 4 > 15) return ExecResult::Unsupported;
@@ -666,6 +709,30 @@ static ExecResult stepInstruction(EmuState &state,
     state.rip = inst_start + pos;
     state.regs[RSP] -= 8;
     writeMem(state, state.regs[RSP], state.regs[reg], 8);
+    return ExecResult::Continue;
+  }
+
+  // PUSH imm32: 68
+  if (opcode == 0x68) {
+    if (pos + 4 > 15) return ExecResult::Unsupported;
+    int32_t imm32;
+    std::memcpy(&imm32, &buf[pos], 4);
+    pos += 4;
+    state.rip = inst_start + pos;
+    state.regs[RSP] -= 8;
+    writeMem(state, state.regs[RSP],
+             static_cast<uint64_t>(static_cast<int64_t>(imm32)), 8);
+    return ExecResult::Continue;
+  }
+
+  // PUSH imm8: 6A
+  if (opcode == 0x6A) {
+    if (pos >= 15) return ExecResult::Unsupported;
+    int8_t imm8 = static_cast<int8_t>(buf[pos++]);
+    state.rip = inst_start + pos;
+    state.regs[RSP] -= 8;
+    writeMem(state, state.regs[RSP],
+             static_cast<uint64_t>(static_cast<int64_t>(imm8)), 8);
     return ExecResult::Continue;
   }
 
@@ -1335,6 +1402,28 @@ static ExecResult stepInstruction(EmuState &state,
     uint64_t res;
 
     switch (reg_field & 7) {
+      case 0: {  // ROL
+        unsigned bits = rm.size * 8;
+        count %= bits;
+        if (count == 0)
+          res = maskToSize(val, rm.size);
+        else
+          res = maskToSize((maskToSize(val, rm.size) << count) |
+                               (maskToSize(val, rm.size) >> (bits - count)),
+                           rm.size);
+        break;
+      }
+      case 1: {  // ROR
+        unsigned bits = rm.size * 8;
+        count %= bits;
+        if (count == 0)
+          res = maskToSize(val, rm.size);
+        else
+          res = maskToSize((maskToSize(val, rm.size) >> count) |
+                               (maskToSize(val, rm.size) << (bits - count)),
+                           rm.size);
+        break;
+      }
       case 4:  // SHL
         res = val << count;
         break;
@@ -1350,14 +1439,20 @@ static ExecResult stepInstruction(EmuState &state,
     }
     writeOp(state, rm, maskToSize(res, rm.size));
     if (count > 0) {
-      updateFlagsLogical(state.flags, res, rm.size);
-      // CF = last bit shifted out (approximate).
-      if ((reg_field & 7) == 5 || (reg_field & 7) == 7)
-        state.flags.CF =
-            (maskToSize(val, rm.size) >> (count - 1)) & 1;
-      else
-        state.flags.CF =
-            (val >> (rm.size * 8 - count)) & 1;
+      if ((reg_field & 7) == 0) {
+        state.flags.CF = res & 1;
+      } else if ((reg_field & 7) == 1) {
+        state.flags.CF = (res >> (rm.size * 8 - 1)) & 1;
+      } else {
+        updateFlagsLogical(state.flags, res, rm.size);
+        // CF = last bit shifted out (approximate).
+        if ((reg_field & 7) == 5 || (reg_field & 7) == 7)
+          state.flags.CF =
+              (maskToSize(val, rm.size) >> (count - 1)) & 1;
+        else
+          state.flags.CF =
+              (val >> (rm.size * 8 - count)) & 1;
+      }
     }
     return ExecResult::Continue;
   }
@@ -1380,13 +1475,37 @@ static ExecResult stepInstruction(EmuState &state,
     uint64_t val = readOp(state, mem, rm) & 0xFF;
     uint64_t res;
     switch (reg_field & 7) {
+      case 0: {
+        count &= 7;
+        if (count == 0)
+          res = val;
+        else
+          res = ((val << count) | (val >> (8 - count))) & 0xFF;
+        break;
+      }
+      case 1: {
+        count &= 7;
+        if (count == 0)
+          res = val;
+        else
+          res = ((val >> count) | (val << (8 - count))) & 0xFF;
+        break;
+      }
       case 4: res = (val << count) & 0xFF; break;
       case 5: res = val >> count; break;
       case 7: res = static_cast<uint64_t>(static_cast<int8_t>(val) >> count) & 0xFF; break;
       default: return ExecResult::Unsupported;
     }
     writeOp(state, rm, res);
-    if (count > 0) updateFlagsLogical(state.flags, res, 1);
+    if (count > 0) {
+      if ((reg_field & 7) == 0) {
+        state.flags.CF = res & 1;
+      } else if ((reg_field & 7) == 1) {
+        state.flags.CF = (res >> 7) & 1;
+      } else {
+        updateFlagsLogical(state.flags, res, 1);
+      }
+    }
     return ExecResult::Continue;
   }
 
@@ -1482,6 +1601,12 @@ static ExecResult stepInstruction(EmuState &state,
 }
 
 }  // anonymous namespace
+
+bool canDecodeX86InstructionAt(const BinaryMemoryMap &mem, uint64_t pc) {
+  EmuState state;
+  state.rip = pc;
+  return stepInstruction(state, mem) != ExecResult::Unsupported;
+}
 
 // ============================================================================
 // VMTraceEmulator Implementation
@@ -1584,6 +1709,31 @@ VMTraceEmulator::parseEntryWrapper(
     return info;
 
   unsigned pos = 0;
+
+  // Some compact VMP wrappers seed stack slots with immediate values before
+  // the usual lea/sub rsp, ... ; call vmentry shape. These stores are part of
+  // the wrapper prologue, not evidence that we missed the wrapper boundary.
+  for (unsigned stores = 0; stores < 4 && pos < sizeof(buf); ++stores) {
+    // mov qword ptr [rsp+disp8], imm32
+    if (pos + 9 <= sizeof(buf) && buf[pos] == 0x48 && buf[pos + 1] == 0xC7 &&
+        buf[pos + 2] == 0x44 && buf[pos + 3] == 0x24) {
+      pos += 9;
+      continue;
+    }
+    // mov dword ptr [rsp+disp8], imm32
+    if (pos + 8 <= sizeof(buf) && buf[pos] == 0xC7 && buf[pos + 1] == 0x44 &&
+        buf[pos + 2] == 0x24) {
+      pos += 8;
+      continue;
+    }
+    // mov qword ptr [rsp+disp32], imm32
+    if (pos + 12 <= sizeof(buf) && buf[pos] == 0x48 && buf[pos + 1] == 0xC7 &&
+        buf[pos + 2] == 0x84 && buf[pos + 3] == 0x24) {
+      pos += 12;
+      continue;
+    }
+    break;
+  }
 
   // 1) lea rsp, [rsp - N]: 48 8D A4 24 <disp32>
   //    or: 48 8D 64 24 <disp8>

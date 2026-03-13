@@ -182,6 +182,25 @@ class OLLVMTest : public LiftAndOptFixture {
     return true;
   }
 
+  bool liftAndOptimize(const std::string &export_name,
+                       const omill::PipelineOptions &opts) {
+    uint64_t va = getExportVA(export_name);
+    if (va == 0) return false;
+
+    current_export_va_ = va;
+    expected_native_prefix_.clear();
+
+    auto *M = liftExport(va);
+    if (!M) return false;
+    auto trace_it = traceManager().traces().find(va);
+    if (trace_it != traceManager().traces().end() && trace_it->second) {
+      expected_native_prefix_ = trace_it->second->getName().str();
+    }
+
+    optimizeWithMemoryMap(opts, shared_pe_->memory_map);
+    return true;
+  }
+
   bool liftAllExportsAndOptimize() {
     traceManager().clearTraces();
 
@@ -801,6 +820,26 @@ TEST_F(OLLVMTest, SHA256) {
       << "Expected SHA-256 to recover at least 3 params";
   EXPECT_LE(NF->arg_size(), 4u)
       << "Expected at most 4 GPR params (got " << NF->arg_size() << ")";
+}
+
+TEST_F(OLLVMTest, SHA256IterativePipelineSanity) {
+  omill::PipelineOptions opts;
+  opts.recover_abi = true;
+  opts.deobfuscate = true;
+  opts.resolve_indirect_targets = true;
+  opts.interprocedural_const_prop = true;
+  opts.max_resolution_iterations = 10;
+
+  ASSERT_TRUE(liftAndOptimize("ollvm_sha256", opts));
+  ASSERT_TRUE(verifyModule()) << "Module invalid after iterative pipeline";
+  EXPECT_GE(countNativeFunctions(), 1u);
+
+  auto *NF = findNativeFunction();
+  ASSERT_NE(NF, nullptr);
+  EXPECT_LT(countTargetNativeInstructions(), 20000u);
+
+  ASSERT_TRUE(iterativeSession());
+  EXPECT_GT(iterativeSession()->graph().nodeCount(), 0u);
 }
 
 // =============================================================================
