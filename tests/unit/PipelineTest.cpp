@@ -1176,4 +1176,147 @@ TEST_F(PipelineTest,
   EXPECT_EQ(M->getFunction("blk_401010"), nullptr);
 }
 
+TEST_F(PipelineTest,
+       ClosedSliceNoAbiCleanupKeepsBlkMustTailFallbackWhenDispatchLives) {
+  auto M = createModule();
+  M->addModuleFlag(llvm::Module::Override, "omill.closed_root_slice_scope", 1u);
+  M->addModuleFlag(llvm::Module::Override, "omill.no_abi_mode", 1u);
+
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+
+  auto *dispatch = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage, "__omill_dispatch_call", *M);
+  auto *blk_decl = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage, "blk_401030", *M);
+
+  auto *root = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.closed_root_slice", "1");
+  root->addFnAttr("omill.closed_root_slice_root", "1");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *dispatched = B.CreateCall(
+        dispatch, {root->getArg(0), B.getInt64(0x500000ULL), root->getArg(2)});
+    auto *tail = B.CreateCall(
+        blk_decl, {root->getArg(0), B.getInt64(0x401030ULL), dispatched});
+    tail->setTailCallKind(llvm::CallInst::TCK_MustTail);
+    B.CreateRet(tail);
+  }
+
+  omill::PipelineOptions opts;
+  opts.lower_intrinsics = false;
+  opts.optimize_state = false;
+  opts.lower_control_flow = false;
+  opts.recover_abi = false;
+  opts.deobfuscate = false;
+  opts.resolve_indirect_targets = false;
+  opts.interprocedural_const_prop = false;
+  opts.generic_static_devirtualize = true;
+  opts.run_cleanup_passes = false;
+
+  runPipeline(*M, opts);
+
+  auto *root_after = M->getFunction("sub_401000");
+  ASSERT_NE(root_after, nullptr);
+
+  unsigned calls_blk = 0;
+  unsigned calls_missing_block = 0;
+  unsigned calls_dispatch = 0;
+  for (auto &BB : *root_after) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *callee = CI->getCalledFunction();
+      if (!callee)
+        continue;
+      if (callee->getName() == "blk_401030")
+        ++calls_blk;
+      if (callee->getName() == "__remill_missing_block")
+        ++calls_missing_block;
+      if (callee->getName() == "__omill_dispatch_call")
+        ++calls_dispatch;
+    }
+  }
+
+  EXPECT_GE(calls_dispatch, 1u);
+  EXPECT_GE(calls_blk, 1u);
+  EXPECT_EQ(calls_missing_block, 0u);
+}
+
+TEST_F(PipelineTest,
+       ClosedSliceNoAbiCleanupRewritesConstantMissingBlockCallToBlkTarget) {
+  auto M = createModule();
+  M->addModuleFlag(llvm::Module::Override, "omill.closed_root_slice_scope", 1u);
+  M->addModuleFlag(llvm::Module::Override, "omill.no_abi_mode", 1u);
+
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+
+  auto *missing_block = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage, "__remill_missing_block", *M);
+
+  auto *target = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage, "blk_401030", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target->getArg(0));
+  }
+
+  auto *root = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.closed_root_slice", "1");
+  root->addFnAttr("omill.closed_root_slice_root", "1");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *call = B.CreateCall(
+        missing_block, {root->getArg(0), B.getInt64(0x401030ULL), root->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  omill::PipelineOptions opts;
+  opts.lower_intrinsics = false;
+  opts.optimize_state = false;
+  opts.lower_control_flow = false;
+  opts.recover_abi = false;
+  opts.deobfuscate = false;
+  opts.resolve_indirect_targets = false;
+  opts.interprocedural_const_prop = false;
+  opts.generic_static_devirtualize = true;
+  opts.run_cleanup_passes = false;
+
+  runPipeline(*M, opts);
+
+  auto *root_after = M->getFunction("sub_401000");
+  ASSERT_NE(root_after, nullptr);
+
+  unsigned calls_missing_block = 0;
+  unsigned calls_blk = 0;
+  for (auto &BB : *root_after) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *callee = CI->getCalledFunction();
+      if (!callee)
+        continue;
+      if (callee->getName() == "__remill_missing_block")
+        ++calls_missing_block;
+      if (callee->getName() == "blk_401030")
+        ++calls_blk;
+    }
+  }
+
+  EXPECT_EQ(calls_missing_block, 0u);
+  EXPECT_GE(calls_blk, 1u);
+}
+
 }  // namespace

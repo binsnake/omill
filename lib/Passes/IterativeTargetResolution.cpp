@@ -980,9 +980,17 @@ void processDeferredFunctions(llvm::ArrayRef<llvm::Function *> deferred,
 
 llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
     llvm::Module &M, llvm::ModuleAnalysisManager &MAM) {
-  (void)MAM.getResult<BinaryMemoryAnalysis>(M);
-  auto &session_result = MAM.getResult<IterativeLiftingSessionAnalysis>(M);
-  auto session = session_result.session;
+  if (MAM.isPassRegistered<BinaryMemoryAnalysis>())
+    (void)MAM.getResult<BinaryMemoryAnalysis>(M);
+
+  std::shared_ptr<IterativeLiftingSession> session;
+  if (MAM.isPassRegistered<IterativeLiftingSessionAnalysis>())
+    session = MAM.getResult<IterativeLiftingSessionAnalysis>(M).session;
+  if (!session)
+    session = std::make_shared<IterativeLiftingSession>();
+
+  const bool run_ipcp =
+      run_ipcp_inside_resolution_ && MAM.isPassRegistered<CallGraphAnalysis>();
   unsigned iteration = 0;
   unsigned prev_count = 0;
 
@@ -1004,7 +1012,7 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
 
   auto *lifted = &MAM.getResult<LiftedFunctionAnalysis>(M);
 
-  if (run_ipcp_inside_resolution_)
+  if (run_ipcp)
     (void)MAM.getResult<CallGraphAnalysis>(M);
 
   // Cache the dispatch semantic set — stable across the ITR loop since
@@ -1170,7 +1178,7 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
     // Step 2a.5: Interprocedural propagation inside the same convergence
     // epoch so caller-provided constants can unlock more dispatch targets
     // before we decide whether this iteration made progress.
-    if (run_ipcp_inside_resolution_) {
+    if (run_ipcp) {
       auto step_start = IterationClock::now();
       ipcp_changed = runInterproceduralResolutionRound(M, MAM, affected);
       ipcp_ms = elapsedMillis(step_start);

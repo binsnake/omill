@@ -3280,6 +3280,7 @@ int main(int argc, char **argv) {
   opts.verify_generic_static_devirtualization =
       VerifyGenericStaticDevirtualization ||
       parseBoolEnv("OMILL_VERIFY_GENERIC_STATIC_DEVIRT").value_or(false);
+  opts.no_abi_mode = NoABI;
   if (!DumpVirtualModel.empty())
     setEnvIfUnset("OMILL_DUMP_VIRTUAL_MODEL", DumpVirtualModel.c_str());
   if (auto v = parseBoolEnv("OMILL_SKIP_BLOCK_MERGE"); v.value_or(false)) {

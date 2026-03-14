@@ -37,6 +37,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <optional>
+#include <set>
 
 #include "omill/Analysis/CallGraphAnalysis.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
@@ -894,6 +895,28 @@ bool markReachableClosedRootSliceFunctions(llvm::Module &M) {
   return changed;
 }
 
+bool isTerminalMissingBlockStub(const llvm::Function &F) {
+  const llvm::Function *missing_block = nullptr;
+  unsigned direct_calls = 0;
+
+  for (const auto &BB : F) {
+    for (const auto &I : BB) {
+      const auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+      if (!CB)
+        continue;
+      auto *callee = CB->getCalledFunction();
+      if (!callee)
+        return false;
+      ++direct_calls;
+      if (callee->getName() != "__remill_missing_block")
+        return false;
+      missing_block = callee;
+    }
+  }
+
+  return missing_block != nullptr && direct_calls == 1;
+}
+
 unsigned countClosedRootSliceDeclaredContinuationCalls(llvm::Module &M) {
   unsigned count = 0;
   const bool debug_late_closure =
@@ -1041,15 +1064,23 @@ struct CollapseSyntheticBlockContinuationCallsPass
         only_when_noabi_mode(only_when_noabi_mode) {}
 
   llvm::PreservedAnalyses run(llvm::Module &M,
-                              llvm::ModuleAnalysisManager &) {
+                              llvm::ModuleAnalysisManager &MAM) {
     if (only_when_noabi_mode && !isNoABIModeModule(M))
       return llvm::PreservedAnalyses::all();
 
     bool changed = false;
     llvm::SmallVector<llvm::CallInst *, 16> calls_to_erase;
     const bool scoped = isClosedRootSliceScopedModule(M);
+    auto has_live_dispatch = [&](llvm::StringRef name) {
+      auto *F = M.getFunction(name);
+      return F && !F->use_empty();
+    };
+    const bool has_unresolved_dispatch =
+        has_live_dispatch("__omill_dispatch_call") ||
+        has_live_dispatch("__omill_dispatch_jump");
     const bool allow_missing_block_rewrite =
-        rewrite_to_missing_block && isNoABIModeModule(M);
+        rewrite_to_missing_block && isNoABIModeModule(M) &&
+        !has_unresolved_dispatch;
     auto getOrCreateMissingBlock = [&](llvm::FunctionType *FT)
         -> llvm::Function * {
       if (auto *F = M.getFunction("__remill_missing_block")) {
@@ -1132,6 +1163,215 @@ struct CollapseSyntheticBlockContinuationCallsPass
     }
     for (auto *F : dead_decls)
       F->eraseFromParent();
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+
+  static bool isRequired() { return true; }
+};
+
+struct LiftConstantContinuationDeclarationTargetsPass
+    : llvm::PassInfoMixin<LiftConstantContinuationDeclarationTargetsPass> {
+  bool only_when_noabi_mode;
+
+  explicit LiftConstantContinuationDeclarationTargetsPass(
+      bool only_when_noabi_mode = false)
+      : only_when_noabi_mode(only_when_noabi_mode) {}
+
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &MAM) {
+    if (only_when_noabi_mode && !isNoABIModeModule(M))
+      return llvm::PreservedAnalyses::all();
+
+    const bool scoped = isClosedRootSliceScopedModule(M);
+    const auto &binary_memory = MAM.getResult<BinaryMemoryAnalysis>(M);
+    std::set<uint64_t> attempted;
+    bool changed = false;
+
+    auto session_result = MAM.getResult<IterativeLiftingSessionAnalysis>(M);
+    const auto &block_lift = MAM.getResult<BlockLiftAnalysis>(M).lift_block;
+    const auto &trace_lift = MAM.getResult<TraceLiftAnalysis>(M).lift_trace;
+
+    for (auto &F : M) {
+      if (F.isDeclaration())
+        continue;
+      if (scoped && !isClosedRootSliceFunction(F))
+        continue;
+
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+          if (!call || call->arg_size() < 2)
+            continue;
+          auto *callee = call->getCalledFunction();
+          if (!callee || !callee->isDeclaration())
+            continue;
+
+          auto continuation_pc = parseSyntheticBlockLikePC(callee->getName());
+          if (!continuation_pc)
+            continue;
+
+          auto *pc_arg =
+              llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+          if (!pc_arg || pc_arg->getZExtValue() != *continuation_pc)
+            continue;
+          if (!binary_memory.isExecutable(*continuation_pc, 1))
+            continue;
+          if (findSyntheticBlockLikeDefinition(M, *continuation_pc))
+            continue;
+          if (!attempted.insert(*continuation_pc).second)
+            continue;
+
+          bool lifted = false;
+          if (session_result.session &&
+              session_result.session->useBlockLifting() && block_lift) {
+            lifted = block_lift(*continuation_pc);
+          } else if (block_lift) {
+            lifted = block_lift(*continuation_pc);
+          } else if (trace_lift) {
+            lifted = trace_lift(*continuation_pc);
+          }
+
+          if (lifted && session_result.session)
+            session_result.session->noteLiftedTarget(*continuation_pc);
+          if (lifted && findSyntheticBlockLikeDefinition(M, *continuation_pc))
+            changed = true;
+        }
+      }
+    }
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+
+  static bool isRequired() { return true; }
+};
+
+struct LiftConstantMissingBlockTargetsPass
+    : llvm::PassInfoMixin<LiftConstantMissingBlockTargetsPass> {
+  bool only_when_noabi_mode;
+
+  explicit LiftConstantMissingBlockTargetsPass(bool only_when_noabi_mode = false)
+      : only_when_noabi_mode(only_when_noabi_mode) {}
+
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &MAM) {
+    if (only_when_noabi_mode && !isNoABIModeModule(M))
+      return llvm::PreservedAnalyses::all();
+
+    const bool scoped = isClosedRootSliceScopedModule(M);
+    const auto &binary_memory = MAM.getResult<BinaryMemoryAnalysis>(M);
+    std::set<uint64_t> attempted;
+    bool changed = false;
+
+    auto session_result = MAM.getResult<IterativeLiftingSessionAnalysis>(M);
+    const auto &block_lift = MAM.getResult<BlockLiftAnalysis>(M).lift_block;
+    const auto &trace_lift = MAM.getResult<TraceLiftAnalysis>(M).lift_trace;
+
+    for (auto &F : M) {
+      if (F.isDeclaration())
+        continue;
+      if (scoped && !isClosedRootSliceFunction(F))
+        continue;
+
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+          if (!call || call->arg_size() < 2)
+            continue;
+          auto *callee = call->getCalledFunction();
+          if (!callee || callee->getName() != "__remill_missing_block")
+            continue;
+
+          auto *pc_arg =
+              llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+          if (!pc_arg)
+            continue;
+          const uint64_t target_pc = pc_arg->getZExtValue();
+          if (!target_pc)
+            continue;
+          if (!binary_memory.isExecutable(target_pc, 1))
+            continue;
+          if (findSyntheticBlockLikeDefinition(M, target_pc))
+            continue;
+          if (!attempted.insert(target_pc).second)
+            continue;
+
+          bool lifted = false;
+          if (session_result.session &&
+              session_result.session->useBlockLifting() && block_lift) {
+            lifted = block_lift(target_pc);
+          } else if (block_lift) {
+            lifted = block_lift(target_pc);
+          } else if (trace_lift) {
+            lifted = trace_lift(target_pc);
+          }
+
+          if (lifted && session_result.session)
+            session_result.session->noteLiftedTarget(target_pc);
+          if (lifted && findSyntheticBlockLikeDefinition(M, target_pc))
+            changed = true;
+        }
+      }
+    }
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+
+  static bool isRequired() { return true; }
+};
+
+struct RewriteConstantMissingBlockCallsPass
+    : llvm::PassInfoMixin<RewriteConstantMissingBlockCallsPass> {
+  bool only_when_noabi_mode;
+
+  explicit RewriteConstantMissingBlockCallsPass(bool only_when_noabi_mode = false)
+      : only_when_noabi_mode(only_when_noabi_mode) {}
+
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &) {
+    if (only_when_noabi_mode && !isNoABIModeModule(M))
+      return llvm::PreservedAnalyses::all();
+
+    const bool scoped = isClosedRootSliceScopedModule(M);
+    bool changed = false;
+
+    for (auto &F : M) {
+      if (F.isDeclaration())
+        continue;
+      if (scoped && !isClosedRootSliceFunction(F))
+        continue;
+
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+          if (!call || call->arg_size() < 2)
+            continue;
+          auto *callee = call->getCalledFunction();
+          if (!callee || callee->getName() != "__remill_missing_block")
+            continue;
+
+          auto *pc_arg =
+              llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+          if (!pc_arg)
+            continue;
+
+          auto *target =
+              findSyntheticBlockLikeDefinition(M, pc_arg->getZExtValue());
+          if (!target || target == &F || target->isDeclaration())
+            continue;
+          if (target->getFunctionType() != call->getFunctionType())
+            continue;
+          if (isTerminalMissingBlockStub(*target))
+            continue;
+
+          call->setCalledFunction(target);
+          changed = true;
+        }
+      }
+    }
 
     return changed ? llvm::PreservedAnalyses::none()
                    : llvm::PreservedAnalyses::all();
@@ -3146,9 +3386,21 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
       buildCleanupPipeline(FPM, CleanupProfile::kBoundary);
       MPM.addPass(createScopedFPM(std::move(FPM),
                                   shouldRunClosedRootSliceScopedPass));
+      if (!opts.recover_abi) {
+        MPM.addPass(LiftConstantContinuationDeclarationTargetsPass(
+            /*only_when_noabi_mode=*/true));
+        MPM.addPass(
+            LiftConstantMissingBlockTargetsPass(/*only_when_noabi_mode=*/true));
+        if (opts.verify_generic_static_devirtualization)
+          MPM.addPass(VerifiedVirtualCFGMaterializationPass());
+        else
+          MPM.addPass(VirtualCFGMaterializationPass());
+      }
       MPM.addPass(CollapseSyntheticBlockContinuationCallsPass(
           /*rewrite_to_missing_block=*/true,
           /*only_when_noabi_mode=*/true));
+      MPM.addPass(
+          RewriteConstantMissingBlockCallsPass(/*only_when_noabi_mode=*/true));
       MPM.addPass(llvm::GlobalDCEPass());
     };
 
@@ -3163,6 +3415,19 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
       addPhaseMarker(MPM, "Phase 3.85: closed root-slice continuation discovery");
       MPM.addPass(LateClosedRootSliceContinuationClosurePass{});
       addClosedSliceShapeProbe(MPM, "phase3.85");
+
+      // Continuation discovery can lift new blk_*/sub_* bodies after the
+      // first generic materialization round. In no-ABI mode, run one more
+      // materialization pass so those continuation bodies get dispatch/callsite
+      // rewrites before readability cleanup.
+      if (opts.no_abi_mode) {
+        addPhaseMarker(MPM, "Phase 3.86: post-continuation materialization");
+        if (opts.verify_generic_static_devirtualization)
+          MPM.addPass(VerifiedVirtualCFGMaterializationPass());
+        else
+          MPM.addPass(VirtualCFGMaterializationPass());
+        addClosedSliceShapeProbe(MPM, "phase3.86");
+      }
     }
 
     add_closed_root_slice_cleanup("Phase 3.9: closed root-slice cleanup");

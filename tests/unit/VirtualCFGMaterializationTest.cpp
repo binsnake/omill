@@ -320,6 +320,60 @@ TEST_F(VirtualCFGMaterializationTest,
   EXPECT_EQ(pc_arg->getZExtValue(), 0x180011140ULL);
 }
 
+TEST_F(VirtualCFGMaterializationTest,
+       RewritesConstantMissingBlockCallToLiftedTarget) {
+  auto M = createModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+
+  auto *missing = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "__remill_missing_block", *M);
+
+  auto *target = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "blk_18000e240", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target->getArg(0));
+  }
+
+  auto *caller = llvm::Function::Create(lifted_ty,
+                                        llvm::Function::ExternalLinkage,
+                                        "sub_18000e200", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", caller);
+    llvm::IRBuilder<> B(entry);
+    auto *call = B.CreateCall(missing, {caller->getArg(0),
+                                        B.getInt64(0x18000E240ULL),
+                                        caller->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  runPass(*M);
+
+  unsigned missing_calls = 0;
+  unsigned direct_calls = 0;
+  for (auto &BB : *caller) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *callee = CI->getCalledFunction();
+      if (!callee)
+        continue;
+      if (callee->getName() == "__remill_missing_block")
+        ++missing_calls;
+      if (callee == target)
+        ++direct_calls;
+    }
+  }
+
+  EXPECT_EQ(missing_calls, 0u);
+  EXPECT_EQ(direct_calls, 1u);
+}
+
 TEST_F(VirtualCFGMaterializationTest, LeavesDynamicDispatchUnchanged) {
   auto M = createModule();
   auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
@@ -3253,6 +3307,74 @@ TEST_F(VirtualCFGMaterializationTest,
 
   EXPECT_EQ(dispatch_calls, 0u);
   EXPECT_EQ(direct_calls, 1u);
+}
+
+TEST_F(
+    VirtualCFGMaterializationTest,
+    MaterializesDispatchInAdjacentWrapperOutsideForwardReachabilityScope) {
+  auto M = createModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+
+  auto *dispatch = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "__omill_dispatch_call", *M);
+
+  auto *target = llvm::Function::Create(lifted_ty,
+                                        llvm::Function::ExternalLinkage,
+                                        "blk_18000b120", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target->getArg(0));
+  }
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::Function::ExternalLinkage,
+                                      "sub_18000b000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *call = B.CreateCall(target, {root->getArg(0), B.getInt64(0x18000B120ULL),
+                                       root->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  auto *wrapper = llvm::Function::Create(lifted_ty,
+                                         llvm::Function::ExternalLinkage,
+                                         "sub_18000b0f0", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", wrapper);
+    llvm::IRBuilder<> B(entry);
+    auto *call = B.CreateCall(dispatch, {wrapper->getArg(0),
+                                         B.getInt64(0x18000B120ULL),
+                                         wrapper->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  runPass(*M);
+
+  unsigned wrapper_dispatch_calls = 0;
+  unsigned wrapper_direct_calls = 0;
+  for (auto &BB : *wrapper) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *callee = CI->getCalledFunction();
+      if (!callee)
+        continue;
+      if (callee->getName() == "__omill_dispatch_call")
+        ++wrapper_dispatch_calls;
+      if (callee == target)
+        ++wrapper_direct_calls;
+    }
+  }
+
+  EXPECT_EQ(wrapper_dispatch_calls, 0u);
+  EXPECT_EQ(wrapper_direct_calls, 1u);
 }
 
 TEST_F(VirtualCFGMaterializationTest,

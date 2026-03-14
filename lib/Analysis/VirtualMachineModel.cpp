@@ -6563,7 +6563,10 @@ static void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
     }
     return callsite.unresolved_reason == "call_target_not_executable" ||
            callsite.unresolved_reason == "call_target_undecodable" ||
-           callsite.unresolved_reason == "call_target_mid_instruction";
+           callsite.unresolved_reason == "call_target_mid_instruction" ||
+           (callsite.unresolved_reason == "call_target_unresolved" &&
+            !handler.is_candidate && handler.dispatches.empty() &&
+            !callsite.resolved_target_pc.has_value());
   };
 
   auto classify_frontier_reason =
@@ -6603,10 +6606,18 @@ static void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
       const auto *handler = worklist.back();
       worklist.pop_back();
 
-      for (const auto &callee_name : handler->direct_callees) {
-        auto it = handler_by_name.find(callee_name);
-        if (it != handler_by_name.end())
-          enqueue_handler(it->second, worklist, reachable_names);
+      bool traverse_direct_callees =
+          handler->is_output_root || handler->is_candidate ||
+          !handler->dispatches.empty() || !handler->called_boundaries.empty() ||
+          llvm::any_of(handler->callsites, [](const VirtualCallSiteSummary &cs) {
+            return cs.continuation_pc.has_value();
+          });
+      if (traverse_direct_callees) {
+        for (const auto &callee_name : handler->direct_callees) {
+          auto it = handler_by_name.find(callee_name);
+          if (it != handler_by_name.end())
+            enqueue_handler(it->second, worklist, reachable_names);
+        }
       }
 
       if (handler->entry_va.has_value()) {
@@ -6631,7 +6642,6 @@ static void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
                     handler_by_pc, prelude->target_pc, target_arch);
                 if (recovered_target && recovered_target->entry_va.has_value()) {
                   recovered_entry_pc = recovered_target->entry_va;
-                  enqueue_handler(recovered_target, worklist, reachable_names);
                   reason = std::string("call_target_mid_instruction");
                 } else {
                   recovered_entry_pc = findNearbyExecutableEntry(
@@ -6640,8 +6650,6 @@ static void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
                     auto recovered_it = handler_by_pc.find(*recovered_entry_pc);
                     if (recovered_it != handler_by_pc.end()) {
                       recovered_target = recovered_it->second;
-                      enqueue_handler(recovered_target, worklist,
-                                      reachable_names);
                       reason = std::string("call_target_mid_instruction");
                     } else {
                       reason = std::string("call_target_nearby_unlifted");
@@ -6656,6 +6664,17 @@ static void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
             } else if (isTargetMapped(binary_memory, prelude->target_pc)) {
               reason = std::string("call_target_not_executable");
             }
+
+            bool skip_mid_instruction_wrapper =
+                reason == "call_target_mid_instruction" &&
+                !handler->is_candidate && !handler->is_output_root &&
+                !handler->callsites.empty();
+            if (skip_mid_instruction_wrapper)
+              continue;
+
+            if (recovered_target && recovered_target->entry_va.has_value())
+              enqueue_handler(recovered_target, worklist, reachable_names);
+
             slice.frontier_edges.push_back(VirtualRootSliceSummary::FrontierEdge{
                 VirtualRootFrontierKind::kCall,
                 handler->function_name,
@@ -6751,6 +6770,12 @@ static void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
       for (size_t callsite_index = 0; callsite_index < handler->callsites.size();
            ++callsite_index) {
         const auto &callsite = handler->callsites[callsite_index];
+        // Root-slice closure tracks callsites that have a modeled continuation
+        // edge. Other helper-side indirect calls may be semantically unrelated
+        // to VM control transfer and can otherwise pollute root frontiers.
+        if (!callsite.continuation_pc.has_value())
+          continue;
+
         const VirtualHandlerSummary *target = nullptr;
         if (callsite.target_function_name.has_value()) {
           auto it = handler_by_name.find(*callsite.target_function_name);

@@ -1214,3 +1214,258 @@ concrete traces, VM-specific emulators, or hardcoded handler semantics.
   - `dispatch_call=0`, `dispatch_jump=0`, `vm_entry=0`
   - `declare_blk=0`, `call_blk=0`, `musttail_blk=0`
   - `missing_block=0`, `missing_block_handler=0`
+
+## March 13, 2026: Default Corpus Bring-Up (Full VM)
+
+- Semantics verification against unprotected baseline is clean for both
+  protected corpora:
+  - `CorpusVMP.compact.dll` matches `Corpus.dll`
+  - `CorpusVMP.default.dll` matches `Corpus.dll`
+  - validated via `TvmpGetAbiVersion`, `TvmpRunDigestScenario`,
+    `TvmpGroundTruthDigest`
+
+- Implemented targeted generic/materialization plumbing for default-corpus
+  continuation chains:
+  - `VirtualCFGMaterialization.cpp` now computes an expanded rewrite scope from
+    closed-slice handlers through direct IR call-graph reachability
+  - added opportunistic lifting of constant executable
+    `__omill_dispatch_call/__omill_dispatch_jump` targets inside that scope
+    (iterative, bounded by existing lift-failure cache)
+
+- Implemented no-ABI cleanup safety gate in `Pipeline.cpp`:
+  - `CollapseSyntheticBlockContinuationCallsPass` now rewrites unresolved
+    synthetic `blk_*` continuation declarations to `__remill_missing_block`
+    only when live dispatch helpers are already gone
+  - when unresolved dispatch helpers remain, continuation declarations/calls are
+    preserved instead of being collapsed into many missing-block fallbacks
+
+- Added regression coverage:
+  - `PipelineTest.ClosedSliceNoAbiCleanupKeepsBlkMustTailFallbackWhenDispatchLives`
+
+- Verification:
+  - `omill-unit-tests.exe --gtest_filter=PipelineTest.*:VirtualMachineModelTest.*:VirtualCFGMaterializationTest.*`
+  - targeted test:
+    `PipelineTest.ClosedSliceNoAbiCleanupKeepsBlkMustTailFallbackWhenDispatchLives`
+
+- Default corpus impact (`CorpusVMP.default.dll`, root `0x180001850`,
+  `--block-lift --no-abi --generic-static-devirtualize`):
+  - root slice still reports closed:
+    `reachable=16 frontier=0 closed=true`
+  - unresolved call-dispatch count is unchanged so far:
+    `dispatch_call=26`, `dispatch_jump=3`, `vm_entry=0`
+  - no-ABI continuation shape is materially improved:
+    - before gate (`omill_current.noabi`):
+      `declare_blk=0`, `call_blk=7`, `musttail_blk=4`, `missing_block=16`
+    - after gate (`omill_dispatchlift3.noabi`):
+      `declare_blk=6`, `call_blk=22`, `musttail_blk=13`, `missing_block=1`
+
+- Default ABI artifact remains clean (`omill_dispatchlift3.verifyabi`):
+  - `dispatch_call=0`, `dispatch_jump=0`, `vm_entry=0`
+  - `declare_blk=0`, `call_blk=0`, `musttail_blk=0`
+  - `missing_block=0`, `missing_block_handler=0`
+
+## March 13, 2026: Default No-ABI Post-Continuation Rematerialization
+
+- Added a second generic materialization round after closed-slice continuation
+  discovery, but scoped to no-ABI mode only:
+  - `PipelineOptions` now carries explicit `no_abi_mode`
+  - `omill-lift` sets `opts.no_abi_mode = NoABI`
+  - Phase `3.86` (`post-continuation materialization`) runs only when
+    `opts.no_abi_mode` is true
+
+- Hardened repeated materialization metadata updates:
+  - `VirtualCFGMaterialization` now uses
+    `Module::setModuleFlag(Override, "omill.closed_root_slice_scope", ...)`
+    so re-running the pass does not duplicate module-flag entries
+
+- Default corpus impact (`CorpusVMP.default.dll`, root `0x180001850`,
+  `--block-lift --no-abi --generic-static-devirtualize`):
+  - artifact:
+    `CorpusVMP.default.vm.block.generic-on.omill_dispatchlift5.noabi.ll`
+  - root slice now expands and stays closed:
+    `reachable=254 frontier=0 closed=true`
+  - dispatch artifacts drop substantially:
+    - before (`omill_dispatchlift3.noabi`):
+      `dispatch_call=26`, `dispatch_jump=3`
+    - after (`omill_dispatchlift5.noabi`):
+      `dispatch_call=5`, `dispatch_jump=0`
+  - continuation targets lifted in this round include previously unresolved
+    call constants (`0x18015529a`, `0x1801a0cd4`, `0x1801c5ca7`,
+    `0x1801d1222`, `0x180207d63`, `0x180209ad4`, `0x180234f76`,
+    `0x180284ba9`, `0x18030b76a`, `0x1803679e8`, plus deeper follow-ons)
+  - emitted no-ABI IR now compiles with `clang -O2 -c` (no verifier crash)
+
+- ABI/default path remains stable and unchanged in shape:
+  - artifact:
+    `CorpusVMP.default.vm.block.generic-on.omill_dispatchlift7.verifyabi.ll`
+  - `dispatch_call=0`, `dispatch_jump=0`, `vm_entry=0`
+  - `declare_blk=0`, `call_blk=0`, `musttail_blk=0`
+  - `missing_block=0`, `missing_block_handler=0`
+
+- Verification:
+  - `omill-unit-tests.exe --gtest_filter=PipelineTest.*:VirtualMachineModelTest.*:VirtualCFGMaterializationTest.*` (`118/118` pass)
+
+## March 13, 2026: Adjacent Wrapper Rewrite Scope For Default No-ABI
+
+- Extended generic rewrite scope expansion in
+  `VirtualCFGMaterialization.cpp`:
+  - `collectReachableHandlerNames` now grows from root-slice handlers to
+    adjacent modeled handlers that feed the slice via:
+    - lifted direct-callee edges
+    - resolved dispatch successors
+    - resolved/recovered callsite target functions
+  - this captures `sub_*` wrappers that are outside forward handler reachability
+    but still carry rewriteable dispatch intrinsics into slice-local targets
+
+- Added regression coverage:
+  - `VirtualCFGMaterializationTest.MaterializesDispatchInAdjacentWrapperOutsideForwardReachabilityScope`
+
+- Verification:
+  - `cmake --build build-remill --target omill-unit-tests omill-lift --config RelWithDebInfo`
+  - `omill-unit-tests.exe --gtest_filter=VirtualCFGMaterializationTest.MaterializesDispatchInAdjacentWrapperOutsideForwardReachabilityScope`
+  - `omill-unit-tests.exe --gtest_filter=PipelineTest.*:VirtualMachineModelTest.*:VirtualCFGMaterializationTest.*` (`119/119` pass)
+
+- Default corpus rerun (`CorpusVMP.default.dll`, root `0x180001850`,
+  `--block-lift --no-abi --generic-static-devirtualize`):
+  - artifacts:
+    - `CorpusVMP.default.vm.block.generic-on.omill_dispatchlift8.noabi.ll`
+    - `default_vm_generic_model.omill_dispatchlift8.noabi.txt`
+  - root slice remains closed:
+    `reachable=254 frontier=0 closed=true`
+  - dispatch helpers are now fully removed from the emitted no-ABI IR:
+    - `dispatch_call=0` (down from `5`)
+    - `dispatch_jump=0`
+    - `vm_entry=0`
+  - continuation/fallback shape after this collapse:
+    - `declare_blk=2`, `call_blk=26`, `musttail_blk=6`
+    - `missing_block=28`
+  - emitted no-ABI IR compiles:
+    `clang -O2 -c ...omill_dispatchlift8.noabi.ll`
+
+- ABI stability check:
+  - artifacts:
+    - `CorpusVMP.default.vm.block.generic-on.omill_dispatchlift8.verifyabi.ll`
+    - `default_vm_generic_model.omill_dispatchlift8.verifyabi.txt`
+  - ABI shape stays clean:
+    `dispatch_call=0 dispatch_jump=0 vm_entry=0`
+    `declare_blk=0 call_blk=0 musttail_blk=0 missing_block=0`
+
+## March 13, 2026: Constant Continuation Target Lift Attempt (Default)
+
+- Added a bounded opportunistic lift step in
+  `VirtualCFGMaterialization.cpp`:
+  - `liftConstantContinuationTargetsInReachableFunctions`
+  - scans reachable functions for declaration-only `blk_*`/`block_*`
+    continuation calls where the call PC argument is constant and matches the
+    synthetic callee PC
+  - attempts iterative lift of that target before no-ABI continuation fallback
+    rewrite runs
+
+- Verification:
+  - `omill-unit-tests.exe --gtest_filter=PipelineTest.*:VirtualMachineModelTest.*:VirtualCFGMaterializationTest.*` (`119/119` pass)
+
+- Default corpus rerun (`omill_dispatchlift9.noabi`):
+  - root slice unchanged and still closed:
+    `reachable=254 frontier=0 closed=true`
+  - no dispatch helpers:
+    `dispatch_call=0 dispatch_jump=0 vm_entry=0`
+  - no-ABI continuation/fallback shape unchanged vs `dispatchlift8`:
+    `declare_blk=2 call_blk=26 musttail_blk=6 missing_block=28`
+  - emitted IR still compiles:
+    `clang -O2 -c ...omill_dispatchlift9.noabi.ll`
+
+- ABI stability rerun (`omill_dispatchlift9.verifyabi`) remains clean:
+  - `dispatch_call=0 dispatch_jump=0 vm_entry=0`
+  - `declare_blk=0 call_blk=0 musttail_blk=0 missing_block=0`
+
+## March 13, 2026: Default Validation Refresh (Stable `dispatchlift11`)
+
+- Re-ran default corpus after the adjacent-wrapper scope change and kept the
+  cleanup-stage continuation-lift experiment disabled in the stable path
+  (that experiment briefly reduced missing-block fallbacks but reintroduced
+  live dispatch helpers in no-ABI output).
+
+- Stable no-ABI artifact:
+  - `CorpusVMP.default.vm.block.generic-on.omill_dispatchlift11.noabi.ll`
+  - `default_vm_generic_model.omill_dispatchlift11.noabi.txt`
+  - metrics:
+    `dispatch_call=0 dispatch_jump=0 vm_entry=0`
+    `declare_blk=2 call_blk=26 musttail_blk=6 missing_block=28`
+  - root slice remains closed:
+    `reachable=254 frontier=0 closed=true`
+  - `clang -O2 -c` succeeds on emitted `.ll`
+
+## March 13, 2026: Default Root Closure Recovery (`decllift7`)
+
+- Root-slice closure for `CorpusVMP.default.dll` (`--va 0x180001850`,
+  `--block-lift --no-abi --generic-static-devirtualize`) is restored after
+  bounded traversal/frontier filters in the generic model:
+  - artifact:
+    `default_vm_generic_model.decllift7.noabi.txt`
+  - root status:
+    `reachable=203 frontier=0 closed=true specializations=1`
+
+- Landed model/materialization architecture fixes to stop non-control helper
+  branches from re-opening the root:
+  - root-slice callsite traversal/frontier now requires modeled
+    `continuation_pc`
+  - prelude recovery now suppresses non-candidate wrapper
+    `call_target_mid_instruction` pollution when the wrapper already has local
+    callsite chaining
+  - direct-callee traversal in root-slice construction is gated to
+    control-transfer-relevant handlers (`output_root`, `candidate`, dispatch,
+    boundary, or continuation-tracked callsite)
+  - unresolved non-candidate/no-dispatch callsites are treated as localized
+    root-closure noise
+  - adjacent-wrapper rewrite scope in `VirtualCFGMaterialization` is now
+    bounded to one hop (no transitive explosion)
+  - continuation/missing-target opportunistic lifting was removed from the
+    semantic materialization fixpoint (kept for cleanup-stage handling)
+
+- Verification:
+  - `omill-unit-tests.exe --gtest_filter=PipelineTest.*:VirtualMachineModelTest.*:VirtualCFGMaterializationTest.*`
+    (`121/121` pass)
+  - `build-remill/tools/omill-lift/omill-lift.exe ... --dump-virtual-model ...decllift7...`
+
+- Current no-ABI default artifact status:
+  - `CorpusVMP.default.vm.block.generic-on.decllift7.noabi.ll`
+  - `dispatch_call=0`
+  - `dispatch_jump=2`
+  - `vm_entry=0`
+  - `declare_blk=22`
+  - `call_blk=77`
+  - `musttail_blk=36`
+  - `missing_block=4`
+  - note: the remaining `dispatch_jump=2` calls are outside the closed
+    root slice (root closure is already `frontier=0 closed=true`)
+
+## March 14, 2026: Full-Suite Stability Fix (Iterative Analysis Registration)
+
+- Fixed a full-unit-suite assertion in
+  `ResolveDispatchTargetsTest.IterativeConvergence` caused by
+  `IterativeTargetResolutionPass` assuming optional analyses were registered in
+  all harnesses.
+
+- Changes:
+  - `IterativeTargetResolution.cpp` now checks
+    `MAM.isPassRegistered<...>()` before querying optional module analyses
+    (`BinaryMemoryAnalysis`, `IterativeLiftingSessionAnalysis`,
+    `CallGraphAnalysis`).
+  - If no shared iterative session analysis is registered, the pass now falls
+    back to a local in-pass session object.
+  - The resolve-dispatch iterative test harness explicitly registers
+    `CallGraphAnalysis` and runs ITR with IPCP disabled for that isolated unit
+    scenario.
+
+- Verification:
+  - `omill-unit-tests.exe --gtest_filter=ResolveDispatchTargetsTest.IterativeConvergence`
+    (pass)
+  - `omill-unit-tests.exe` full sweep: `712/712` passing.
+
+- Stable ABI artifact:
+  - `CorpusVMP.default.vm.block.generic-on.omill_dispatchlift11.verifyabi.ll`
+  - `default_vm_generic_model.omill_dispatchlift11.verifyabi.txt`
+  - metrics:
+    `dispatch_call=0 dispatch_jump=0 vm_entry=0`
+    `declare_blk=0 call_blk=0 musttail_blk=0 missing_block=0`
+  - `clang -O2 -c` succeeds on emitted `.ll`

@@ -12,6 +12,7 @@
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 
 #include "omill/Analysis/BinaryMemoryMap.h"
+#include "omill/Analysis/CallGraphAnalysis.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
 #include "omill/BC/TraceLiftAnalysis.h"
 #include "omill/Passes/ConstantMemoryFolding.h"
@@ -62,6 +63,7 @@ class ResolveDispatchTargetsTest : public ::testing::Test {
 
     MAM.registerPass(
         [&]() { return omill::BinaryMemoryAnalysis(std::move(map)); });
+    MAM.registerPass([] { return omill::CallGraphAnalysis(); });
     MAM.registerPass([] { return omill::LiftedFunctionAnalysis(); });
     MAM.registerPass([] { return omill::TraceLiftAnalysis(); });
 
@@ -90,6 +92,7 @@ class ResolveDispatchTargetsTest : public ::testing::Test {
 
     MAM.registerPass(
         [&]() { return omill::BinaryMemoryAnalysis(std::move(map)); });
+    MAM.registerPass([] { return omill::CallGraphAnalysis(); });
     MAM.registerPass([] { return omill::LiftedFunctionAnalysis(); });
     MAM.registerPass([] { return omill::TraceLiftAnalysis(); });
 
@@ -103,7 +106,8 @@ class ResolveDispatchTargetsTest : public ::testing::Test {
     (void)MAM.getResult<omill::LiftedFunctionAnalysis>(*M);
 
     llvm::ModulePassManager MPM;
-    MPM.addPass(omill::IterativeTargetResolutionPass(max_iter));
+    MPM.addPass(omill::IterativeTargetResolutionPass(
+        max_iter, /*run_ipcp_inside_resolution=*/false));
     MPM.run(*M, MAM);
   }
 

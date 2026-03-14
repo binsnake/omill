@@ -100,6 +100,9 @@ struct PipelineOptions {
   /// iterative discovery is closed.
   bool preserve_lifted_semantics = false;
 
+  /// Indicates the driver requested no-ABI output shape.
+  bool no_abi_mode = false;
+
   /// Merge block functions only after the discovery epoch converges.
   bool merge_block_functions_after_fixpoint = true;
 

@@ -1242,6 +1242,98 @@ static std::set<std::string> collectReachableHandlerNames(
     for (const auto &handler_name : slice.reachable_handler_names)
       reachable.insert(handler_name);
   }
+
+  // Root slices track handler/block reachability. Expand a single bounded
+  // layer to include modeled wrappers/callers that are directly adjacent to
+  // slice handlers, so dispatch rewrites can clean up those wrappers too
+  // without pulling in transitive handler graph noise.
+  std::set<std::string> base_reachable = reachable;
+  for (const auto &handler : model.handlers()) {
+    if (reachable.find(handler.function_name) != reachable.end())
+      continue;
+
+    bool adjacent = false;
+    for (const auto &callee_name : handler.direct_callees) {
+      if (base_reachable.find(callee_name) != base_reachable.end()) {
+        adjacent = true;
+        break;
+      }
+    }
+
+    if (!adjacent) {
+      for (const auto &dispatch : handler.dispatches) {
+        for (const auto &successor : dispatch.successors) {
+          if (!successor.target_function_name.has_value())
+            continue;
+          if (base_reachable.find(*successor.target_function_name) !=
+              base_reachable.end()) {
+            adjacent = true;
+            break;
+          }
+        }
+        if (adjacent)
+          break;
+      }
+    }
+
+    if (!adjacent) {
+      for (const auto &callsite : handler.callsites) {
+        if (callsite.target_function_name.has_value() &&
+            base_reachable.find(*callsite.target_function_name) !=
+                base_reachable.end()) {
+          adjacent = true;
+          break;
+        }
+        if (callsite.recovered_target_function_name.has_value() &&
+            base_reachable.find(*callsite.recovered_target_function_name) !=
+                base_reachable.end()) {
+          adjacent = true;
+          break;
+        }
+      }
+    }
+
+    if (adjacent)
+      reachable.insert(handler.function_name);
+  }
+
+  return reachable;
+}
+
+static std::set<std::string> collectReachableRewriteFunctionNames(
+    llvm::Module &M, const std::set<std::string> &seed_handlers,
+    bool has_root_slices) {
+  std::set<std::string> reachable = seed_handlers;
+  if (!has_root_slices)
+    return reachable;
+
+  llvm::SmallVector<llvm::Function *, 16> worklist;
+  for (const auto &name : seed_handlers) {
+    auto *F = M.getFunction(name);
+    if (!F || F->isDeclaration())
+      continue;
+    worklist.push_back(F);
+  }
+
+  while (!worklist.empty()) {
+    auto *F = worklist.back();
+    worklist.pop_back();
+
+    for (auto &BB : *F) {
+      for (auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+        if (!call)
+          continue;
+        auto *callee = call->getCalledFunction();
+        if (!callee || callee->isDeclaration())
+          continue;
+        if (!reachable.insert(callee->getName().str()).second)
+          continue;
+        worklist.push_back(callee);
+      }
+    }
+  }
+
   return reachable;
 }
 
@@ -1298,6 +1390,165 @@ static bool shouldAttemptLiftFrontier(
              frontier.reason == "call_target_nearby_unlifted";
   }
   return false;
+}
+
+static bool liftConstantDispatchTargetsInReachableHandlers(
+    llvm::Module &M, llvm::ModuleAnalysisManager &AM,
+    const BinaryMemoryMap &binary_memory,
+    const std::set<std::string> &reachable_functions, bool has_root_slices,
+    llvm::SmallDenseSet<uint64_t, 16> &failed_targets,
+    llvm::SmallVectorImpl<std::string> *diagnostics) {
+  bool changed = false;
+
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    if (has_root_slices &&
+        reachable_functions.find(F.getName().str()) ==
+            reachable_functions.end()) {
+      continue;
+    }
+
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+        if (!call || call->arg_size() < 2)
+          continue;
+
+        auto *callee = call->getCalledFunction();
+        if (!callee)
+          continue;
+
+        auto callee_name = callee->getName();
+        if (callee_name != "__omill_dispatch_call" &&
+            callee_name != "__omill_dispatch_jump") {
+          continue;
+        }
+
+        auto *target_pc = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+        if (!target_pc)
+          continue;
+
+        uint64_t pc = target_pc->getZExtValue();
+        if (pc == 0 || !isExecutableTargetAddress(binary_memory, pc))
+          continue;
+
+        if (!tryLiftTarget(M, AM, pc, failed_targets, diagnostics))
+          continue;
+
+        changed = true;
+        if (diagnostics) {
+          diagnostics->push_back("dispatch-const-lift caller=" + F.getName().str() +
+                                 " target=0x" + llvm::utohexstr(pc));
+        }
+      }
+    }
+  }
+
+  return changed;
+}
+
+[[maybe_unused]] static bool liftConstantContinuationTargetsInReachableFunctions(
+    llvm::Module &M, llvm::ModuleAnalysisManager &AM,
+    const BinaryMemoryMap &binary_memory,
+    const std::set<std::string> &reachable_functions, bool has_root_slices,
+    llvm::SmallDenseSet<uint64_t, 16> &failed_targets,
+    llvm::SmallVectorImpl<std::string> *diagnostics) {
+  bool changed = false;
+
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    if (has_root_slices &&
+        reachable_functions.find(F.getName().str()) ==
+            reachable_functions.end()) {
+      continue;
+    }
+
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+        if (!call || call->arg_size() < 2)
+          continue;
+
+        auto *callee = call->getCalledFunction();
+        if (!callee || !callee->isDeclaration())
+          continue;
+
+        uint64_t pc = extractSyntheticBlockLikePC(callee->getName());
+        if (!pc)
+          continue;
+
+        auto *target_pc = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+        if (!target_pc || target_pc->getZExtValue() != pc)
+          continue;
+        if (!isExecutableTargetAddress(binary_memory, pc))
+          continue;
+
+        if (!tryLiftTarget(M, AM, pc, failed_targets, diagnostics))
+          continue;
+
+        changed = true;
+        if (diagnostics) {
+          diagnostics->push_back(
+              "continuation-const-lift caller=" + F.getName().str() +
+              " target=0x" + llvm::utohexstr(pc));
+        }
+      }
+    }
+  }
+
+  return changed;
+}
+
+[[maybe_unused]] static bool liftConstantMissingBlockTargetsInReachableFunctions(
+    llvm::Module &M, llvm::ModuleAnalysisManager &AM,
+    const BinaryMemoryMap &binary_memory,
+    const std::set<std::string> &reachable_functions, bool has_root_slices,
+    llvm::SmallDenseSet<uint64_t, 16> &failed_targets,
+    llvm::SmallVectorImpl<std::string> *diagnostics) {
+  bool changed = false;
+
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    if (has_root_slices &&
+        reachable_functions.find(F.getName().str()) ==
+            reachable_functions.end()) {
+      continue;
+    }
+
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+        if (!call || call->arg_size() < 2)
+          continue;
+        auto *callee = call->getCalledFunction();
+        if (!callee || callee->getName() != "__remill_missing_block")
+          continue;
+
+        auto *target_pc = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+        if (!target_pc)
+          continue;
+
+        uint64_t pc = target_pc->getZExtValue();
+        if (pc == 0 || !isExecutableTargetAddress(binary_memory, pc))
+          continue;
+
+        if (!tryLiftTarget(M, AM, pc, failed_targets, diagnostics))
+          continue;
+
+        changed = true;
+        if (diagnostics) {
+          diagnostics->push_back(
+              "missing-block-const-lift caller=" + F.getName().str() +
+              " target=0x" + llvm::utohexstr(pc));
+        }
+      }
+    }
+  }
+
+  return changed;
 }
 
 static bool synthesizeLocalizedContinuationShims(
@@ -1456,7 +1707,7 @@ static void annotateClosedRootSlices(llvm::Module &M,
     }
   }
 
-  M.addModuleFlag(llvm::Module::Override, "omill.closed_root_slice_scope",
+  M.setModuleFlag(llvm::Module::Override, "omill.closed_root_slice_scope",
                   static_cast<uint32_t>(has_closed_slice ? 1 : 0));
 }
 
@@ -1484,9 +1735,14 @@ static MaterializationResult runMaterialization(llvm::Module &M,
     bool has_root_slices = false;
     auto reachable_handlers =
         collectReachableHandlerNames(final_model, has_root_slices);
+    auto reachable_rewrite_functions = collectReachableRewriteFunctionNames(
+        M, reachable_handlers, has_root_slices);
     genericDebugLog("iteration " + llvm::Twine(iteration).str() +
                     " reachable-handlers=" +
                     llvm::Twine(reachable_handlers.size()).str());
+    genericDebugLog("iteration " + llvm::Twine(iteration).str() +
+                    " reachable-rewrite-functions=" +
+                    llvm::Twine(reachable_rewrite_functions.size()).str());
 
     bool lifted_new_target = false;
     for (const auto &slice : final_model.rootSlices()) {
@@ -1505,6 +1761,12 @@ static MaterializationResult runMaterialization(llvm::Module &M,
           result.changed = true;
         }
       }
+    }
+    if (liftConstantDispatchTargetsInReachableHandlers(
+            M, AM, binary_memory, reachable_rewrite_functions, has_root_slices,
+            failed_lift_targets, &result.diagnostics)) {
+      lifted_new_target = true;
+      result.changed = true;
     }
     genericDebugLog("iteration " + llvm::Twine(iteration).str() +
                     " frontier-lift-done changed=" +
@@ -1539,8 +1801,10 @@ static MaterializationResult runMaterialization(llvm::Module &M,
       if (F.isDeclaration())
         continue;
       if (has_root_slices &&
-          reachable_handlers.find(F.getName().str()) == reachable_handlers.end())
+          reachable_rewrite_functions.find(F.getName().str()) ==
+              reachable_rewrite_functions.end()) {
         continue;
+      }
 
       const auto *summary = final_model.lookupHandler(F.getName());
       if (!summary)
@@ -1613,13 +1877,55 @@ static MaterializationResult runMaterialization(llvm::Module &M,
     llvm::SmallVector<BranchCandidate, 8> branch_candidates;
     llvm::SmallVector<ChoiceCandidate, 8> switch_candidates;
     llvm::SmallVector<MissingCandidate, 8> missing_candidates;
+    llvm::SmallPtrSet<llvm::CallInst *, 16> missing_candidate_calls;
+
+    auto enqueue_missing_candidate = [&](llvm::CallInst *call,
+                                         llvm::Function *source_fn,
+                                         const ResolvedTarget &resolved) {
+      if (!call || !source_fn || !resolved.function)
+        return;
+      if (!missing_candidate_calls.insert(call).second)
+        return;
+      missing_candidates.push_back(MissingCandidate{
+          call, source_fn, resolved.function, resolved.pc,
+          resolved.store_pc_to_state});
+    };
 
     for (auto &F : M) {
       if (F.isDeclaration())
         continue;
       if (has_root_slices &&
-          reachable_handlers.find(F.getName().str()) == reachable_handlers.end())
+          reachable_rewrite_functions.find(F.getName().str()) ==
+              reachable_rewrite_functions.end()) {
         continue;
+      }
+
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+          if (!call)
+            continue;
+          auto *callee = call->getCalledFunction();
+          if (!callee || callee->getName() != "__remill_missing_block")
+            continue;
+          if (call->arg_size() < 2)
+            continue;
+          auto *pc_arg =
+              llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+          if (!pc_arg)
+            continue;
+
+          auto resolved =
+              resolveTarget(M, binary_memory, final_model,
+                            call->getFunctionType(), pc_arg->getZExtValue(),
+                            &result.diagnostics);
+          if (!resolved.function || resolved.function == &F ||
+              resolved.function->getName() == "__remill_missing_block") {
+            continue;
+          }
+          enqueue_missing_candidate(call, &F, resolved);
+        }
+      }
 
       const auto *summary = final_model.lookupHandler(F.getName());
       if (!summary)
@@ -1640,9 +1946,7 @@ static MaterializationResult runMaterialization(llvm::Module &M,
               auto *callee = call->getCalledFunction();
               if (!callee || callee->getName() != "__remill_missing_block")
                 continue;
-              missing_candidates.push_back(
-                  MissingCandidate{call, &F, resolved.function, resolved.pc,
-                                   resolved.store_pc_to_state});
+              enqueue_missing_candidate(call, &F, resolved);
             }
           }
         }
