@@ -319,6 +319,11 @@ static std::optional<uint64_t> evaluateVirtualExprImpl(
       if (expr.stack_cell_id.has_value())
         return lookup_stack(*expr.stack_cell_id);
       return std::nullopt;
+    case VirtualExprKind::kMemoryRead:
+    case VirtualExprKind::kZExt:
+    case VirtualExprKind::kSExt:
+    case VirtualExprKind::kTrunc:
+      return std::nullopt;
     case VirtualExprKind::kAdd:
       return fold_binary([](uint64_t a, uint64_t b) { return a + b; });
     case VirtualExprKind::kSub:
@@ -1233,6 +1238,13 @@ static bool specializeReachableCallsites(
 
 static std::set<std::string> collectReachableHandlerNames(
     const VirtualMachineModel &model, bool &has_root_slices) {
+  auto is_devirt_relevant_handler = [](const VirtualHandlerSummary &handler) {
+    return handler.entry_va.has_value() || handler.is_output_root ||
+           handler.is_specialized || handler.is_candidate ||
+           !handler.dispatches.empty() || !handler.called_boundaries.empty() ||
+           !handler.callsites.empty();
+  };
+
   std::set<std::string> reachable;
   has_root_slices = !model.rootSlices().empty();
   if (!has_root_slices)
@@ -1249,6 +1261,8 @@ static std::set<std::string> collectReachableHandlerNames(
   // without pulling in transitive handler graph noise.
   std::set<std::string> base_reachable = reachable;
   for (const auto &handler : model.handlers()) {
+    if (!is_devirt_relevant_handler(handler))
+      continue;
     if (reachable.find(handler.function_name) != reachable.end())
       continue;
 
@@ -1301,8 +1315,18 @@ static std::set<std::string> collectReachableHandlerNames(
 }
 
 static std::set<std::string> collectReachableRewriteFunctionNames(
-    llvm::Module &M, const std::set<std::string> &seed_handlers,
-    bool has_root_slices) {
+    llvm::Module &M, const VirtualMachineModel &model,
+    const std::set<std::string> &seed_handlers, bool has_root_slices) {
+  auto is_devirt_relevant_function = [&](const llvm::Function &F) {
+    const auto *summary = model.lookupHandler(F.getName());
+    if (!summary)
+      return false;
+    return summary->entry_va.has_value() || summary->is_output_root ||
+           summary->is_specialized || summary->is_candidate ||
+           !summary->dispatches.empty() ||
+           !summary->called_boundaries.empty() || !summary->callsites.empty();
+  };
+
   std::set<std::string> reachable = seed_handlers;
   if (!has_root_slices)
     return reachable;
@@ -1310,7 +1334,7 @@ static std::set<std::string> collectReachableRewriteFunctionNames(
   llvm::SmallVector<llvm::Function *, 16> worklist;
   for (const auto &name : seed_handlers) {
     auto *F = M.getFunction(name);
-    if (!F || F->isDeclaration())
+    if (!F || F->isDeclaration() || !is_devirt_relevant_function(*F))
       continue;
     worklist.push_back(F);
   }
@@ -1326,6 +1350,8 @@ static std::set<std::string> collectReachableRewriteFunctionNames(
           continue;
         auto *callee = call->getCalledFunction();
         if (!callee || callee->isDeclaration())
+          continue;
+        if (!is_devirt_relevant_function(*callee))
           continue;
         if (!reachable.insert(callee->getName().str()).second)
           continue;
@@ -1384,6 +1410,8 @@ static bool shouldAttemptLiftFrontier(
   switch (frontier.kind) {
     case VirtualRootFrontierKind::kDispatch:
       return frontier.reason == "missing_lifted_target" ||
+             frontier.reason == "dispatch_target_unlifted" ||
+             frontier.reason == "dispatch_target_nearby_unlifted" ||
              frontier.reason == "boundary_target_unlifted";
     case VirtualRootFrontierKind::kCall:
       return frontier.reason == "call_target_unlifted" ||
@@ -1721,12 +1749,14 @@ static MaterializationResult runMaterialization(llvm::Module &M,
   llvm::SmallDenseSet<uint64_t, 16> failed_lift_targets;
   std::map<std::pair<uint64_t, std::string>, unsigned> variants_per_source;
   unsigned total_specialized_functions = 0;
+  bool final_model_current = false;
 
   constexpr unsigned kMaxIterations = 32;
   for (unsigned iteration = 0; iteration < kMaxIterations; ++iteration) {
     genericDebugLog("iteration " + llvm::Twine(iteration).str() +
                     " model-start");
     final_model = VirtualMachineModelAnalysis().run(M, AM);
+    final_model_current = true;
     genericDebugLog("iteration " + llvm::Twine(iteration).str() +
                     " model-done handlers=" +
                     llvm::Twine(final_model.handlers().size()).str() +
@@ -1736,7 +1766,7 @@ static MaterializationResult runMaterialization(llvm::Module &M,
     auto reachable_handlers =
         collectReachableHandlerNames(final_model, has_root_slices);
     auto reachable_rewrite_functions = collectReachableRewriteFunctionNames(
-        M, reachable_handlers, has_root_slices);
+        M, final_model, reachable_handlers, has_root_slices);
     genericDebugLog("iteration " + llvm::Twine(iteration).str() +
                     " reachable-handlers=" +
                     llvm::Twine(reachable_handlers.size()).str());
@@ -1759,6 +1789,7 @@ static MaterializationResult runMaterialization(llvm::Module &M,
                           &result.diagnostics)) {
           lifted_new_target = true;
           result.changed = true;
+          final_model_current = false;
         }
       }
     }
@@ -1767,6 +1798,7 @@ static MaterializationResult runMaterialization(llvm::Module &M,
             failed_lift_targets, &result.diagnostics)) {
       lifted_new_target = true;
       result.changed = true;
+      final_model_current = false;
     }
     genericDebugLog("iteration " + llvm::Twine(iteration).str() +
                     " frontier-lift-done changed=" +
@@ -1783,6 +1815,7 @@ static MaterializationResult runMaterialization(llvm::Module &M,
       genericDebugLog("iteration " + llvm::Twine(iteration).str() +
                       " specialize-changed");
       result.changed = true;
+      final_model_current = false;
       continue;
     }
 
@@ -1791,6 +1824,7 @@ static MaterializationResult runMaterialization(llvm::Module &M,
       genericDebugLog("iteration " + llvm::Twine(iteration).str() +
                       " localized-continuation-shims");
       result.changed = true;
+      final_model_current = false;
       continue;
     }
     genericDebugLog("iteration " + llvm::Twine(iteration).str() +
@@ -1836,6 +1870,7 @@ static MaterializationResult runMaterialization(llvm::Module &M,
                         &result.diagnostics)) {
         lifted_terminal_target = true;
         result.changed = true;
+        final_model_current = false;
       }
     }
     if (lifted_terminal_target) {
@@ -1994,7 +2029,7 @@ static MaterializationResult runMaterialization(llvm::Module &M,
             }
           }
 
-          if (dispatch.successors.size() >= 2 && !dispatch.is_jump &&
+          if (dispatch.successors.size() >= 2 &&
               call->getArgOperand(1)->getType()->isIntegerTy()) {
             llvm::SmallVector<ResolvedTarget, 4> resolved_choices;
             bool all_resolved = true;
@@ -2061,6 +2096,7 @@ static MaterializationResult runMaterialization(llvm::Module &M,
                                         branch_candidate.false_target)) {
         result.changed = true;
         iteration_changed = true;
+        final_model_current = false;
         result.changed_functions.insert(branch_candidate.source_fn);
       }
     }
@@ -2073,6 +2109,7 @@ static MaterializationResult runMaterialization(llvm::Module &M,
                                       switch_candidate.targets)) {
         result.changed = true;
         iteration_changed = true;
+        final_model_current = false;
         result.changed_functions.insert(switch_candidate.source_fn);
       }
     }
@@ -2085,6 +2122,7 @@ static MaterializationResult runMaterialization(llvm::Module &M,
                             candidate.store_pc_to_state)) {
         result.changed = true;
         iteration_changed = true;
+        final_model_current = false;
         ++total_direct_rewrites;
         result.changed_functions.insert(candidate.source_fn);
       }
@@ -2098,6 +2136,7 @@ static MaterializationResult runMaterialization(llvm::Module &M,
                             candidate.store_pc_to_state)) {
         result.changed = true;
         iteration_changed = true;
+        final_model_current = false;
         ++total_direct_rewrites;
         result.changed_functions.insert(candidate.source_fn);
       }
@@ -2110,7 +2149,8 @@ static MaterializationResult runMaterialization(llvm::Module &M,
   }
 
   genericDebugLog("final-model-start");
-  final_model = VirtualMachineModelAnalysis().run(M, AM);
+  if (!final_model_current)
+    final_model = VirtualMachineModelAnalysis().run(M, AM);
   genericDebugLog("final-model-done");
   annotateClosedRootSlices(M, final_model);
 
@@ -2124,9 +2164,13 @@ static MaterializationResult runMaterialization(llvm::Module &M,
   for (auto *F : dead_missing_stubs) {
     F->eraseFromParent();
     result.changed = true;
+    final_model_current = false;
   }
-  if (!dead_missing_stubs.empty()) {
+  const char *dump_path = std::getenv("OMILL_DUMP_VIRTUAL_MODEL");
+  const bool need_accurate_final_dump = dump_path && dump_path[0] != '\0';
+  if (!dead_missing_stubs.empty() && need_accurate_final_dump) {
     final_model = VirtualMachineModelAnalysis().run(M, AM);
+    final_model_current = true;
   }
 
   if (const char *dump_path = std::getenv("OMILL_DUMP_VIRTUAL_MODEL");

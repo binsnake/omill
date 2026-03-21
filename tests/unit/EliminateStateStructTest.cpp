@@ -147,6 +147,39 @@ TEST_F(EliminateStateStructTest, ClosedRootSliceScopeSkipsUnmarkedFunctions) {
   EXPECT_EQ(other_lifted->getLinkage(), llvm::GlobalValue::ExternalLinkage);
 }
 
+TEST_F(EliminateStateStructTest, ClosedRootOutputRootBecomesAlwaysInline) {
+  auto M = createTestModule();
+  M->addModuleFlag(llvm::Module::Override, "omill.closed_root_slice_scope", 1u);
+
+  auto *lifted_fn = M->getFunction("sub_401000");
+  ASSERT_NE(lifted_fn, nullptr);
+  lifted_fn->addFnAttr("omill.output_root");
+  lifted_fn->addFnAttr("omill.closed_root_slice", "1");
+  lifted_fn->addFnAttr("omill.closed_root_slice_root", "1");
+  lifted_fn->addFnAttr(llvm::Attribute::NoInline);
+  lifted_fn->addFnAttr(llvm::Attribute::OptimizeNone);
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+  llvm::ModulePassManager MPM;
+  MPM.addPass(omill::EliminateStateStructPass());
+  MPM.run(*M, MAM);
+
+  EXPECT_EQ(lifted_fn->getLinkage(), llvm::GlobalValue::InternalLinkage);
+  EXPECT_TRUE(lifted_fn->hasFnAttribute(llvm::Attribute::AlwaysInline));
+  EXPECT_FALSE(lifted_fn->hasFnAttribute(llvm::Attribute::NoInline));
+  EXPECT_FALSE(lifted_fn->hasFnAttribute(llvm::Attribute::OptimizeNone));
+}
+
 TEST_F(EliminateStateStructTest, RemovesUnusedRemillDecls) {
   auto M = createTestModule();
 

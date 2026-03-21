@@ -29,7 +29,8 @@ void internalizeRecoveredFunctions(llvm::Module &M) {
     std::string native_name = F.getName().str() + "_native";
     if (M.getFunction(native_name)) {
       F.setLinkage(llvm::GlobalValue::InternalLinkage);
-      if (F.hasFnAttribute("omill.output_root")) {
+      if (F.hasFnAttribute("omill.output_root") &&
+          !isClosedRootSliceRoot(F)) {
         // Keeping the exported lifted root as a call boundary avoids
         // force-inlining the whole stateful body into the public wrapper,
         // which can collapse the concrete success path into the fastfail arm.
@@ -37,7 +38,8 @@ void internalizeRecoveredFunctions(llvm::Module &M) {
         F.addFnAttr(llvm::Attribute::NoInline);
       } else {
         // optnone requires noinline and is incompatible with alwaysinline.
-        // Block-lifted helper functions can still carry optnone here.
+        // Block-lifted helper functions and closed recovered roots can still
+        // carry optnone here.
         if (F.hasFnAttribute(llvm::Attribute::OptimizeNone))
           F.removeFnAttr(llvm::Attribute::OptimizeNone);
         F.removeFnAttr(llvm::Attribute::NoInline);

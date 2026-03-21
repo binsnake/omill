@@ -110,10 +110,50 @@ static cl::opt<bool> IPCP(
     cl::desc("Enable interprocedural constant propagation"),
     cl::init(false));
 
+static cl::opt<bool> GenericStaticDevirtualize(
+    "generic-static-devirtualize",
+    cl::desc("Enable generic static devirtualization passes"),
+    cl::init(false));
+
+static cl::opt<bool> VerifyGenericStaticDevirtualization(
+    "verify-generic-static-devirtualization",
+    cl::desc("Validate generic static devirtualization rewrites"),
+    cl::init(false));
+
+static cl::opt<bool> BlockLift(
+    "block-lift",
+    cl::desc("Use block-lifting pipeline mode"),
+    cl::init(false));
+
+static cl::opt<bool> NoABIMode(
+    "no-abi-mode",
+    cl::desc("Run the pipeline in no-ABI mode"),
+    cl::init(false));
+
+static cl::opt<bool> PreserveLiftedSemantics(
+    "preserve-lifted-semantics",
+    cl::desc("Keep lifted semantic support alive across the pipeline"),
+    cl::init(false));
+
+static cl::opt<std::string> DumpVirtualModel(
+    "dump-virtual-model",
+    cl::desc("Dump generic virtual-machine model/materialization diagnostics"),
+    cl::init(""));
+
 static cl::opt<bool> OmillTimePasses(
     "omill-time-passes",
     cl::desc("Time each pass, printing elapsed time on exit"),
     cl::init(false));
+
+static void setEnvValue(const char *name, const std::string &value) {
+  if (value.empty())
+    return;
+#if defined(_WIN32)
+  _putenv_s(name, value.c_str());
+#else
+  setenv(name, value.c_str(), 1);
+#endif
+}
 
 int main(int argc, char **argv) {
   omill::setProcessMemoryLimit(32ULL * 1024 * 1024 * 1024);  // 32 GB
@@ -154,6 +194,15 @@ int main(int argc, char **argv) {
     opts.refine_signatures = RefineSignatures;
     opts.interprocedural_const_prop = IPCP;
   }
+
+  opts.generic_static_devirtualize = GenericStaticDevirtualize;
+  opts.verify_generic_static_devirtualization =
+      VerifyGenericStaticDevirtualization;
+  opts.use_block_lifting = BlockLift;
+  opts.no_abi_mode = NoABIMode;
+  opts.preserve_lifted_semantics = PreserveLiftedSemantics;
+
+  setEnvValue("OMILL_DUMP_VIRTUAL_MODEL", DumpVirtualModel);
 
   // When running --recover-abi on a checkpoint file, scope phases 0-3
   // to only process functions that still have the remill signature

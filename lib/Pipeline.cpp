@@ -316,6 +316,25 @@ bool envDisabled(const char *name) {
          (v[0] == 'T' && v[1] == '\0');
 }
 
+bool envEnabled(const char *name) {
+  const char *v = std::getenv(name);
+  if (!v || v[0] == '\0') return false;
+  return (v[0] == '1' && v[1] == '\0') ||
+         (v[0] == 't' && v[1] == '\0') ||
+         (v[0] == 'T' && v[1] == '\0') ||
+         (v[0] == 'y' && v[1] == '\0') ||
+         (v[0] == 'Y' && v[1] == '\0');
+}
+
+bool enableClosedSliceContinuationDiscovery() {
+  return envEnabled("OMILL_ENABLE_CLOSED_SLICE_CONTINUATION_DISCOVERY") &&
+         !envDisabled("OMILL_SKIP_CLOSED_SLICE_CONTINUATION_DISCOVERY");
+}
+
+bool enableNoAbiClosedSliceContinuationRelift() {
+  return envEnabled("OMILL_ENABLE_NOABI_CLOSED_SLICE_RELIFT");
+}
+
 std::optional<uint32_t> envUint32(const char *name) {
   const char *v = std::getenv(name);
   if (!v || v[0] == '\0') return std::nullopt;
@@ -693,6 +712,37 @@ bool shouldRunClosedRootSliceScopedPass(llvm::Function &F) {
   return isClosedRootSliceFunction(F);
 }
 
+bool isClosedRootSliceCodeBearingFunction(const llvm::Function &F) {
+  if (F.isDeclaration())
+    return false;
+  if (F.hasFnAttribute("omill.localized_continuation_shim"))
+    return false;
+
+  auto name = F.getName();
+  if (name.starts_with("sub_") || name.starts_with("block_") ||
+      name.starts_with("blk_") || name.starts_with("__lifted_") ||
+      name.ends_with("_native")) {
+    return true;
+  }
+
+  return F.hasFnAttribute("omill.output_root") ||
+         F.hasFnAttribute("omill.virtual_specialized") ||
+         F.hasFnAttribute("omill.closed_root_slice_root") ||
+         F.hasFnAttribute("omill.vm_wrapper") ||
+         F.hasFnAttribute("omill.vm_newly_lifted") ||
+         F.hasFnAttribute("omill.newly_lifted") ||
+         F.getFnAttribute("omill.vm_demerged_clone").isValid() ||
+         F.getFnAttribute("omill.vm_outlined_virtual_call").isValid() ||
+         F.getFnAttribute("omill.trace_native_target").isValid();
+}
+
+bool shouldRunClosedRootSliceCodeBearingPass(llvm::Function &F) {
+  if (!isClosedRootSliceScopedModule(*F.getParent()))
+    return true;
+  return isClosedRootSliceFunction(F) &&
+         isClosedRootSliceCodeBearingFunction(F);
+}
+
 bool shouldRunClosedRootSliceNativePass(llvm::Function &F) {
   if (!F.getName().ends_with("_native"))
     return false;
@@ -717,6 +767,55 @@ bool isNoABIModeModule(const llvm::Module &M) {
 bool isSyntheticBlockLikeFunctionName(llvm::StringRef name) {
   return name.starts_with("blk_") || name.starts_with("block_");
 }
+
+bool isClosedRootSliceNativeSubHelperName(llvm::StringRef name) {
+  return name.starts_with("sub_") && name.ends_with("_native");
+}
+
+bool hasCorrespondingLiftedOutputRoot(const llvm::Function &F) {
+  if (!F.getName().ends_with("_native"))
+    return false;
+  llvm::StringRef lifted_name = F.getName().drop_back(7);
+  auto *lifted = F.getParent()->getFunction(lifted_name);
+  return lifted &&
+         (lifted->hasFnAttribute("omill.output_root") ||
+          isClosedRootSliceRoot(*lifted));
+}
+
+struct InternalizeDeadNativeHelpersPass
+    : llvm::PassInfoMixin<InternalizeDeadNativeHelpersPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &) {
+    auto has_live_dispatch = [&](llvm::StringRef name) {
+      auto *F = M.getFunction(name);
+      return F && !F->use_empty();
+    };
+    if (has_live_dispatch("__omill_dispatch_call") ||
+        has_live_dispatch("__omill_dispatch_jump")) {
+      return llvm::PreservedAnalyses::all();
+    }
+
+    bool changed = false;
+    for (auto &F : M) {
+      if (F.isDeclaration() || !F.getName().ends_with("_native"))
+        continue;
+      if (F.hasFnAttribute("omill.output_root") || isClosedRootSliceRoot(F) ||
+          hasCorrespondingLiftedOutputRoot(F)) {
+        continue;
+      }
+      if (!F.use_empty())
+        continue;
+      if (!F.hasExternalLinkage())
+        continue;
+      F.setLinkage(llvm::GlobalValue::InternalLinkage);
+      changed = true;
+    }
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+  static bool isRequired() { return true; }
+};
 
 unsigned countNonDebugInstructions(const llvm::Function &F) {
   unsigned inst_count = 0;
@@ -750,11 +849,23 @@ bool maybeMarkClosedRootSliceHelperForInlining(
     return false;
   if (F.getName().ends_with("_native") != native_helper)
     return false;
-  if (!isSyntheticBlockLikeFunctionName(F.getName()))
+  const bool is_block_like = isSyntheticBlockLikeFunctionName(F.getName());
+  const bool is_native_sub_helper =
+      native_helper && isClosedRootSliceNativeSubHelperName(F.getName()) &&
+      !F.hasFnAttribute("omill.output_root");
+  if (!is_block_like && !is_native_sub_helper)
     return false;
   if (native_helper && shouldPreserveOutlinedWrapper(F, virtual_callees))
     return false;
+  if (is_native_sub_helper && F.getNumUses() > 2)
+    return false;
   unsigned inline_budget = max_inst_count;
+  if (is_native_sub_helper && F.use_empty()) {
+    // Dead closed-slice native wrappers still clutter ABI output if they keep
+    // external linkage. Internalize them regardless of size so GlobalDCE can
+    // erase the unreachable state-wrapper remnants.
+    inline_budget = std::numeric_limits<unsigned>::max();
+  }
   if (native_helper) {
     // Late continuation discovery can produce a few larger closed-slice
     // blk_*_native wrappers with a single remaining caller. Allow a wider
@@ -763,7 +874,7 @@ bool maybeMarkClosedRootSliceHelperForInlining(
       inline_budget = std::max(inline_budget, 384u);
     else if (F.getNumUses() <= 2)
       inline_budget = std::max(inline_budget, 192u);
-  } else if (!envDisabled("OMILL_SKIP_CLOSED_SLICE_CONTINUATION_DISCOVERY")) {
+  } else if (enableClosedSliceContinuationDiscovery()) {
     // The experimental continuation discovery path exposes a few larger
     // lifted blk_* continuations before ABI recovery. Inline single-caller
     // continuations earlier so ABI recovery sees a flatter closed slice.
@@ -801,6 +912,49 @@ bool maybeMarkClosedRootSliceHelperForInlining(
     F.setLinkage(llvm::GlobalValue::InternalLinkage);
     changed = true;
   }
+  return changed;
+}
+
+bool maybeMarkClosedRootSliceSemanticHelperForInlining(llvm::Function &F,
+                                                       unsigned max_inst_count) {
+  if (F.isDeclaration() || !F.hasLocalLinkage())
+    return false;
+
+  auto name = F.getName();
+  if (name.starts_with("sub_") || isSyntheticBlockLikeFunctionName(name) ||
+      name.starts_with("__remill_") || name.starts_with("__omill_") ||
+      name.ends_with("_native")) {
+    return false;
+  }
+  if (!F.getMetadata("remill.function.type"))
+    return false;
+  if (countNonDebugInstructions(F) > max_inst_count)
+    return false;
+
+  bool has_direct_caller = false;
+  for (auto *U : F.users()) {
+    auto *CB = llvm::dyn_cast<llvm::CallBase>(U);
+    if (!CB || CB->getCalledFunction() != &F)
+      return false;
+    has_direct_caller = true;
+  }
+  if (!has_direct_caller)
+    return false;
+
+  bool changed = false;
+  if (F.hasFnAttribute(llvm::Attribute::OptimizeNone)) {
+    F.removeFnAttr(llvm::Attribute::OptimizeNone);
+    changed = true;
+  }
+  if (F.hasFnAttribute(llvm::Attribute::NoInline)) {
+    F.removeFnAttr(llvm::Attribute::NoInline);
+    changed = true;
+  }
+  if (!F.hasFnAttribute(llvm::Attribute::AlwaysInline)) {
+    F.addFnAttr(llvm::Attribute::AlwaysInline);
+    changed = true;
+  }
+
   return changed;
 }
 
@@ -881,6 +1035,57 @@ void collectReachableClosedRootSliceFunctions(
   }
 }
 
+void collectReachableClosedRootSliceCodeFunctionsFromRoots(
+    llvm::Module &M, llvm::SmallVectorImpl<llvm::Function *> &functions) {
+  llvm::DenseSet<llvm::Function *> seen;
+  llvm::DenseSet<llvm::Function *> recorded;
+  llvm::SmallVector<llvm::Function *, 16> traversal_queue;
+  auto enqueue_traversal = [&](llvm::Function *F) {
+    if (!F || F->isDeclaration())
+      return;
+    if (!seen.insert(F).second)
+      return;
+    traversal_queue.push_back(F);
+  };
+
+  auto maybe_record = [&](llvm::Function *F) {
+    if (!F || F->isDeclaration() ||
+        !isClosedRootSliceCodeBearingFunction(*F) ||
+        !recorded.insert(F).second) {
+      return;
+    }
+    functions.push_back(F);
+  };
+
+  for (auto &F : M) {
+    if (isClosedRootSliceRoot(F))
+      enqueue_traversal(&F);
+  }
+
+  if (traversal_queue.empty()) {
+    for (auto &F : M) {
+      if (isClosedRootSliceFunction(F))
+        enqueue_traversal(&F);
+    }
+  }
+
+  for (size_t i = 0; i < traversal_queue.size(); ++i) {
+    auto *F = traversal_queue[i];
+    maybe_record(F);
+    for (auto &BB : *F) {
+      for (auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+        if (!call)
+          continue;
+        auto *callee = call->getCalledFunction();
+        if (!callee || callee->isDeclaration())
+          continue;
+        enqueue_traversal(callee);
+      }
+    }
+  }
+}
+
 bool markReachableClosedRootSliceFunctions(llvm::Module &M) {
   llvm::SmallVector<llvm::Function *, 16> reachable;
   collectReachableClosedRootSliceFunctions(M, reachable);
@@ -892,6 +1097,44 @@ bool markReachableClosedRootSliceFunctions(llvm::Module &M) {
       changed = true;
     }
   }
+  return changed;
+}
+
+bool rebuildClosedRootSliceCodeScope(llvm::Module &M) {
+  if (!isClosedRootSliceScopedModule(M))
+    return false;
+
+  llvm::SmallVector<llvm::Function *, 16> reachable;
+  collectReachableClosedRootSliceCodeFunctionsFromRoots(M, reachable);
+  llvm::DenseSet<llvm::Function *> keep(reachable.begin(), reachable.end());
+
+  bool has_root = false;
+  for (auto &F : M) {
+    if (!isClosedRootSliceRoot(F))
+      continue;
+    keep.insert(&F);
+    has_root = true;
+  }
+
+  bool changed = false;
+  for (auto &F : M) {
+    const bool should_keep = keep.contains(&F);
+    if (should_keep) {
+      if (!F.hasFnAttribute("omill.closed_root_slice")) {
+        F.addFnAttr("omill.closed_root_slice", "1");
+        changed = true;
+      }
+      continue;
+    }
+
+    if (F.hasFnAttribute("omill.closed_root_slice")) {
+      F.removeFnAttr("omill.closed_root_slice");
+      changed = true;
+    }
+  }
+
+  M.setModuleFlag(llvm::Module::Override, "omill.closed_root_slice_scope",
+                  static_cast<uint32_t>(has_root ? 1 : 0));
   return changed;
 }
 
@@ -1009,6 +1252,24 @@ struct MarkClosedRootSliceNativeHelpersForInliningPass
       changed |= maybeMarkClosedRootSliceHelperForInlining(
           F, /*max_inst_count=*/96, /*native_helper=*/true,
           &virtual_callees);
+    }
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+};
+
+struct MarkClosedRootSliceSemanticHelpersForInliningPass
+    : llvm::PassInfoMixin<MarkClosedRootSliceSemanticHelpersForInliningPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &) {
+    if (!isClosedRootSliceScopedModule(M))
+      return llvm::PreservedAnalyses::all();
+
+    bool changed = false;
+    for (auto &F : M) {
+      changed |= maybeMarkClosedRootSliceSemanticHelperForInlining(
+          F, /*max_inst_count=*/96);
     }
 
     return changed ? llvm::PreservedAnalyses::none()
@@ -1184,6 +1445,8 @@ struct LiftConstantContinuationDeclarationTargetsPass
     if (only_when_noabi_mode && !isNoABIModeModule(M))
       return llvm::PreservedAnalyses::all();
 
+    const bool debug_continuation_lifts =
+        (std::getenv("OMILL_DEBUG_CONTINUATION_LIFTS") != nullptr);
     const bool scoped = isClosedRootSliceScopedModule(M);
     const auto &binary_memory = MAM.getResult<BinaryMemoryAnalysis>(M);
     std::set<uint64_t> attempted;
@@ -1216,12 +1479,27 @@ struct LiftConstantContinuationDeclarationTargetsPass
               llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
           if (!pc_arg || pc_arg->getZExtValue() != *continuation_pc)
             continue;
-          if (!binary_memory.isExecutable(*continuation_pc, 1))
+          if (!binary_memory.isExecutable(*continuation_pc, 1)) {
+            if (debug_continuation_lifts)
+              llvm::errs() << "[continuation-lift] skip non-executable pc=0x"
+                           << llvm::Twine::utohexstr(*continuation_pc) << " in "
+                           << F.getName() << "\n";
             continue;
-          if (findSyntheticBlockLikeDefinition(M, *continuation_pc))
+          }
+          if (findSyntheticBlockLikeDefinition(M, *continuation_pc)) {
+            if (debug_continuation_lifts)
+              llvm::errs() << "[continuation-lift] already-defined pc=0x"
+                           << llvm::Twine::utohexstr(*continuation_pc) << "\n";
             continue;
+          }
           if (!attempted.insert(*continuation_pc).second)
             continue;
+
+          if (debug_continuation_lifts)
+            llvm::errs() << "[continuation-lift] attempt pc=0x"
+                         << llvm::Twine::utohexstr(*continuation_pc)
+                         << " caller=" << F.getName()
+                         << " callee=" << callee->getName() << "\n";
 
           bool lifted = false;
           if (session_result.session &&
@@ -1235,7 +1513,29 @@ struct LiftConstantContinuationDeclarationTargetsPass
 
           if (lifted && session_result.session)
             session_result.session->noteLiftedTarget(*continuation_pc);
-          if (lifted && findSyntheticBlockLikeDefinition(M, *continuation_pc))
+          auto *lifted_target =
+              lifted ? findSyntheticBlockLikeDefinition(M, *continuation_pc)
+                     : nullptr;
+          if (debug_continuation_lifts) {
+            llvm::errs() << "[continuation-lift] result pc=0x"
+                         << llvm::Twine::utohexstr(*continuation_pc)
+                         << " lifted=" << lifted
+                         << " defined=" << (lifted_target != nullptr);
+            if (auto *blk =
+                    M.getFunction((llvm::Twine("blk_") +
+                                   llvm::Twine::utohexstr(*continuation_pc))
+                                      .str())) {
+              llvm::errs() << " blk_decl=" << blk->isDeclaration();
+            }
+            if (auto *sub =
+                    M.getFunction((llvm::Twine("sub_") +
+                                   llvm::Twine::utohexstr(*continuation_pc))
+                                      .str())) {
+              llvm::errs() << " sub_decl=" << sub->isDeclaration();
+            }
+            llvm::errs() << "\n";
+          }
+          if (lifted_target)
             changed = true;
         }
       }
@@ -1260,6 +1560,8 @@ struct LiftConstantMissingBlockTargetsPass
     if (only_when_noabi_mode && !isNoABIModeModule(M))
       return llvm::PreservedAnalyses::all();
 
+    const bool debug_continuation_lifts =
+        (std::getenv("OMILL_DEBUG_CONTINUATION_LIFTS") != nullptr);
     const bool scoped = isClosedRootSliceScopedModule(M);
     const auto &binary_memory = MAM.getResult<BinaryMemoryAnalysis>(M);
     std::set<uint64_t> attempted;
@@ -1291,12 +1593,26 @@ struct LiftConstantMissingBlockTargetsPass
           const uint64_t target_pc = pc_arg->getZExtValue();
           if (!target_pc)
             continue;
-          if (!binary_memory.isExecutable(target_pc, 1))
+          if (!binary_memory.isExecutable(target_pc, 1)) {
+            if (debug_continuation_lifts)
+              llvm::errs() << "[missing-block-lift] skip non-executable pc=0x"
+                           << llvm::Twine::utohexstr(target_pc) << " in "
+                           << F.getName() << "\n";
             continue;
-          if (findSyntheticBlockLikeDefinition(M, target_pc))
+          }
+          if (findSyntheticBlockLikeDefinition(M, target_pc)) {
+            if (debug_continuation_lifts)
+              llvm::errs() << "[missing-block-lift] already-defined pc=0x"
+                           << llvm::Twine::utohexstr(target_pc) << "\n";
             continue;
+          }
           if (!attempted.insert(target_pc).second)
             continue;
+
+          if (debug_continuation_lifts)
+            llvm::errs() << "[missing-block-lift] attempt pc=0x"
+                         << llvm::Twine::utohexstr(target_pc)
+                         << " caller=" << F.getName() << "\n";
 
           bool lifted = false;
           if (session_result.session &&
@@ -1310,7 +1626,28 @@ struct LiftConstantMissingBlockTargetsPass
 
           if (lifted && session_result.session)
             session_result.session->noteLiftedTarget(target_pc);
-          if (lifted && findSyntheticBlockLikeDefinition(M, target_pc))
+          auto *lifted_target =
+              lifted ? findSyntheticBlockLikeDefinition(M, target_pc) : nullptr;
+          if (debug_continuation_lifts) {
+            llvm::errs() << "[missing-block-lift] result pc=0x"
+                         << llvm::Twine::utohexstr(target_pc)
+                         << " lifted=" << lifted
+                         << " defined=" << (lifted_target != nullptr);
+            if (auto *blk =
+                    M.getFunction((llvm::Twine("blk_") +
+                                   llvm::Twine::utohexstr(target_pc))
+                                      .str())) {
+              llvm::errs() << " blk_decl=" << blk->isDeclaration();
+            }
+            if (auto *sub =
+                    M.getFunction((llvm::Twine("sub_") +
+                                   llvm::Twine::utohexstr(target_pc))
+                                      .str())) {
+              llvm::errs() << " sub_decl=" << sub->isDeclaration();
+            }
+            llvm::errs() << "\n";
+          }
+          if (lifted_target)
             changed = true;
         }
       }
@@ -1372,6 +1709,107 @@ struct RewriteConstantMissingBlockCallsPass
         }
       }
     }
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+
+  static bool isRequired() { return true; }
+};
+
+struct RewriteTerminalSyntheticBlockCallsToMissingBlockHandlerPass
+    : llvm::PassInfoMixin<
+          RewriteTerminalSyntheticBlockCallsToMissingBlockHandlerPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &) {
+    if (isNoABIModeModule(M))
+      return llvm::PreservedAnalyses::all();
+
+    const bool scoped = isClosedRootSliceScopedModule(M);
+    llvm::Function *missing_block_handler = nullptr;
+    bool changed = false;
+
+    auto getOrCreateMissingBlockHandler = [&]() -> llvm::Function * {
+      if (missing_block_handler)
+        return missing_block_handler;
+      auto &ctx = M.getContext();
+      auto *handler_ty = llvm::FunctionType::get(
+          llvm::Type::getVoidTy(ctx), {llvm::Type::getInt64Ty(ctx)}, false);
+      missing_block_handler = llvm::cast<llvm::Function>(
+          M.getOrInsertFunction("__omill_missing_block_handler", handler_ty)
+              .getCallee());
+      return missing_block_handler;
+    };
+
+    auto isTerminalSyntheticMemoryArg = [](llvm::Value *V) {
+      auto *C = llvm::dyn_cast<llvm::Constant>(V);
+      if (!C)
+        return false;
+      return C->isNullValue() || llvm::isa<llvm::PoisonValue>(C) ||
+             llvm::isa<llvm::UndefValue>(C);
+    };
+
+    auto nextNonDebug = [](llvm::Instruction *I) -> llvm::Instruction * {
+      for (auto *next = I->getNextNode(); next; next = next->getNextNode()) {
+        if (!llvm::isa<llvm::DbgInfoIntrinsic>(next))
+          return next;
+      }
+      return nullptr;
+    };
+
+    for (auto &F : M) {
+      if (F.isDeclaration())
+        continue;
+      if (scoped && !isClosedRootSliceFunction(F))
+        continue;
+
+      for (auto &BB : F) {
+        for (auto &I : llvm::make_early_inc_range(BB)) {
+          auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+          if (!call || call->arg_size() < 3 || !call->use_empty())
+            continue;
+
+          auto *callee = call->getCalledFunction();
+          if (!callee || !callee->isDeclaration())
+            continue;
+
+          auto continuation_pc = parseSyntheticBlockLikePC(callee->getName());
+          if (!continuation_pc)
+            continue;
+
+          auto *pc_arg =
+              llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+          if (!pc_arg || pc_arg->getZExtValue() != *continuation_pc)
+            continue;
+          if (!isTerminalSyntheticMemoryArg(call->getArgOperand(2)))
+            continue;
+
+          auto *next = nextNonDebug(call);
+          if (!next || !llvm::isa<llvm::UnreachableInst>(next))
+            continue;
+
+          llvm::IRBuilder<> B(call);
+          B.CreateCall(getOrCreateMissingBlockHandler(),
+                       {llvm::ConstantInt::get(
+                           llvm::Type::getInt64Ty(M.getContext()),
+                           *continuation_pc)});
+          call->eraseFromParent();
+          changed = true;
+        }
+      }
+    }
+
+    llvm::SmallVector<llvm::Function *, 16> dead_decls;
+    for (auto &F : M) {
+      if (!F.isDeclaration())
+        continue;
+      if (!parseSyntheticBlockLikePC(F.getName()))
+        continue;
+      if (F.use_empty())
+        dead_decls.push_back(&F);
+    }
+    for (auto *F : dead_decls)
+      F->eraseFromParent();
 
     return changed ? llvm::PreservedAnalyses::none()
                    : llvm::PreservedAnalyses::all();
@@ -1792,6 +2230,60 @@ struct MarkReachableClosedRootSliceFunctionsPass
     bool changed = markReachableClosedRootSliceFunctions(M);
     return changed ? llvm::PreservedAnalyses::none()
                    : llvm::PreservedAnalyses::all();
+  }
+  static bool isRequired() { return true; }
+};
+
+struct RebuildClosedRootSliceCodeScopePass
+    : llvm::PassInfoMixin<RebuildClosedRootSliceCodeScopePass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &) {
+    bool changed = rebuildClosedRootSliceCodeScope(M);
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+  static bool isRequired() { return true; }
+};
+
+struct NoAbiPostCleanupMaterializationPass
+    : llvm::PassInfoMixin<NoAbiPostCleanupMaterializationPass> {
+  explicit NoAbiPostCleanupMaterializationPass(bool verify = false)
+      : verify_materialization(verify) {}
+
+  bool verify_materialization = false;
+
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &MAM) {
+    if (!isClosedRootSliceScopedModule(M))
+      return llvm::PreservedAnalyses::all();
+
+    llvm::ModulePassManager PM;
+    PM.addPass(RebuildClosedRootSliceCodeScopePass{});
+    PM.addPass(
+        llvm::RequireAnalysisPass<BinaryMemoryAnalysis, llvm::Module>());
+    {
+      llvm::FunctionPassManager FPM;
+      FPM.addPass(ConstantMemoryFoldingPass());
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::GVNPass());
+      FPM.addPass(llvm::InstCombinePass());
+      PM.addPass(createScopedFPM(std::move(FPM),
+                                 shouldRunClosedRootSliceCodeBearingPass));
+    }
+    if (verify_materialization)
+      PM.addPass(VerifiedVirtualCFGMaterializationPass());
+    else
+      PM.addPass(VirtualCFGMaterializationPass());
+    PM.addPass(RebuildClosedRootSliceCodeScopePass{});
+    PM.addPass(CollapseSyntheticBlockContinuationCallsPass(
+        /*rewrite_to_missing_block=*/true,
+        /*only_when_noabi_mode=*/true));
+    PM.addPass(
+        RewriteConstantMissingBlockCallsPass(/*only_when_noabi_mode=*/true));
+    PM.addPass(llvm::GlobalDCEPass());
+    PM.addPass(RebuildClosedRootSliceCodeScopePass{});
+    PM.run(M, MAM);
+    return llvm::PreservedAnalyses::none();
   }
   static bool isRequired() { return true; }
 };
@@ -2459,6 +2951,7 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
 
       MPM.addPass(PreserveOutlinedWrappersPass{});
       MPM.addPass(MarkClosedRootSliceNativeHelpersForInliningPass());
+      MPM.addPass(MarkClosedRootSliceSemanticHelpersForInliningPass());
       MPM.addPass(RepairBeforeInlinePass{});
       if (!envDisabled("OMILL_SKIP_ABI_ALWAYS_INLINE"))
         MPM.addPass(llvm::AlwaysInlinerPass());
@@ -2469,6 +2962,22 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
         FPM.addPass(llvm::InstCombinePass());
         FPM.addPass(llvm::GVNPass());
         MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+      }
+      {
+        llvm::FunctionPassManager FPM;
+        FPM.addPass(LowerRemillIntrinsicsPass(
+            LowerCategories::Flags | LowerCategories::Barriers |
+            LowerCategories::Memory | LowerCategories::Atomics |
+            LowerCategories::HyperCalls | LowerCategories::ErrorMissing |
+            LowerCategories::Undefined));
+        if (!envDisabled("OMILL_SKIP_ABI_DEAD_STATE_STORE_DSE"))
+          FPM.addPass(DeadStateStoreDSEPass());
+        if (!envDisabled("OMILL_SKIP_ABI_SROA"))
+          FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+        FPM.addPass(llvm::InstCombinePass());
+        FPM.addPass(llvm::GVNPass());
+        MPM.addPass(createScopedFPM(std::move(FPM),
+                                    shouldRunClosedRootSliceScopedPass));
       }
       if (!envDisabled("OMILL_SKIP_SPLIT_LARGE_ALLOCA")) {
         llvm::FunctionPassManager FPM;
@@ -2481,6 +2990,8 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
         buildCleanupPipeline(FPM, CleanupProfile::kBoundary);
         MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
       }
+      if (!envDisabled("OMILL_SKIP_INTERNALIZE_DEAD_NATIVE_HELPERS"))
+        MPM.addPass(InternalizeDeadNativeHelpersPass{});
       MPM.addPass(llvm::GlobalDCEPass());
     }
 
@@ -2491,6 +3002,23 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
     }
     addPhaseMarker(MPM, "ABI: collapse null-memory blk continuations (late)");
     MPM.addPass(CollapseSyntheticBlockContinuationCallsPass(false));
+    addPhaseMarker(
+        MPM, "ABI: terminalize unresolved blk continuations (late)");
+    MPM.addPass(RewriteTerminalSyntheticBlockCallsToMissingBlockHandlerPass{});
+    {
+      llvm::FunctionPassManager FPM;
+      if (!envDisabled("OMILL_SKIP_ABI_DEAD_STATE_STORE_DSE"))
+        FPM.addPass(DeadStateStoreDSEPass());
+      if (!envDisabled("OMILL_SKIP_ABI_SROA"))
+        FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::GVNPass());
+      FPM.addPass(llvm::ADCEPass());
+      FPM.addPass(llvm::SimplifyCFGPass());
+      MPM.addPass(createScopedFPM(std::move(FPM),
+                                  shouldRunClosedRootSliceScopedPass));
+    }
+    MPM.addPass(llvm::GlobalDCEPass());
     addClosedSliceShapeProbe(MPM, "abi-final");
   }
 }
@@ -3348,6 +3876,23 @@ static void buildStandaloneInterproceduralResolutionEpoch(
 
 static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
                                           const PipelineOptions &opts) {
+  auto addLiftedResolutionScopedFPM = [&](llvm::FunctionPassManager FPM) {
+    auto lifted_scope = [](llvm::Function &F) {
+      return isLiftedPipelineFunction(F);
+    };
+    if (opts.scope_predicate) {
+      auto user_scope = opts.scope_predicate;
+      MPM.addPass(createScopedFPM(
+          std::move(FPM),
+          [lifted_scope, user_scope = std::move(user_scope)](
+              llvm::Function &F) mutable {
+            return lifted_scope(F) && user_scope(F);
+          }));
+    } else {
+      MPM.addPass(createScopedFPM(std::move(FPM), lifted_scope));
+    }
+  };
+
   addPhaseMarker(MPM, "Phase 3.6: iterative target resolution");
   if (opts.use_block_lifting) {
     MPM.addPass(IterativeBlockDiscoveryPass(opts.max_resolution_iterations));
@@ -3375,34 +3920,53 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
   if (opts.generic_static_devirtualize) {
     auto add_closed_root_slice_cleanup = [&](llvm::StringRef phase_name) {
       addPhaseMarker(MPM, phase_name);
-      if (!opts.recover_abi) {
+      if (opts.no_abi_mode) {
         MPM.addPass(RelaxClosedSliceMustTailMissingBlockPass{});
       }
+      MPM.addPass(MarkReachableClosedRootSliceFunctionsPass{});
       MPM.addPass(MarkClosedRootSliceHelpersForInliningPass());
       MPM.addPass(RepairBeforeInlinePass{});
       MPM.addPass(llvm::AlwaysInlinerPass());
       MPM.addPass(llvm::GlobalDCEPass());
+      MPM.addPass(MarkReachableClosedRootSliceFunctionsPass{});
       llvm::FunctionPassManager FPM;
       buildCleanupPipeline(FPM, CleanupProfile::kBoundary);
       MPM.addPass(createScopedFPM(std::move(FPM),
                                   shouldRunClosedRootSliceScopedPass));
-      if (!opts.recover_abi) {
-        MPM.addPass(LiftConstantContinuationDeclarationTargetsPass(
-            /*only_when_noabi_mode=*/true));
-        MPM.addPass(
-            LiftConstantMissingBlockTargetsPass(/*only_when_noabi_mode=*/true));
+      MPM.addPass(MarkReachableClosedRootSliceFunctionsPass{});
+      MPM.addPass(LiftConstantContinuationDeclarationTargetsPass());
+      if (!opts.skip_closed_slice_missing_block_lift) {
+        MPM.addPass(LiftConstantMissingBlockTargetsPass());
+      }
+      MPM.addPass(RewriteConstantMissingBlockCallsPass());
+      MPM.addPass(MarkReachableClosedRootSliceFunctionsPass{});
+      if (opts.no_abi_mode && enableNoAbiClosedSliceContinuationRelift()) {
         if (opts.verify_generic_static_devirtualization)
           MPM.addPass(VerifiedVirtualCFGMaterializationPass());
         else
           MPM.addPass(VirtualCFGMaterializationPass());
       }
+      MPM.addPass(MarkReachableClosedRootSliceFunctionsPass{});
       MPM.addPass(CollapseSyntheticBlockContinuationCallsPass(
           /*rewrite_to_missing_block=*/true,
           /*only_when_noabi_mode=*/true));
       MPM.addPass(
           RewriteConstantMissingBlockCallsPass(/*only_when_noabi_mode=*/true));
       MPM.addPass(llvm::GlobalDCEPass());
+      MPM.addPass(MarkReachableClosedRootSliceFunctionsPass{});
     };
+
+    addPhaseMarker(MPM, "Phase 3.75: pre-materialization constant memory fold");
+    MPM.addPass(
+        llvm::RequireAnalysisPass<BinaryMemoryAnalysis, llvm::Module>());
+    {
+      llvm::FunctionPassManager FPM;
+      FPM.addPass(ConstantMemoryFoldingPass());
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::GVNPass());
+      FPM.addPass(llvm::InstCombinePass());
+      addLiftedResolutionScopedFPM(std::move(FPM));
+    }
 
     addPhaseMarker(MPM, "Phase 3.8: generic static devirtualization");
     if (opts.verify_generic_static_devirtualization)
@@ -3411,7 +3975,7 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
       MPM.addPass(VirtualCFGMaterializationPass());
     addClosedSliceShapeProbe(MPM, "phase3.8");
 
-    if (!envDisabled("OMILL_SKIP_CLOSED_SLICE_CONTINUATION_DISCOVERY")) {
+    if (enableClosedSliceContinuationDiscovery()) {
       addPhaseMarker(MPM, "Phase 3.85: closed root-slice continuation discovery");
       MPM.addPass(LateClosedRootSliceContinuationClosurePass{});
       addClosedSliceShapeProbe(MPM, "phase3.85");
@@ -3432,6 +3996,20 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
 
     add_closed_root_slice_cleanup("Phase 3.9: closed root-slice cleanup");
     addClosedSliceShapeProbe(MPM, "phase3.9");
+
+    // Phase 3.9 can define new closed-slice blk_* continuations late via
+    // LiftConstantContinuationDeclarationTargetsPass and missing-block
+    // rewrites. Run one final bounded materialization sweep in no-ABI mode so
+    // those newly reachable continuations get a last generic devirtualization
+    // pass before emission, without re-entering continuation discovery.
+    if (opts.no_abi_mode &&
+        !envDisabled("OMILL_SKIP_NOABI_POST_CLEANUP_MATERIALIZATION")) {
+      addPhaseMarker(MPM,
+                     "Phase 3.95: no-ABI post-cleanup materialization");
+      MPM.addPass(NoAbiPostCleanupMaterializationPass{
+          opts.verify_generic_static_devirtualization});
+      addClosedSliceShapeProbe(MPM, "phase3.95");
+    }
 
   }
 }
@@ -4667,38 +5245,6 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
   // otherwise internalize them so the final GlobalDCE can drop the wrapper
   // plus any remill helper baggage it alone references.
   if (!envDisabled("OMILL_SKIP_INTERNALIZE_DEAD_NATIVE_HELPERS")) {
-    struct InternalizeDeadNativeHelpersPass
-        : llvm::PassInfoMixin<InternalizeDeadNativeHelpersPass> {
-      llvm::PreservedAnalyses run(llvm::Module &M,
-                                   llvm::ModuleAnalysisManager &) {
-        auto has_live_dispatch = [&](llvm::StringRef name) {
-          auto *F = M.getFunction(name);
-          return F && !F->use_empty();
-        };
-        if (has_live_dispatch("__omill_dispatch_call") ||
-            has_live_dispatch("__omill_dispatch_jump")) {
-          return llvm::PreservedAnalyses::all();
-        }
-
-        bool changed = false;
-        for (auto &F : M) {
-          if (F.isDeclaration() || !F.getName().ends_with("_native"))
-            continue;
-          if (F.hasFnAttribute("omill.output_root"))
-            continue;
-          if (!F.use_empty())
-            continue;
-          if (!F.hasExternalLinkage())
-            continue;
-          F.setLinkage(llvm::GlobalValue::InternalLinkage);
-          changed = true;
-        }
-
-        return changed ? llvm::PreservedAnalyses::none()
-                       : llvm::PreservedAnalyses::all();
-      }
-      static bool isRequired() { return true; }
-    };
     MPM.addPass(InternalizeDeadNativeHelpersPass{});
   }
 

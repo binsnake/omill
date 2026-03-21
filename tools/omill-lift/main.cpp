@@ -3280,7 +3280,9 @@ int main(int argc, char **argv) {
   opts.verify_generic_static_devirtualization =
       VerifyGenericStaticDevirtualization ||
       parseBoolEnv("OMILL_VERIFY_GENERIC_STATIC_DEVIRT").value_or(false);
-  opts.no_abi_mode = NoABI;
+  const bool use_pre_abi_noabi_cleanup =
+      !NoABI && opts.generic_static_devirtualize;
+  opts.no_abi_mode = NoABI || use_pre_abi_noabi_cleanup;
   if (!DumpVirtualModel.empty())
     setEnvIfUnset("OMILL_DUMP_VIRTUAL_MODEL", DumpVirtualModel.c_str());
   if (auto v = parseBoolEnv("OMILL_SKIP_BLOCK_MERGE"); v.value_or(false)) {
@@ -3494,36 +3496,393 @@ int main(int argc, char **argv) {
         }
       };
 
-  auto rerunLateDiscoveryPipeline = [&](llvm::StringRef attr_name) {
+  auto rerunLateDiscoveryPipeline = [&](llvm::StringRef attr_name, bool run_abi,
+                                        bool skip_missing_block_lift,
+                                        bool clear_attr = true) {
     MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+    llvm::DenseSet<llvm::Function *> pre_rerun_funcs;
+    llvm::DenseSet<llvm::Function *> pre_rerun_defs;
+    const bool debug_continuation_lifts =
+        parseBoolEnv("OMILL_DEBUG_CONTINUATION_LIFTS").value_or(false);
+    for (auto &F : *module) {
+      pre_rerun_funcs.insert(&F);
+      if (!F.isDeclaration())
+        pre_rerun_defs.insert(&F);
+    }
 
     omill::PipelineOptions late_opts = opts;
     late_opts.resolve_indirect_targets = false;
-    late_opts.scope_predicate = [attr_name = attr_name.str()](
-                                    llvm::Function &F) {
-      return F.getFnAttribute(attr_name).isValid();
+    late_opts.skip_closed_slice_missing_block_lift = skip_missing_block_lift;
+    if (skip_missing_block_lift) {
+      // The late missing-block wave already lifts a fixed target set. Avoid
+      // re-entering the global block-discovery epoch here; it adds a large
+      // amount of work and can chase unrelated continuations before the
+      // explicit bounded continuation round below runs.
+      late_opts.use_block_lifting = false;
+      late_opts.merge_block_functions_after_fixpoint = false;
+    }
+    const bool include_closed_slice_context =
+        !run_abi && opts.generic_static_devirtualize && BlockLift;
+    late_opts.scope_predicate =
+        [attr_name = attr_name.str(), include_closed_slice_context](
+            llvm::Function &F) {
+          if (F.getFnAttribute(attr_name).isValid())
+            return true;
+          return include_closed_slice_context &&
+                 F.hasFnAttribute("omill.closed_root_slice");
+        };
+    late_opts.preserve_lifted_semantics = preserve_lift_infrastructure;
+
+    auto runScopedLatePipeline = [&](const omill::PipelineOptions &rerun_opts,
+                                     llvm::StringRef stage_name) {
+      ModulePassManager MPM;
+      omill::buildPipeline(MPM, rerun_opts);
+      MPM.run(*module, MAM);
+      emitIterativeSessionEvents(events, iterative_session, stage_name);
+      if (run_abi) {
+        ModulePassManager MPM;
+        omill::buildABIRecoveryPipeline(MPM, rerun_opts);
+        MPM.run(*module, MAM);
+      }
+    };
+
+    runScopedLatePipeline(late_opts, "late-discovery-rerun");
+
+    for (auto &F : *module) {
+      if (F.isDeclaration())
+        continue;
+      const bool is_new_function = !pre_rerun_funcs.count(&F);
+      const bool became_defined = !is_new_function && !pre_rerun_defs.count(&F);
+      if (!is_new_function && !became_defined)
+        continue;
+      F.addFnAttr(attr_name, "1");
+      F.addFnAttr("omill.closed_root_slice", "1");
+      if (!F.hasLocalLinkage())
+        F.setLinkage(llvm::GlobalValue::InternalLinkage);
+      if (debug_continuation_lifts) {
+        errs() << "[late-rerun-new-fn] attr=" << attr_name
+               << " fn=" << F.getName()
+               << " existing_decl=" << (became_defined ? 1 : 0) << "\n";
+      }
+    }
+
+    if (clear_attr)
+      clearLiftRoundAttr(attr_name);
+  };
+
+  auto collectContinuationTargetsForScope =
+      [&](llvm::function_ref<bool(const llvm::Function &)> include_fn) {
+    llvm::DenseSet<uint64_t> targets;
+
+    auto parseContinuationPC = [&](llvm::StringRef name) -> std::optional<uint64_t> {
+      if (name.starts_with("blk_")) {
+        uint64_t pc = 0;
+        if (!name.drop_front(4).getAsInteger(16, pc))
+          return pc;
+        return std::nullopt;
+      }
+      if (name.starts_with("block_")) {
+        uint64_t pc = 0;
+        if (!name.drop_front(6).getAsInteger(16, pc))
+          return pc;
+      }
+      return std::nullopt;
+    };
+
+    for (auto &F : *module) {
+      if (F.isDeclaration() || !include_fn(F))
+        continue;
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+          if (!call || call->arg_size() < 2)
+            continue;
+          auto *callee = call->getCalledFunction();
+          if (!callee || !callee->isDeclaration())
+            continue;
+          auto maybe_pc = parseContinuationPC(callee->getName());
+          if (!maybe_pc)
+            continue;
+          auto *pc_arg =
+              llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+          if (!pc_arg || pc_arg->getZExtValue() != *maybe_pc)
+            continue;
+          targets.insert(*maybe_pc);
+        }
+      }
+    }
+
+    return targets;
+  };
+
+  auto collectClosedSliceContinuationTargets = [&]() {
+    return collectContinuationTargetsForScope([](const llvm::Function &F) {
+      return F.hasFnAttribute("omill.closed_root_slice");
+    });
+  };
+
+  auto isInCode = [&](uint64_t target) {
+    if (RawBinary)
+      return target >= BaseAddress && target < BaseAddress + raw_code.size();
+    for (auto &sec : pe.code_sections) {
+      if (target >= sec.va && target < sec.va + sec.size)
+        return true;
+    }
+    return false;
+  };
+
+  auto readCodeBytes = [&](uint64_t pc, uint8_t *buf, size_t size) {
+    if (RawBinary) {
+      if (pc < BaseAddress || pc >= BaseAddress + raw_code.size())
+        return false;
+      const auto offset = static_cast<size_t>(pc - BaseAddress);
+      if (offset + size > raw_code.size())
+        return false;
+      std::memcpy(buf, raw_code.data() + offset, size);
+      return true;
+    }
+    return pe.memory_map.read(pc, buf, size);
+  };
+
+  auto looksLikeLateMissingBlockRoot = [&](uint64_t pc) {
+    if (!isInCode(pc))
+      return false;
+
+    constexpr unsigned kMaxProbeInstructions = 12;
+    uint64_t current_pc = pc;
+    for (unsigned i = 0; i < kMaxProbeInstructions; ++i) {
+      uint8_t probe_buf[15] = {};
+      if (!readCodeBytes(current_pc, probe_buf, sizeof(probe_buf)))
+        return false;
+
+      std::string_view probe_bytes(
+          reinterpret_cast<const char *>(probe_buf), sizeof(probe_buf));
+      remill::Instruction probe_inst;
+      if (!arch->DecodeInstruction(current_pc, probe_bytes, probe_inst,
+                                   arch->CreateInitialContext())) {
+        return false;
+      }
+
+      switch (probe_inst.category) {
+        case remill::Instruction::kCategoryInvalid:
+        case remill::Instruction::kCategoryError:
+        case remill::Instruction::kCategoryDirectFunctionCall:
+        case remill::Instruction::kCategoryIndirectFunctionCall:
+        case remill::Instruction::kCategoryConditionalDirectFunctionCall:
+        case remill::Instruction::kCategoryConditionalIndirectFunctionCall:
+          return false;
+
+        case remill::Instruction::kCategoryDirectJump:
+        case remill::Instruction::kCategoryIndirectJump:
+        case remill::Instruction::kCategoryConditionalBranch:
+        case remill::Instruction::kCategoryConditionalIndirectJump:
+        case remill::Instruction::kCategoryFunctionReturn:
+        case remill::Instruction::kCategoryConditionalFunctionReturn:
+        case remill::Instruction::kCategoryAsyncHyperCall:
+        case remill::Instruction::kCategoryConditionalAsyncHyperCall:
+          return true;
+
+        case remill::Instruction::kCategoryNormal:
+        case remill::Instruction::kCategoryNoOp:
+          current_pc = probe_inst.next_pc;
+          break;
+      }
+    }
+
+    return false;
+  };
+
+  auto collectClosedSliceMissingBlockTargets = [&]() {
+    llvm::DenseSet<uint64_t> targets;
+    const bool debug_continuation_lifts =
+        parseBoolEnv("OMILL_DEBUG_CONTINUATION_LIFTS").value_or(false);
+
+    for (auto &F : *module) {
+      if (F.isDeclaration() || !F.hasFnAttribute("omill.closed_root_slice"))
+        continue;
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+          if (!call || call->arg_size() < 2)
+            continue;
+          auto *callee = call->getCalledFunction();
+          if (!callee || callee->getName() != "__remill_missing_block")
+            continue;
+          auto *pc_arg =
+              llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+          if (!pc_arg)
+            continue;
+          const uint64_t pc = pc_arg->getZExtValue();
+          const bool looks_like_root =
+              pc != 0 && looksLikeLateMissingBlockRoot(pc);
+          if (debug_continuation_lifts) {
+            errs() << "[late-missing-candidate] pc=0x"
+                   << llvm::Twine::utohexstr(pc)
+                   << " caller=" << F.getName()
+                   << " accepted=" << (looks_like_root ? 1 : 0) << "\n";
+          }
+          if (!looks_like_root)
+            continue;
+          targets.insert(pc);
+        }
+      }
+    }
+
+    return targets;
+  };
+
+  auto liftScopedTargets = [&](llvm::ArrayRef<uint64_t> targets,
+                               llvm::StringRef attr_name, bool run_abi,
+                               bool skip_missing_block_lift,
+                               bool clear_attr = true) {
+    auto block_cb = iterative_session->blockLiftCallback();
+    if (!block_cb)
+      return false;
+
+    llvm::DenseSet<llvm::Function *> pre_lift_funcs;
+    for (auto &F : *module)
+      pre_lift_funcs.insert(&F);
+
+    unsigned lifted_any = 0;
+    for (uint64_t pc : targets) {
+      auto *existing = findLiftedOrBlockFunction(pc, /*native=*/false);
+      if (existing && !existing->isDeclaration())
+        continue;
+
+      iterative_session->queueTarget(pc);
+      if (block_cb(pc))
+        ++lifted_any;
+    }
+
+    if (!lifted_any)
+      return false;
+
+    fixLiftedFunctionNamingCollisions();
+    tagNewlyLiftedFunctions(attr_name, pre_lift_funcs);
+    for (auto &F : *module) {
+      if (!F.getFnAttribute(attr_name).isValid())
+        continue;
+      F.addFnAttr("omill.closed_root_slice", "1");
+      if (!F.hasLocalLinkage())
+        F.setLinkage(llvm::GlobalValue::InternalLinkage);
+    }
+    rerunLateDiscoveryPipeline(attr_name, run_abi, skip_missing_block_lift,
+                               clear_attr);
+    return true;
+  };
+
+  auto liftLateTargets = [&](llvm::ArrayRef<uint64_t> targets) {
+    return liftScopedTargets(targets, "omill.late_newly_lifted",
+                             /*run_abi=*/false,
+                             /*skip_missing_block_lift=*/true);
+  };
+
+  auto runLateContinuationRounds = [&](unsigned max_rounds) {
+    constexpr unsigned kMaxTargetsPerRound = 8;
+
+    for (unsigned round = 0; round < max_rounds; ++round) {
+      auto targets = collectClosedSliceContinuationTargets();
+      if (targets.empty())
+        break;
+
+      llvm::SmallVector<uint64_t, 16> ordered_targets(targets.begin(),
+                                                      targets.end());
+      llvm::sort(ordered_targets);
+      if (ordered_targets.size() > kMaxTargetsPerRound)
+        ordered_targets.resize(kMaxTargetsPerRound);
+
+      if (!liftLateTargets(ordered_targets))
+        break;
+    }
+  };
+
+  auto rerunLateContinuationPipeline = [&]() {
+    if (!opts.generic_static_devirtualize || !BlockLift ||
+        parseBoolEnv("OMILL_SKIP_LATE_CONTINUATION_RERUN").value_or(false)) {
+      return;
+    }
+
+    // In no-ABI mode the first late continuation rerun is useful, but
+    // additional rounds tend to explode the reopened block graph and have been
+    // observed to crash on the compact corpus after the root slice is already
+    // closed. Keep the no-ABI path bounded to one follow-up round and reserve
+    // deeper continuation chasing for ABI mode.
+    runLateContinuationRounds(/*max_rounds=*/NoABI ? 1u : 3u);
+
+    if (NoABI ||
+        parseBoolEnv("OMILL_SKIP_LATE_MISSING_BLOCK_RERUN").value_or(false)) {
+      return;
+    }
+
+    auto missing_targets = collectClosedSliceMissingBlockTargets();
+    if (missing_targets.empty())
+      return;
+
+    constexpr unsigned kMaxMissingTargets = 4;
+    llvm::SmallVector<uint64_t, 8> ordered_missing_targets(
+        missing_targets.begin(), missing_targets.end());
+    llvm::sort(ordered_missing_targets);
+    if (ordered_missing_targets.size() > kMaxMissingTargets)
+      ordered_missing_targets.resize(kMaxMissingTargets);
+
+    liftLateTargets(ordered_missing_targets);
+  };
+
+  auto hasClosedSlicePendingOpaqueEdges = [&]() {
+    for (auto &F : *module) {
+      if (F.isDeclaration() || !F.hasFnAttribute("omill.closed_root_slice"))
+        continue;
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+          if (!call)
+            continue;
+          auto *callee = call->getCalledFunction();
+          if (!callee)
+            continue;
+          auto name = callee->getName();
+          if (name == "__omill_dispatch_call" ||
+              name == "__omill_dispatch_jump") {
+            return true;
+          }
+          if ((name.starts_with("blk_") || name.starts_with("block_")) &&
+              callee->isDeclaration()) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  };
+
+  auto rerunFinalClosedSlicePipeline = [&]() {
+    if (!opts.generic_static_devirtualize || !BlockLift || !NoABI ||
+        parseBoolEnv("OMILL_SKIP_FINAL_CLOSED_SLICE_RERUN").value_or(false)) {
+      return;
+    }
+    if (!hasClosedSlicePendingOpaqueEdges())
+      return;
+
+    MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+    omill::PipelineOptions late_opts = opts;
+    late_opts.resolve_indirect_targets = false;
+    late_opts.use_block_lifting = false;
+    late_opts.merge_block_functions_after_fixpoint = false;
+    late_opts.skip_closed_slice_missing_block_lift = true;
+    late_opts.scope_predicate = [](llvm::Function &F) {
+      return F.hasFnAttribute("omill.closed_root_slice");
     };
     late_opts.preserve_lifted_semantics = preserve_lift_infrastructure;
 
-    {
-      ModulePassManager MPM;
-      omill::buildPipeline(MPM, late_opts);
-      MPM.run(*module, MAM);
-      emitIterativeSessionEvents(events, iterative_session,
-                                 "late-discovery-rerun");
-    }
-    {
-      ModulePassManager MPM;
-      omill::buildABIRecoveryPipeline(MPM, late_opts);
-      MPM.run(*module, MAM);
-    }
-
-    clearLiftRoundAttr(attr_name);
+    ModulePassManager MPM;
+    omill::buildPipeline(MPM, late_opts);
+    MPM.run(*module, MAM);
+    emitIterativeSessionEvents(events, iterative_session,
+                               "late-closed-slice-rerun");
   };
 
-  if (NoABI) {
-    module->addModuleFlag(llvm::Module::Override, "omill.no_abi_mode", 1u);
-  }
+  if (opts.no_abi_mode)
+    module->setModuleFlag(llvm::Module::Override, "omill.no_abi_mode", 1u);
 
   events.emitInfo("pipeline_started", "main pipeline started");
   {
@@ -3534,6 +3893,9 @@ int main(int argc, char **argv) {
   emitIterativeSessionEvents(events, iterative_session, "main-pipeline");
   errs() << "Main pipeline complete\n";
   events.emitInfo("pipeline_completed", "main pipeline completed");
+
+  rerunLateContinuationPipeline();
+  rerunFinalClosedSlicePipeline();
 
   if (VerifyEach && verifyModule(*module, nullptr)) {
     errs() << "ERROR: module verification failed after main pipeline\n";
@@ -3761,6 +4123,12 @@ int main(int argc, char **argv) {
 
   // ABI recovery
   if (!NoABI) {
+    if (use_pre_abi_noabi_cleanup) {
+      // The pre-ABI generic cleanup reuses the safer no-ABI closed-slice path
+      // to flatten the slice before signature recovery. Clear the marker before
+      // ABI recovery so ABI-only rewrites do not inherit no-ABI mode.
+      module->setModuleFlag(llvm::Module::Override, "omill.no_abi_mode", 0u);
+    }
     restoreVMHandlerAttrs();
     events.emitInfo("abi_recovery_started", "abi recovery started");
     // Repair broken PHIs before saving checkpoint (otherwise LLVM parser
@@ -5163,7 +5531,8 @@ int main(int argc, char **argv) {
         module->print(os, nullptr);
       }
 
-      rerunLateDiscoveryPipeline("omill.late_newly_lifted");
+      rerunLateDiscoveryPipeline("omill.late_newly_lifted", /*run_abi=*/true,
+                                 /*skip_missing_block_lift=*/false);
 
       if (DumpIR) {
         std::error_code ec;

@@ -1469,3 +1469,564 @@ concrete traces, VM-specific emulators, or hardcoded handler semantics.
     `dispatch_call=0 dispatch_jump=0 vm_entry=0`
     `declare_blk=0 call_blk=0 musttail_blk=0 missing_block=0`
   - `clang -O2 -c` succeeds on emitted `.ll`
+
+## March 18, 2026: Closed-Root ABI Collapse Fix
+
+- Status:
+  fixed the ABI cleanup gap that left live lifted-State IR reachable from
+  `_native` wrappers even after root-slice closure. The issue was not another
+  unresolved virtual frontier; it was `EliminateStateStructPass` forcing every
+  `omill.output_root` lifted function to stay `NoInline`, including closed
+  recovered roots that should have been allowed to collapse into their native
+  wrappers.
+
+- Implementation:
+  - `EliminateStateStruct.cpp` now keeps the old `NoInline` policy only for
+    non-closed output roots.
+  - A lifted function that is both `omill.output_root` and
+    `omill.closed_root_slice_root` is now internalized as inlinable:
+    `OptimizeNone` removed, `NoInline` removed, `AlwaysInline` added.
+  - Added unit coverage in `EliminateStateStructTest` for the new attribute
+    policy and in `PipelineTest` for the full collapse path:
+    closed lifted root inlines into `_native`, the lifted `sub_*` disappears,
+    and live `__remill_read_memory_*` calls are lowered away.
+
+- Compact/default impact:
+  original corpus DLLs are not present in this workspace, so validation here
+  used the existing closed no-ABI lifts plus `omill-opt --only-recover-abi`.
+  Replaying ABI recovery on:
+  - `CorpusVMP.compact.vm.block.generic-on.omill_current.noabi.ll`
+  - `CorpusVMP.default.vm.block.generic-on.omill_current.noabi.ll`
+  now produces:
+  - `dispatch_call=0 dispatch_jump=0 vm_entry=0`
+  - `declare_blk=0 call_blk=0`
+  - `call_lifted_root=0 define_lifted_root=0 define_native_root=1`
+  - `remill_read=0 remill_write=0 remill_sync=0`
+  - `llc -filetype=obj -O2` succeeds on both replayed `.ll` files
+
+- New diagnostic conclusion:
+  the poor-quality ABI artifact was caused by a cleanup-policy mismatch after
+  semantic recovery, not by missing dispatch resolution, missing jump-table
+  recovery, or another VM-model frontier. The remaining external requirement
+  is to rerun the full lift from the original corpus DLLs once those inputs are
+  available in this checkout, so the stable replayed ABI shape becomes the
+  default emitted artifact again.
+
+## March 18, 2026: Default ABI VM-Context Cleanup Fix
+
+- Status:
+  fixed the remaining default-shape cleanup gap where ABI replay still kept
+  dead or outlined `sub_*_native` wrappers carrying `%struct.State` allocas and
+  `__remill_function_return` even after dispatches and lifted-root calls were
+  gone.
+
+- Root cause:
+  - closed-slice native-helper inlining only considered `blk_*` / `block_*`
+    names, so internal `sub_*_native` wrappers were excluded from the normal
+    collapse path
+  - dead `_native` helper internalization existed only in the late
+    lift-infrastructure cleanup pipeline, not in `buildABIRecoveryPipeline`
+  - on the default replay path, some surviving `_native` wrappers had already
+    lost the `omill.closed_root_slice` string attr by the time the late ABI
+    cleanup ran, so relying on slice attrs alone was insufficient
+
+- Implementation:
+  - `Pipeline.cpp` now treats eligible closed-slice `sub_*_native` helpers as
+    native inlining candidates alongside `blk_*_native`
+  - dead closed-slice native sub-wrappers bypass the inline-size budget so
+    they can be internalized and dropped by `GlobalDCE`
+  - `InternalizeDeadNativeHelpersPass` was hoisted into shared pipeline scope
+    and added to `buildABIRecoveryPipeline`, preserving output roots via either
+    native attrs or the corresponding lifted `sub_*` root metadata
+  - added pipeline regressions for:
+    - inlining closed-slice `sub_*_native` helpers
+    - removing dead closed-slice `sub_*_native` helpers
+    - removing dead native sub-helpers even when slice attrs are already gone
+
+- Validation:
+  - `omill-unit-tests.exe --gtest_filter=PipelineTest.*`:
+    `35/35` pass
+  - replayed ABI recovery with the rebuilt `omill-opt` on:
+    - `CorpusVMP.default.vm.block.generic-on.omill_current.noabi.ll`
+    - `CorpusVMP.compact.vm.block.generic-on.omill_current.noabi.ll`
+  - resulting artifacts:
+    - `abi_fix_probe/CorpusVMP.default.omill_current.recoverabi5.ll`
+    - `abi_fix_probe/CorpusVMP.compact.omill_current.recoverabi5.ll`
+  - both now report:
+    - `define_sub_native=1`
+    - `alloca_state=0`
+    - `remill_return=0`
+    - `remill_read=0`
+    - `remill_write=0`
+    - `dispatch_jump=0`
+    - `declare_blk=0`
+    - exported root shape restored to `define i64 @sub_180001850_native(ptr %0, ptr %1)`
+  - `llc -filetype=obj -O2` succeeds on both replayed `.ll` files
+
+## March 18, 2026: ABI-Run Closed-Slice Cleanup Gate Fix
+
+- Status:
+  fixed a real driver/pipeline bug in the fresh binary lift path, but did not
+  finish end-to-end quality recovery for the current `omill` worktree.
+
+- Root cause:
+  - `tools/omill-lift/main.cpp` intentionally runs the main pipeline with
+    `opts.recover_abi = false` and then invokes ABI recovery later as a
+    separate stage
+  - `buildIterativeResolutionEpoch` incorrectly used `!opts.recover_abi` to
+    decide whether to schedule no-ABI-only closed-slice cleanup/materialization
+    work in phase 3.9
+  - as a result, normal ABI runs were taking the no-ABI phase-3.9 branch,
+    including an extra `VirtualCFGMaterializationPass`
+  - on fresh `CorpusVMP.compact.dll` relifts this manifested as a crash after
+    `LiftConstantMissingBlockTargetsPass` / before the extra materialization
+
+- Implementation:
+  - `Pipeline.cpp` now gates the no-ABI-only phase-3.9 branch on
+    `opts.no_abi_mode` instead of `!opts.recover_abi`
+  - added a pass-scheduling regression in `PipelineTest`:
+    `AbiIntendedPrePipelineSkipsNoAbiOnlyClosedSlicePasses`
+    which verifies that ABI-intended pre-pipeline runs schedule exactly one
+    `VirtualCFGMaterializationPass` and skip the no-ABI-only
+    continuation/missing-block lift passes
+
+- Validation:
+  - focused tests:
+    `PipelineTest.AbiIntendedPrePipelineSkipsNoAbiOnlyClosedSlicePasses`
+    `PipelineTest.AbiPipelineInlinesClosedSliceNativeSubHelpers`
+    `PipelineTest.AbiPipelineRemovesDeadNativeSubHelpersWithoutSliceAttrs`
+    all pass
+  - fresh binary relifts from:
+    - `omill-main-remill/build-remill/test_obf/corpus/CorpusVMP.compact.dll`
+    - `omill-main-remill/build-remill/test_obf/corpus/CorpusVMP.default.dll`
+    now both complete without the previous compact crash
+
+- Fresh compact/default impact:
+  - this fixes the compact access violation in the main pipeline
+  - it does **not** yet restore the high-quality closed-slice outputs in the
+    current `omill` tree
+  - fresh outputs remain poor:
+    - compact still has live `__omill_dispatch_call`, declared/called `blk_*`,
+      `%struct.State` allocas, and live Remill memory helpers
+    - default still has `%struct.State` allocas, live Remill memory helpers,
+      `__remill_sync_hyper_call`, and `unreachable` in the exported root
+  - conclusion: the replay-only ABI cleanup fixes were valid, but the current
+    `omill` source tree is still behind the sibling `omill-main-remill` tree on
+    the actual generic devirtualization / continuation-closure implementation
+## March 19, 2026: Late Continuation Cleanup Split and Current Residual Frontier
+
+Status:
+- Landed: experimental closed-slice continuation discovery is now opt-in via `OMILL_ENABLE_CLOSED_SLICE_CONTINUATION_DISCOVERY`.
+- Landed: no-ABI closed-slice continuation relift/rematerialization is now opt-in via `OMILL_ENABLE_NOABI_CLOSED_SLICE_RELIFT`.
+- Landed: phase 3.9 closed-slice cleanup now reseeds reachable `omill.closed_root_slice` membership around inline/DCE cleanup.
+- Landed: safe constant continuation/missing-block lifting stays on by default in phase 3.9, without the unstable whole-slice rematerialization step.
+- Landed: `omill-lift` now runs a bounded pre-ABI late continuation rerun for newly lifted continuation functions, scoped to those new functions only.
+- Landed: env-gated diagnostics for continuation/missing-block target lifting via `OMILL_DEBUG_CONTINUATION_LIFTS=1`.
+
+Compact impact:
+- Fresh direct ABI relift no longer ends with declaration-only `blk_*` continuations.
+- Current compact fresh ABI shape (`CorpusVMP.compact.dll`, `--va 0x180001850`, `--block-lift`, `--generic-static-devirtualize`):
+  - `dispatch_call=0`
+  - `dispatch_jump=0`
+  - `declare_blk=0`
+  - `call_blk=0`
+  - `missing_block_handler=2`
+  - `alloca_state=1`
+  - `remill_read=0`
+  - `remill_write=0`
+- The surviving compact missing-block target is `0x5CF919FF`, which is out of image and currently looks like a genuine non-liftable boundary.
+
+Default impact:
+- Fresh direct ABI relift no longer ends with declaration-only `blk_*` continuations.
+- Current default fresh ABI shape (`CorpusVMP.default.dll`, same root/options):
+  - `dispatch_call=0`
+  - `dispatch_jump=0`
+  - `declare_blk=0`
+  - `call_blk=0`
+  - `missing_block_handler=5`
+  - `alloca_state=4`
+  - `remill_read=9`
+  - `remill_write=12`
+- The surviving default missing-block targets are in-image:
+  - `0x18036A6B9`
+  - `0x1801F77DD`
+  - `0x1802181F4`
+  - `0x180371172`
+
+Newly discovered frontier shape:
+- The original residual `blk_*` PCs were not decode failures. Direct lift probes for `0x18030F17A` and `0x180065449` both reached `Lifting complete`.
+- `OMILL_DEBUG_CONTINUATION_LIFTS=1` showed that phase-3.9 continuation lifting successfully materializes only the first continuation layer (e.g. `0x18030F16D`, `0x18005C2F4`, `0x180031314`, `0x180065435`, `0x18005536A`, `0x180002065`).
+- The remaining continuation PCs (`0x18030F17A`, `0x180065449`, `0x180055383`, `0x1800020B3`) are introduced later by those newly lifted bodies, which is why the one-shot phase-3.9 lift pass never saw them.
+- The bounded late continuation rerun in `main.cpp` is what eliminates those declaration-only `blk_*` calls.
+- After that rerun, the remaining frontier is no longer `blk_*` continuations. It is terminal missing-block boundaries emitted from `_native` continuations.
+
+Next required architectural change:
+- Add a bounded ABI-local recovery step for constant in-image missing-block-handler targets that appear inside late-lifted `_native` continuations.
+- Do not re-enable the old blanket continuation discovery path for this. The current evidence points to a narrower ABI-local boundary continuation problem, not another generic dispatch frontier.
+
+## March 19, 2026: ABI Late Semantic Helper Collapse and Codegen Repair
+
+Status:
+- Landed: ABI post-inline cleanup now marks small internal semantic helpers
+  (`!remill.function.type`, direct-call only) for late inlining, not just
+  `blk_*_native` / `sub_*_native` wrappers.
+- Landed: ABI post-inline cleanup now reruns Remill lowering plus
+  `DeadStateStoreDSE` + `SROA` on the final closed-slice body after those
+  helpers inline.
+- Landed: the semantic-helper inlining gate was widened so non-slice callers no
+  longer block late ABI inlining for the helpers used by the live root.
+- Landed: `omill-lift` now uses `Module::setModuleFlag` for
+  `omill.no_abi_mode`, fixing duplicate module flags in fresh ABI output.
+
+Validation:
+- Focused pipeline tests pass:
+  - `PipelineTest.AbiPipelineInlinesClosedSliceSemanticHelpersAndRelowersMemory`
+  - `PipelineTest.AbiPipelineInlinesSemanticHelpersEvenWithNonSliceCallers`
+- Fresh relifts from the sibling corpus inputs:
+  - `omill-main-remill/build-remill/test_obf/corpus/CorpusVMP.default.dll`
+  - `omill-main-remill/build-remill/test_obf/corpus/CorpusVMP.compact.dll`
+- Fresh `verifyabi` outputs now assemble/codegen with `llc -filetype=obj -O2`
+  after the module-flag fix.
+
+Fresh compact/default impact:
+- Compact fresh ABI shape (`CorpusVMP.compact.dll`, `--va 0x180001850`,
+  `--block-lift`, `--generic-static-devirtualize`):
+  - `dispatch_call=0`
+  - `dispatch_jump=0`
+  - `declare_blk=0`
+  - `call_blk=0`
+  - `alloca_state=1`
+  - `remill_read=0`
+  - `remill_write=0`
+  - `semantic_calls=0`
+  - live `__omill_missing_block_handler` callsites: `1`
+- Default fresh ABI shape after the late semantic-helper collapse:
+  - `dispatch_call=0`
+  - `dispatch_jump=0`
+  - `declare_blk=0`
+  - `call_blk=0`
+  - `alloca_state=0`
+  - `remill_read=0`
+  - `remill_write=0`
+  - `semantic_calls=0`
+  - live `__omill_missing_block_handler` callsites: `2`
+- This closes the earlier “default still looks like a VM-context wrapper”
+  issue. The fresh default root is now lowered/native-shaped; the remaining
+  frontier is only terminal missing-block boundaries.
+
+Newly discovered frontier shape:
+- Remaining default boundary targets are now just:
+  - `0x1801F77DD`
+  - `0x180371172`
+- Both are in-image `.7ir` entries, but they are not clean function starts.
+  Current disassembly suggests mid-block / odd-entry continuation cases rather
+  than a generic VM-state cleanup problem.
+- Remaining compact boundary target is still `0x5CF919FF`, which is out of
+  image and currently looks like a genuine external/non-liftable boundary.
+
+Next required architectural change:
+- Add a bounded ABI-local continuation/boundary recovery step for constant
+  in-image `__omill_missing_block_handler` targets that survive after full ABI
+  cleanup.
+- Scope that work to the remaining default mid-block entries first. Compact’s
+  out-of-image target should stay an explicit terminal boundary unless we add a
+  separate external-target lifting mode.
+## March 19, 2026: Bounded Late Missing-Block Rerun Stabilization
+
+Status:
+- Landed: added `PipelineOptions::skip_closed_slice_missing_block_lift` so a
+  scoped rerun can suppress the generic phase-3.9 missing-block lift pass.
+- Landed: the late missing-block rerun in `omill-lift` now uses that skip plus
+  `use_block_lifting=false` for the special scoped rerun, so it does not
+  re-enter the full block-discovery epoch on the newly lifted boundary roots.
+- Landed: removed the extra recursive continuation wave after the late
+  missing-block rerun. The scoped rerun already performs the local
+  continuation-declaration lift; the extra round was what exploded into a large
+  transitive continuation closure.
+- Landed: added a focused pass-scheduling regression:
+  `PipelineTest.ScopedLateRerunCanSkipClosedSliceMissingBlockLiftPass`.
+
+Validation:
+- Focused pipeline tests pass:
+  - `PipelineTest.AbiIntendedPrePipelineSkipsNoAbiOnlyClosedSliceRematerialization`
+  - `PipelineTest.ScopedLateRerunCanSkipClosedSliceMissingBlockLiftPass`
+  - `PipelineTest.NoAbiPipelineRunsSafeClosedSliceContinuationLiftsByDefault`
+- Fresh relifts from the sibling corpus inputs still complete and codegen:
+  - `build-remill/test_obf/corpus/lifted/fresh_relift_fix17/default.ll`
+  - `build-remill/test_obf/corpus/lifted/fresh_relift_fix17/compact.ll`
+  - both assemble/codegen with `llc -filetype=obj -O2`
+
+Fresh compact/default impact:
+- Default fresh ABI shape (`CorpusVMP.default.dll`, `--va 0x180001850`,
+  `--block-lift`, `--generic-static-devirtualize`):
+  - `dispatch_call=0`
+  - `dispatch_jump=0`
+  - `vm_entry=0`
+  - `missing_block_handler=0`
+  - `declare_blk=1`
+  - `call_blk=1`
+  - `alloca_state=1`
+  - `remill_read=0`
+  - `remill_write=0`
+  - `semantic_calls=0`
+- Compact fresh ABI shape on the same tree:
+  - `dispatch_call=0`
+  - `dispatch_jump=0`
+  - `vm_entry=0`
+  - `declare_blk=0`
+  - `call_blk=0`
+  - live `__omill_missing_block_handler` callsites: `1`
+  - `alloca_state=1`
+  - `remill_read=0`
+  - `remill_write=0`
+  - `semantic_calls=0`
+
+Newly discovered frontier shape:
+- The bounded late missing-block rerun does real work on `default`: the two
+  terminal `__omill_missing_block_handler` sites are gone in fresh ABI output.
+- The remaining default readability issue is now ABI-local and singular:
+  one external `blk_18023fe2d` continuation call survives inside
+  `sub_180001850_native`, keeping one `%struct.State` alloca alive.
+- That residual `blk_*` call is not present in `before_abi.ll`; it appears
+  during ABI recovery, so the next fix is not another generic late
+  continuation sweep. It is a post-ABI constant code-target recovery /
+  continuation materialization issue.
+- Compact remains on the earlier terminal external-boundary shape. The
+  remaining target is still not a generic VM-state cleanup problem.
+
+Next required architectural change:
+- Add a bounded ABI-local recovery step for constant in-image continuation/code
+  targets that only become visible inside closed-slice `_native` wrappers after
+  ABI recovery.
+- Scope it to closed-root-slice `_native` functions and require either:
+  - a lifted definition is created in the same round, or
+  - an existing lifted definition can be ABI-recovered in the same round.
+- Do not reintroduce another blanket late continuation sweep. The stable path
+  now shows that the remaining default issue is one ABI-local residual target,
+  not another broad generic frontier.
+
+## March 19, 2026: ABI Terminal Residual Continuation Classification
+
+Status:
+- Landed: added a late ABI cleanup step that rewrites terminal residual
+  declaration-only `blk_*` continuation calls of the form
+  `call @blk_<pc>(..., poison/null); unreachable` into explicit
+  `__omill_missing_block_handler(pc)` boundaries.
+- Landed: followed that rewrite with one more closed-slice-scoped
+  DSE/SROA/InstCombine/GVN/ADCE/SimplifyCFG cleanup sweep so dead local
+  `%struct.State` plumbing can collapse when the unresolved continuation was
+  the last remaining user.
+- Landed: added an ABI pipeline regression
+  `PipelineTest.AbiPipelineTerminalizesPoisonMemoryBlockContinuationCalls`.
+
+Validation:
+- Focused pipeline tests pass:
+  - `PipelineTest.AbiPipelineCollapsesNullMemoryBlockContinuationCalls`
+  - `PipelineTest.AbiPipelineTerminalizesPoisonMemoryBlockContinuationCalls`
+  - `PipelineTest.AbiIntendedPrePipelineSkipsNoAbiOnlyClosedSliceRematerialization`
+  - `PipelineTest.ScopedLateRerunCanSkipClosedSliceMissingBlockLiftPass`
+  - `PipelineTest.NoAbiPipelineRunsSafeClosedSliceContinuationLiftsByDefault`
+- Fresh relifts from the sibling corpus inputs still complete:
+  - `build-remill/test_obf/corpus/lifted/fresh_relift_fix21/default.ll`
+  - `build-remill/test_obf/corpus/lifted/fresh_relift_fix21/compact.ll`
+- Both fresh artifacts assemble/codegen with `llc -filetype=obj -O2`.
+
+Fresh compact/default impact:
+- Default fresh ABI shape (`CorpusVMP.default.dll`, `--va 0x180001850`,
+  `--block-lift`, `--generic-static-devirtualize`):
+  - `dispatch_call=0`
+  - `dispatch_jump=0`
+  - `declare_blk=0`
+  - `call_blk=0`
+  - `alloca_state=0`
+  - `remill_read=0`
+  - `remill_write=0`
+  - live `__omill_missing_block_handler` callsites: `1`
+- Compact fresh ABI shape on the same tree:
+  - `dispatch_call=0`
+  - `dispatch_jump=0`
+  - `declare_blk=0`
+  - `call_blk=0`
+  - live `__omill_missing_block_handler` callsites: `1`
+  - `alloca_state=1`
+  - `remill_read=0`
+  - `remill_write=0`
+
+Newly discovered frontier shape:
+- The remaining default residual was not a cheap continuation-lift miss.
+  A direct block-lift probe of `0x18023fe2d` from the binary reached
+  `AlwaysInlinerPass` and failed with LLVM out-of-memory.
+- That makes this class of target a bounded terminal-boundary problem, not a
+  good candidate for another automatic continuation wave.
+- The new ABI terminalization step converts that residual from an external
+  `blk_*` call into an explicit boundary marker and allows the wrapper-local
+  state struct to disappear.
+
+Next required architectural change:
+- Add a real bounded late-target classifier for in-image residual boundaries so
+  we can distinguish:
+  - cheap liftable continuations
+  - oversized / non-convergent targets that should terminalize immediately
+- Apply that classifier before any future late continuation lifting attempt.
+- Compact still has one surviving terminal boundary with `%struct.State`
+  plumbing; that one now needs the same bounded classification/collapse logic
+  for the remaining wrapper shape rather than more generic devirtualization.
+- 2026-03-20: Landed bounded overlapping-slot partial-register import/propagation in the generic model. Compact impact: the root is still open (`reachable=66 frontier=2 closed=false`), but live predecessor handlers now carry merged wide-register facts derived from byte/word helper writes instead of dropping them. Newly observed frontier shape: the remaining `blk_180024ae7` jump-table target is blocked by nested low-lane merge-expression blowup (`or(and(...), and(...))`) rather than missing helper import/remap.
+- 2026-03-20: Raised single-block leaf-helper local replay budget from `32` to `64` and added bounded finite-choice evaluation for local replay value expressions so `__remill_read_memory_*` can fold small finite image-address sets into constants/phis. Compact impact: no change yet (`reachable=66 frontier=2 closed=false`). Newly confirmed blocker shape: `blk_180024ae7` still ends as `NEXT_PC <- slot(arg0+0x8d8)` because `MOVSXI(..., arg3)` still falls back to the placeholder `stack(slot(arg3+0x0)+0x0)` and imports as `unmapped-import`; the computed table-read address is not a constant or small finite set under the current caller facts.
+- 2026-03-20: Fixed the post-main no-ABI compact relift crash in `omill-lift` by bounding the late continuation rerun to one round in no-ABI mode. Validation: the previously crashing compact relift (`CorpusVMP.compact.dll --va 0x180001850 --block-lift --no-abi --generic-static-devirtualize`) now exits cleanly and emits `build-remill/test_obf/corpus/lifted/fresh_relift_fix41/compact.ll`, which also codegens with `llc -filetype=obj -O2`.
+- 2026-03-20: Widened the late no-ABI rerun scope so newly lifted continuation blocks are reprocessed in closed-slice context, and added `VirtualMachineModelTest.TreatsLiftedCallsiteDispatchBlockWithMinimalStateAsCandidate` to cover lifted/block functions that carry `CALLI` plus dispatch edges with only minimal visible state. Validation: the new regression passes, and the focused `VirtualMachineModelTest.*:VirtualCFGMaterializationTest.*` failure set remains unchanged at the existing 4 tests.
+- 2026-03-20: Current compact no-ABI state after the crash fix is stable but still incomplete. Fresh artifact `build-remill/test_obf/corpus/lifted/fresh_relift_fix43/compact.ll` emits successfully, but still has live `__omill_dispatch_call=3`, `declare @blk_*=10`, and `call @blk_*=21`. The remaining issue is no longer the original jump-table frontier; it is a post-rerun call-frontier/materialization gap. The final LL contains late-lifted call blocks like `blk_180026eb7` with live `CALLI -> __omill_dispatch_call`, while the dumped virtual model still reflects only the pre-rerun closed slice. Next required architectural change: run a truthful final model/materialization pass over the post-rerun closed slice, then close or explicitly frontier those late-lifted `CALLI` blocks instead of reporting the slice as already closed.
+- 2026-03-20: Landed a default no-ABI post-cleanup materialization sweep in `buildPipeline` and updated `PipelineTest` coverage. Validation: `PipelineTest.AbiIntendedPrePipelineSkipsNoAbiOnlyClosedSliceRematerialization`, `PipelineTest.NoAbiPipelineRunsSafeClosedSliceContinuationLiftsByDefault`, `PipelineTest.NoAbiPipelineCanSkipPostCleanupMaterialization`, and `PipelineTest.NoAbiPipelineEnablesExperimentalClosedSliceExpansionWhenRequested` all pass. Compact impact: the final model now matches the late no-ABI state by default, `__omill_dispatch_call` drops to `0`, and the live frontier is reported truthfully instead of as a stale pre-rerun closed slice.
+- 2026-03-20: Added bounded single-bit-mask finite-choice evaluation (`x & 1` -> `{0,1}`) to the virtual model and enabled multi-successor lowering for `dispatch_jump` in `VirtualCFGMaterialization`. Validation: new regressions `VirtualMachineModelTest.ResolvesSingleBitMaskedSlotDispatchToFiniteSuccessors` and `VirtualCFGMaterializationTest.MaterializesDispatchFromSingleBitMaskedSlotChoices` pass, and the focused `VirtualMachineModelTest.*:VirtualCFGMaterializationTest.*` failure set is back to the same 4 pre-existing failures. Compact impact: `blk_180060f01` no longer stops at `unsupported_slot_provenance_target`; it now resolves to two concrete successor PCs (`0x18005CA5C`, `0x18005CA5D`) and is blocked only by `missing_lifted_target`.
+- 2026-03-20: Added nearby-entry recovery for dispatch successors and covered it with `VirtualMachineModelTest.RecoversNearbyLiftedEntryForDispatchSuccessor` plus `VirtualCFGMaterializationTest.MaterializesDispatchToNearbyRecoveredLiftedEntry`. This is the generic fix for targets like `0x18005CA5C/0x18005CA5D` that land a few bytes into an already lifted `blk_*` entry.
+- 2026-03-20: Added a bounded inverse fold for low-byte reconstruction patterns in the virtual-expression simplifier:
+  - `or(and(x, ~0xff), and(zext(trunc(x)), 0xff)) -> x`
+  - Validation: `VirtualMachineModelTest.ResolvesDispatchFromHelperMaskedLowByteReconstruction` and `VirtualCFGMaterializationTest.MaterializesDispatchFromHelperMaskedLowByteReconstruction` pass.
+  - Compact impact: this targets the remaining `blk_180066044` / root frontier shape, where `NEXT_PC`-like targets are still wrapped in byte-mask reconstruction noise instead of exposing the underlying stack/slot fact.
+  - Important constraint: a broader multi-round fact-specialization attempt regressed the full compact driver during `propagateVirtualStateFacts`, so it was backed out. The low-byte fold remains landed; the iterative propagation change does not.
+- 2026-03-20: Split unknown dispatch frontiers into bounded executable vs terminal classes in the root-slice summary:
+  - `dispatch_target_unlifted`
+  - `dispatch_target_nearby_unlifted`
+  - `dispatch_target_not_executable`
+  - `dispatch_target_undecodable`
+  - Validation: added `VirtualMachineModelTest.TreatsNonExecutableDispatchTargetAsClosedTerminalSlice`, `VirtualMachineModelTest.TreatsUndecodableDispatchTargetAsClosedTerminalSlice`, `VirtualMachineModelTest.MarksDecodableDispatchTargetAsUnliftedFrontier`, and `VirtualMachineModelTest.RecoversNearbyDispatchEntryAsCanonicalUnliftedFrontier`; all pass along with the nearby-entry and nested-phi dispatch materialization regressions.
+  - Materialization impact: late lifting now attempts only executable dispatch frontiers (`dispatch_target_unlifted`, `dispatch_target_nearby_unlifted`) instead of treating every unknown dispatch PC as the same `missing_lifted_target`.
+  - Compact impact: a binary-backed rerun from `CorpusVMP.compact.dll` still timed out before final emit, but the partial dump at `build-remill/test_obf/corpus/lifted/fresh_relift_fix65/compact.model.txt` confirms the live remaining handler is still `blk_180064933` with concrete successors `0x180061A0E` and `0x18006A04D`. The remaining gap is now final root-slice reporting / late attach for that mixed frontier, not more slot simplification.
+- 2026-03-20: Narrowed root-slice membership and late rewrite seeding so helper semantics functions are no longer treated as devirtualized slice members by default.
+  - Root-slice traversal still walks through helper semantics functions when they are the only bridge to a lifted `blk_*`, but only lifted/candidate/root/specialized code-bearing handlers are recorded in `reachable_handler_names`.
+  - Late rewrite scope in `VirtualCFGMaterialization` now follows the same predicate instead of recursively pulling every defined helper callee into post-fixpoint materialization work.
+  - Validation: `VirtualMachineModelTest.TraversesDirectLiftedCallChainsThroughNonCandidateBlocks` and `VirtualMachineModelTest.ExcludesVmSemanticsHelpersFromRootSliceMembers` pass, along with the existing dispatch-frontier coverage.
+  - Compact impact: a short binary-backed rerun still did not reach the model dump within eight minutes, so there is no runtime delta yet, but this directly targets the helper-pollution seen in the earlier partial root-slice dump (`CALLI` / `LEAI` / `MOVI` listed as slice handlers).
+- 2026-03-20: Narrowed the virtual-model initial seed set so generic devirtualization no longer starts from every `omill.vm_handler`.
+  - Initial model seeding now starts from lifted/block/root/specialized/wrapper functions, then pulls helpers in only through actual direct-callee reachability.
+  - This preserves helper summaries when a lifted root really calls them, but stops unreferenced semantics helpers from being summarized as full handlers up front.
+  - Validation: `VirtualMachineModelTest.DoesNotSeedUnreferencedVmSemanticsHelpersIntoModel`, `VirtualMachineModelTest.ExcludesVmSemanticsHelpersFromRootSliceMembers`, `VirtualMachineModelTest.TracksVmStackFactsAcrossHelperPushPopChain`, and `VirtualCFGMaterializationTest.MaterializesDispatchFromHelperWrittenNextPcFacts` all pass on the updated tree.
+  - Expected compact impact: lower handler-count and less work in `summarizeFunction` / `propagateVirtualStateFacts` before we even reach the root-scoped fixpoint loop. Runtime still needs a real binary-backed measurement.
+- 2026-03-21: Tightened closed-slice code-bearing classification so `omill.closed_root_slice` alone no longer makes VM semantics helpers into virtual-model seeds.
+  - Validation: added `VirtualMachineModelTest.DoesNotSeedClosedSliceTaggedVmSemanticsHelpersIntoModel`; it passes together with the existing closed-slice helper-chain regressions.
+  - This fixes the specific seed pollution bug where phase 3.9 tagging could cause helper semantics functions to re-enter the generic model solely because they inherited `omill.closed_root_slice`.
+- 2026-03-21: Added a no-ABI closed-slice scope rebuild pass and narrowed the phase 3.95 scoped FPM to code-bearing functions only.
+  - Validation: added `PipelineTest.NoAbiPostCleanupRebuildDropsClosedSliceTagFromSemanticHelpers`, while keeping `PipelineTest.AbiPipelineInlinesClosedSliceSemanticHelpersAndRelowersMemory` and `PipelineTest.AbiPipelineInlinesSemanticHelpersEvenWithNonSliceCallers` green.
+  - This keeps no-ABI late cleanup from reusing helper-inline scope tags as if they were root-slice members.
+- 2026-03-21: Wrapped phase 3.95 (`no-ABI post-cleanup materialization`) in a runtime closed-slice-scope guard.
+  - Before this change, open-slice compact relifts still entered an unscoped late `VirtualMachineModelAnalysis` run and exploded to `summarize-handlers-done count=740`.
+  - After this change, the same compact relift from `CorpusVMP.compact.dll --va 0x180001850 --block-lift --no-abi --generic-static-devirtualize` no longer re-enters that late 740-handler VM-model rebuild; the log proceeds directly from `Phase 3.95` to `Phase 4: ABI recovery`, `Phase 5: deobfuscation`, and `Final: cleanup`, and the run completes with emitted artifacts in `build-remill/test_obf/corpus/lifted/fresh_relift_fix73/`.
+  - Remaining gap: the compact root slice is still open in the dumped model (`reachable=39 frontier=3 closed=false`), so the next work item is back to actual target closure (`blk_180026dce` dispatch frontier plus `blk_180055365` call frontier), not late semantics-helper performance.
+- 2026-03-21: Added incremental handler-summary reuse inside `VirtualMachineModelAnalysis`.
+  - The analysis now caches pre-canonicalization `summarizeFunction` results per module, keyed by LLVM structural function hash plus the function attributes that affect handler summarization (`omill.output_root`, specialization attrs, closed-slice attrs, vm-wrapper/clone attrs, etc.).
+  - Validation: added `VirtualMachineModelTest.InvalidatesCachedHandlerSummaryAfterBodyChange` to prove body edits invalidate the cache; focused `VirtualMachineModelTest`, `VirtualCFGMaterializationTest`, and `PipelineTest` regressions remain green.
+  - Compact impact: the full no-ABI compact relift from `CorpusVMP.compact.dll --va 0x180001850 --block-lift --no-abi --generic-static-devirtualize` dropped from about `1137.3s` (`fresh_relift_fix73`) to about `1069.9s` (`fresh_relift_fix74`), a savings of roughly `67.5s` / `5.9%`.
+  - The stage logs confirm the cache is doing real work during phase 3.8. By the final iterations the virtual-model summarize step reaches `hits=86 misses=0`, so remaining phase-3.8 cost is now dominated by propagation / successor summarization / rewrite work, not raw handler rescanning.
+- 2026-03-21: Added two more low-risk phase-3.8 runtime cuts:
+  - on-demand cached direct-callee discovery for the root-slice seed/worklist, instead of rebuilding a whole-module direct-callee map every `VirtualMachineModelAnalysis` run
+  - removal of unnecessary final `VirtualMachineModelAnalysis` reruns in `VirtualCFGMaterialization` when the current iteration already holds a valid final model (and when dead-stub cleanup does not need a dump-accurate recompute)
+  - Validation: focused `VirtualMachineModelTest`, `VirtualCFGMaterializationTest`, and `PipelineTest` regressions remain green; the emitted compact artifact in `build-remill/test_obf/corpus/lifted/fresh_relift_fix75/` still codegens with `llc -filetype=obj -O2`.
+  - Compact impact: the same full no-ABI compact relift now drops again from about `1069.9s` (`fresh_relift_fix74`) to about `820.3s` (`fresh_relift_fix75`), another savings of roughly `249.6s` / `23.3%`.
+  - End-to-end from the pre-optimization stable point (`fresh_relift_fix73`) to the current tree (`fresh_relift_fix75`), compact runtime dropped from about `1137.3s` to about `820.3s`, a total savings of roughly `317.1s` / `27.9%`.
+  - Remaining runtime conclusion: phase 3.8 still dominates, but the repeated raw function rescans are no longer the main offender. The next real asymptotic change is to make `propagateVirtualStateFacts` and the downstream dispatch/root-slice recomputation dirty-set based instead of whole-model per iteration.
+- 2026-03-21: Switched `propagateVirtualStateFacts` from whole-model outgoing recompute rounds to a conservative dirty-handler schedule.
+  - Outgoing facts are now recomputed only for handlers whose incoming facts changed, whose direct callees changed outgoing facts, or which are conservatively marked callsite-sensitive after a target-summary change.
+  - The incoming merge / prelude import pass is still whole-model, so this remains a low-risk scheduling optimization rather than a semantic rewrite of the propagation lattice.
+  - Validation: focused `VirtualMachineModelTest`, `VirtualCFGMaterializationTest`, and `PipelineTest` regressions remain green; the emitted compact artifact in `build-remill/test_obf/corpus/lifted/fresh_relift_fix76/` still codegens with `llc -filetype=obj -O2`.
+  - Compact impact: the same full no-ABI compact relift now drops again from about `820.3s` (`fresh_relift_fix75`) to about `678.9s` (`fresh_relift_fix76`), another savings of roughly `141.4s` / `17.2%`.
+  - End-to-end from the earlier stable baseline (`fresh_relift_fix73`) to the current tree (`fresh_relift_fix76`), compact runtime dropped from about `1137.3s` to about `678.9s`, a total savings of roughly `458.5s` / `40.3%`.
+  - Remaining runtime conclusion: phase 3.8 still dominates, but the expensive piece is now much more likely the full incoming merge / prelude import pass and the later dispatch/root-slice recomputation, not handler summarization or unconditional outgoing recompute.
+- 2026-03-21: Made the remaining incoming-merge work in `propagateVirtualStateFacts` incremental as well.
+  - Direct-callee incoming propagation now runs only for dirty source handlers instead of every handler with direct callees on every round.
+  - Entry-prelude import now runs only for dirty prelude consumers instead of every handler with a recognized prelude on every round.
+  - Incoming-fact merges now feed those two worklists explicitly, so propagation only revisits the direct-callee and prelude edges affected by a real lattice change.
+  - Validation: focused `VirtualMachineModelTest`, `VirtualCFGMaterializationTest`, and `PipelineTest` regressions remained green, and the emitted compact artifact in `build-remill/test_obf/corpus/lifted/fresh_relift_fix77/` still codegens with `llc -filetype=obj -O2`.
+  - Compact impact: the same full no-ABI compact relift dropped again from about `678.9s` (`fresh_relift_fix76`) to about `349.6s` (`fresh_relift_fix77`), another savings of roughly `329.3s` / `48.5%`.
+  - End-to-end from the earlier stable baseline (`fresh_relift_fix73`) to `fresh_relift_fix77`, compact runtime dropped from about `1137.3s` to about `349.6s`, a total savings of roughly `787.7s` / `69.3%`.
+- 2026-03-21: Removed dead broad callsite-handler invalidation from `propagateVirtualStateFacts`.
+  - The propagation loop was still re-enqueuing every handler with a `callsites` summary whenever any outgoing fact changed, even though outgoing recomputation no longer applies localized callsite-return effects there.
+  - That broad invalidation was dead work: handlers with real incoming changes were already being re-enqueued through the normal incoming-fact worklists, while unrelated callsite-bearing handlers were just burning extra propagation rounds.
+  - Validation: focused `VirtualMachineModelTest`, `VirtualCFGMaterializationTest`, and `PipelineTest` regressions remain green, and the emitted compact artifact in `build-remill/test_obf/corpus/lifted/fresh_relift_fix78/` still codegens with `llc -filetype=obj -O2`.
+  - Compact impact: the same full no-ABI compact relift dropped again from about `349.6s` (`fresh_relift_fix77`) to about `332.7s` (`fresh_relift_fix78`), another savings of roughly `16.9s` / `4.8%`.
+  - End-to-end from the earlier stable baseline (`fresh_relift_fix73`) to `fresh_relift_fix78`, compact runtime dropped from about `1137.3s` to about `332.7s`, a total savings of roughly `804.6s` / `70.7%`.
+  - Remaining runtime conclusion: whole-model propagation is no longer the obvious bottleneck. The next likely cost center is repeated full downstream analysis in phase 3.8 (`summarizeDispatchSuccessors`, `summarizeCallSites`, `summarizeRootSlices`, and the surrounding materialization iterations), which now needs stage timing and then a dirty-set redesign rather than another blind invalidation cut.
+- 2026-03-21: Added per-stage timing inside `VirtualMachineModelAnalysis::run` and remeasured compact on the reverted `fresh_relift_fix78` baseline.
+  - Validation: focused `VirtualMachineModelTest`, `VirtualCFGMaterializationTest`, and `PipelineTest` regressions remain green, and the emitted compact artifact in `build-remill/test_obf/corpus/lifted/fresh_relift_fix80/` still codegens with `llc -filetype=obj -O2`.
+  - Compact impact: the same full no-ABI compact relift now measures at about `329.1s` in `fresh_relift_fix80`, essentially matching the `fresh_relift_fix78` baseline and confirming the earlier failed lookup-map rewrite was noise rather than a real win.
+  - Stage-timing result: the remaining cost is overwhelmingly inside `propagateVirtualStateFacts`, not the downstream summary passes.
+    - Late virtual-model runs with `~85-86` handlers spend about `41-42s` in `propagateVirtualStateFacts`.
+    - The same runs spend only about `0.7-0.8s` in `summarizeCallSites`, about `0-0.002s` in dispatch/root-slice/region summarization, and only a few milliseconds in canonicalization.
+    - Handler summarization is now small as well: mostly tens of milliseconds, with the cache eliminating almost all rescanning by the late iterations.
+  - Updated runtime conclusion: the next real optimization target is now inside propagation itself, most likely repeated localized single-block outgoing replay and the remaining dirty-worklist churn inside `propagateVirtualStateFacts`, not `summarizeDispatchSuccessors`, `summarizeCallSites`, or `summarizeRootSlices`.
+- 2026-03-21: Added a top-level localized single-block replay cache inside `propagateVirtualStateFacts`.
+  - The cache is scoped to a single propagation run and keyed by:
+    - handler function
+    - current incoming slot facts
+    - current incoming stack facts
+    - current incoming argument facts
+    - current direct-callee outgoing slot/stack facts
+  - This avoids recomputing the same top-level localized handler replay across propagation rounds when neither the handler inputs nor the callee summaries actually changed.
+  - Validation: focused `VirtualMachineModelTest`, `VirtualCFGMaterializationTest`, and `PipelineTest` regressions remain green, and the emitted compact artifact in `build-remill/test_obf/corpus/lifted/fresh_relift_fix81/` still codegens with `llc -filetype=obj -O2`.
+  - Compact impact: the same full no-ABI compact relift dropped again from about `329.1s` (`fresh_relift_fix80`) to about `314.1s` (`fresh_relift_fix81`), another savings of roughly `15.0s` / `4.6%`.
+  - Stage-timing result: the cache gets real reuse even in late iterations, but only at the top-level handler replay layer. The late propagation-heavy runs still spend about `39-40s` in `propagateVirtualStateFacts`, so most remaining cost is deeper than the top-level replay entry.
+- 2026-03-21: Tried extending the replay cache one level deeper to callsite-localized direct-callee replay inside `applySingleDirectCalleeEffects`, then reverted it.
+  - The experiment did produce substantial nested cache hits, but on the real compact run it regressed total time from about `314.1s` (`fresh_relift_fix81`) to about `330.8s` (`fresh_relift_fix82`).
+  - The likely reason is cache-key construction overhead on the hot nested path outweighing the saved replay work.
+  - Current tree is reverted to the faster `fix81` shape, keeping the top-level propagation replay cache and the stage instrumentation while dropping the nested callsite cache complexity.
+- 2026-03-21: Added iteration-level propagation diagnostics under `OMILL_DEBUG_VIRTUAL_MODEL_STAGES`.
+  - `propagateVirtualStateFacts` now logs per-iteration:
+    - dirty handler count
+    - dirty direct-call source count
+    - dirty prelude count
+    - localized replay attempt/success counts
+    - iteration time
+  - Binary-backed compact rerun with this extra logging (`fresh_relift_fix83`) confirms the remaining late propagation cost is not mostly localized replay.
+    - In the late `85-86` handler runs, top-level localized attempts stay relatively small (`~10-15` in the busiest rounds).
+    - But the worklist still churns across many iterations with very large dirty sets (`~58-86` dirty handlers, `10-13` rounds in the worst runs).
+    - The direct-call source worklist is already mostly gone after the first `1-2` rounds; the remaining time is dominated by repeated handler reprocessing after outgoing-change fanout, not by sustained argument-import work.
+  - Updated runtime conclusion: the next real optimization target is now dirty-worklist convergence inside `propagateVirtualStateFacts` itself, especially repeated incoming-merge/prelude churn, not another replay cache layer.
+- 2026-03-21: Tried restricting direct-call argument propagation to only newly tracked live-in argument IDs, then reverted it.
+  - The idea was sound in isolation, but on the real compact run it regressed total time from about `314.1s` (`fresh_relift_fix81`) to about `344.5s` (`fresh_relift_fix85`).
+  - Current tree is reverted to the faster `fix81` behavior, keeping the propagation diagnostics but dropping the argument-live-in gating.
+  - Practical conclusion: the remaining late dirty rounds are not being driven primarily by irrelevant direct-call argument facts, so the next optimization should target outgoing-change fanout or handler-level convergence checks instead.
+- 2026-03-21: Tightened localized replay output tracking to only export actually written slot / stack facts.
+  - `computeLocalizedSingleBlockOutgoingFacts` now records the exact canonical slot IDs and stack-cell IDs it writes, including writes imported from nested localized direct callees.
+  - `propagateVirtualStateFacts` and direct-callee import now filter localized outputs through those precise write sets instead of treating every carried-through fact in the localized state snapshot as a write.
+  - Validation: the focused `VirtualMachineModelTest`, `VirtualCFGMaterializationTest`, and `PipelineTest` runtime/regression set remained green before and after the change.
+  - Compact impact: the full no-ABI compact relift dropped from about `314.1s` (`fresh_relift_fix81`) to about `278.9s` (`fresh_relift_fix87`), a savings of roughly `35.2s` / `11.2%`.
+  - Semantic impact: the dumped compact root slice shape did not change; it remains `reachable=38 frontier=2 closed=false`, with the same `blk_180055365` call frontier and `blk_180026dce` dispatch frontier.
+- 2026-03-21: Added a cached non-localized outgoing-facts path inside `propagateVirtualStateFacts`.
+  - Non-localized outgoing fact computation is now cached per module, keyed by:
+    - handler function fingerprint
+    - current incoming slot facts
+    - current incoming stack facts
+    - current incoming argument facts
+    - current direct-callee outgoing slot / stack facts
+  - The cache stores the fully rebased outgoing slot / stack facts plus the stack-budget flag, so late propagation rounds can skip recomputing `computeOutgoingFacts`, `computeOutgoingStackFacts`, and `applyDirectCalleeEffects` when the effective inputs are unchanged.
+  - Validation: added `VirtualMachineModelTest.InvalidatesCachedOutgoingFactsAfterCalleeBodyChange`, and the focused `VirtualMachineModelTest`, `VirtualCFGMaterializationTest`, and `PipelineTest` regression set remained green. The emitted artifact in `build-remill/test_obf/corpus/lifted/fresh_relift_fix88/` still codegens with `llc -filetype=obj -O2`.
+  - Compact impact: the same full no-ABI compact relift dropped again from about `278.9s` (`fresh_relift_fix87`) to about `199.5s` (`fresh_relift_fix88`), another savings of roughly `79.4s` / `28.5%`.
+  - End-to-end from the earlier stable baseline (`fresh_relift_fix73`) to `fresh_relift_fix88`, compact runtime dropped from about `1137.3s` to about `199.5s`, a total savings of roughly `937.8s` / `82.5%`.
+  - Updated runtime conclusion: handler-summary rescanning and plain outgoing transfer recomputation are no longer the main issue. The remaining late cost is dirty-worklist convergence in `propagateVirtualStateFacts` itself, especially repeated outgoing-change fanout across the last open frontier handlers.
+- 2026-03-21: Narrowed reverse-caller invalidation to caller-visible callee output changes.
+  - `propagateVirtualStateFacts` still treats any outgoing change as relevant for:
+    - the handler's own direct-callee propagation
+    - entry-prelude consumers
+  - But reverse callers are now only re-enqueued when the callee changed outputs that a caller can actually observe:
+    - written slot IDs
+    - rebased written stack-cell IDs
+  - This avoids reopening caller handlers when only pass-through incoming facts changed inside the callee's full outgoing map.
+  - Validation: the focused `VirtualMachineModelTest`, `VirtualCFGMaterializationTest`, and `PipelineTest` regression set remained green. The emitted artifact in `build-remill/test_obf/corpus/lifted/fresh_relift_fix89/` still codegens with `llc -filetype=obj -O2`.
+  - Compact impact: the same full no-ABI compact relift dropped again from about `199.5s` (`fresh_relift_fix88`) to about `180.0s` (`fresh_relift_fix89`), another savings of roughly `19.5s` / `9.8%`.
+  - End-to-end from the earlier stable baseline (`fresh_relift_fix73`) to `fresh_relift_fix89`, compact runtime dropped from about `1137.3s` to about `180.0s`, a total savings of roughly `957.3s` / `84.2%`.
+  - Semantic impact: the compact root slice remains unchanged at `reachable=38 frontier=2 closed=false`, with the same `blk_180055365` call frontier and `blk_180026dce` dispatch frontier.
+- 2026-03-21: Added persistent propagation-state reuse across successive `VirtualMachineModelAnalysis` runs.
+  - Each handler now caches a stable, cross-run propagation snapshot keyed by:
+    - handler function fingerprint
+    - stable incoming argument facts
+    - stable incoming slot facts
+    - stable outgoing slot facts
+    - stable incoming stack facts
+    - stable outgoing stack facts
+    - stack-budget flag
+  - The cached facts are stored in slot/stack summary form rather than raw canonical IDs, then re-annotated against the current model on restore. That avoids relying on slot/cell ID stability across reruns.
+  - New VM-model runs now restore unchanged handlers from the previous solved lattice state and seed the initial dirty worklists only from changed/new handlers plus their direct dependents.
+  - Validation: the focused `VirtualMachineModelTest`, `VirtualCFGMaterializationTest`, and `PipelineTest` regression set remained green, and the emitted artifact in `build-remill/test_obf/corpus/lifted/fresh_relift_fix90/` still codegens with `llc -filetype=obj -O2`.
+  - Compact impact: the same full no-ABI compact relift dropped again from about `180.0s` (`fresh_relift_fix89`) to about `67.8s` (`fresh_relift_fix90`), another savings of roughly `112.2s` / `62.3%`.
+  - End-to-end from the earlier stable baseline (`fresh_relift_fix73`) to `fresh_relift_fix90`, compact runtime dropped from about `1137.3s` to about `67.8s`, a total savings of roughly `1069.5s` / `94.0%`.
+  - Stage evidence: after the first VM-model run, later runs restore most handlers directly (`restored-state handlers=80+` in the late compact iterations), and many of those reruns now spend only `~0.1s-2.5s` in propagation unless a newly lifted frontier target forces a real wave through the slice.
+  - Semantic impact: the compact root slice remains unchanged at `reachable=38 frontier=2 closed=false`, with the same `blk_180055365` call frontier and `blk_180026dce` dispatch frontier.

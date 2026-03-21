@@ -74,6 +74,174 @@ struct SymbolicAddress {
   int64_t offset = 0;
 };
 
+llvm::Constant *constantFromBits(llvm::Type *ty, uint64_t bits);
+
+std::optional<unsigned> remillReadMemoryByteWidth(llvm::StringRef name) {
+  if (!name.starts_with("__remill_read_memory_"))
+    return std::nullopt;
+
+  name = name.drop_front(strlen("__remill_read_memory_"));
+  unsigned bits = 0;
+  if (name.getAsInteger(10, bits) || bits == 0 || (bits % 8) != 0)
+    return std::nullopt;
+  return bits / 8;
+}
+
+unsigned scalarBitWidth(llvm::Type *ty, const llvm::DataLayout &DL) {
+  if (auto *int_ty = llvm::dyn_cast<llvm::IntegerType>(ty))
+    return int_ty->getBitWidth();
+  if (ty->isFloatTy())
+    return 32;
+  if (ty->isDoubleTy())
+    return 64;
+  if (ty->isPointerTy())
+    return DL.getPointerSizeInBits(ty->getPointerAddressSpace());
+  return 0;
+}
+
+std::optional<uint64_t> resolveConstantIntegerValueImpl(
+    llvm::Value *V, const llvm::DataLayout &DL,
+    llvm::DenseMap<llvm::Value *, std::optional<uint64_t>> &cache,
+    llvm::SmallPtrSetImpl<llvm::Value *> &visiting);
+
+std::optional<uint64_t> resolveLoadFromLocalAlloca(
+    llvm::LoadInst *LI, const llvm::DataLayout &DL,
+    llvm::DenseMap<llvm::Value *, std::optional<uint64_t>> &cache,
+    llvm::SmallPtrSetImpl<llvm::Value *> &visiting) {
+  auto *ptr = LI->getPointerOperand()->stripPointerCasts();
+  auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(ptr);
+  if (!alloca)
+    return std::nullopt;
+
+  auto it = LI->getIterator();
+  while (it != LI->getParent()->begin()) {
+    --it;
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(&*it);
+    if (!store)
+      continue;
+    if (store->getPointerOperand()->stripPointerCasts() != alloca)
+      continue;
+    return resolveConstantIntegerValueImpl(store->getValueOperand(), DL, cache,
+                                          visiting);
+  }
+
+  return std::nullopt;
+}
+
+std::optional<uint64_t> resolveConstantIntegerValueImpl(
+    llvm::Value *V, const llvm::DataLayout &DL,
+    llvm::DenseMap<llvm::Value *, std::optional<uint64_t>> &cache,
+    llvm::SmallPtrSetImpl<llvm::Value *> &visiting) {
+  if (auto found = cache.find(V); found != cache.end())
+    return found->second;
+  if (!visiting.insert(V).second)
+    return std::nullopt;
+
+  auto cache_result = [&](std::optional<uint64_t> value) {
+    visiting.erase(V);
+    cache[V] = value;
+    return value;
+  };
+
+  if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(V))
+    return cache_result(CI->getZExtValue());
+
+  if (auto *load = llvm::dyn_cast<llvm::LoadInst>(V))
+    return cache_result(resolveLoadFromLocalAlloca(load, DL, cache, visiting));
+
+  if (auto *cast = llvm::dyn_cast<llvm::CastInst>(V)) {
+    auto inner = resolveConstantIntegerValueImpl(cast->getOperand(0), DL, cache,
+                                                 visiting);
+    if (!inner)
+      return cache_result(std::nullopt);
+
+    unsigned src_bits = scalarBitWidth(cast->getOperand(0)->getType(), DL);
+    unsigned dst_bits = scalarBitWidth(cast->getType(), DL);
+    if (src_bits == 0 || dst_bits == 0 || src_bits > 64 || dst_bits > 64)
+      return cache_result(std::nullopt);
+
+    llvm::APInt ap(src_bits, *inner);
+    switch (cast->getOpcode()) {
+      case llvm::Instruction::ZExt:
+      case llvm::Instruction::IntToPtr:
+      case llvm::Instruction::PtrToInt:
+      case llvm::Instruction::BitCast:
+        return cache_result(ap.zextOrTrunc(dst_bits).getZExtValue());
+      case llvm::Instruction::SExt:
+        return cache_result(ap.sextOrTrunc(dst_bits).getZExtValue());
+      case llvm::Instruction::Trunc:
+        return cache_result(ap.trunc(dst_bits).getZExtValue());
+      default:
+        return cache_result(std::nullopt);
+    }
+  }
+
+  if (auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(V)) {
+    auto lhs = resolveConstantIntegerValueImpl(BO->getOperand(0), DL, cache,
+                                               visiting);
+    auto rhs = resolveConstantIntegerValueImpl(BO->getOperand(1), DL, cache,
+                                               visiting);
+    if (!lhs || !rhs)
+      return cache_result(std::nullopt);
+
+    unsigned bits = scalarBitWidth(BO->getType(), DL);
+    if (bits == 0 || bits > 64)
+      return cache_result(std::nullopt);
+
+    llvm::APInt lhs_ap(bits, *lhs);
+    llvm::APInt rhs_ap(bits, *rhs);
+    switch (BO->getOpcode()) {
+      case llvm::Instruction::Add:
+        return cache_result((lhs_ap + rhs_ap).getZExtValue());
+      case llvm::Instruction::Sub:
+        return cache_result((lhs_ap - rhs_ap).getZExtValue());
+      case llvm::Instruction::And:
+        return cache_result((lhs_ap & rhs_ap).getZExtValue());
+      case llvm::Instruction::Or:
+        return cache_result((lhs_ap | rhs_ap).getZExtValue());
+      case llvm::Instruction::Xor:
+        return cache_result((lhs_ap ^ rhs_ap).getZExtValue());
+      case llvm::Instruction::Shl:
+        return cache_result(
+            (lhs_ap.shl(rhs_ap.getLimitedValue(bits))).getZExtValue());
+      case llvm::Instruction::LShr:
+        return cache_result(
+            (lhs_ap.lshr(rhs_ap.getLimitedValue(bits))).getZExtValue());
+      case llvm::Instruction::AShr:
+        return cache_result(
+            (lhs_ap.ashr(rhs_ap.getLimitedValue(bits))).getZExtValue());
+      default:
+        return cache_result(std::nullopt);
+    }
+  }
+
+  return cache_result(std::nullopt);
+}
+
+std::optional<uint64_t> resolveConstantIntegerValue(llvm::Value *V,
+                                                    const llvm::DataLayout &DL) {
+  llvm::DenseMap<llvm::Value *, std::optional<uint64_t>> cache;
+  llvm::SmallPtrSet<llvm::Value *, 16> visiting;
+  return resolveConstantIntegerValueImpl(V, DL, cache, visiting);
+}
+
+llvm::Constant *readMappedConstant(llvm::Type *ty, uint64_t addr,
+                                   unsigned bytes, const BinaryMemoryMap &map,
+                                   bool suspicious_base) {
+  if (!map.isReadOnly(addr, bytes))
+    return nullptr;
+
+  auto val = map.readInt(addr, bytes);
+  if (!val)
+    return nullptr;
+
+  auto kind = map.classifyRelocatedValue(addr, bytes, *val);
+  if (kind == RelocValueKind::Suspicious && suspicious_base)
+    return nullptr;
+
+  return constantFromBits(ty, *val);
+}
+
 /// Resolve integer expression into (base + const_offset).
 /// Examples:
 ///   add i64 %rsp, -56   -> {base=%rsp, offset=-56}
@@ -332,6 +500,38 @@ llvm::PreservedAnalyses ConstantMemoryFoldingPass::run(
     LI->eraseFromParent();
     changed = true;
   }
+
+  llvm::SmallVector<llvm::CallInst *, 16> folded_reads;
+  for (auto &BB : F) {
+    for (auto &I : BB) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!call || call->arg_size() < 2)
+        continue;
+
+      auto *callee = call->getCalledFunction();
+      if (!callee)
+        continue;
+
+      auto width = remillReadMemoryByteWidth(callee->getName());
+      if (!width)
+        continue;
+
+      auto addr = resolveConstantIntegerValue(call->getArgOperand(1), DL);
+      if (!addr)
+        continue;
+
+      auto *replacement =
+          readMappedConstant(call->getType(), *addr, *width, *map, suspicious_base);
+      if (!replacement)
+        continue;
+
+      call->replaceAllUsesWith(replacement);
+      folded_reads.push_back(call);
+      changed = true;
+    }
+  }
+  for (auto *call : folded_reads)
+    call->eraseFromParent();
 
   // Local fold: track constant bytes for stack-like symbolic addresses
   // (inttoptr(base + const)) and fold subsequent scalar loads.

@@ -6,6 +6,7 @@
 #include <llvm/ADT/ScopeExit.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/SmallPtrSet.h>
+#include <llvm/ADT/StableHashing.h>
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/Argument.h>
@@ -14,10 +15,12 @@
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/StructuralHash.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/IR/Type.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -42,6 +45,25 @@ static bool vmModelImportDebugEnabled() {
   return v && v[0] != '\0';
 }
 
+static bool vmModelStageDebugEnabled() {
+  const char *v = std::getenv("OMILL_DEBUG_VIRTUAL_MODEL_STAGES");
+  return v && v[0] != '\0';
+}
+
+static void vmModelStageDebugLog(llvm::StringRef message) {
+  if (!vmModelStageDebugEnabled())
+    return;
+  llvm::errs() << "[omill.vm-model] " << message << "\n";
+}
+
+static uint64_t elapsedMilliseconds(
+    std::chrono::steady_clock::time_point begin,
+    std::chrono::steady_clock::time_point end) {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(end - begin)
+          .count());
+}
+
 static void vmModelImportDebugLog(llvm::StringRef message) {
   if (!vmModelImportDebugEnabled())
     return;
@@ -58,6 +80,88 @@ static void vmModelLocalReplayDebugLog(llvm::StringRef message) {
     return;
   llvm::errs() << "[omill.vm-model.local-replay] " << message << "\n";
 }
+
+struct CachedHandlerSummaryEntry {
+  llvm::stable_hash fingerprint = 0;
+  VirtualHandlerSummary summary;
+};
+
+struct CallsiteLocalizedOutgoingFacts {
+  std::map<unsigned, VirtualValueExpr> outgoing_slots;
+  std::map<unsigned, VirtualValueExpr> outgoing_stack;
+  std::set<unsigned> written_slot_ids;
+  std::set<unsigned> written_stack_cell_ids;
+};
+
+struct CachedOutgoingFactsEntry {
+  std::map<unsigned, VirtualValueExpr> outgoing_slots;
+  std::map<unsigned, VirtualValueExpr> outgoing_stack;
+  bool stack_memory_budget_exceeded = false;
+};
+
+struct CachedStableSlotFactEntry {
+  VirtualStateSlotSummary slot;
+  VirtualValueExpr value;
+};
+
+struct CachedStableStackFactEntry {
+  VirtualStackCellSummary cell;
+  VirtualValueExpr value;
+};
+
+struct CachedStableArgumentFactEntry {
+  unsigned argument_index = 0;
+  VirtualValueExpr value;
+};
+
+struct CachedPropagationEntry {
+  llvm::stable_hash fingerprint = 0;
+  std::vector<CachedStableArgumentFactEntry> incoming_arguments;
+  std::vector<CachedStableSlotFactEntry> incoming_slots;
+  std::vector<CachedStableSlotFactEntry> outgoing_slots;
+  std::vector<CachedStableStackFactEntry> incoming_stack;
+  std::vector<CachedStableStackFactEntry> outgoing_stack;
+  bool stack_memory_budget_exceeded = false;
+};
+
+struct CachedDirectCalleeEntry {
+  llvm::stable_hash fingerprint = 0;
+  llvm::SmallVector<std::string, 8> callees;
+};
+
+struct CachedModuleHandlerSummaryState {
+  std::map<std::string, CachedHandlerSummaryEntry> summaries;
+  std::map<std::string, CachedDirectCalleeEntry> direct_callees;
+  std::map<std::string, std::optional<CallsiteLocalizedOutgoingFacts>>
+      localized_top_level_replays;
+  std::map<std::string, CachedOutgoingFactsEntry> outgoing_facts;
+  std::map<std::string, CachedPropagationEntry> propagation_entries;
+};
+
+static std::map<const llvm::Module *, CachedModuleHandlerSummaryState> &
+virtualModelSummaryCaches() {
+  static auto *caches =
+      new std::map<const llvm::Module *, CachedModuleHandlerSummaryState>();
+  return *caches;
+}
+
+static VirtualValueExpr castExpr(const VirtualValueExpr &expr,
+                                 llvm::Instruction::CastOps opcode,
+                                 unsigned target_bits);
+
+static VirtualValueExpr constantExpr(uint64_t value, unsigned bits);
+
+static uint64_t bitMask(unsigned bits);
+
+static uint64_t signExtendBits(uint64_t value, unsigned from_bits);
+
+static std::optional<VirtualValueExpr> readBinaryConstantExpr(
+    const BinaryMemoryMap &binary_memory, uint64_t addr, unsigned width_bits);
+
+static std::optional<uint64_t> resolveSpecializedExprToConstant(
+    const VirtualValueExpr &expr,
+    const std::map<unsigned, VirtualValueExpr> &caller_outgoing,
+    const std::map<unsigned, VirtualValueExpr> &caller_outgoing_stack);
 
 static std::string normalizeBoundaryName(llvm::StringRef name) {
   return name.lower();
@@ -104,6 +208,43 @@ static std::optional<uint64_t> extractHexAttr(const llvm::Function &F,
   if (attr.getValueAsString().getAsInteger(16, value))
     return std::nullopt;
   return value;
+}
+
+static llvm::stable_hash stableHashAttribute(const llvm::Function &F,
+                                             llvm::StringRef attr_name) {
+  auto attr = F.getFnAttribute(attr_name);
+  if (!attr.isValid())
+    return llvm::stable_hash_combine(llvm::stable_hash_name(attr_name), 0);
+  if (attr.isStringAttribute()) {
+    return llvm::stable_hash_combine(
+        llvm::stable_hash_name(attr_name),
+        llvm::stable_hash_name(attr.getValueAsString()));
+  }
+  return llvm::stable_hash_combine(llvm::stable_hash_name(attr_name), 1);
+}
+
+static llvm::stable_hash summaryRelevantFunctionFingerprint(
+    const llvm::Function &F) {
+  llvm::stable_hash hash = llvm::StructuralHash(F, /*DetailedHash=*/true);
+  static constexpr llvm::StringLiteral kRelevantAttrs[] = {
+      "omill.output_root",
+      "omill.virtual_specialized",
+      "omill.virtual_specialization.root_va",
+      "omill.virtual_specialization.facts",
+      "omill.virtual_specialization.stack_facts",
+      "omill.closed_root_slice",
+      "omill.closed_root_slice_root",
+      "omill.vm_handler",
+      "omill.vm_wrapper",
+      "omill.vm_newly_lifted",
+      "omill.newly_lifted",
+      "omill.vm_demerged_clone",
+      "omill.vm_outlined_virtual_call",
+      "omill.trace_native_target",
+  };
+  for (llvm::StringLiteral attr_name : kRelevantAttrs)
+    hash = llvm::stable_hash_combine(hash, stableHashAttribute(F, attr_name));
+  return hash;
 }
 
 static std::vector<VirtualSlotFact> parseSpecializationFacts(
@@ -226,6 +367,41 @@ static bool isLiftedOrHelperSeedFunction(const llvm::Function &F) {
   return false;
 }
 
+static bool isVirtualModelNamedCodeFunction(const llvm::Function &F) {
+  auto name = F.getName();
+  return name.starts_with("sub_") || name.starts_with("blk_") ||
+         name.starts_with("block_") || name.starts_with("__lifted_") ||
+         name.ends_with("_native");
+}
+
+static bool hasVirtualModelCodeBearingAttr(const llvm::Function &F) {
+  return F.hasFnAttribute("omill.output_root") ||
+         F.hasFnAttribute("omill.virtual_specialized") ||
+         F.hasFnAttribute("omill.closed_root_slice_root") ||
+         F.hasFnAttribute("omill.vm_wrapper") ||
+         F.hasFnAttribute("omill.vm_newly_lifted") ||
+         F.hasFnAttribute("omill.newly_lifted") ||
+         F.getFnAttribute("omill.vm_demerged_clone").isValid() ||
+         F.getFnAttribute("omill.vm_outlined_virtual_call").isValid() ||
+         F.getFnAttribute("omill.trace_native_target").isValid();
+}
+
+static bool isVirtualModelInitialSeedFunction(const llvm::Function &F) {
+  if (F.isDeclaration())
+    return false;
+  if (F.hasFnAttribute("omill.localized_continuation_shim"))
+    return false;
+  return isVirtualModelNamedCodeFunction(F) ||
+         hasVirtualModelCodeBearingAttr(F);
+}
+
+static bool isVirtualModelCodeBearingFunction(const llvm::Function &F) {
+  return !F.isDeclaration() &&
+         !F.hasFnAttribute("omill.localized_continuation_shim") &&
+         (isVirtualModelNamedCodeFunction(F) ||
+          hasVirtualModelCodeBearingAttr(F));
+}
+
 static bool isDispatchIntrinsic(const llvm::Function &F) {
   return F.getName() == "__omill_dispatch_call" ||
          F.getName() == "__omill_dispatch_jump";
@@ -305,8 +481,31 @@ extractStateSlotSummary(llvm::Value *ptr, unsigned width,
   return summary;
 }
 
+static llvm::Module *moduleForValue(llvm::Value *V) {
+  if (auto *I = llvm::dyn_cast<llvm::Instruction>(V))
+    return I->getModule();
+  if (auto *A = llvm::dyn_cast<llvm::Argument>(V))
+    return A->getParent() ? A->getParent()->getParent() : nullptr;
+  if (auto *F = llvm::dyn_cast<llvm::Function>(V))
+    return F->getParent();
+  return nullptr;
+}
+
+static std::optional<unsigned> nativeStackPointerOffsetForValue(llvm::Value *V) {
+  auto *M = moduleForValue(V);
+  if (!M)
+    return std::nullopt;
+  StateFieldMap field_map(*M);
+  for (const char *sp_name : {"RSP", "SP", "sp"}) {
+    if (auto field = field_map.fieldByName(sp_name))
+      return field->offset;
+  }
+  return std::nullopt;
+}
+
 static std::optional<VirtualStackCellSummary> extractStackCellSummaryFromExpr(
-    const VirtualValueExpr &expr, unsigned width) {
+    const VirtualValueExpr &expr, unsigned width,
+    std::optional<unsigned> native_sp_offset = std::nullopt) {
   using BaseSummary =
       std::tuple<std::string, int64_t, unsigned, bool, bool>;
   auto expr_width_bytes = [](const VirtualValueExpr &value) {
@@ -332,6 +531,18 @@ static std::optional<VirtualStackCellSummary> extractStackCellSummaryFromExpr(
         value.state_base_name.has_value() && value.state_offset.has_value()) {
       auto base_name = *value.state_base_name;
       const bool from_argument = llvm::StringRef(base_name).starts_with("arg");
+      bool is_stack_base = false;
+      if (from_argument) {
+        is_stack_base = !native_sp_offset.has_value() ||
+                        *value.state_offset ==
+                            static_cast<int64_t>(*native_sp_offset);
+      } else if (!from_argument) {
+        llvm::StringRef name(base_name);
+        is_stack_base = name.equals_insensitive("RSP") ||
+                        name.equals_insensitive("SP");
+      }
+      if (!is_stack_base)
+        return std::nullopt;
       return std::tuple<std::string, int64_t, unsigned, bool, bool>{
           base_name,
           *value.state_offset,
@@ -341,7 +552,7 @@ static std::optional<VirtualStackCellSummary> extractStackCellSummaryFromExpr(
       };
     }
 
-    if (value.kind == VirtualExprKind::kArgument &&
+    if (!native_sp_offset.has_value() && value.kind == VirtualExprKind::kArgument &&
         value.argument_index.has_value()) {
       return std::tuple<std::string, int64_t, unsigned, bool, bool>{
           "arg" + std::to_string(*value.argument_index),
@@ -454,7 +665,8 @@ static std::optional<uint64_t> evaluateVirtualExprImpl(
     const VirtualValueExpr &expr, const std::vector<VirtualSlotFact> &facts,
     const std::vector<VirtualStackFact> &stack_facts,
     llvm::SmallDenseSet<unsigned, 8> &visiting_slots,
-    llvm::SmallDenseSet<unsigned, 8> &visiting_cells) {
+    llvm::SmallDenseSet<unsigned, 8> &visiting_cells,
+    const BinaryMemoryMap *binary_memory = nullptr) {
   auto lookup_slot = [&](unsigned slot_id) -> std::optional<uint64_t> {
     auto it = std::find_if(facts.begin(), facts.end(),
                            [&](const VirtualSlotFact &fact) {
@@ -465,7 +677,8 @@ static std::optional<uint64_t> evaluateVirtualExprImpl(
     if (!visiting_slots.insert(slot_id).second)
       return std::nullopt;
     auto value = evaluateVirtualExprImpl(it->value, facts, stack_facts,
-                                         visiting_slots, visiting_cells);
+                                         visiting_slots, visiting_cells,
+                                         binary_memory);
     visiting_slots.erase(slot_id);
     return value;
   };
@@ -480,7 +693,8 @@ static std::optional<uint64_t> evaluateVirtualExprImpl(
     if (!visiting_cells.insert(cell_id).second)
       return std::nullopt;
     auto value = evaluateVirtualExprImpl(it->value, facts, stack_facts,
-                                         visiting_slots, visiting_cells);
+                                         visiting_slots, visiting_cells,
+                                         binary_memory);
     visiting_cells.erase(cell_id);
     return value;
   };
@@ -489,12 +703,25 @@ static std::optional<uint64_t> evaluateVirtualExprImpl(
     if (expr.operands.size() != 2)
       return std::nullopt;
     auto lhs = evaluateVirtualExprImpl(expr.operands[0], facts, stack_facts,
-                                       visiting_slots, visiting_cells);
+                                       visiting_slots, visiting_cells,
+                                       binary_memory);
     auto rhs = evaluateVirtualExprImpl(expr.operands[1], facts, stack_facts,
-                                       visiting_slots, visiting_cells);
+                                       visiting_slots, visiting_cells,
+                                       binary_memory);
     if (!lhs || !rhs)
       return std::nullopt;
     return fn(*lhs, *rhs);
+  };
+
+  auto fold_unary = [&](auto fn) -> std::optional<uint64_t> {
+    if (expr.operands.size() != 1)
+      return std::nullopt;
+    auto value = evaluateVirtualExprImpl(expr.operands[0], facts, stack_facts,
+                                         visiting_slots, visiting_cells,
+                                         binary_memory);
+    if (!value)
+      return std::nullopt;
+    return fn(*value);
   };
 
   switch (expr.kind) {
@@ -508,6 +735,36 @@ static std::optional<uint64_t> evaluateVirtualExprImpl(
       if (expr.stack_cell_id.has_value())
         return lookup_stack(*expr.stack_cell_id);
       return std::nullopt;
+    case VirtualExprKind::kMemoryRead:
+      if (!binary_memory || expr.operands.size() != 1)
+        return std::nullopt;
+      if (auto addr = evaluateVirtualExprImpl(expr.operands[0], facts, stack_facts,
+                                              visiting_slots, visiting_cells,
+                                              binary_memory)) {
+        if (auto value = readBinaryConstantExpr(*binary_memory, *addr,
+                                                expr.bit_width)) {
+          return value->constant;
+        }
+      }
+      return std::nullopt;
+    case VirtualExprKind::kZExt:
+      return fold_unary([&](uint64_t value) {
+        unsigned source_bits = expr.operands.front().bit_width
+                                   ? expr.operands.front().bit_width
+                                   : expr.bit_width;
+        return value & bitMask(std::min(source_bits, expr.bit_width));
+      });
+    case VirtualExprKind::kSExt:
+      return fold_unary([&](uint64_t value) {
+        unsigned source_bits = expr.operands.front().bit_width
+                                   ? expr.operands.front().bit_width
+                                   : expr.bit_width;
+        return signExtendBits(value, source_bits) & bitMask(expr.bit_width);
+      });
+    case VirtualExprKind::kTrunc:
+      return fold_unary([&](uint64_t value) {
+        return value & bitMask(expr.bit_width);
+      });
     case VirtualExprKind::kAdd:
       return fold_binary([](uint64_t a, uint64_t b) { return a + b; });
     case VirtualExprKind::kSub:
@@ -584,10 +841,11 @@ static std::optional<uint64_t> evaluateVirtualExprImpl(
         return std::nullopt;
       if (auto cond =
               evaluateVirtualExprImpl(expr.operands[0], facts, stack_facts,
-                                      visiting_slots, visiting_cells)) {
+                                      visiting_slots, visiting_cells,
+                                      binary_memory)) {
         return evaluateVirtualExprImpl(expr.operands[*cond ? 1 : 2], facts,
                                        stack_facts, visiting_slots,
-                                       visiting_cells);
+                                       visiting_cells, binary_memory);
       }
       return std::nullopt;
     case VirtualExprKind::kPhi:
@@ -596,13 +854,14 @@ static std::optional<uint64_t> evaluateVirtualExprImpl(
       {
         auto first =
             evaluateVirtualExprImpl(expr.operands.front(), facts, stack_facts,
-                                    visiting_slots, visiting_cells);
+                                    visiting_slots, visiting_cells,
+                                    binary_memory);
         if (!first)
           return std::nullopt;
         for (size_t i = 1; i < expr.operands.size(); ++i) {
           auto other = evaluateVirtualExprImpl(expr.operands[i], facts,
                                                stack_facts, visiting_slots,
-                                               visiting_cells);
+                                               visiting_cells, binary_memory);
           if (!other || *other != *first)
             return std::nullopt;
         }
@@ -618,11 +877,12 @@ static std::optional<uint64_t> evaluateVirtualExprImpl(
 
 static std::optional<uint64_t> evaluateVirtualExpr(
     const VirtualValueExpr &expr, const std::vector<VirtualSlotFact> &facts,
-    const std::vector<VirtualStackFact> &stack_facts = {}) {
+    const std::vector<VirtualStackFact> &stack_facts = {},
+    const BinaryMemoryMap *binary_memory = nullptr) {
   llvm::SmallDenseSet<unsigned, 8> visiting_slots;
   llvm::SmallDenseSet<unsigned, 8> visiting_cells;
   return evaluateVirtualExprImpl(expr, facts, stack_facts, visiting_slots,
-                                 visiting_cells);
+                                 visiting_cells, binary_memory);
 }
 
 static VirtualValueExpr summarizeValueExprImpl(
@@ -630,6 +890,7 @@ static VirtualValueExpr summarizeValueExprImpl(
     llvm::SmallPtrSetImpl<llvm::Value *> &visited, unsigned depth) {
   VirtualValueExpr expr;
   expr.bit_width = getValueBitWidth(V, dl);
+  const auto native_sp_offset = nativeStackPointerOffsetForValue(V);
 
   if (depth > 8 || !visited.insert(V).second)
     return expr;
@@ -666,7 +927,8 @@ static VirtualValueExpr summarizeValueExprImpl(
       auto pointer_expr =
           summarizeValueExprImpl(load->getPointerOperand(), dl, visited, depth + 1);
       if (auto cell = extractStackCellSummaryFromExpr(pointer_expr,
-                                                      width.getFixedValue())) {
+                                                      width.getFixedValue(),
+                                                      native_sp_offset)) {
         expr.kind = VirtualExprKind::kStackCell;
         expr.complete = pointer_expr.complete;
         expr.state_base_name = cell->base_name;
@@ -688,8 +950,8 @@ static VirtualValueExpr summarizeValueExprImpl(
       case llvm::Instruction::IntToPtr: {
         auto inner =
             summarizeValueExprImpl(cast->getOperand(0), dl, visited, depth + 1);
-        inner.bit_width = expr.bit_width ? expr.bit_width : inner.bit_width;
-        return inner;
+        return castExpr(inner, cast->getOpcode(),
+                        expr.bit_width ? expr.bit_width : inner.bit_width);
       }
       default:
         break;
@@ -701,16 +963,19 @@ static VirtualValueExpr summarizeValueExprImpl(
         callee && isRemillReadMemoryIntrinsic(*callee) && call->arg_size() >= 2) {
       auto pointer_expr =
           summarizeValueExprImpl(call->getArgOperand(1), dl, visited, depth + 1);
+      expr.kind = VirtualExprKind::kMemoryRead;
+      expr.complete = pointer_expr.complete;
+      expr.operands.push_back(std::move(pointer_expr));
       if (auto cell = extractStackCellSummaryFromExpr(
-              pointer_expr, getValueBitWidth(V, dl) / 8)) {
+              expr.operands.front(), getValueBitWidth(V, dl) / 8,
+              native_sp_offset)) {
         expr.kind = VirtualExprKind::kStackCell;
-        expr.complete = pointer_expr.complete;
         expr.state_base_name = cell->base_name;
         expr.state_offset = cell->base_offset;
         expr.stack_offset = cell->offset;
         expr.bit_width = cell->width ? (cell->width * 8u) : expr.bit_width;
-        return expr;
       }
+      return expr;
     }
   }
 
@@ -1128,9 +1393,37 @@ static VirtualHandlerSummary summarizeFunction(llvm::Function &F) {
   const bool has_dispatch =
       (summary.dispatch_call_count + summary.dispatch_jump_count) != 0;
   const bool has_boundary_call = summary.protected_boundary_call_count != 0;
+  const bool has_callsite = !summary.callsites.empty();
+  const bool has_control_transfer =
+      has_dispatch || has_boundary_call || has_callsite;
   const bool has_state_shape = summary.state_slots.size() >= 2;
-  summary.is_candidate = has_state_shape && (has_dispatch || has_boundary_call);
+  const bool has_minimal_state =
+      !summary.state_slots.empty() || !summary.stack_cells.empty();
+  const bool is_lifted_like = isLiftedOrHelperSeedFunction(F);
+  summary.is_candidate =
+      (has_state_shape && (has_dispatch || has_boundary_call)) ||
+      (is_lifted_like && has_control_transfer && has_minimal_state);
   return summary;
+}
+
+static llvm::SmallVector<std::string, 8> collectDirectCalleesForFunction(
+    const llvm::Function &F) {
+  llvm::SmallVector<std::string, 8> callees;
+  for (auto &BB : F) {
+    for (auto &I : BB) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+      if (!call)
+        continue;
+      auto *callee = call->getCalledFunction();
+      if (!callee || callee->isDeclaration() ||
+          callee->hasFnAttribute("omill.localized_continuation_shim")) {
+        continue;
+      }
+      if (!llvm::is_contained(callees, callee->getName().str()))
+        callees.push_back(callee->getName().str());
+    }
+  }
+  return callees;
 }
 
 struct SlotKey {
@@ -1272,6 +1565,37 @@ static void annotateExprStackCells(
     annotateExprStackCells(operand, stack_cell_ids, slot_ids);
 }
 
+static void canonicalizeMemoryReadsToStackCells(
+    VirtualValueExpr &expr, const std::map<StackCellKey, unsigned> &stack_cell_ids,
+    const std::map<SlotKey, unsigned> &slot_ids) {
+  for (auto &operand : expr.operands)
+    canonicalizeMemoryReadsToStackCells(operand, stack_cell_ids, slot_ids);
+
+  if (expr.kind != VirtualExprKind::kMemoryRead || expr.operands.size() != 1)
+    return;
+
+  unsigned width_bytes =
+      expr.bit_width ? std::max(1u, expr.bit_width / 8u) : 8u;
+  auto cell =
+      extractStackCellSummaryFromExpr(expr.operands.front(), width_bytes);
+  if (!cell)
+    return;
+
+  VirtualValueExpr replacement;
+  replacement.kind = VirtualExprKind::kStackCell;
+  replacement.bit_width = cell->width ? cell->width * 8u : 0u;
+  replacement.complete = true;
+  replacement.state_base_name = cell->base_name;
+  replacement.state_offset = cell->base_offset;
+  replacement.stack_offset = cell->offset;
+  replacement.slot_id = cell->canonical_base_slot_id;
+  replacement.stack_cell_id = cell->canonical_id;
+  annotateExprSlots(replacement, slot_ids);
+  annotateExprStackCells(replacement, stack_cell_ids, slot_ids);
+  if (replacement.stack_cell_id.has_value())
+    expr = std::move(replacement);
+}
+
 static uint64_t bitMask(unsigned bits) {
   if (bits == 0 || bits >= 64)
     return ~0ULL;
@@ -1295,6 +1619,228 @@ static bool exprEquals(const VirtualValueExpr &lhs, const VirtualValueExpr &rhs)
       return false;
   }
   return true;
+}
+
+static bool exprReferencesSlotId(const VirtualValueExpr &expr,
+                                 unsigned slot_id) {
+  if (expr.kind == VirtualExprKind::kStateSlot && expr.slot_id.has_value() &&
+      *expr.slot_id == slot_id) {
+    return true;
+  }
+  return llvm::any_of(expr.operands, [&](const VirtualValueExpr &operand) {
+    return exprReferencesSlotId(operand, slot_id);
+  });
+}
+
+static VirtualValueExpr castExprToBitWidth(const VirtualValueExpr &expr,
+                                           unsigned target_bits) {
+  VirtualValueExpr casted = expr;
+  unsigned source_bits = expr.bit_width ? expr.bit_width : target_bits;
+  if (source_bits == target_bits) {
+    casted.bit_width = target_bits;
+    return casted;
+  }
+  auto opcode = source_bits > target_bits ? llvm::Instruction::Trunc
+                                          : llvm::Instruction::ZExt;
+  return castExpr(expr, opcode, target_bits);
+}
+
+static VirtualValueExpr binaryExpr(VirtualExprKind kind, VirtualValueExpr lhs,
+                                   VirtualValueExpr rhs, unsigned bit_width) {
+  VirtualValueExpr result;
+  result.kind = kind;
+  result.bit_width = bit_width;
+  result.complete = lhs.complete && rhs.complete;
+  result.operands.push_back(std::move(lhs));
+  result.operands.push_back(std::move(rhs));
+  return result;
+}
+
+static bool isContiguousLowBitMask(uint64_t mask) {
+  return mask && ((mask & (mask + 1)) == 0);
+}
+
+static unsigned contiguousLowBitMaskWidth(uint64_t mask) {
+  unsigned width = 0;
+  while ((mask & 1u) != 0u) {
+    ++width;
+    mask >>= 1u;
+  }
+  return width;
+}
+
+static bool matchAndConstantMask(const VirtualValueExpr &expr,
+                                 const VirtualValueExpr *&base,
+                                 uint64_t &mask) {
+  if (expr.kind != VirtualExprKind::kAnd || expr.operands.size() != 2)
+    return false;
+
+  if (expr.operands[0].constant.has_value()) {
+    base = &expr.operands[1];
+    mask = *expr.operands[0].constant;
+    return true;
+  }
+  if (expr.operands[1].constant.has_value()) {
+    base = &expr.operands[0];
+    mask = *expr.operands[1].constant;
+    return true;
+  }
+  return false;
+}
+
+static bool isLowBitsProjectionOfExpr(const VirtualValueExpr &expr,
+                                      const VirtualValueExpr &base,
+                                      unsigned low_bits) {
+  if (exprEquals(expr, base))
+    return true;
+
+  if (expr.constant.has_value() && base.constant.has_value()) {
+    return (*expr.constant & bitMask(low_bits)) ==
+           (*base.constant & bitMask(low_bits));
+  }
+
+  if (expr.kind == VirtualExprKind::kPhi && base.kind == VirtualExprKind::kPhi &&
+      expr.operands.size() == base.operands.size() && !expr.operands.empty()) {
+    for (size_t i = 0; i < expr.operands.size(); ++i) {
+      if (!isLowBitsProjectionOfExpr(expr.operands[i], base.operands[i],
+                                     low_bits)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  if (expr.kind == VirtualExprKind::kTrunc && expr.operands.size() == 1 &&
+      expr.bit_width == low_bits && exprEquals(expr.operands[0], base)) {
+    return true;
+  }
+
+  if ((expr.kind == VirtualExprKind::kZExt ||
+       expr.kind == VirtualExprKind::kSExt) &&
+      expr.operands.size() == 1 && expr.bit_width == base.bit_width) {
+    return isLowBitsProjectionOfExpr(expr.operands[0], base, low_bits);
+  }
+
+  return false;
+}
+
+static std::optional<VirtualValueExpr> simplifyMaskedLowBitReconstruction(
+    const VirtualValueExpr &preserved_high_bits,
+    const VirtualValueExpr &inserted_low_bits, unsigned result_bits) {
+  const VirtualValueExpr *base = nullptr;
+  const VirtualValueExpr *low_projection = nullptr;
+  uint64_t high_mask = 0;
+  uint64_t low_mask = 0;
+  if (!matchAndConstantMask(preserved_high_bits, base, high_mask) ||
+      !matchAndConstantMask(inserted_low_bits, low_projection, low_mask)) {
+    return std::nullopt;
+  }
+
+  if (!isContiguousLowBitMask(low_mask))
+    return std::nullopt;
+
+  uint64_t full_mask = bitMask(result_bits);
+  if ((high_mask & low_mask) != 0 || (high_mask | low_mask) != full_mask)
+    return std::nullopt;
+
+  unsigned low_bits = contiguousLowBitMaskWidth(low_mask);
+  if (!low_bits || low_bits > result_bits)
+    return std::nullopt;
+
+  if (!isLowBitsProjectionOfExpr(*low_projection, *base, low_bits))
+    return std::nullopt;
+
+  auto rebuilt = castExprToBitWidth(*base, result_bits);
+  rebuilt.complete =
+      preserved_high_bits.complete && inserted_low_bits.complete;
+  return rebuilt;
+}
+
+static std::optional<VirtualValueExpr> mergeLowBitsIntoWiderStateExpr(
+    const VirtualValueExpr &existing_wide, unsigned wide_bits,
+    const VirtualValueExpr &written_value, unsigned written_bits,
+    std::optional<unsigned> self_slot_id = std::nullopt) {
+  if (written_bits == 0 || written_bits > 64 || wide_bits == 0 ||
+      wide_bits > 64 || wide_bits <= written_bits) {
+    return std::nullopt;
+  }
+
+  auto normalized_existing = castExprToBitWidth(existing_wide, wide_bits);
+  if (self_slot_id && exprReferencesSlotId(normalized_existing, *self_slot_id))
+    return std::nullopt;
+
+  uint64_t low_mask = bitMask(written_bits);
+  uint64_t high_mask = bitMask(wide_bits) & ~low_mask;
+
+  auto inserted = castExprToBitWidth(written_value, wide_bits);
+  if (low_mask != bitMask(wide_bits)) {
+    inserted = binaryExpr(VirtualExprKind::kAnd, std::move(inserted),
+                          constantExpr(low_mask, wide_bits), wide_bits);
+  }
+
+  if (high_mask == 0)
+    return inserted;
+
+  auto preserved =
+      binaryExpr(VirtualExprKind::kAnd, std::move(normalized_existing),
+                 constantExpr(high_mask, wide_bits), wide_bits);
+  return binaryExpr(VirtualExprKind::kOr, std::move(preserved),
+                    std::move(inserted), wide_bits);
+}
+
+static void propagateAliasedStateSlotWrite(
+    std::map<unsigned, VirtualValueExpr> &slot_facts, unsigned written_slot_id,
+    const VirtualValueExpr &written_value,
+    const std::map<unsigned, const VirtualStateSlotInfo *> &slot_info) {
+  auto written_it = slot_info.find(written_slot_id);
+  if (written_it == slot_info.end())
+    return;
+
+  const auto &written_slot = *written_it->second;
+  unsigned written_bits = written_slot.width ? (written_slot.width * 8u) : 0u;
+  if (written_bits == 0 || written_bits > 64)
+    return;
+
+  auto normalized_written = castExprToBitWidth(written_value, written_bits);
+
+  for (const auto &[alias_slot_id, alias_slot_ptr] : slot_info) {
+    if (alias_slot_id == written_slot_id)
+      continue;
+
+    const auto &alias_slot = *alias_slot_ptr;
+    if (alias_slot.base_name != written_slot.base_name ||
+        alias_slot.offset != written_slot.offset ||
+        alias_slot.from_argument != written_slot.from_argument ||
+        alias_slot.from_alloca != written_slot.from_alloca) {
+      continue;
+    }
+
+    unsigned alias_bits = alias_slot.width ? (alias_slot.width * 8u) : 0u;
+    if (alias_bits == 0 || alias_bits > 64)
+      continue;
+
+    if (alias_bits < written_bits) {
+      slot_facts[alias_slot_id] =
+          castExprToBitWidth(normalized_written, alias_bits);
+      continue;
+    }
+
+    if (alias_bits == written_bits) {
+      slot_facts[alias_slot_id] = normalized_written;
+      continue;
+    }
+
+    auto existing_it = slot_facts.find(alias_slot_id);
+    if (existing_it == slot_facts.end())
+      continue;
+
+    auto merged = mergeLowBitsIntoWiderStateExpr(
+        existing_it->second, alias_bits, normalized_written, written_bits,
+        alias_slot_id);
+    if (!merged)
+      continue;
+    slot_facts[alias_slot_id] = std::move(*merged);
+  }
 }
 
 static bool slotFactMapEquals(const std::map<unsigned, VirtualValueExpr> &lhs,
@@ -1335,6 +1881,18 @@ static bool containsStackCellExpr(const VirtualValueExpr &expr) {
   return llvm::any_of(expr.operands, containsStackCellExpr);
 }
 
+static bool containsMemoryReadExpr(const VirtualValueExpr &expr) {
+  if (expr.kind == VirtualExprKind::kMemoryRead)
+    return true;
+  return llvm::any_of(expr.operands, containsMemoryReadExpr);
+}
+
+static bool containsArgumentExpr(const VirtualValueExpr &expr) {
+  if (expr.kind == VirtualExprKind::kArgument)
+    return true;
+  return llvm::any_of(expr.operands, containsArgumentExpr);
+}
+
 static unsigned exprByteWidth(const VirtualValueExpr &expr,
                               unsigned fallback = 8) {
   return expr.bit_width ? std::max(1u, expr.bit_width / 8u) : fallback;
@@ -1362,6 +1920,13 @@ static bool isBoundedFactExpr(const VirtualValueExpr &expr,
     case VirtualExprKind::kStateSlot:
     case VirtualExprKind::kStackCell:
       return true;
+    case VirtualExprKind::kMemoryRead:
+    case VirtualExprKind::kZExt:
+    case VirtualExprKind::kSExt:
+    case VirtualExprKind::kTrunc:
+      return expr.operands.size() == 1 &&
+             isBoundedFactExpr(expr.operands.front(), allow_arguments,
+                               depth + 1);
     case VirtualExprKind::kArgument:
       return allow_arguments;
     case VirtualExprKind::kAdd:
@@ -1392,6 +1957,66 @@ static bool isBoundedArgumentFactExpr(const VirtualValueExpr &expr,
 static bool isBoundedStateProvenanceExpr(const VirtualValueExpr &expr,
                                          unsigned depth = 0) {
   return isBoundedFactExpr(expr, /*allow_arguments=*/false, depth);
+}
+
+static bool isBoundedLocalizedTransferExpr(const VirtualValueExpr &expr,
+                                           unsigned depth = 0) {
+  if (depth > 6)
+    return false;
+
+  switch (expr.kind) {
+    case VirtualExprKind::kConstant:
+    case VirtualExprKind::kStateSlot:
+    case VirtualExprKind::kStackCell:
+    case VirtualExprKind::kArgument:
+      return true;
+    case VirtualExprKind::kMemoryRead:
+    case VirtualExprKind::kZExt:
+    case VirtualExprKind::kSExt:
+    case VirtualExprKind::kTrunc:
+      return expr.operands.size() == 1 &&
+             isBoundedLocalizedTransferExpr(expr.operands.front(), depth + 1);
+    case VirtualExprKind::kAdd:
+    case VirtualExprKind::kSub:
+    case VirtualExprKind::kXor:
+    case VirtualExprKind::kAnd:
+    case VirtualExprKind::kOr:
+    case VirtualExprKind::kShl:
+    case VirtualExprKind::kLShr:
+    case VirtualExprKind::kAShr:
+    case VirtualExprKind::kEq:
+    case VirtualExprKind::kNe:
+    case VirtualExprKind::kUlt:
+    case VirtualExprKind::kUle:
+    case VirtualExprKind::kUgt:
+    case VirtualExprKind::kUge:
+    case VirtualExprKind::kSlt:
+    case VirtualExprKind::kSle:
+    case VirtualExprKind::kSgt:
+    case VirtualExprKind::kSge:
+      if (expr.operands.size() != 2)
+        return false;
+      return countSymbolicRefs(expr) <= 4 &&
+             isBoundedLocalizedTransferExpr(expr.operands[0], depth + 1) &&
+             isBoundedLocalizedTransferExpr(expr.operands[1], depth + 1);
+    case VirtualExprKind::kSelect:
+      if (expr.operands.size() != 3)
+        return false;
+      return countSymbolicRefs(expr) <= 4 &&
+             isBoundedLocalizedTransferExpr(expr.operands[0], depth + 1) &&
+             isBoundedLocalizedTransferExpr(expr.operands[1], depth + 1) &&
+             isBoundedLocalizedTransferExpr(expr.operands[2], depth + 1);
+    case VirtualExprKind::kPhi:
+      return !expr.operands.empty() && expr.operands.size() <= 4 &&
+             countSymbolicRefs(expr) <= 4 &&
+             std::all_of(expr.operands.begin(), expr.operands.end(),
+                         [&](const VirtualValueExpr &operand) {
+                           return isBoundedLocalizedTransferExpr(
+                               operand, depth + 1);
+                         });
+    default:
+      return false;
+  }
 }
 
 static bool isIdentitySlotExpr(const VirtualValueExpr &expr, unsigned slot_id) {
@@ -1444,6 +2069,119 @@ static VirtualValueExpr constantExpr(uint64_t value, unsigned bits) {
   expr.complete = true;
   expr.constant = value & bitMask(bits);
   return expr;
+}
+
+static uint64_t signExtendBits(uint64_t value, unsigned from_bits) {
+  if (from_bits == 0 || from_bits >= 64)
+    return value;
+  uint64_t masked = value & bitMask(from_bits);
+  uint64_t sign_bit = 1ULL << (from_bits - 1);
+  if ((masked & sign_bit) == 0)
+    return masked;
+  return masked | ~bitMask(from_bits);
+}
+
+static VirtualValueExpr castExpr(const VirtualValueExpr &expr,
+                                 llvm::Instruction::CastOps opcode,
+                                 unsigned target_bits) {
+  VirtualValueExpr casted = expr;
+  unsigned source_bits = expr.bit_width ? expr.bit_width : target_bits;
+  if (source_bits == target_bits &&
+      (opcode == llvm::Instruction::BitCast ||
+       opcode == llvm::Instruction::PtrToInt ||
+       opcode == llvm::Instruction::IntToPtr)) {
+    casted.bit_width = target_bits;
+    return casted;
+  }
+  casted.bit_width = target_bits;
+  if (!casted.constant.has_value() && casted.kind == VirtualExprKind::kPhi) {
+    casted.operands.clear();
+    casted.complete = true;
+    for (const auto &operand : expr.operands) {
+      casted.operands.push_back(castExpr(operand, opcode, target_bits));
+      casted.complete &= casted.operands.back().complete;
+    }
+    return casted;
+  }
+  if (!casted.constant.has_value() && casted.kind == VirtualExprKind::kSelect &&
+      casted.operands.size() == 3) {
+    casted.operands.clear();
+    casted.operands.push_back(expr.operands[0]);
+    casted.operands.push_back(castExpr(expr.operands[1], opcode, target_bits));
+    casted.operands.push_back(castExpr(expr.operands[2], opcode, target_bits));
+    casted.complete = std::all_of(
+        casted.operands.begin(), casted.operands.end(),
+        [](const VirtualValueExpr &operand) { return operand.complete; });
+    return casted;
+  }
+  if (!casted.constant.has_value()) {
+    switch (opcode) {
+      case llvm::Instruction::ZExt:
+      case llvm::Instruction::PtrToInt:
+      case llvm::Instruction::IntToPtr:
+        casted.kind = VirtualExprKind::kZExt;
+        casted.operands = {expr};
+        casted.complete = expr.complete;
+        return casted;
+      case llvm::Instruction::SExt:
+        casted.kind = VirtualExprKind::kSExt;
+        casted.operands = {expr};
+        casted.complete = expr.complete;
+        return casted;
+      case llvm::Instruction::Trunc:
+        casted.kind = VirtualExprKind::kTrunc;
+        casted.operands = {expr};
+        casted.complete = expr.complete;
+        return casted;
+      case llvm::Instruction::BitCast:
+        return casted;
+      default:
+        return casted;
+    }
+  }
+
+  if (!casted.constant.has_value())
+    return casted;
+
+  uint64_t value = *casted.constant;
+  switch (opcode) {
+    case llvm::Instruction::ZExt:
+    case llvm::Instruction::BitCast:
+    case llvm::Instruction::PtrToInt:
+    case llvm::Instruction::IntToPtr:
+      casted.constant = value & bitMask(std::min(source_bits, target_bits));
+      break;
+    case llvm::Instruction::SExt:
+      casted.constant =
+          signExtendBits(value, source_bits) & bitMask(target_bits);
+      break;
+    case llvm::Instruction::Trunc:
+      casted.constant = value & bitMask(target_bits);
+      break;
+    default:
+      break;
+  }
+  return casted;
+}
+
+static std::optional<VirtualValueExpr> readBinaryConstantExpr(
+    const BinaryMemoryMap &binary_memory, uint64_t addr, unsigned width_bits) {
+  unsigned width_bytes = std::max(1u, width_bits / 8u);
+  if (!binary_memory.isReadOnly(addr, width_bytes))
+    return std::nullopt;
+
+  auto value = binary_memory.readInt(addr, width_bytes);
+  if (!value)
+    return std::nullopt;
+
+  auto reloc_kind =
+      binary_memory.classifyRelocatedValue(addr, width_bytes, *value);
+  if (reloc_kind == RelocValueKind::Suspicious &&
+      binary_memory.isSuspiciousImageBase()) {
+    return std::nullopt;
+  }
+
+  return constantExpr(*value, width_bits);
 }
 
 struct EntryPreludeCallInfo {
@@ -1536,7 +2274,8 @@ static bool collectEvaluatedTargetChoicesImpl(
     const std::set<BooleanSlotExprKey> *boolean_slot_expr_keys,
     llvm::SmallDenseSet<unsigned, 8> &visiting_slots,
     llvm::SmallDenseSet<unsigned, 8> &visiting_cells,
-    llvm::SmallVectorImpl<uint64_t> &pcs, unsigned depth) {
+    llvm::SmallVectorImpl<uint64_t> &pcs, unsigned depth,
+    const BinaryMemoryMap *binary_memory = nullptr) {
   if (depth > 4 || pcs.size() > 4)
     return false;
 
@@ -1561,7 +2300,7 @@ static bool collectEvaluatedTargetChoicesImpl(
     bool ok = collectEvaluatedTargetChoicesImpl(
         it->value, facts, stack_facts, boolean_slot_ids,
         boolean_slot_expr_keys, visiting_slots, visiting_cells, pcs,
-        depth + 1);
+        depth + 1, binary_memory);
     visiting_slots.erase(slot_id);
     if (!ok && boolean_slot_ids && boolean_slot_ids->contains(slot_id) &&
         isUnknownLikeExpr(it->value)) {
@@ -1580,7 +2319,7 @@ static bool collectEvaluatedTargetChoicesImpl(
     bool ok = collectEvaluatedTargetChoicesImpl(
         it->value, facts, stack_facts, boolean_slot_ids,
         boolean_slot_expr_keys, visiting_slots, visiting_cells, pcs,
-        depth + 1);
+        depth + 1, binary_memory);
     visiting_cells.erase(cell_id);
     return ok;
   };
@@ -1593,7 +2332,8 @@ static bool collectEvaluatedTargetChoicesImpl(
                                            boolean_slot_ids,
                                            boolean_slot_expr_keys,
                                            visiting_slots, visiting_cells,
-                                           base_pcs, depth + 1)) {
+                                           base_pcs, depth + 1,
+                                           binary_memory)) {
       return false;
     }
     for (uint64_t base_pc : base_pcs) {
@@ -1606,7 +2346,7 @@ static bool collectEvaluatedTargetChoicesImpl(
 
   if (auto resolved =
           evaluateVirtualExprImpl(expr, facts, stack_facts, visiting_slots,
-                                  visiting_cells)) {
+                                  visiting_cells, binary_memory)) {
     return append_pc(*resolved);
   }
 
@@ -1625,6 +2365,43 @@ static bool collectEvaluatedTargetChoicesImpl(
       return false;
     case VirtualExprKind::kStackCell:
       return expr.stack_cell_id.has_value() && lookup_stack(*expr.stack_cell_id);
+    case VirtualExprKind::kZExt:
+    case VirtualExprKind::kSExt:
+    case VirtualExprKind::kTrunc: {
+      if (expr.operands.size() != 1)
+        return false;
+      llvm::SmallVector<uint64_t, 4> values;
+      if (!collectEvaluatedTargetChoicesImpl(expr.operands.front(), facts,
+                                             stack_facts, boolean_slot_ids,
+                                             boolean_slot_expr_keys,
+                                             visiting_slots, visiting_cells,
+                                             values, depth + 1,
+                                             binary_memory)) {
+        return false;
+      }
+      unsigned source_bits = expr.operands.front().bit_width
+                                 ? expr.operands.front().bit_width
+                                 : expr.bit_width;
+      for (uint64_t value : values) {
+        uint64_t casted = value;
+        switch (expr.kind) {
+          case VirtualExprKind::kZExt:
+            casted = value & bitMask(std::min(source_bits, expr.bit_width));
+            break;
+          case VirtualExprKind::kSExt:
+            casted = signExtendBits(value, source_bits) & bitMask(expr.bit_width);
+            break;
+          case VirtualExprKind::kTrunc:
+            casted = value & bitMask(expr.bit_width);
+            break;
+          default:
+            break;
+        }
+        if (!append_pc(casted))
+          return false;
+      }
+      return !pcs.empty() && pcs.size() <= 4;
+    }
     case VirtualExprKind::kAdd:
     case VirtualExprKind::kSub:
       if (expr.operands.size() != 2)
@@ -1649,7 +2426,8 @@ static bool collectEvaluatedTargetChoicesImpl(
                                                boolean_slot_ids,
                                                boolean_slot_expr_keys,
                                                visiting_slots, visiting_cells,
-                                               pcs, depth + 1)) {
+                                               pcs, depth + 1,
+                                               binary_memory)) {
           return false;
         }
       }
@@ -1664,15 +2442,306 @@ static bool collectEvaluatedTargetChoices(const VirtualValueExpr &expr,
                                           const std::vector<VirtualStackFact> &stack_facts,
                                           const llvm::DenseSet<unsigned> *boolean_slot_ids,
                                           const std::set<BooleanSlotExprKey> *boolean_slot_expr_keys,
-                                          llvm::SmallVectorImpl<uint64_t> &pcs) {
+                                          llvm::SmallVectorImpl<uint64_t> &pcs,
+                                          const BinaryMemoryMap *binary_memory = nullptr) {
   llvm::SmallDenseSet<unsigned, 8> visiting_slots;
   llvm::SmallDenseSet<unsigned, 8> visiting_cells;
   return collectEvaluatedTargetChoicesImpl(expr, facts, stack_facts,
                                            boolean_slot_ids,
                                            boolean_slot_expr_keys,
                                            visiting_slots, visiting_cells, pcs,
-                                           /*depth=*/0) &&
+                                           /*depth=*/0, binary_memory) &&
          pcs.size() >= 2;
+}
+
+static bool collectEvaluatedValueChoicesImpl(
+    const VirtualValueExpr &expr, const std::vector<VirtualSlotFact> &facts,
+    const std::vector<VirtualStackFact> &stack_facts,
+    llvm::SmallDenseSet<unsigned, 8> &visiting_slots,
+    llvm::SmallDenseSet<unsigned, 8> &visiting_cells,
+    llvm::SmallVectorImpl<uint64_t> &values, unsigned depth = 0,
+    const BinaryMemoryMap *binary_memory = nullptr) {
+  if (depth > 4 || expr.kind == VirtualExprKind::kUnknown)
+    return false;
+
+  llvm::SmallDenseSet<uint64_t, 8> unique_values;
+  auto append_value = [&](uint64_t value) {
+    value &= bitMask(expr.bit_width);
+    if (!unique_values.insert(value).second)
+      return true;
+    values.push_back(value);
+    return values.size() <= 4;
+  };
+
+  auto lookup_slot =
+      [&](unsigned slot_id, llvm::SmallVectorImpl<uint64_t> &slot_values) {
+        if (!visiting_slots.insert(slot_id).second)
+          return false;
+        auto pop_visit =
+            llvm::make_scope_exit([&] { visiting_slots.erase(slot_id); });
+        auto it = llvm::find_if(facts, [&](const VirtualSlotFact &fact) {
+          return fact.slot_id == slot_id;
+        });
+        if (it == facts.end())
+          return false;
+        return collectEvaluatedValueChoicesImpl(it->value, facts, stack_facts,
+                                                visiting_slots, visiting_cells,
+                                                slot_values, depth + 1,
+                                                binary_memory);
+      };
+
+  auto lookup_stack =
+      [&](unsigned cell_id, llvm::SmallVectorImpl<uint64_t> &cell_values) {
+        if (!visiting_cells.insert(cell_id).second)
+          return false;
+        auto pop_visit =
+            llvm::make_scope_exit([&] { visiting_cells.erase(cell_id); });
+        auto it = llvm::find_if(stack_facts, [&](const VirtualStackFact &fact) {
+          return fact.cell_id == cell_id;
+        });
+        if (it == stack_facts.end())
+          return false;
+        return collectEvaluatedValueChoicesImpl(it->value, facts, stack_facts,
+                                                visiting_slots, visiting_cells,
+                                                cell_values, depth + 1,
+                                                binary_memory);
+      };
+
+  auto collect_operand_choices =
+      [&](const VirtualValueExpr &operand,
+          llvm::SmallVectorImpl<uint64_t> &operand_values) {
+        llvm::SmallDenseSet<unsigned, 8> nested_slots = visiting_slots;
+        llvm::SmallDenseSet<unsigned, 8> nested_cells = visiting_cells;
+        return collectEvaluatedValueChoicesImpl(operand, facts, stack_facts,
+                                                nested_slots, nested_cells,
+                                                operand_values, depth + 1,
+                                                binary_memory);
+      };
+
+  switch (expr.kind) {
+    case VirtualExprKind::kConstant:
+      return expr.constant.has_value() && append_value(*expr.constant);
+    case VirtualExprKind::kStateSlot: {
+      if (!expr.slot_id.has_value())
+        return false;
+      return lookup_slot(*expr.slot_id, values);
+    }
+    case VirtualExprKind::kStackCell: {
+      if (!expr.stack_cell_id.has_value())
+        return false;
+      return lookup_stack(*expr.stack_cell_id, values);
+    }
+    case VirtualExprKind::kMemoryRead: {
+      if (!binary_memory || expr.operands.size() != 1)
+        return false;
+      llvm::SmallVector<uint64_t, 4> address_values;
+      if (!collect_operand_choices(expr.operands[0], address_values) ||
+          address_values.empty()) {
+        return false;
+      }
+      for (uint64_t address : address_values) {
+        auto loaded = readBinaryConstantExpr(*binary_memory, address,
+                                             expr.bit_width);
+        if (!loaded || !loaded->constant.has_value())
+          return false;
+        if (!append_value(*loaded->constant))
+          return false;
+      }
+      return !values.empty();
+    }
+    case VirtualExprKind::kZExt:
+    case VirtualExprKind::kSExt:
+    case VirtualExprKind::kTrunc: {
+      if (expr.operands.size() != 1)
+        return false;
+      llvm::SmallVector<uint64_t, 4> operand_values;
+      if (!collect_operand_choices(expr.operands[0], operand_values) ||
+          operand_values.empty()) {
+        return false;
+      }
+      unsigned source_bits = expr.operands.front().bit_width
+                                 ? expr.operands.front().bit_width
+                                 : expr.bit_width;
+      for (uint64_t value : operand_values) {
+        uint64_t casted = value;
+        switch (expr.kind) {
+          case VirtualExprKind::kZExt:
+            casted = value & bitMask(std::min(source_bits, expr.bit_width));
+            break;
+          case VirtualExprKind::kSExt:
+            casted = signExtendBits(value, source_bits) & bitMask(expr.bit_width);
+            break;
+          case VirtualExprKind::kTrunc:
+            casted = value & bitMask(expr.bit_width);
+            break;
+          default:
+            break;
+        }
+        if (!append_value(casted))
+          return false;
+      }
+      return !values.empty();
+    }
+    case VirtualExprKind::kAdd:
+    case VirtualExprKind::kSub:
+    case VirtualExprKind::kMul:
+    case VirtualExprKind::kXor:
+    case VirtualExprKind::kAnd:
+    case VirtualExprKind::kOr:
+    case VirtualExprKind::kShl:
+    case VirtualExprKind::kLShr:
+    case VirtualExprKind::kAShr:
+    case VirtualExprKind::kEq:
+    case VirtualExprKind::kNe:
+    case VirtualExprKind::kUlt:
+    case VirtualExprKind::kUle:
+    case VirtualExprKind::kUgt:
+    case VirtualExprKind::kUge:
+    case VirtualExprKind::kSlt:
+    case VirtualExprKind::kSle:
+    case VirtualExprKind::kSgt:
+    case VirtualExprKind::kSge: {
+      if (expr.operands.size() != 2)
+        return false;
+
+      // Bounded fallback: a single-bit mask always collapses to a finite
+      // two-value set even if the masked operand itself is not otherwise
+      // enumerable. This is enough to recover patterns like
+      // `base + zext((slot >> k) & 1)` as a 2-way dispatch choice.
+      if (expr.kind == VirtualExprKind::kAnd) {
+        const auto &lhs = expr.operands[0];
+        const auto &rhs = expr.operands[1];
+        auto append_mask_choices = [&](uint64_t mask) {
+          mask &= bitMask(expr.bit_width);
+          if (llvm::popcount(mask) != 1)
+            return false;
+          return append_value(0) && append_value(mask);
+        };
+        if (rhs.constant.has_value() && append_mask_choices(*rhs.constant))
+          return true;
+        if (lhs.constant.has_value() && append_mask_choices(*lhs.constant))
+          return true;
+      }
+
+      llvm::SmallVector<uint64_t, 4> lhs_values;
+      llvm::SmallVector<uint64_t, 4> rhs_values;
+      if (!collect_operand_choices(expr.operands[0], lhs_values) ||
+          !collect_operand_choices(expr.operands[1], rhs_values) ||
+          lhs_values.empty() || rhs_values.empty() ||
+          (lhs_values.size() * rhs_values.size()) > 4) {
+        return false;
+      }
+
+      auto apply_binary = [&](uint64_t lhs, uint64_t rhs) -> uint64_t {
+        switch (expr.kind) {
+          case VirtualExprKind::kAdd:
+            return lhs + rhs;
+          case VirtualExprKind::kSub:
+            return lhs - rhs;
+          case VirtualExprKind::kMul:
+            return lhs * rhs;
+          case VirtualExprKind::kXor:
+            return lhs ^ rhs;
+          case VirtualExprKind::kAnd:
+            return lhs & rhs;
+          case VirtualExprKind::kOr:
+            return lhs | rhs;
+          case VirtualExprKind::kShl:
+            return rhs < 64 ? (lhs << rhs) : 0ULL;
+          case VirtualExprKind::kLShr:
+            return rhs < 64 ? (lhs >> rhs) : 0ULL;
+          case VirtualExprKind::kAShr:
+            if (rhs >= 64)
+              return (lhs & (1ULL << 63)) ? ~0ULL : 0ULL;
+            return static_cast<uint64_t>(static_cast<int64_t>(lhs) >>
+                                         static_cast<int64_t>(rhs));
+          case VirtualExprKind::kEq:
+            return static_cast<uint64_t>(lhs == rhs);
+          case VirtualExprKind::kNe:
+            return static_cast<uint64_t>(lhs != rhs);
+          case VirtualExprKind::kUlt:
+            return static_cast<uint64_t>(lhs < rhs);
+          case VirtualExprKind::kUle:
+            return static_cast<uint64_t>(lhs <= rhs);
+          case VirtualExprKind::kUgt:
+            return static_cast<uint64_t>(lhs > rhs);
+          case VirtualExprKind::kUge:
+            return static_cast<uint64_t>(lhs >= rhs);
+          case VirtualExprKind::kSlt:
+            return static_cast<uint64_t>(static_cast<int64_t>(lhs) <
+                                         static_cast<int64_t>(rhs));
+          case VirtualExprKind::kSle:
+            return static_cast<uint64_t>(static_cast<int64_t>(lhs) <=
+                                         static_cast<int64_t>(rhs));
+          case VirtualExprKind::kSgt:
+            return static_cast<uint64_t>(static_cast<int64_t>(lhs) >
+                                         static_cast<int64_t>(rhs));
+          case VirtualExprKind::kSge:
+            return static_cast<uint64_t>(static_cast<int64_t>(lhs) >=
+                                         static_cast<int64_t>(rhs));
+          default:
+            return 0;
+        }
+      };
+
+      for (uint64_t lhs : lhs_values) {
+        for (uint64_t rhs : rhs_values) {
+          if (!append_value(apply_binary(lhs, rhs)))
+            return false;
+        }
+      }
+      return !values.empty();
+    }
+    case VirtualExprKind::kSelect: {
+      if (expr.operands.size() != 3)
+        return false;
+      llvm::SmallVector<uint64_t, 4> cond_values;
+      llvm::SmallVector<uint64_t, 4> true_values;
+      llvm::SmallVector<uint64_t, 4> false_values;
+      if (!collect_operand_choices(expr.operands[0], cond_values) ||
+          !collect_operand_choices(expr.operands[1], true_values) ||
+          !collect_operand_choices(expr.operands[2], false_values) ||
+          cond_values.empty()) {
+        return false;
+      }
+      for (uint64_t cond : cond_values) {
+        auto &branch_values = cond ? true_values : false_values;
+        for (uint64_t value : branch_values) {
+          if (!append_value(value))
+            return false;
+        }
+      }
+      return !values.empty();
+    }
+    case VirtualExprKind::kPhi: {
+      if (expr.operands.empty() || expr.operands.size() > 4)
+        return false;
+      for (const auto &operand : expr.operands) {
+        llvm::SmallVector<uint64_t, 4> operand_values;
+        if (!collect_operand_choices(operand, operand_values))
+          return false;
+        for (uint64_t value : operand_values) {
+          if (!append_value(value))
+            return false;
+        }
+      }
+      return !values.empty();
+    }
+    default:
+      return false;
+  }
+}
+
+static bool collectEvaluatedValueChoices(const VirtualValueExpr &expr,
+                                         const std::vector<VirtualSlotFact> &facts,
+                                         const std::vector<VirtualStackFact> &stack_facts,
+                                         llvm::SmallVectorImpl<uint64_t> &values,
+                                         const BinaryMemoryMap *binary_memory = nullptr) {
+  llvm::SmallDenseSet<unsigned, 8> visiting_slots;
+  llvm::SmallDenseSet<unsigned, 8> visiting_cells;
+  return collectEvaluatedValueChoicesImpl(expr, facts, stack_facts,
+                                          visiting_slots, visiting_cells,
+                                          values, /*depth=*/0, binary_memory);
 }
 
 static VirtualValueExpr specializeExpr(
@@ -1719,7 +2788,38 @@ static VirtualValueExpr specializeExpr(
         result.bit_width);
   };
 
+  auto fold_unary = [&](auto fn) -> std::optional<VirtualValueExpr> {
+    if (result.operands.size() != 1 || !result.operands[0].constant.has_value())
+      return std::nullopt;
+    return constantExpr(fn(*result.operands[0].constant) &
+                            bitMask(result.bit_width),
+                        result.bit_width);
+  };
+
   switch (result.kind) {
+    case VirtualExprKind::kZExt:
+      if (auto folded = fold_unary([&](uint64_t value) {
+            unsigned source_bits = result.operands.front().bit_width
+                                       ? result.operands.front().bit_width
+                                       : result.bit_width;
+            return value & bitMask(std::min(source_bits, result.bit_width));
+          }))
+        return *folded;
+      break;
+    case VirtualExprKind::kSExt:
+      if (auto folded = fold_unary([&](uint64_t value) {
+            unsigned source_bits = result.operands.front().bit_width
+                                       ? result.operands.front().bit_width
+                                       : result.bit_width;
+            return signExtendBits(value, source_bits);
+          }))
+        return *folded;
+      break;
+    case VirtualExprKind::kTrunc:
+      if (auto folded =
+              fold_unary([&](uint64_t value) { return value & bitMask(result.bit_width); }))
+        return *folded;
+      break;
     case VirtualExprKind::kAdd:
       if (auto folded = fold_binary([](uint64_t a, uint64_t b) { return a + b; }))
         return *folded;
@@ -1743,6 +2843,14 @@ static VirtualValueExpr specializeExpr(
     case VirtualExprKind::kOr:
       if (auto folded = fold_binary([](uint64_t a, uint64_t b) { return a | b; }))
         return *folded;
+      if (auto rebuilt = simplifyMaskedLowBitReconstruction(
+              result.operands[0], result.operands[1], result.bit_width)) {
+        return *rebuilt;
+      }
+      if (auto rebuilt = simplifyMaskedLowBitReconstruction(
+              result.operands[1], result.operands[0], result.bit_width)) {
+        return *rebuilt;
+      }
       break;
     case VirtualExprKind::kShl:
       if (auto folded =
@@ -1867,6 +2975,9 @@ static VirtualValueExpr specializeExprToFixpoint(
   annotateExprSlots(expr, slot_ids);
   annotateExprStackCells(expr, stack_cell_ids, slot_ids);
   auto specialized = specializeExpr(expr, incoming, incoming_stack, incoming_args);
+  annotateExprSlots(specialized, slot_ids);
+  annotateExprStackCells(specialized, stack_cell_ids, slot_ids);
+  canonicalizeMemoryReadsToStackCells(specialized, stack_cell_ids, slot_ids);
   annotateExprSlots(specialized, slot_ids);
   annotateExprStackCells(specialized, stack_cell_ids, slot_ids);
   return specialized;
@@ -2321,10 +3432,27 @@ static unsigned rebaseSingleStackCellId(
   return rebased.empty() ? cell_id : *rebased.begin();
 }
 
-struct CallsiteLocalizedOutgoingFacts {
-  std::map<unsigned, VirtualValueExpr> outgoing_slots;
-  std::map<unsigned, VirtualValueExpr> outgoing_stack;
+struct LocalizedReplayCacheState {
+  std::map<std::string, std::optional<CallsiteLocalizedOutgoingFacts>>
+      top_level_entries;
+  unsigned top_level_hits = 0;
+  unsigned top_level_misses = 0;
 };
+
+struct OutgoingFactsCacheState {
+  std::map<std::string, CachedOutgoingFactsEntry> entries;
+  unsigned hits = 0;
+  unsigned misses = 0;
+};
+
+static void appendExprMapCacheKey(
+    llvm::raw_ostream &os, const std::map<unsigned, VirtualValueExpr> &facts,
+    llvm::StringRef label) {
+  os << label << "{";
+  for (const auto &[id, value] : facts)
+    os << id << "=" << renderVirtualValueExpr(value) << ";";
+  os << "}";
+}
 
 static std::vector<VirtualSlotFact> slotFactsForMap(
     const std::map<unsigned, VirtualValueExpr> &facts);
@@ -2334,7 +3462,7 @@ static std::vector<VirtualStackFact> stackFactsForMap(
 
 static constexpr unsigned kMaxCallsiteLocalizationDepth = 4;
 static constexpr unsigned kMaxLocalizedDirectCallees = 8;
-static constexpr unsigned kMaxLocalizedLeafHelperInstructions = 32;
+static constexpr unsigned kMaxLocalizedLeafHelperInstructions = 64;
 static constexpr unsigned kMaxLocalizedSingleBlockHandlerInstructions = 96;
 
 static std::optional<llvm::SmallVector<llvm::BasicBlock *, 4>>
@@ -2511,7 +3639,8 @@ computeResolvedCallTargetOutgoingFacts(
     const std::map<unsigned, VirtualValueExpr> &caller_outgoing,
     const std::map<unsigned, VirtualValueExpr> &caller_outgoing_stack,
     const std::map<unsigned, VirtualValueExpr> &caller_argument_map,
-    const ResolvedCallSiteInfo &callsite, unsigned depth,
+    const ResolvedCallSiteInfo &callsite,
+    const BinaryMemoryMap &binary_memory, unsigned depth,
     llvm::SmallPtrSetImpl<const llvm::Function *> &visiting);
 
 static std::optional<CallsiteLocalizedOutgoingFacts>
@@ -2528,7 +3657,8 @@ computeEntryPreludeCallOutgoingFacts(
     const std::map<unsigned, VirtualValueExpr> &caller_incoming,
     const std::map<unsigned, VirtualValueExpr> &caller_incoming_stack,
     const std::map<unsigned, VirtualValueExpr> &caller_argument_map,
-    uint64_t continuation_pc, unsigned depth,
+    uint64_t continuation_pc, const BinaryMemoryMap &binary_memory,
+    unsigned depth,
     llvm::SmallPtrSetImpl<const llvm::Function *> &visiting);
 
 static void applyLocalizedCallsiteReturnEffects(
@@ -2546,7 +3676,8 @@ static void applyLocalizedCallsiteReturnEffects(
     const std::map<unsigned, VirtualValueExpr> &caller_argument_map,
     std::map<unsigned, VirtualValueExpr> &caller_outgoing,
     std::map<unsigned, VirtualValueExpr> &caller_outgoing_stack,
-    unsigned depth, llvm::SmallPtrSetImpl<const llvm::Function *> &visiting);
+    const BinaryMemoryMap &binary_memory, unsigned depth,
+    llvm::SmallPtrSetImpl<const llvm::Function *> &visiting);
 
 static VirtualValueExpr remapCalleeExprToCaller(
     const VirtualValueExpr &expr, llvm::CallBase &call,
@@ -2590,6 +3721,7 @@ computeCallsiteLocalizedOutgoingFacts(
     const std::map<unsigned, VirtualValueExpr> &caller_outgoing,
     const std::map<unsigned, VirtualValueExpr> &caller_outgoing_stack,
     const std::map<unsigned, VirtualValueExpr> &caller_argument_map,
+    const BinaryMemoryMap &binary_memory,
     unsigned depth,
     llvm::SmallPtrSetImpl<const llvm::Function *> &visiting);
 
@@ -2606,7 +3738,8 @@ static bool applySingleDirectCalleeEffects(
     const std::map<unsigned, const VirtualStateSlotInfo *> &slot_info,
     const std::map<StackCellKey, unsigned> &stack_cell_ids,
     const std::map<unsigned, const VirtualStackCellInfo *> &stack_cell_info,
-    const llvm::DataLayout &dl, unsigned depth,
+    const llvm::DataLayout &dl, const BinaryMemoryMap &binary_memory,
+    unsigned depth,
     llvm::SmallPtrSetImpl<const llvm::Function *> &visiting) {
   auto *callee = call.getCalledFunction();
   if (!callee)
@@ -2617,17 +3750,28 @@ static bool applySingleDirectCalleeEffects(
     return false;
 
   const auto &callee_summary = model.handlers()[callee_it->second];
-  const auto specialized_call_args = buildSpecializedCallArgumentMap(
-      call, dl, slot_ids, stack_cell_ids, caller_outgoing,
-      caller_outgoing_stack, caller_argument_map);
+  const auto native_sp_offset = nativeStackPointerOffsetForValue(&call);
+  const auto specialized_call_args = [&]() {
+    if (native_sp_offset.has_value()) {
+      auto local_call_state = computeLocalFactsBeforeCall(
+          call, dl, slot_ids, stack_cell_ids, caller_outgoing,
+          caller_outgoing_stack, caller_argument_map);
+      return buildSpecializedCallArgumentMap(
+          call, dl, slot_ids, stack_cell_ids, local_call_state.slot_facts,
+          local_call_state.stack_facts, caller_argument_map);
+    }
+    return buildSpecializedCallArgumentMap(
+        call, dl, slot_ids, stack_cell_ids, caller_outgoing,
+        caller_outgoing_stack, caller_argument_map);
+  }();
   llvm::SmallDenseSet<unsigned, 16> written_slots(
       callee_summary.written_slot_ids.begin(),
       callee_summary.written_slot_ids.end());
   auto localized_outgoing = computeCallsiteLocalizedOutgoingFacts(
       call, model, callee_summary, slot_info, stack_cell_info, slot_ids,
       stack_cell_ids, dl, handler_index, outgoing_maps, outgoing_stack_maps,
-      caller_outgoing, caller_outgoing_stack, caller_argument_map, depth + 1,
-      visiting);
+      caller_outgoing, caller_outgoing_stack, caller_argument_map,
+      binary_memory, depth + 1, visiting);
   const auto &callee_outgoing_map =
       localized_outgoing ? localized_outgoing->outgoing_slots
                          : outgoing_maps[callee_it->second];
@@ -2637,13 +3781,15 @@ static bool applySingleDirectCalleeEffects(
   if (localized_outgoing) {
     vmModelImportDebugLog("callsite-local effects call=" +
                           callee->getName().str());
+    written_slots = llvm::SmallDenseSet<unsigned, 16>(
+        localized_outgoing->written_slot_ids.begin(),
+        localized_outgoing->written_slot_ids.end());
   }
   llvm::SmallDenseSet<unsigned, 16> written_stack_cells;
   if (localized_outgoing) {
-    for (const auto &[cell_id, value] : callee_outgoing_stack_map) {
-      (void) value;
-      written_stack_cells.insert(cell_id);
-    }
+    written_stack_cells = llvm::SmallDenseSet<unsigned, 16>(
+        localized_outgoing->written_stack_cell_ids.begin(),
+        localized_outgoing->written_stack_cell_ids.end());
   } else {
     written_stack_cells = rebaseWrittenStackCellIds(
         model, callee_outgoing_map, callee_summary.written_stack_cell_ids);
@@ -2691,11 +3837,8 @@ static bool applySingleDirectCalleeEffects(
                   callee_value, call, slot_info, stack_cell_info, slot_ids,
                   stack_cell_ids, dl, caller_outgoing, caller_outgoing_stack,
                   caller_argument_map);
-    if (localized_outgoing &&
-        (!specialized.has_value() ||
-         (specialized.has_value() &&
-          (isUnknownLikeExpr(*specialized) ||
-           !isBoundedStateProvenanceExpr(*specialized))))) {
+    if (localized_outgoing && specialized.has_value() &&
+        containsArgumentExpr(*specialized)) {
       if (auto remapped = normalizeImportedExprForCaller(
               callee_value, call, slot_info, stack_cell_info, slot_ids,
               stack_cell_ids, dl, caller_outgoing, caller_outgoing_stack,
@@ -2703,8 +3846,24 @@ static bool applySingleDirectCalleeEffects(
         specialized = std::move(remapped);
       }
     }
+    if (localized_outgoing &&
+        (!specialized.has_value() ||
+         (specialized.has_value() &&
+          (isUnknownLikeExpr(*specialized) ||
+           !isBoundedLocalizedTransferExpr(*specialized))))) {
+      if (auto remapped = normalizeImportedExprForCaller(
+              callee_value, call, slot_info, stack_cell_info, slot_ids,
+              stack_cell_ids, dl, caller_outgoing, caller_outgoing_stack,
+              caller_argument_map)) {
+        specialized = std::move(remapped);
+      }
+    }
+    bool acceptable =
+        specialized.has_value() &&
+        (localized_outgoing ? isBoundedLocalizedTransferExpr(*specialized)
+                            : isBoundedStateProvenanceExpr(*specialized));
     if (!specialized.has_value() || isUnknownLikeExpr(*specialized) ||
-        !isBoundedStateProvenanceExpr(*specialized)) {
+        !acceptable) {
       if (vmModelImportDebugEnabled()) {
         std::string reason = !specialized.has_value()
                                  ? "no-specialized"
@@ -2733,7 +3892,31 @@ static bool applySingleDirectCalleeEffects(
                           slot_info.at(*mapped_slot_id)->base_name + "+" +
                           std::to_string(slot_info.at(*mapped_slot_id)->offset) +
                           ")");
-    caller_outgoing[*mapped_slot_id] = std::move(*specialized);
+    unsigned mapped_bits =
+        slot_info.at(*mapped_slot_id)->width
+            ? (slot_info.at(*mapped_slot_id)->width * 8u)
+            : 0u;
+    unsigned callee_bits =
+        slot_info_it->second->width ? (slot_info_it->second->width * 8u) : 0u;
+    if (mapped_bits > callee_bits) {
+      auto existing_wide = caller_outgoing.find(*mapped_slot_id);
+      if (existing_wide == caller_outgoing.end())
+        continue;
+      auto merged = mergeLowBitsIntoWiderStateExpr(
+          existing_wide->second, mapped_bits, *specialized, callee_bits,
+          *mapped_slot_id);
+      if (!merged)
+        continue;
+      caller_outgoing[*mapped_slot_id] = std::move(*merged);
+    } else if (mapped_bits != 0 && callee_bits > mapped_bits) {
+      caller_outgoing[*mapped_slot_id] =
+          castExprToBitWidth(*specialized, mapped_bits);
+    } else {
+      caller_outgoing[*mapped_slot_id] = std::move(*specialized);
+    }
+    propagateAliasedStateSlotWrite(caller_outgoing, *mapped_slot_id,
+                                   caller_outgoing.at(*mapped_slot_id),
+                                   slot_info);
   }
 
   for (const auto &[callee_cell_id, callee_value] : callee_outgoing_stack_map) {
@@ -2794,11 +3977,8 @@ static bool applySingleDirectCalleeEffects(
                   callee_value, call, slot_info, stack_cell_info, slot_ids,
                   stack_cell_ids, dl, caller_outgoing, caller_outgoing_stack,
                   caller_argument_map);
-    if (localized_outgoing &&
-        (!specialized.has_value() ||
-         (specialized.has_value() &&
-          (isUnknownLikeExpr(*specialized) ||
-           !isBoundedStateProvenanceExpr(*specialized))))) {
+    if (localized_outgoing && specialized.has_value() &&
+        containsArgumentExpr(*specialized)) {
       if (auto remapped = normalizeImportedExprForCaller(
               callee_value, call, slot_info, stack_cell_info, slot_ids,
               stack_cell_ids, dl, caller_outgoing, caller_outgoing_stack,
@@ -2806,8 +3986,24 @@ static bool applySingleDirectCalleeEffects(
         specialized = std::move(remapped);
       }
     }
+    if (localized_outgoing &&
+        (!specialized.has_value() ||
+         (specialized.has_value() &&
+          (isUnknownLikeExpr(*specialized) ||
+           !isBoundedLocalizedTransferExpr(*specialized))))) {
+      if (auto remapped = normalizeImportedExprForCaller(
+              callee_value, call, slot_info, stack_cell_info, slot_ids,
+              stack_cell_ids, dl, caller_outgoing, caller_outgoing_stack,
+              caller_argument_map)) {
+        specialized = std::move(remapped);
+      }
+    }
+    bool acceptable =
+        specialized.has_value() &&
+        (localized_outgoing ? isBoundedLocalizedTransferExpr(*specialized)
+                            : isBoundedStateProvenanceExpr(*specialized));
     if (!specialized.has_value() || isUnknownLikeExpr(*specialized) ||
-        !isBoundedStateProvenanceExpr(*specialized)) {
+        !acceptable) {
       continue;
     }
     auto existing = caller_outgoing_stack.find(*mapped_cell_id);
@@ -2845,7 +4041,8 @@ static void applyDirectCalleeEffectsImpl(
     const std::map<unsigned, const VirtualStateSlotInfo *> &slot_info,
     const std::map<StackCellKey, unsigned> &stack_cell_ids,
     const std::map<unsigned, const VirtualStackCellInfo *> &stack_cell_info,
-    const llvm::DataLayout &dl, unsigned depth,
+    const llvm::DataLayout &dl, const BinaryMemoryMap &binary_memory,
+    unsigned depth,
     llvm::SmallPtrSetImpl<const llvm::Function *> &visiting) {
   for (auto &BB : caller_fn) {
     for (auto &I : BB) {
@@ -2859,7 +4056,7 @@ static void applyDirectCalleeEffectsImpl(
               caller_fn, *call, model, handler_index, outgoing_maps,
               outgoing_stack_maps, caller_argument_map, caller_outgoing,
               caller_outgoing_stack, slot_ids, slot_info, stack_cell_ids,
-              stack_cell_info, dl, depth, visiting)) {
+              stack_cell_info, dl, binary_memory, depth, visiting)) {
         continue;
       }
 
@@ -2883,7 +4080,7 @@ static void applyDirectCalleeEffectsImpl(
           *call, model, *target_summary, slot_info, stack_cell_info, slot_ids,
           stack_cell_ids, dl, handler_index, outgoing_maps, outgoing_stack_maps,
           caller_outgoing, caller_outgoing_stack, caller_argument_map, callsite,
-          depth + 1, visiting);
+          binary_memory, depth + 1, visiting);
       if (!localized_outgoing)
         continue;
 
@@ -2908,7 +4105,7 @@ static void applyDirectCalleeEffectsImpl(
             value, caller_fn, slot_ids, stack_cell_ids, caller_outgoing,
             caller_outgoing_stack, caller_argument_map);
         if (!specialized.has_value() || isUnknownLikeExpr(*specialized) ||
-            !isBoundedStateProvenanceExpr(*specialized)) {
+            !isBoundedLocalizedTransferExpr(*specialized)) {
           continue;
         }
         auto existing = caller_outgoing.find(slot_id);
@@ -2930,7 +4127,7 @@ static void applyDirectCalleeEffectsImpl(
             value, caller_fn, slot_ids, stack_cell_ids, caller_outgoing,
             caller_outgoing_stack, caller_argument_map);
         if (!specialized.has_value() || isUnknownLikeExpr(*specialized) ||
-            !isBoundedStateProvenanceExpr(*specialized)) {
+            !isBoundedLocalizedTransferExpr(*specialized)) {
           continue;
         }
         auto existing = caller_outgoing_stack.find(cell_id);
@@ -3060,7 +4257,7 @@ static uint64_t nearbyEntrySearchWindow(TargetArch arch) {
       return 4;
     case TargetArch::kX86_64:
     default:
-      return 15;
+      return 64;
   }
 }
 
@@ -3146,6 +4343,7 @@ static LocalCallSiteState computeLocalFactsBeforeCall(
   auto *block = call.getParent();
   if (!block)
     return state;
+  const auto native_sp_offset = nativeStackPointerOffsetForValue(&call);
 
   auto record_value = [&](llvm::Value *value) {
     auto expr = summarizeValueExpr(value, dl);
@@ -3172,7 +4370,8 @@ static LocalCallSiteState computeLocalFactsBeforeCall(
       }
       auto pointer_expr = summarizeValueExpr(store->getPointerOperand(), dl);
       if (auto cell = extractStackCellSummaryFromExpr(pointer_expr,
-                                                      width.getFixedValue())) {
+                                                      width.getFixedValue(),
+                                                      native_sp_offset)) {
         auto cell_id = lookupStackCellIdForSummary(*cell, stack_cell_ids);
         if (!cell_id)
           continue;
@@ -3191,7 +4390,8 @@ static LocalCallSiteState computeLocalFactsBeforeCall(
     unsigned width_bits = remillMemoryBitWidth(callee->getName()).value_or(0);
     unsigned width_bytes = width_bits / 8;
     auto address_expr = summarizeValueExpr(cb->getArgOperand(1), dl);
-    if (auto cell = extractStackCellSummaryFromExpr(address_expr, width_bytes)) {
+    if (auto cell = extractStackCellSummaryFromExpr(address_expr, width_bytes,
+                                                    native_sp_offset)) {
       auto cell_id = lookupStackCellIdForSummary(*cell, stack_cell_ids);
       if (!cell_id)
         continue;
@@ -3256,10 +4456,12 @@ computeLocalizedSingleBlockOutgoingFacts(
     const std::map<std::string, size_t> &handler_index,
     const std::vector<std::map<unsigned, VirtualValueExpr>> &outgoing_maps,
     const std::vector<std::map<unsigned, VirtualValueExpr>> &outgoing_stack_maps,
+    const BinaryMemoryMap &binary_memory,
     unsigned depth, llvm::SmallPtrSetImpl<const llvm::Function *> &visiting,
     llvm::CallBase *localizing_call = nullptr,
     const std::map<unsigned, VirtualValueExpr> *caller_stack_facts = nullptr,
-    const std::map<unsigned, VirtualValueExpr> *caller_slot_facts = nullptr) {
+    const std::map<unsigned, VirtualValueExpr> *caller_slot_facts = nullptr,
+    LocalizedReplayCacheState *localized_replay_cache = nullptr) {
   (void) summary;
   (void) localizing_call;
   (void) caller_stack_facts;
@@ -3269,6 +4471,7 @@ computeLocalizedSingleBlockOutgoingFacts(
     return std::nullopt;
 
   const auto &dl = F.getParent()->getDataLayout();
+  const auto native_sp_offset = lookupNativeStackPointerOffset(*F.getParent());
   const auto slot_info = buildSlotInfoMap(model);
   const auto stack_cell_info = buildStackCellInfoMap(model);
   struct LocalLeafReplayState {
@@ -3280,6 +4483,8 @@ computeLocalizedSingleBlockOutgoingFacts(
   LocalLeafReplayState state;
   state.slot_facts = incoming_slots;
   state.stack_facts = incoming_stack;
+  std::set<unsigned> localized_written_slot_ids;
+  std::set<unsigned> localized_written_stack_cell_ids;
   auto normalize_expr = [&](VirtualValueExpr expr,
                             unsigned fallback_bits = 0u) {
     if (!expr.bit_width)
@@ -3479,7 +4684,8 @@ computeLocalizedSingleBlockOutgoingFacts(
       annotateExprSlots(actual_expr, slot_ids);
       annotateExprStackCells(actual_expr, stack_cell_ids, slot_ids);
       if (auto actual_cell = extractStackCellSummaryFromExpr(actual_expr,
-                                                             cell.width)) {
+                                                             cell.width,
+                                                             native_sp_offset)) {
         mapped_cell.base_name = actual_cell->base_name;
         mapped_cell.base_offset += actual_cell->base_offset;
         mapped_cell.base_width = actual_cell->base_width;
@@ -3615,9 +4821,28 @@ computeLocalizedSingleBlockOutgoingFacts(
       auto pointer_expr = eval_value(load->getPointerOperand());
       if (!pointer_expr)
         return std::nullopt;
+      if (auto pointer_slot =
+              extractStateSlotSummaryFromExpr(*pointer_expr, slot_info)) {
+        pointer_slot->width = width.getFixedValue();
+        auto canonical_slot = canonicalize_slot(*pointer_slot);
+        VirtualValueExpr result = stateSlotExpr(canonical_slot);
+        if (canonical_slot.canonical_id.has_value()) {
+          if (auto it = state.slot_facts.find(*canonical_slot.canonical_id);
+              it != state.slot_facts.end()) {
+            result = normalize_expr(it->second, width.getFixedValue() * 8u);
+          } else {
+            result = normalize_expr(result, width.getFixedValue() * 8u);
+          }
+        } else {
+          result = normalize_expr(result, width.getFixedValue() * 8u);
+        }
+        cache_instruction_expr(result);
+        return result;
+      }
       if (auto cell =
               extractStackCellSummaryFromExpr(*pointer_expr,
-                                             width.getFixedValue())) {
+                                             width.getFixedValue(),
+                                             native_sp_offset)) {
         auto canonical_cell = canonicalize_cell(*cell);
         VirtualValueExpr result = stackCellExpr(canonical_cell);
         if (canonical_cell.canonical_id.has_value()) {
@@ -3666,8 +4891,8 @@ computeLocalizedSingleBlockOutgoingFacts(
           auto inner = eval_value(cast->getOperand(0));
           if (!inner)
             return std::nullopt;
-          auto result = *inner;
-          result.bit_width = getValueBitWidth(value, dl);
+          auto result =
+              castExpr(*inner, cast->getOpcode(), getValueBitWidth(value, dl));
           result = normalize_expr(result, result.bit_width);
           cache_instruction_expr(result);
           return result;
@@ -3777,9 +5002,52 @@ computeLocalizedSingleBlockOutgoingFacts(
         auto address_expr = eval_value(call->getArgOperand(1));
         if (!address_expr)
           return std::nullopt;
+        if (auto constant_addr = resolveSpecializedExprToConstant(
+                *address_expr, state.slot_facts, state.stack_facts)) {
+          if (auto folded =
+                  readBinaryConstantExpr(binary_memory, *constant_addr,
+                                         width_bits)) {
+            auto result = normalize_expr(*folded, width_bits);
+            cache_instruction_expr(result);
+            return result;
+          }
+        }
+        auto slot_fact_values = slotFactsForMap(state.slot_facts);
+        auto stack_fact_values = stackFactsForMap(state.stack_facts);
+        llvm::SmallVector<uint64_t, 4> address_choices;
+        if (collectEvaluatedValueChoices(*address_expr, slot_fact_values,
+                                         stack_fact_values, address_choices) &&
+            !address_choices.empty() && address_choices.size() <= 4) {
+          llvm::SmallVector<VirtualValueExpr, 4> loaded_choices;
+          for (uint64_t address_choice : address_choices) {
+            auto folded =
+                readBinaryConstantExpr(binary_memory, address_choice, width_bits);
+            if (!folded.has_value()) {
+              loaded_choices.clear();
+              break;
+            }
+            loaded_choices.push_back(*folded);
+          }
+          if (!loaded_choices.empty()) {
+            VirtualValueExpr result;
+            if (loaded_choices.size() == 1) {
+              result = loaded_choices.front();
+            } else {
+              result.kind = VirtualExprKind::kPhi;
+              result.bit_width = width_bits;
+              result.complete = true;
+              result.operands.assign(loaded_choices.begin(),
+                                     loaded_choices.end());
+            }
+            result = normalize_expr(result, width_bits);
+            cache_instruction_expr(result);
+            return result;
+          }
+        }
         if (auto cell =
                 extractStackCellSummaryFromExpr(*address_expr,
-                                               width_bytes)) {
+                                               width_bytes,
+                                               native_sp_offset)) {
           auto canonical_cell = canonicalize_cell(*cell);
           VirtualValueExpr result = stackCellExpr(canonical_cell);
           if (canonical_cell.canonical_id.has_value()) {
@@ -3814,7 +5082,14 @@ computeLocalizedSingleBlockOutgoingFacts(
           cache_instruction_expr(result);
           return result;
         }
-        return std::nullopt;
+        VirtualValueExpr result;
+        result.kind = VirtualExprKind::kMemoryRead;
+        result.bit_width = width_bits;
+        result.complete = address_expr->complete;
+        result.operands.push_back(*address_expr);
+        result = normalize_expr(result, width_bits);
+        cache_instruction_expr(result);
+        return result;
       }
 
       if (isRemillWriteMemoryIntrinsic(*callee) && call->arg_size() >= 1) {
@@ -3904,6 +5179,10 @@ computeLocalizedSingleBlockOutgoingFacts(
             return std::nullopt;
           }
           state.slot_facts[*canonical_slot.canonical_id] = normalized_value;
+          localized_written_slot_ids.insert(*canonical_slot.canonical_id);
+          propagateAliasedStateSlotWrite(
+              state.slot_facts, *canonical_slot.canonical_id, normalized_value,
+              slot_info);
           vmModelLocalReplayDebugLog("helper=" + F.getName().str() + " " +
                                      render_update("slot",
                                                    *canonical_slot.canonical_id,
@@ -3917,8 +5196,29 @@ computeLocalizedSingleBlockOutgoingFacts(
                                      " reason=store-pointer");
           return std::nullopt;
         }
+        if (auto pointer_slot =
+                extractStateSlotSummaryFromExpr(*pointer_expr, slot_info)) {
+          pointer_slot->width = width.getFixedValue();
+          auto canonical_slot = canonicalize_slot(*pointer_slot);
+          if (!canonical_slot.canonical_id.has_value()) {
+            vmModelLocalReplayDebugLog("bail helper=" + F.getName().str() +
+                                       " reason=unknown-store-slot");
+            return std::nullopt;
+          }
+          state.slot_facts[*canonical_slot.canonical_id] = normalized_value;
+          localized_written_slot_ids.insert(*canonical_slot.canonical_id);
+          propagateAliasedStateSlotWrite(
+              state.slot_facts, *canonical_slot.canonical_id, normalized_value,
+              slot_info);
+          vmModelLocalReplayDebugLog("helper=" + F.getName().str() + " " +
+                                     render_update("slot",
+                                                   *canonical_slot.canonical_id,
+                                                   normalized_value));
+          continue;
+        }
         auto cell = extractStackCellSummaryFromExpr(*pointer_expr,
-                                                    width.getFixedValue());
+                                                    width.getFixedValue(),
+                                                    native_sp_offset);
         if (!cell) {
           vmModelLocalReplayDebugLog("bail helper=" + F.getName().str() +
                                      " reason=store-target");
@@ -3931,6 +5231,7 @@ computeLocalizedSingleBlockOutgoingFacts(
           return std::nullopt;
         }
         state.stack_facts[*canonical_cell.canonical_id] = normalized_value;
+        localized_written_stack_cell_ids.insert(*canonical_cell.canonical_id);
         vmModelLocalReplayDebugLog("helper=" + F.getName().str() + " " +
                                    render_update("cell",
                                                  *canonical_cell.canonical_id,
@@ -3971,7 +5272,8 @@ computeLocalizedSingleBlockOutgoingFacts(
         auto normalized_value = *value_expr;
         if (!normalized_value.bit_width)
           normalized_value.bit_width = std::max(1u, width_bits);
-        auto cell = extractStackCellSummaryFromExpr(*address_expr, width_bytes);
+        auto cell = extractStackCellSummaryFromExpr(*address_expr, width_bytes,
+                                                    native_sp_offset);
         if (!cell) {
           vmModelLocalReplayDebugLog("bail helper=" + F.getName().str() +
                                      " reason=write-memory-target");
@@ -3984,6 +5286,7 @@ computeLocalizedSingleBlockOutgoingFacts(
           return std::nullopt;
         }
         state.stack_facts[*canonical_cell.canonical_id] = normalized_value;
+        localized_written_stack_cell_ids.insert(*canonical_cell.canonical_id);
         vmModelLocalReplayDebugLog("helper=" + F.getName().str() + " " +
                                    render_update("cell",
                                                  *canonical_cell.canonical_id,
@@ -3991,11 +5294,27 @@ computeLocalizedSingleBlockOutgoingFacts(
         continue;
       }
 
+      auto slot_facts_before_call = state.slot_facts;
+      auto stack_facts_before_call = state.stack_facts;
       if (applySingleDirectCalleeEffects(
               F, *call, model, handler_index, outgoing_maps,
               outgoing_stack_maps, incoming_args, state.slot_facts,
               state.stack_facts, slot_ids, slot_info, stack_cell_ids,
-              stack_cell_info, dl, depth, visiting)) {
+              stack_cell_info, dl, binary_memory, depth, visiting)) {
+        for (const auto &[slot_id, value] : state.slot_facts) {
+          auto before_it = slot_facts_before_call.find(slot_id);
+          if (before_it == slot_facts_before_call.end() ||
+              !exprEquals(before_it->second, value)) {
+            localized_written_slot_ids.insert(slot_id);
+          }
+        }
+        for (const auto &[cell_id, value] : state.stack_facts) {
+          auto before_it = stack_facts_before_call.find(cell_id);
+          if (before_it == stack_facts_before_call.end() ||
+              !exprEquals(before_it->second, value)) {
+            localized_written_stack_cell_ids.insert(cell_id);
+          }
+        }
         specializeFactStateToFixpoint(state.slot_facts, state.stack_facts,
                                       &incoming_args, slot_ids,
                                       stack_cell_ids);
@@ -4015,6 +5334,8 @@ computeLocalizedSingleBlockOutgoingFacts(
   CallsiteLocalizedOutgoingFacts localized;
   localized.outgoing_slots = std::move(state.slot_facts);
   localized.outgoing_stack = std::move(state.stack_facts);
+  localized.written_slot_ids = std::move(localized_written_slot_ids);
+  localized.written_stack_cell_ids = std::move(localized_written_stack_cell_ids);
   return localized;
 }
 
@@ -4265,6 +5586,7 @@ computeCallsiteLocalizedOutgoingFacts(
     const std::map<unsigned, VirtualValueExpr> &caller_outgoing,
     const std::map<unsigned, VirtualValueExpr> &caller_outgoing_stack,
     const std::map<unsigned, VirtualValueExpr> &caller_argument_map,
+    const BinaryMemoryMap &binary_memory,
     unsigned depth,
     llvm::SmallPtrSetImpl<const llvm::Function *> &visiting) {
   auto *callee_fn = call.getCalledFunction();
@@ -4278,9 +5600,21 @@ computeCallsiteLocalizedOutgoingFacts(
   std::map<unsigned, VirtualValueExpr> callee_incoming;
   std::map<unsigned, VirtualValueExpr> callee_incoming_stack;
   std::map<unsigned, VirtualValueExpr> callee_incoming_args;
-  const auto specialized_call_args = buildSpecializedCallArgumentMap(
-      call, dl, slot_ids, stack_cell_ids, caller_outgoing,
-      caller_outgoing_stack, caller_argument_map);
+  std::map<unsigned, VirtualValueExpr> callee_localized_args;
+  const auto native_sp_offset = nativeStackPointerOffsetForValue(&call);
+  const auto specialized_call_args = [&]() {
+    if (native_sp_offset.has_value()) {
+      auto local_call_state = computeLocalFactsBeforeCall(
+          call, dl, slot_ids, stack_cell_ids, caller_outgoing,
+          caller_outgoing_stack, caller_argument_map);
+      return buildSpecializedCallArgumentMap(
+          call, dl, slot_ids, stack_cell_ids, local_call_state.slot_facts,
+          local_call_state.stack_facts, caller_argument_map);
+    }
+    return buildSpecializedCallArgumentMap(
+        call, dl, slot_ids, stack_cell_ids, caller_outgoing,
+        caller_outgoing_stack, caller_argument_map);
+  }();
 
   for (const auto &fact : callee_summary.specialization_facts)
     callee_incoming[fact.slot_id] = fact.value;
@@ -4288,6 +5622,7 @@ computeCallsiteLocalizedOutgoingFacts(
     callee_incoming_stack[fact.cell_id] = fact.value;
   if (callee_summary.entry_va.has_value())
     callee_incoming_args[1] = constantExpr(*callee_summary.entry_va, 64);
+  callee_localized_args = callee_incoming_args;
 
   if (!callee_summary.direct_callees.empty()) {
     for (const auto &[slot_id, value] : caller_outgoing) {
@@ -4403,6 +5738,8 @@ computeCallsiteLocalizedOutgoingFacts(
       continue;
     mergeFactIntoMap(callee_incoming_args, arg_index, specialized);
   }
+  for (const auto &[arg_index, specialized] : specialized_call_args)
+    callee_localized_args[arg_index] = specialized;
 
   seedLiftedCallContinuationStackCell(call, callee_summary, stack_cell_info,
                                       callee_incoming_stack);
@@ -4411,9 +5748,10 @@ computeCallsiteLocalizedOutgoingFacts(
   if (canComputeLocalizedSingleBlockOutgoingFacts(*callee_fn, callee_summary)) {
     if (auto leaf_localized = computeLocalizedSingleBlockOutgoingFacts(
             *callee_fn, model, callee_summary, slot_ids, stack_cell_ids,
-            callee_incoming, callee_incoming_stack, callee_incoming_args,
-            handler_index, outgoing_maps, outgoing_stack_maps, depth, visiting,
-            &call, &caller_outgoing_stack, &caller_outgoing)) {
+            callee_incoming, callee_incoming_stack, callee_localized_args,
+            handler_index, outgoing_maps, outgoing_stack_maps, binary_memory,
+            depth, visiting, &call, &caller_outgoing_stack,
+            &caller_outgoing)) {
       visiting.erase(callee_fn);
       return leaf_localized;
     }
@@ -4433,14 +5771,15 @@ computeCallsiteLocalizedOutgoingFacts(
     applyDirectCalleeEffectsImpl(
         *callee_fn, model, handler_index, outgoing_maps, outgoing_stack_maps,
         callee_incoming_args, localized.outgoing_slots, localized.outgoing_stack,
-        slot_ids, slot_info, stack_cell_ids, stack_cell_info, dl, depth,
-        visiting);
+        slot_ids, slot_info, stack_cell_ids, stack_cell_info, dl,
+        binary_memory, depth, visiting);
   if (!callee_summary.callsites.empty())
     applyLocalizedCallsiteReturnEffects(
         *callee_fn, model, callee_summary, slot_info, stack_cell_info, slot_ids,
         stack_cell_ids, handler_index, outgoing_maps, outgoing_stack_maps,
         callee_incoming, callee_incoming_stack, callee_incoming_args,
-        localized.outgoing_slots, localized.outgoing_stack, depth, visiting);
+        localized.outgoing_slots, localized.outgoing_stack, binary_memory,
+        depth, visiting);
   if (!callee_summary.direct_callees.empty()) {
     const auto snapshot_slots = localized.outgoing_slots;
     const auto snapshot_stack = localized.outgoing_stack;
@@ -4477,7 +5816,8 @@ computeResolvedCallTargetOutgoingFacts(
     const std::map<unsigned, VirtualValueExpr> &caller_outgoing,
     const std::map<unsigned, VirtualValueExpr> &caller_outgoing_stack,
     const std::map<unsigned, VirtualValueExpr> &caller_argument_map,
-    const ResolvedCallSiteInfo &callsite, unsigned depth,
+    const ResolvedCallSiteInfo &callsite,
+    const BinaryMemoryMap &binary_memory, unsigned depth,
     llvm::SmallPtrSetImpl<const llvm::Function *> &visiting) {
   auto *target_fn = call.getModule()
                         ? call.getModule()->getFunction(target_summary.function_name)
@@ -4546,8 +5886,8 @@ computeResolvedCallTargetOutgoingFacts(
     if (auto leaf_localized = computeLocalizedSingleBlockOutgoingFacts(
             *target_fn, model, target_summary, slot_ids, stack_cell_ids,
             callee_incoming, callee_incoming_stack, callee_incoming_args,
-            handler_index, outgoing_maps, outgoing_stack_maps, depth, visiting,
-            nullptr, nullptr, &caller_outgoing)) {
+            handler_index, outgoing_maps, outgoing_stack_maps, binary_memory,
+            depth, visiting, nullptr, nullptr, &caller_outgoing)) {
       visiting.erase(target_fn);
       return leaf_localized;
     }
@@ -4568,15 +5908,16 @@ computeResolvedCallTargetOutgoingFacts(
     applyDirectCalleeEffectsImpl(
         *target_fn, model, handler_index, outgoing_maps, outgoing_stack_maps,
         callee_incoming_args, localized.outgoing_slots, localized.outgoing_stack,
-        slot_ids, slot_info, stack_cell_ids, stack_cell_info, dl, depth,
-        visiting);
+        slot_ids, slot_info, stack_cell_ids, stack_cell_info, dl,
+        binary_memory, depth, visiting);
   }
   if (!target_summary.callsites.empty()) {
     applyLocalizedCallsiteReturnEffects(
         *target_fn, model, target_summary, slot_info, stack_cell_info, slot_ids,
         stack_cell_ids, handler_index, outgoing_maps, outgoing_stack_maps,
         callee_incoming, callee_incoming_stack, callee_incoming_args,
-        localized.outgoing_slots, localized.outgoing_stack, depth, visiting);
+        localized.outgoing_slots, localized.outgoing_stack, binary_memory,
+        depth, visiting);
   }
   if (!target_summary.direct_callees.empty() || !target_summary.callsites.empty()) {
     const auto snapshot_slots = localized.outgoing_slots;
@@ -4615,7 +5956,8 @@ static void applyLocalizedCallsiteReturnEffects(
     const std::map<unsigned, VirtualValueExpr> &caller_argument_map,
     std::map<unsigned, VirtualValueExpr> &caller_outgoing,
     std::map<unsigned, VirtualValueExpr> &caller_outgoing_stack,
-    unsigned depth, llvm::SmallPtrSetImpl<const llvm::Function *> &visiting) {
+    const BinaryMemoryMap &binary_memory, unsigned depth,
+    llvm::SmallPtrSetImpl<const llvm::Function *> &visiting) {
   const auto &dl = caller_fn.getParent()->getDataLayout();
 
   size_t callsite_index = 0;
@@ -4667,7 +6009,7 @@ static void applyLocalizedCallsiteReturnEffects(
           *call, model, *target_summary, slot_info, stack_cell_info, slot_ids,
           stack_cell_ids, dl, handler_index, outgoing_maps, outgoing_stack_maps,
           resolved_slot_facts, resolved_stack_facts, caller_argument_map,
-          resolved, depth + 1, visiting);
+          resolved, binary_memory, depth + 1, visiting);
       if (!localized)
         continue;
 
@@ -4684,7 +6026,7 @@ static void applyLocalizedCallsiteReturnEffects(
             value, caller_fn, slot_ids, stack_cell_ids, caller_outgoing,
             caller_outgoing_stack, caller_argument_map);
         if (!normalized.has_value() || isUnknownLikeExpr(*normalized) ||
-            !isBoundedStateProvenanceExpr(*normalized)) {
+            !isBoundedLocalizedTransferExpr(*normalized)) {
           continue;
         }
         mergeFactIntoMap(caller_outgoing, slot_id, *normalized);
@@ -4697,7 +6039,7 @@ static void applyLocalizedCallsiteReturnEffects(
             value, caller_fn, slot_ids, stack_cell_ids, caller_outgoing,
             caller_outgoing_stack, caller_argument_map);
         if (!normalized.has_value() || isUnknownLikeExpr(*normalized) ||
-            !isBoundedStateProvenanceExpr(*normalized)) {
+            !isBoundedLocalizedTransferExpr(*normalized)) {
           continue;
         }
         mergeFactIntoMap(caller_outgoing_stack, cell_id, *normalized);
@@ -4721,7 +6063,8 @@ computeEntryPreludeCallOutgoingFacts(
     const std::map<unsigned, VirtualValueExpr> &caller_incoming,
     const std::map<unsigned, VirtualValueExpr> &caller_incoming_stack,
     const std::map<unsigned, VirtualValueExpr> &caller_argument_map,
-    uint64_t continuation_pc, unsigned depth,
+    uint64_t continuation_pc, const BinaryMemoryMap &binary_memory,
+    unsigned depth,
     llvm::SmallPtrSetImpl<const llvm::Function *> &visiting) {
   auto *target_fn = M.getFunction(target_summary.function_name);
   if (!target_fn)
@@ -4781,8 +6124,8 @@ computeEntryPreludeCallOutgoingFacts(
     if (auto leaf_localized = computeLocalizedSingleBlockOutgoingFacts(
             *target_fn, model, target_summary, slot_ids, stack_cell_ids,
             callee_incoming, callee_incoming_stack, callee_incoming_args,
-            handler_index, outgoing_maps, outgoing_stack_maps, depth, visiting,
-            nullptr, nullptr, &caller_incoming)) {
+            handler_index, outgoing_maps, outgoing_stack_maps, binary_memory,
+            depth, visiting, nullptr, nullptr, &caller_incoming)) {
       visiting.erase(target_fn);
       return leaf_localized;
     }
@@ -4804,14 +6147,15 @@ computeEntryPreludeCallOutgoingFacts(
         *target_fn, model, handler_index, outgoing_maps, outgoing_stack_maps,
         callee_incoming_args, localized.outgoing_slots, localized.outgoing_stack,
         slot_ids, slot_info, stack_cell_ids, stack_cell_info, M.getDataLayout(),
-        depth, visiting);
+        binary_memory, depth, visiting);
   }
   if (!target_summary.callsites.empty()) {
     applyLocalizedCallsiteReturnEffects(
         *target_fn, model, target_summary, slot_info, stack_cell_info, slot_ids,
         stack_cell_ids, handler_index, outgoing_maps, outgoing_stack_maps,
         callee_incoming, callee_incoming_stack, callee_incoming_args,
-        localized.outgoing_slots, localized.outgoing_stack, depth, visiting);
+        localized.outgoing_slots, localized.outgoing_stack, binary_memory,
+        depth, visiting);
   }
   if (!target_summary.direct_callees.empty() || !target_summary.callsites.empty()) {
     const auto snapshot_slots = localized.outgoing_slots;
@@ -5009,6 +6353,141 @@ static std::optional<unsigned> lookupStackCellIdForSummary(
   return findEquivalentArgumentStackCellId(
       summary.base_offset, summary.base_width, summary.base_from_argument,
       summary.base_from_alloca, summary.offset, summary.width, stack_cell_ids);
+}
+
+static void decanonicalizeVirtualValueExpr(VirtualValueExpr &expr) {
+  expr.slot_id.reset();
+  expr.stack_cell_id.reset();
+  for (auto &operand : expr.operands)
+    decanonicalizeVirtualValueExpr(operand);
+}
+
+static VirtualStateSlotSummary stableSlotSummaryForInfo(
+    const VirtualStateSlotInfo &slot) {
+  VirtualStateSlotSummary summary;
+  summary.base_name = slot.base_name;
+  summary.offset = slot.offset;
+  summary.width = slot.width;
+  summary.from_argument = slot.from_argument;
+  summary.from_alloca = slot.from_alloca;
+  return summary;
+}
+
+static VirtualStackCellSummary stableStackCellSummaryForInfo(
+    const VirtualStackCellInfo &cell) {
+  VirtualStackCellSummary summary;
+  summary.base_name = cell.base_name;
+  summary.base_offset = cell.base_offset;
+  summary.base_width = cell.base_width;
+  summary.offset = cell.cell_offset;
+  summary.width = cell.width;
+  summary.base_from_argument = cell.base_from_argument;
+  summary.base_from_alloca = cell.base_from_alloca;
+  return summary;
+}
+
+static std::vector<CachedStableArgumentFactEntry> captureStableArgumentFacts(
+    const std::map<unsigned, VirtualValueExpr> &facts) {
+  std::vector<CachedStableArgumentFactEntry> captured;
+  for (const auto &[argument_index, value] : facts) {
+    auto stable_value = value;
+    decanonicalizeVirtualValueExpr(stable_value);
+    captured.push_back(
+        CachedStableArgumentFactEntry{argument_index, std::move(stable_value)});
+  }
+  return captured;
+}
+
+static std::vector<CachedStableSlotFactEntry> captureStableSlotFacts(
+    const std::map<unsigned, VirtualValueExpr> &facts,
+    const std::map<unsigned, const VirtualStateSlotInfo *> &slot_info) {
+  std::vector<CachedStableSlotFactEntry> captured;
+  for (const auto &[slot_id, value] : facts) {
+    auto info_it = slot_info.find(slot_id);
+    if (info_it == slot_info.end())
+      continue;
+    auto stable_value = value;
+    decanonicalizeVirtualValueExpr(stable_value);
+    captured.push_back(CachedStableSlotFactEntry{
+        stableSlotSummaryForInfo(*info_it->second), std::move(stable_value)});
+  }
+  return captured;
+}
+
+static std::vector<CachedStableStackFactEntry> captureStableStackFacts(
+    const std::map<unsigned, VirtualValueExpr> &facts,
+    const std::map<unsigned, const VirtualStackCellInfo *> &stack_cell_info) {
+  std::vector<CachedStableStackFactEntry> captured;
+  for (const auto &[cell_id, value] : facts) {
+    auto info_it = stack_cell_info.find(cell_id);
+    if (info_it == stack_cell_info.end())
+      continue;
+    auto stable_value = value;
+    decanonicalizeVirtualValueExpr(stable_value);
+    captured.push_back(CachedStableStackFactEntry{
+        stableStackCellSummaryForInfo(*info_it->second), std::move(stable_value)});
+  }
+  return captured;
+}
+
+static std::map<unsigned, VirtualValueExpr> restoreStableArgumentFactMap(
+    const std::vector<CachedStableArgumentFactEntry> &facts,
+    const std::map<SlotKey, unsigned> &slot_ids,
+    const std::map<StackCellKey, unsigned> &stack_cell_ids) {
+  std::map<unsigned, VirtualValueExpr> restored;
+  for (const auto &fact : facts) {
+    auto value = fact.value;
+    decanonicalizeVirtualValueExpr(value);
+    annotateExprSlots(value, slot_ids);
+    annotateExprStackCells(value, stack_cell_ids, slot_ids);
+    canonicalizeMemoryReadsToStackCells(value, stack_cell_ids, slot_ids);
+    annotateExprSlots(value, slot_ids);
+    annotateExprStackCells(value, stack_cell_ids, slot_ids);
+    restored[fact.argument_index] = std::move(value);
+  }
+  return restored;
+}
+
+static std::map<unsigned, VirtualValueExpr> restoreStableSlotFactMap(
+    const std::vector<CachedStableSlotFactEntry> &facts,
+    const std::map<SlotKey, unsigned> &slot_ids,
+    const std::map<StackCellKey, unsigned> &stack_cell_ids) {
+  std::map<unsigned, VirtualValueExpr> restored;
+  for (const auto &fact : facts) {
+    auto slot_id = lookupSlotIdForSummary(fact.slot, slot_ids);
+    if (!slot_id)
+      continue;
+    auto value = fact.value;
+    decanonicalizeVirtualValueExpr(value);
+    annotateExprSlots(value, slot_ids);
+    annotateExprStackCells(value, stack_cell_ids, slot_ids);
+    canonicalizeMemoryReadsToStackCells(value, stack_cell_ids, slot_ids);
+    annotateExprSlots(value, slot_ids);
+    annotateExprStackCells(value, stack_cell_ids, slot_ids);
+    restored[*slot_id] = std::move(value);
+  }
+  return restored;
+}
+
+static std::map<unsigned, VirtualValueExpr> restoreStableStackFactMap(
+    const std::vector<CachedStableStackFactEntry> &facts,
+    const std::map<SlotKey, unsigned> &slot_ids,
+    const std::map<StackCellKey, unsigned> &stack_cell_ids) {
+  std::map<unsigned, VirtualValueExpr> restored;
+  for (const auto &fact : facts) {
+    auto cell_id = lookupStackCellIdForSummary(fact.cell, stack_cell_ids);
+    if (!cell_id)
+      continue;
+    auto value = fact.value;
+    decanonicalizeVirtualValueExpr(value);
+    annotateExprSlots(value, slot_ids);
+    annotateExprStackCells(value, stack_cell_ids, slot_ids);
+    canonicalizeMemoryReadsToStackCells(value, stack_cell_ids, slot_ids);
+    annotateExprSlots(value, slot_ids);
+    annotateExprStackCells(value, stack_cell_ids, slot_ids);
+    restored[*cell_id] = std::move(value);
+  }
+  return restored;
 }
 
 static std::optional<VirtualValueExpr> remapStateSlotExprByShape(
@@ -5307,7 +6786,8 @@ static void applyDirectCalleeEffects(
     const std::vector<std::map<unsigned, VirtualValueExpr>> &outgoing_stack_maps,
     const std::map<unsigned, VirtualValueExpr> &caller_argument_map,
     std::map<unsigned, VirtualValueExpr> &caller_outgoing,
-    std::map<unsigned, VirtualValueExpr> &caller_outgoing_stack) {
+    std::map<unsigned, VirtualValueExpr> &caller_outgoing_stack,
+    const BinaryMemoryMap &binary_memory) {
   const auto slot_ids = buildSlotIdMap(model);
   const auto slot_info = buildSlotInfoMap(model);
   const auto stack_cell_ids = buildStackCellIdMap(model);
@@ -5318,7 +6798,8 @@ static void applyDirectCalleeEffects(
   applyDirectCalleeEffectsImpl(
       caller_fn, model, handler_index, outgoing_maps, outgoing_stack_maps,
       caller_argument_map, caller_outgoing, caller_outgoing_stack, slot_ids,
-      slot_info, stack_cell_ids, stack_cell_info, dl, /*depth=*/0, visiting);
+      slot_info, stack_cell_ids, stack_cell_info, dl, binary_memory,
+      /*depth=*/0, visiting);
 }
 
 static void canonicalizeVirtualState(VirtualMachineModel &model) {
@@ -5507,8 +6988,24 @@ static void canonicalizeVirtualState(VirtualMachineModel &model) {
 
 static void propagateVirtualStateFacts(llvm::Module &M,
                                        VirtualMachineModel &model,
-                                       const BinaryMemoryMap &binary_memory) {
+                                       const BinaryMemoryMap &binary_memory,
+                                       CachedModuleHandlerSummaryState *module_cache) {
   constexpr unsigned kMaxTrackedStackCells = 32;
+  auto factSubsetChanged = [](const std::map<unsigned, VirtualValueExpr> &before,
+                              const std::map<unsigned, VirtualValueExpr> &after,
+                              const llvm::SmallDenseSet<unsigned, 16> &ids) {
+    for (unsigned id : ids) {
+      auto before_it = before.find(id);
+      auto after_it = after.find(id);
+      if (before_it == before.end() && after_it == after.end())
+        continue;
+      if (before_it == before.end() || after_it == after.end() ||
+          !exprEquals(before_it->second, after_it->second)) {
+        return true;
+      }
+    }
+    return false;
+  };
 
   auto &handlers = model.mutableHandlers();
   const auto slot_ids = buildSlotIdMap(model);
@@ -5518,6 +7015,43 @@ static void propagateVirtualStateFacts(llvm::Module &M,
   std::map<std::string, size_t> handler_index;
   for (size_t i = 0; i < handlers.size(); ++i)
     handler_index.emplace(handlers[i].function_name, i);
+  std::vector<llvm::SmallVector<size_t, 4>> reverse_caller_indices(
+      handlers.size());
+  llvm::SmallVector<size_t, 16> handlers_with_direct_callees;
+  std::vector<std::optional<EntryPreludeCallInfo>> prelude_infos(
+      handlers.size());
+  std::vector<llvm::SmallVector<size_t, 2>> reverse_prelude_indices(
+      handlers.size());
+  llvm::SmallVector<size_t, 16> handlers_with_prelude;
+  std::vector<uint8_t> has_prelude(handlers.size(), 0);
+  std::vector<uint8_t> has_direct_callees(handlers.size(), 0);
+  for (size_t i = 0; i < handlers.size(); ++i) {
+    for (const auto &callee_name : handlers[i].direct_callees) {
+      auto callee_it = handler_index.find(callee_name);
+      if (callee_it == handler_index.end())
+        continue;
+      reverse_caller_indices[callee_it->second].push_back(i);
+    }
+    if (!handlers[i].direct_callees.empty()) {
+      handlers_with_direct_callees.push_back(i);
+      has_direct_callees[i] = 1;
+    }
+    if (handlers[i].entry_va.has_value()) {
+      auto prelude =
+          detectEntryPreludeDirectCall(binary_memory, *handlers[i].entry_va);
+      if (prelude.has_value()) {
+        prelude_infos[i] = prelude;
+        handlers_with_prelude.push_back(i);
+        has_prelude[i] = 1;
+        if (const auto *target_summary =
+                lookupHandlerByEntryVA(model, prelude->target_pc)) {
+          auto target_it = handler_index.find(target_summary->function_name);
+          if (target_it != handler_index.end())
+            reverse_prelude_indices[target_it->second].push_back(i);
+        }
+      }
+    }
+  }
 
   std::vector<std::map<unsigned, VirtualValueExpr>> incoming_maps(
       handlers.size());
@@ -5531,8 +7065,71 @@ static void propagateVirtualStateFacts(llvm::Module &M,
       handlers.size());
   std::vector<std::set<unsigned>> forced_incoming_slots(handlers.size());
   std::vector<std::set<unsigned>> forced_incoming_stack_cells(handlers.size());
+  LocalizedReplayCacheState localized_replay_cache;
+  OutgoingFactsCacheState outgoing_facts_cache;
+  auto *persistent_top_level_replay_cache =
+      module_cache ? &module_cache->localized_top_level_replays : nullptr;
+  auto *persistent_outgoing_facts_cache =
+      module_cache ? &module_cache->outgoing_facts : nullptr;
+  auto *persistent_propagation_entries =
+      module_cache ? &module_cache->propagation_entries : nullptr;
+  auto build_handler_outgoing_cache_key =
+      [&](size_t handler_index_value, const llvm::Function *handler_fn,
+          bool include_callees) {
+        std::string key_storage;
+        llvm::raw_string_ostream os(key_storage);
+        os << handlers[handler_index_value].function_name << "|fp="
+           << (handler_fn ? summaryRelevantFunctionFingerprint(*handler_fn) : 0)
+           << "|";
+        appendExprMapCacheKey(os, incoming_maps[handler_index_value], "in");
+        appendExprMapCacheKey(os, incoming_stack_maps[handler_index_value],
+                              "stack");
+        appendExprMapCacheKey(os, incoming_argument_maps[handler_index_value],
+                              "args");
+        if (include_callees) {
+          os << "callees{";
+          for (const auto &callee_name :
+               handlers[handler_index_value].direct_callees) {
+            auto callee_it = handler_index.find(callee_name);
+            if (callee_it == handler_index.end())
+              continue;
+            os << callee_name << ":";
+            appendExprMapCacheKey(os, outgoing_maps[callee_it->second], "out");
+            appendExprMapCacheKey(os, outgoing_stack_maps[callee_it->second],
+                                  "ostack");
+          }
+          os << "}";
+        }
+        os.flush();
+        return key_storage;
+      };
+  std::vector<llvm::stable_hash> handler_fingerprints(handlers.size(), 0);
+  std::vector<uint8_t> restored_propagation_state(handlers.size(), 0);
 
   for (size_t i = 0; i < handlers.size(); ++i) {
+    auto *handler_fn = M.getFunction(handlers[i].function_name);
+    if (handler_fn)
+      handler_fingerprints[i] = summaryRelevantFunctionFingerprint(*handler_fn);
+    if (persistent_propagation_entries) {
+      auto cache_it =
+          persistent_propagation_entries->find(handlers[i].function_name);
+      if (cache_it != persistent_propagation_entries->end() &&
+          cache_it->second.fingerprint == handler_fingerprints[i]) {
+        incoming_argument_maps[i] = restoreStableArgumentFactMap(
+            cache_it->second.incoming_arguments, slot_ids, stack_cell_ids);
+        incoming_maps[i] = restoreStableSlotFactMap(
+            cache_it->second.incoming_slots, slot_ids, stack_cell_ids);
+        outgoing_maps[i] = restoreStableSlotFactMap(
+            cache_it->second.outgoing_slots, slot_ids, stack_cell_ids);
+        incoming_stack_maps[i] = restoreStableStackFactMap(
+            cache_it->second.incoming_stack, slot_ids, stack_cell_ids);
+        outgoing_stack_maps[i] = restoreStableStackFactMap(
+            cache_it->second.outgoing_stack, slot_ids, stack_cell_ids);
+        handlers[i].stack_memory_budget_exceeded =
+            cache_it->second.stack_memory_budget_exceeded;
+        restored_propagation_state[i] = 1;
+      }
+    }
     for (const auto &fact : handlers[i].specialization_facts) {
       incoming_maps[i][fact.slot_id] = fact.value;
       forced_incoming_slots[i].insert(fact.slot_id);
@@ -5547,37 +7144,167 @@ static void propagateVirtualStateFacts(llvm::Module &M,
     }
   }
 
-  bool changed = true;
-  unsigned iterations = 0;
-  while (changed && iterations++ < 16) {
-    changed = false;
-
+  llvm::SmallVector<size_t, 32> dirty_handlers;
+  llvm::SmallVector<size_t, 32> dirty_call_source_handlers;
+  llvm::SmallVector<size_t, 16> dirty_prelude_handlers;
+  std::vector<uint8_t> initial_dirty_flags(handlers.size(), 0);
+  std::vector<uint8_t> initial_dirty_call_flags(handlers.size(), 0);
+  std::vector<uint8_t> initial_dirty_prelude_flags(handlers.size(), 0);
+  auto seed_dirty = [&](size_t index) {
+    if (index >= handlers.size() || initial_dirty_flags[index])
+      return;
+    initial_dirty_flags[index] = 1;
+    dirty_handlers.push_back(index);
+  };
+  auto seed_dirty_call_source = [&](size_t index) {
+    if (index >= handlers.size() || initial_dirty_call_flags[index] ||
+        !has_direct_callees[index]) {
+      return;
+    }
+    initial_dirty_call_flags[index] = 1;
+    dirty_call_source_handlers.push_back(index);
+  };
+  auto seed_dirty_prelude = [&](size_t index) {
+    if (index >= handlers.size() || initial_dirty_prelude_flags[index] ||
+        !has_prelude[index]) {
+      return;
+    }
+    initial_dirty_prelude_flags[index] = 1;
+    dirty_prelude_handlers.push_back(index);
+  };
+  for (size_t i = 0; i < handlers.size(); ++i) {
+    if (restored_propagation_state[i])
+      continue;
+    seed_dirty(i);
+    seed_dirty_call_source(i);
+    seed_dirty_prelude(i);
+    for (size_t caller_index : reverse_caller_indices[i])
+      seed_dirty(caller_index);
+    for (size_t prelude_index : reverse_prelude_indices[i])
+      seed_dirty_prelude(prelude_index);
+  }
+  if (dirty_handlers.empty() && !handlers.empty()) {
     for (size_t i = 0; i < handlers.size(); ++i) {
+      seed_dirty(i);
+      seed_dirty_call_source(i);
+      seed_dirty_prelude(i);
+    }
+  }
+  unsigned iterations = 0;
+  while ((!dirty_handlers.empty() || !dirty_call_source_handlers.empty() ||
+          !dirty_prelude_handlers.empty()) &&
+         iterations++ < 16) {
+    const auto iteration_begin = std::chrono::steady_clock::now();
+    bool changed = false;
+    unsigned localized_attempts = 0;
+    unsigned localized_successes = 0;
+    unsigned summary_recomputes = 0;
+    llvm::SmallVector<size_t, 32> next_dirty_handlers;
+    llvm::SmallVector<size_t, 32> next_dirty_call_sources;
+    llvm::SmallVector<size_t, 16> next_dirty_preludes;
+    std::vector<uint8_t> next_dirty_flags(handlers.size(), 0);
+    std::vector<uint8_t> next_dirty_call_flags(handlers.size(), 0);
+    std::vector<uint8_t> next_dirty_prelude_flags(handlers.size(), 0);
+    auto enqueue_dirty = [&](size_t index) {
+      if (index >= handlers.size() || next_dirty_flags[index])
+        return;
+      next_dirty_flags[index] = 1;
+      next_dirty_handlers.push_back(index);
+    };
+    auto enqueue_dirty_call_source = [&](size_t index) {
+      if (index >= handlers.size() || next_dirty_call_flags[index] ||
+          !has_direct_callees[index]) {
+        return;
+      }
+      next_dirty_call_flags[index] = 1;
+      next_dirty_call_sources.push_back(index);
+    };
+    auto enqueue_dirty_prelude = [&](size_t index) {
+      if (index >= handlers.size() || next_dirty_prelude_flags[index] ||
+          !has_prelude[index]) {
+        return;
+      }
+      next_dirty_prelude_flags[index] = 1;
+      next_dirty_preludes.push_back(index);
+    };
+    auto note_incoming_change = [&](size_t target_index, bool arg_change) {
+      enqueue_dirty(target_index);
+      if (arg_change)
+        enqueue_dirty_call_source(target_index);
+      enqueue_dirty_prelude(target_index);
+    };
+    llvm::SmallVector<size_t, 16> active_call_sources(
+        dirty_call_source_handlers.begin(), dirty_call_source_handlers.end());
+    std::vector<uint8_t> active_call_source_flags(handlers.size(), 0);
+    for (size_t i : active_call_sources)
+      active_call_source_flags[i] = 1;
+    llvm::SmallVector<size_t, 16> active_prelude_handlers(
+        dirty_prelude_handlers.begin(), dirty_prelude_handlers.end());
+    std::vector<uint8_t> active_prelude_flags(handlers.size(), 0);
+    for (size_t i : active_prelude_handlers)
+      active_prelude_flags[i] = 1;
+
+    for (size_t i : dirty_handlers) {
       std::map<unsigned, VirtualValueExpr> outgoing_map;
       std::map<unsigned, VirtualValueExpr> outgoing_stack_map;
       bool used_localized = false;
+      bool have_cached_outgoing = false;
+      bool budget_exceeded = false;
       if (auto *caller_fn = M.getFunction(handlers[i].function_name)) {
         if (!handlers[i].direct_callees.empty() &&
             canComputeLocalizedSingleBlockOutgoingFacts(*caller_fn,
                                                        handlers[i])) {
-          llvm::SmallPtrSet<const llvm::Function *, 8> visiting;
-          visiting.insert(caller_fn);
-          if (auto localized = computeLocalizedSingleBlockOutgoingFacts(
-                  *caller_fn, model, handlers[i], slot_ids, stack_cell_ids,
-                  incoming_maps[i], incoming_stack_maps[i],
-                  incoming_argument_maps[i], handler_index, outgoing_maps,
-                  outgoing_stack_maps, /*depth=*/0, visiting)) {
+          ++localized_attempts;
+          auto cache_key = build_handler_outgoing_cache_key(
+              i, caller_fn, /*include_callees=*/true);
+          auto cache_it =
+              localized_replay_cache.top_level_entries.find(cache_key);
+          std::optional<CallsiteLocalizedOutgoingFacts> localized;
+          if (cache_it != localized_replay_cache.top_level_entries.end()) {
+            ++localized_replay_cache.top_level_hits;
+            localized = cache_it->second;
+          } else if (persistent_top_level_replay_cache) {
+            auto persistent_it =
+                persistent_top_level_replay_cache->find(cache_key);
+            if (persistent_it != persistent_top_level_replay_cache->end()) {
+              ++localized_replay_cache.top_level_hits;
+              localized = persistent_it->second;
+              localized_replay_cache.top_level_entries.emplace(cache_key,
+                                                               localized);
+            }
+          }
+          if (!localized.has_value() &&
+              localized_replay_cache.top_level_entries.find(cache_key) ==
+                  localized_replay_cache.top_level_entries.end()) {
+            ++localized_replay_cache.top_level_misses;
+            llvm::SmallPtrSet<const llvm::Function *, 8> visiting;
+            visiting.insert(caller_fn);
+            localized = computeLocalizedSingleBlockOutgoingFacts(
+                *caller_fn, model, handlers[i], slot_ids, stack_cell_ids,
+                incoming_maps[i], incoming_stack_maps[i],
+                incoming_argument_maps[i], handler_index, outgoing_maps,
+                outgoing_stack_maps, binary_memory, /*depth=*/0, visiting,
+                nullptr, nullptr, nullptr, &localized_replay_cache);
+            localized_replay_cache.top_level_entries.emplace(
+                std::move(cache_key), localized);
+            if (persistent_top_level_replay_cache) {
+              persistent_top_level_replay_cache->insert_or_assign(
+                  cache_key, localized);
+            }
+          }
+          if (localized) {
+            ++localized_successes;
             llvm::SmallDenseSet<unsigned, 16> written_slots(
-                handlers[i].written_slot_ids.begin(),
-                handlers[i].written_slot_ids.end());
+                localized->written_slot_ids.begin(),
+                localized->written_slot_ids.end());
             for (const auto &[slot_id, value] : localized->outgoing_slots) {
               if (!written_slots.empty() && !written_slots.count(slot_id))
                 continue;
               outgoing_map.emplace(slot_id, value);
             }
-            auto written_stack_cells = rebaseWrittenStackCellIds(
-                model, localized->outgoing_slots,
-                handlers[i].written_stack_cell_ids);
+            llvm::SmallDenseSet<unsigned, 16> written_stack_cells(
+                localized->written_stack_cell_ids.begin(),
+                localized->written_stack_cell_ids.end());
             for (const auto &[cell_id, value] : localized->outgoing_stack) {
               if (!written_stack_cells.empty() &&
                   !written_stack_cells.count(cell_id)) {
@@ -5589,23 +7316,67 @@ static void propagateVirtualStateFacts(llvm::Module &M,
           }
         }
         if (!used_localized) {
-          auto new_outgoing =
-              computeOutgoingFacts(handlers[i], incoming_maps[i],
-                                   incoming_stack_maps[i],
-                                   incoming_argument_maps[i]);
-          auto new_outgoing_stack = computeOutgoingStackFacts(
-              handlers[i], incoming_maps[i], incoming_stack_maps[i],
-              incoming_argument_maps[i]);
-          for (const auto &fact : new_outgoing)
-            outgoing_map[fact.slot_id] = fact.value;
-          for (const auto &fact : new_outgoing_stack)
-            outgoing_stack_map[fact.cell_id] = fact.value;
-          applyDirectCalleeEffects(*caller_fn, model, handler_index,
-                                   outgoing_maps, outgoing_stack_maps,
-                                   incoming_argument_maps[i], outgoing_map,
-                                   outgoing_stack_map);
+          auto cache_key = build_handler_outgoing_cache_key(
+              i, caller_fn, /*include_callees=*/true);
+          auto cache_it = outgoing_facts_cache.entries.find(cache_key);
+          if (cache_it != outgoing_facts_cache.entries.end()) {
+            ++outgoing_facts_cache.hits;
+            outgoing_map = cache_it->second.outgoing_slots;
+            outgoing_stack_map = cache_it->second.outgoing_stack;
+            budget_exceeded = cache_it->second.stack_memory_budget_exceeded;
+            have_cached_outgoing = true;
+          } else if (persistent_outgoing_facts_cache) {
+            auto persistent_it =
+                persistent_outgoing_facts_cache->find(cache_key);
+            if (persistent_it != persistent_outgoing_facts_cache->end()) {
+              ++outgoing_facts_cache.hits;
+              outgoing_map = persistent_it->second.outgoing_slots;
+              outgoing_stack_map = persistent_it->second.outgoing_stack;
+              budget_exceeded =
+                  persistent_it->second.stack_memory_budget_exceeded;
+              outgoing_facts_cache.entries.emplace(cache_key,
+                                                  persistent_it->second);
+              have_cached_outgoing = true;
+            }
+          }
+          if (!have_cached_outgoing) {
+            ++outgoing_facts_cache.misses;
+            ++summary_recomputes;
+            auto new_outgoing =
+                computeOutgoingFacts(handlers[i], incoming_maps[i],
+                                     incoming_stack_maps[i],
+                                     incoming_argument_maps[i]);
+            auto new_outgoing_stack = computeOutgoingStackFacts(
+                handlers[i], incoming_maps[i], incoming_stack_maps[i],
+                incoming_argument_maps[i]);
+            for (const auto &fact : new_outgoing)
+              outgoing_map[fact.slot_id] = fact.value;
+            for (const auto &fact : new_outgoing_stack)
+              outgoing_stack_map[fact.cell_id] = fact.value;
+            applyDirectCalleeEffects(*caller_fn, model, handler_index,
+                                     outgoing_maps, outgoing_stack_maps,
+                                     incoming_argument_maps[i], outgoing_map,
+                                     outgoing_stack_map, binary_memory);
+            outgoing_stack_map =
+                rebaseOutgoingStackFacts(model, outgoing_map, outgoing_stack_map);
+            budget_exceeded = outgoing_stack_map.size() > kMaxTrackedStackCells;
+            if (budget_exceeded) {
+              while (outgoing_stack_map.size() > kMaxTrackedStackCells)
+                outgoing_stack_map.erase(std::prev(outgoing_stack_map.end()));
+            }
+            CachedOutgoingFactsEntry cache_entry;
+            cache_entry.outgoing_slots = outgoing_map;
+            cache_entry.outgoing_stack = outgoing_stack_map;
+            cache_entry.stack_memory_budget_exceeded = budget_exceeded;
+            outgoing_facts_cache.entries.emplace(cache_key, cache_entry);
+            if (persistent_outgoing_facts_cache) {
+              persistent_outgoing_facts_cache->insert_or_assign(cache_key,
+                                                                cache_entry);
+            }
+          }
         }
       } else {
+        ++summary_recomputes;
         auto new_outgoing =
             computeOutgoingFacts(handlers[i], incoming_maps[i],
                                  incoming_stack_maps[i],
@@ -5618,28 +7389,104 @@ static void propagateVirtualStateFacts(llvm::Module &M,
         for (const auto &fact : new_outgoing_stack)
           outgoing_stack_map[fact.cell_id] = fact.value;
       }
-      outgoing_stack_map =
-          rebaseOutgoingStackFacts(model, outgoing_map, outgoing_stack_map);
-      bool budget_exceeded = outgoing_stack_map.size() > kMaxTrackedStackCells;
-      if (budget_exceeded) {
-        while (outgoing_stack_map.size() > kMaxTrackedStackCells)
-          outgoing_stack_map.erase(std::prev(outgoing_stack_map.end()));
+      if (!have_cached_outgoing) {
+        outgoing_stack_map =
+            rebaseOutgoingStackFacts(model, outgoing_map, outgoing_stack_map);
+        budget_exceeded = outgoing_stack_map.size() > kMaxTrackedStackCells;
+        if (budget_exceeded) {
+          while (outgoing_stack_map.size() > kMaxTrackedStackCells)
+            outgoing_stack_map.erase(std::prev(outgoing_stack_map.end()));
+        }
       }
       if (handlers[i].stack_memory_budget_exceeded != budget_exceeded) {
         handlers[i].stack_memory_budget_exceeded = budget_exceeded;
         changed = true;
       }
-      if (!slotFactMapEquals(outgoing_map, outgoing_maps[i])) {
+      const auto &previous_outgoing_map = outgoing_maps[i];
+      const auto &previous_outgoing_stack_map = outgoing_stack_maps[i];
+      bool slot_outgoing_changed =
+          !slotFactMapEquals(outgoing_map, previous_outgoing_map);
+      bool stack_outgoing_changed =
+          !stackFactMapEquals(outgoing_stack_map, previous_outgoing_stack_map);
+      bool outgoing_changed = slot_outgoing_changed || stack_outgoing_changed;
+      bool caller_visible_change = false;
+      if (outgoing_changed) {
+        llvm::SmallDenseSet<unsigned, 16> caller_visible_written_slots(
+            handlers[i].written_slot_ids.begin(),
+            handlers[i].written_slot_ids.end());
+        auto previous_visible_stack_ids =
+            rebaseWrittenStackCellIds(model, previous_outgoing_map,
+                                      handlers[i].written_stack_cell_ids);
+        auto new_visible_stack_ids =
+            rebaseWrittenStackCellIds(model, outgoing_map,
+                                      handlers[i].written_stack_cell_ids);
+        llvm::SmallDenseSet<unsigned, 16> caller_visible_written_stack_cells(
+            previous_visible_stack_ids.begin(), previous_visible_stack_ids.end());
+        caller_visible_written_stack_cells.insert(new_visible_stack_ids.begin(),
+                                                  new_visible_stack_ids.end());
+        caller_visible_change =
+            factSubsetChanged(previous_outgoing_map, outgoing_map,
+                              caller_visible_written_slots) ||
+            factSubsetChanged(previous_outgoing_stack_map, outgoing_stack_map,
+                              caller_visible_written_stack_cells);
+      }
+      if (slot_outgoing_changed) {
         outgoing_maps[i] = std::move(outgoing_map);
         changed = true;
       }
-      if (!stackFactMapEquals(outgoing_stack_map, outgoing_stack_maps[i])) {
+      if (stack_outgoing_changed) {
         outgoing_stack_maps[i] = std::move(outgoing_stack_map);
         changed = true;
       }
+      if (outgoing_changed) {
+        if (!active_call_source_flags[i] && has_direct_callees[i]) {
+          active_call_source_flags[i] = 1;
+          active_call_sources.push_back(i);
+        }
+        for (size_t prelude_index : reverse_prelude_indices[i]) {
+          if (active_prelude_flags[prelude_index])
+            continue;
+          active_prelude_flags[prelude_index] = 1;
+          active_prelude_handlers.push_back(prelude_index);
+        }
+        if (caller_visible_change) {
+          for (size_t caller_index : reverse_caller_indices[i])
+            enqueue_dirty(caller_index);
+        }
+      }
     }
+    auto merge_fact = [&](std::map<unsigned, VirtualValueExpr> &dst,
+                          unsigned id, const VirtualValueExpr &value,
+                          size_t target_index, bool arg_change) {
+      auto existing = dst.find(id);
+      if (existing == dst.end()) {
+        dst.emplace(id, value);
+        changed = true;
+        note_incoming_change(target_index, arg_change);
+        return;
+      }
+      if (exprEquals(existing->second, value))
+        return;
+      auto merged = mergeIncomingExpr(existing->second, value);
+      if (merged.has_value()) {
+        if (!exprEquals(existing->second, *merged)) {
+          existing->second = std::move(*merged);
+          changed = true;
+          note_incoming_change(target_index, arg_change);
+        }
+        return;
+      }
+      auto unknown = unknownExpr(existing->second.bit_width
+                                     ? existing->second.bit_width
+                                     : value.bit_width);
+      if (!exprEquals(existing->second, unknown)) {
+        existing->second = std::move(unknown);
+        changed = true;
+        note_incoming_change(target_index, arg_change);
+      }
+    };
 
-    for (size_t i = 0; i < handlers.size(); ++i) {
+    for (size_t i : active_call_sources) {
       auto *caller_fn = M.getFunction(handlers[i].function_name);
       if (!caller_fn)
         continue;
@@ -5647,33 +7494,6 @@ static void propagateVirtualStateFacts(llvm::Module &M,
       const auto &caller_outgoing_stack = outgoing_stack_maps[i];
       const auto &caller_arguments = incoming_argument_maps[i];
       const auto &dl = M.getDataLayout();
-
-      auto merge_fact = [&](std::map<unsigned, VirtualValueExpr> &dst,
-                            unsigned id, const VirtualValueExpr &value) {
-        auto existing = dst.find(id);
-        if (existing == dst.end()) {
-          dst.emplace(id, value);
-          changed = true;
-          return;
-        }
-        if (exprEquals(existing->second, value))
-          return;
-        auto merged = mergeIncomingExpr(existing->second, value);
-        if (merged.has_value()) {
-          if (!exprEquals(existing->second, *merged)) {
-            existing->second = std::move(*merged);
-            changed = true;
-          }
-          return;
-        }
-        auto unknown = unknownExpr(existing->second.bit_width
-                                       ? existing->second.bit_width
-                                       : value.bit_width);
-        if (!exprEquals(existing->second, unknown)) {
-          existing->second = std::move(unknown);
-          changed = true;
-        }
-      };
 
       for (auto &BB : *caller_fn) {
         for (auto &I : BB) {
@@ -5705,7 +7525,8 @@ static void propagateVirtualStateFacts(llvm::Module &M,
             if (!isGloballyMergeableStateFactExpr(
                     value, /*allow_arguments=*/false))
               continue;
-            merge_fact(callee_incoming, slot_id, value);
+            merge_fact(callee_incoming, slot_id, value, callee_it->second,
+                       /*arg_change=*/false);
           }
           for (const auto &[cell_id, value] : caller_outgoing_stack) {
             if (!allowed_stack.empty() && !allowed_stack.count(cell_id))
@@ -5715,7 +7536,8 @@ static void propagateVirtualStateFacts(llvm::Module &M,
             if (!isGloballyMergeableStateFactExpr(
                     value, /*allow_arguments=*/false))
               continue;
-            merge_fact(callee_incoming_stack, cell_id, value);
+            merge_fact(callee_incoming_stack, cell_id, value,
+                       callee_it->second, /*arg_change=*/false);
           }
 
           for (unsigned callee_slot_id : callee_summary.live_in_slot_ids) {
@@ -5734,7 +7556,8 @@ static void propagateVirtualStateFacts(llvm::Module &M,
             if (!isSimpleRemappableFactExpr(value_it->second) ||
                 containsCallerLocalAllocaStateExpr(value_it->second))
               continue;
-            merge_fact(callee_incoming, callee_slot_id, value_it->second);
+            merge_fact(callee_incoming, callee_slot_id, value_it->second,
+                       callee_it->second, /*arg_change=*/false);
           }
 
           for (unsigned callee_cell_id : callee_summary.live_in_stack_cell_ids) {
@@ -5755,7 +7578,8 @@ static void propagateVirtualStateFacts(llvm::Module &M,
             if (!isSimpleRemappableFactExpr(value_it->second) ||
                 containsCallerLocalAllocaStateExpr(value_it->second))
               continue;
-            merge_fact(callee_incoming_stack, callee_cell_id, value_it->second);
+            merge_fact(callee_incoming_stack, callee_cell_id, value_it->second,
+                       callee_it->second, /*arg_change=*/false);
           }
 
           for (unsigned arg_index = 0; arg_index < call->arg_size(); ++arg_index) {
@@ -5768,7 +7592,8 @@ static void propagateVirtualStateFacts(llvm::Module &M,
             if (!isGloballyMergeableStateFactExpr(
                     specialized, /*allow_arguments=*/true))
               continue;
-            merge_fact(callee_incoming_args, arg_index, specialized);
+            merge_fact(callee_incoming_args, arg_index, specialized,
+                       callee_it->second, /*arg_change=*/true);
           }
 
           if (auto continuation_pc = inferLiftedCallContinuationPc(*call)) {
@@ -5790,63 +7615,83 @@ static void propagateVirtualStateFacts(llvm::Module &M,
                                       " pc=0x" +
                                       llvm::utohexstr(*continuation_pc));
                 merge_fact(callee_incoming_stack, callee_cell_id,
-                           constantExpr(*continuation_pc, cell->width * 8));
-              }
-            }
-          }
-        }
-      }
-
-      if (handlers[i].entry_va.has_value()) {
-        auto prelude =
-            detectEntryPreludeDirectCall(binary_memory, *handlers[i].entry_va);
-        if (prelude.has_value()) {
-          if (const auto *target_summary =
-                  lookupHandlerByEntryVA(model, prelude->target_pc)) {
-            llvm::SmallPtrSet<const llvm::Function *, 8> visiting;
-            auto localized = computeEntryPreludeCallOutgoingFacts(
-                M, model, *target_summary, slot_info, stack_cell_info, slot_ids,
-                stack_cell_ids, handler_index, outgoing_maps, outgoing_stack_maps,
-                incoming_maps[i], incoming_stack_maps[i],
-                incoming_argument_maps[i], prelude->continuation_pc,
-                /*depth=*/1, visiting);
-            if (localized) {
-              llvm::SmallDenseSet<unsigned, 16> written_slots(
-                  target_summary->written_slot_ids.begin(),
-                  target_summary->written_slot_ids.end());
-              auto written_stack_cells = rebaseWrittenStackCellIds(
-                  model, localized->outgoing_slots,
-                  target_summary->written_stack_cell_ids);
-
-              for (const auto &[slot_id, value] : localized->outgoing_slots) {
-                if (!written_slots.empty() && !written_slots.count(slot_id))
-                  continue;
-                if (forced_incoming_slots[i].count(slot_id))
-                  continue;
-                if (!isGloballyMergeableStateFactExpr(
-                        value, /*allow_arguments=*/false)) {
-                  continue;
-                }
-                merge_fact(incoming_maps[i], slot_id, value);
-              }
-              for (const auto &[cell_id, value] : localized->outgoing_stack) {
-                if (!written_stack_cells.empty() &&
-                    !written_stack_cells.count(cell_id)) {
-                  continue;
-                }
-                if (forced_incoming_stack_cells[i].count(cell_id))
-                  continue;
-                if (!isGloballyMergeableStateFactExpr(
-                        value, /*allow_arguments=*/false)) {
-                  continue;
-                }
-                merge_fact(incoming_stack_maps[i], cell_id, value);
+                           constantExpr(*continuation_pc, cell->width * 8),
+                           callee_it->second, /*arg_change=*/false);
               }
             }
           }
         }
       }
     }
+
+    for (size_t i : active_prelude_handlers) {
+      if (!prelude_infos[i].has_value())
+        continue;
+      if (const auto *target_summary =
+              lookupHandlerByEntryVA(model, prelude_infos[i]->target_pc)) {
+        llvm::SmallPtrSet<const llvm::Function *, 8> visiting;
+        auto localized = computeEntryPreludeCallOutgoingFacts(
+            M, model, *target_summary, slot_info, stack_cell_info, slot_ids,
+            stack_cell_ids, handler_index, outgoing_maps, outgoing_stack_maps,
+            incoming_maps[i], incoming_stack_maps[i], incoming_argument_maps[i],
+            prelude_infos[i]->continuation_pc, binary_memory, /*depth=*/1,
+            visiting);
+        if (localized) {
+          llvm::SmallDenseSet<unsigned, 16> written_slots(
+              target_summary->written_slot_ids.begin(),
+              target_summary->written_slot_ids.end());
+          auto written_stack_cells = rebaseWrittenStackCellIds(
+              model, localized->outgoing_slots,
+              target_summary->written_stack_cell_ids);
+
+          for (const auto &[slot_id, value] : localized->outgoing_slots) {
+            if (!written_slots.empty() && !written_slots.count(slot_id))
+              continue;
+            if (forced_incoming_slots[i].count(slot_id))
+              continue;
+            if (!isGloballyMergeableStateFactExpr(
+                    value, /*allow_arguments=*/false)) {
+              continue;
+            }
+            merge_fact(incoming_maps[i], slot_id, value, i,
+                       /*arg_change=*/false);
+          }
+          for (const auto &[cell_id, value] : localized->outgoing_stack) {
+            if (!written_stack_cells.empty() &&
+                !written_stack_cells.count(cell_id)) {
+              continue;
+            }
+            if (forced_incoming_stack_cells[i].count(cell_id))
+              continue;
+            if (!isGloballyMergeableStateFactExpr(
+                    value, /*allow_arguments=*/false)) {
+              continue;
+            }
+            merge_fact(incoming_stack_maps[i], cell_id, value, i,
+                       /*arg_change=*/false);
+          }
+        }
+      }
+    }
+
+    if (!changed)
+      break;
+    vmModelStageDebugLog(
+        "propagate: iteration=" + llvm::Twine(iterations).str() +
+        " dirty_handlers=" + llvm::Twine(dirty_handlers.size()).str() +
+        " dirty_call_sources=" +
+        llvm::Twine(dirty_call_source_handlers.size()).str() +
+        " dirty_preludes=" + llvm::Twine(dirty_prelude_handlers.size()).str() +
+        " localized_attempts=" + llvm::Twine(localized_attempts).str() +
+        " localized_successes=" + llvm::Twine(localized_successes).str() +
+        " summary_recomputes=" + llvm::Twine(summary_recomputes).str() +
+        " ms=" +
+        llvm::Twine(elapsedMilliseconds(iteration_begin,
+                                        std::chrono::steady_clock::now()))
+            .str());
+    dirty_handlers = std::move(next_dirty_handlers);
+    dirty_call_source_handlers = std::move(next_dirty_call_sources);
+    dirty_prelude_handlers = std::move(next_dirty_preludes);
   }
 
   for (size_t i = 0; i < handlers.size(); ++i) {
@@ -5872,6 +7717,38 @@ static void propagateVirtualStateFacts(llvm::Module &M,
     for (const auto &[cell_id, value] : outgoing_stack_maps[i])
       handlers[i].outgoing_stack_facts.push_back(VirtualStackFact{cell_id, value});
   }
+  if (persistent_propagation_entries) {
+    for (size_t i = 0; i < handlers.size(); ++i) {
+      CachedPropagationEntry entry;
+      entry.fingerprint = handler_fingerprints[i];
+      entry.incoming_arguments =
+          captureStableArgumentFacts(incoming_argument_maps[i]);
+      entry.incoming_slots = captureStableSlotFacts(incoming_maps[i], slot_info);
+      entry.outgoing_slots = captureStableSlotFacts(outgoing_maps[i], slot_info);
+      entry.incoming_stack =
+          captureStableStackFacts(incoming_stack_maps[i], stack_cell_info);
+      entry.outgoing_stack =
+          captureStableStackFacts(outgoing_stack_maps[i], stack_cell_info);
+      entry.stack_memory_budget_exceeded =
+          handlers[i].stack_memory_budget_exceeded;
+      persistent_propagation_entries->insert_or_assign(handlers[i].function_name,
+                                                       std::move(entry));
+    }
+  }
+  vmModelStageDebugLog("propagate: top-level-localized-replay-cache hits=" +
+                       llvm::Twine(localized_replay_cache.top_level_hits).str() +
+                       " misses=" +
+                       llvm::Twine(localized_replay_cache.top_level_misses)
+                           .str());
+  vmModelStageDebugLog("propagate: outgoing-fact-cache hits=" +
+                       llvm::Twine(outgoing_facts_cache.hits).str() +
+                       " misses=" +
+                       llvm::Twine(outgoing_facts_cache.misses).str());
+  vmModelStageDebugLog("propagate: restored-state handlers=" +
+                       llvm::Twine(std::count(restored_propagation_state.begin(),
+                                              restored_propagation_state.end(),
+                                              static_cast<uint8_t>(1)))
+                           .str());
 }
 
 static const VirtualBoundaryInfo *lookupBoundaryByEntryVA(
@@ -5945,7 +7822,7 @@ static std::optional<BoundaryTargetSummary> lookupBoundaryTargetSummary(
 static std::optional<VirtualDispatchSuccessorSummary>
 classifyDispatchSuccessor(const VirtualMachineModel &model,
                          const BinaryMemoryMap &binary_memory,
-                         uint64_t pc) {
+                         uint64_t pc, TargetArch target_arch) {
   if (auto boundary =
           lookupBoundaryTargetSummary(model, binary_memory, pc)) {
     VirtualDispatchSuccessorSummary successor;
@@ -6002,7 +7879,59 @@ classifyDispatchSuccessor(const VirtualMachineModel &model,
     return successor;
   }
 
+  if (const auto *nearby = findNearbyLiftedHandlerEntry(model, pc, target_arch)) {
+    if (nearby->entry_va.has_value() && *nearby->entry_va != pc) {
+      VirtualDispatchSuccessorSummary successor;
+      llvm::StringRef handler_name(nearby->function_name);
+      if (handler_name.starts_with("blk_")) {
+        successor.kind = VirtualSuccessorKind::kLiftedBlock;
+      } else if (handler_name.starts_with("block_")) {
+        successor.kind = VirtualSuccessorKind::kTraceBlock;
+      } else {
+        successor.kind = VirtualSuccessorKind::kLiftedHandler;
+      }
+      successor.target_pc = *nearby->entry_va;
+      successor.target_function_name = nearby->function_name;
+      return successor;
+    }
+  }
+
   return std::nullopt;
+}
+
+struct DispatchFrontierClassification {
+  std::string reason;
+  std::optional<uint64_t> canonical_target_va;
+};
+
+static DispatchFrontierClassification classifyUnknownDispatchFrontier(
+    const BinaryMemoryMap &binary_memory, uint64_t target_pc,
+    TargetArch target_arch) {
+  DispatchFrontierClassification classification;
+  classification.reason = "missing_lifted_target";
+  if (!target_pc)
+    return classification;
+
+  if (!isTargetExecutable(binary_memory, target_pc)) {
+    classification.reason = "dispatch_target_not_executable";
+    return classification;
+  }
+
+  auto decodable_entry =
+      isTargetDecodableEntry(binary_memory, target_pc, target_arch);
+  if (decodable_entry.has_value() && !*decodable_entry) {
+    if (auto nearby_entry =
+            findNearbyExecutableEntry(binary_memory, target_pc, target_arch)) {
+      classification.reason = "dispatch_target_nearby_unlifted";
+      classification.canonical_target_va = nearby_entry;
+    } else {
+      classification.reason = "dispatch_target_undecodable";
+    }
+    return classification;
+  }
+
+  classification.reason = "dispatch_target_unlifted";
+  return classification;
 }
 
 static std::map<unsigned, VirtualValueExpr> factMapFor(
@@ -6050,6 +7979,7 @@ static std::vector<VirtualStackFact> stackFactsForMap(
 static void summarizeDispatchSuccessors(llvm::Module &M,
                                         VirtualMachineModel &model,
                                         const BinaryMemoryMap &binary_memory) {
+  auto target_arch = targetArchForModule(M);
   auto slot_ids = buildSlotIdMap(model);
   auto stack_cell_ids = buildStackCellIdMap(model);
   auto boolean_slot_ids = buildBooleanFlagSlotIds(M, model);
@@ -6123,14 +8053,23 @@ static void summarizeDispatchSuccessors(llvm::Module &M,
         annotateExprSlots(expr, slot_ids);
         annotateExprStackCells(expr, stack_cell_ids, slot_ids);
         note_target_expr(expr, source);
-        if (auto pc = evaluateVirtualExpr(expr, slot_facts, stack_facts)) {
+        if (auto pc = evaluateVirtualExpr(expr, slot_facts, stack_facts,
+                                          &binary_memory)) {
           append_pc(*pc, source);
           return;
         }
         llvm::SmallVector<uint64_t, 4> choices;
         if (collectEvaluatedTargetChoices(expr, slot_facts, stack_facts,
                                          &boolean_slot_ids,
-                                         &boolean_slot_expr_keys, choices)) {
+                                         &boolean_slot_expr_keys, choices,
+                                         &binary_memory)) {
+          for (uint64_t pc : choices)
+            append_pc(pc, source);
+          return;
+        }
+        if (collectEvaluatedValueChoices(expr, slot_facts, stack_facts, choices,
+                                         &binary_memory) &&
+            !choices.empty()) {
           for (uint64_t pc : choices)
             append_pc(pc, source);
         }
@@ -6176,7 +8115,8 @@ static void summarizeDispatchSuccessors(llvm::Module &M,
 
       for (const auto &resolved_pc : resolved_pcs) {
         if (auto successor =
-                classifyDispatchSuccessor(model, binary_memory, resolved_pc.pc)) {
+                classifyDispatchSuccessor(model, binary_memory, resolved_pc.pc,
+                                          target_arch)) {
           successor->resolution_source = resolved_pc.source;
           dispatch.successors.push_back(*successor);
           continue;
@@ -6196,7 +8136,8 @@ static void summarizeDispatchSuccessors(llvm::Module &M,
                    !isBoundedStateProvenanceExpr(dispatch.specialized_target)) {
           dispatch.unresolved_reason = "unsupported_slot_provenance_target";
         } else if (summary.has_unsupported_stack_memory ||
-                   (containsStackCellExpr(dispatch.specialized_target) &&
+                   ((containsStackCellExpr(dispatch.specialized_target) ||
+                     containsMemoryReadExpr(dispatch.specialized_target)) &&
                     !isBoundedStateProvenanceExpr(
                         dispatch.specialized_target))) {
           dispatch.unresolved_reason = "unsupported_memory_target";
@@ -6406,7 +8347,8 @@ static void summarizeCallSites(llvm::Module &M, VirtualMachineModel &model,
             *call, model, *localized_target_summary, slot_info, stack_cell_info,
             slot_ids, stack_cell_ids, dl, handler_index, outgoing_maps,
             outgoing_stack_maps, caller_outgoing, caller_outgoing_stack,
-            caller_argument_map, resolved, /*depth=*/1, visiting);
+            caller_argument_map, resolved, binary_memory, /*depth=*/1,
+            visiting);
         if (!localized) {
           if (callsite_summary.unresolved_reason.empty())
             callsite_summary.unresolved_reason = "call_return_unresolved";
@@ -6427,7 +8369,7 @@ static void summarizeCallSites(llvm::Module &M, VirtualMachineModel &model,
               value, *caller_fn, slot_ids, stack_cell_ids, caller_outgoing,
               caller_outgoing_stack, caller_argument_map);
           if (!normalized.has_value() || isUnknownLikeExpr(*normalized) ||
-              !isBoundedStateProvenanceExpr(*normalized)) {
+              !isBoundedLocalizedTransferExpr(*normalized)) {
             continue;
           }
           callsite_summary.return_slot_facts.push_back(
@@ -6442,7 +8384,7 @@ static void summarizeCallSites(llvm::Module &M, VirtualMachineModel &model,
               value, *caller_fn, slot_ids, stack_cell_ids, caller_outgoing,
               caller_outgoing_stack, caller_argument_map);
           if (!normalized.has_value() || isUnknownLikeExpr(*normalized) ||
-              !isBoundedStateProvenanceExpr(*normalized)) {
+              !isBoundedLocalizedTransferExpr(*normalized)) {
             continue;
           }
           callsite_summary.return_stack_facts.push_back(
@@ -6478,11 +8420,21 @@ static void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
       handler_by_pc.emplace(*handler.entry_va, &handler);
   }
 
+  auto is_root_slice_member = [](const VirtualHandlerSummary &handler) {
+    return handler.entry_va.has_value() || handler.is_output_root ||
+           handler.is_specialized || handler.is_candidate ||
+           !handler.dispatches.empty() || !handler.called_boundaries.empty() ||
+           !handler.callsites.empty();
+  };
+
   auto enqueue_handler = [&](const VirtualHandlerSummary *handler,
                              std::vector<const VirtualHandlerSummary *> &queue,
-                             std::set<std::string> &visited) {
-    if (!handler || !visited.insert(handler->function_name).second)
+                             std::set<std::string> &queued,
+                             std::set<std::string> &reachable) {
+    if (!handler || !queued.insert(handler->function_name).second)
       return;
+    if (is_root_slice_member(*handler))
+      reachable.insert(handler->function_name);
     queue.push_back(handler);
   };
 
@@ -6592,6 +8544,33 @@ static void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
         return std::string("dynamic_target");
       };
 
+  auto is_terminal_frontier =
+      [&](const VirtualRootSliceSummary::FrontierEdge &frontier) {
+        switch (frontier.kind) {
+          case VirtualRootFrontierKind::kCall:
+            return frontier.reason == "call_target_not_executable" ||
+                   frontier.reason == "call_target_undecodable";
+
+          case VirtualRootFrontierKind::kDispatch:
+            if (frontier.reason == "dispatch_target_not_executable" ||
+                frontier.reason == "dispatch_target_undecodable") {
+              return true;
+            }
+            if (frontier.reason != "boundary_target_unlifted")
+              return false;
+            if (!frontier.canonical_target_va.has_value() &&
+                !frontier.target_pc.has_value()) {
+              return true;
+            }
+            if (frontier.canonical_target_va.has_value()) {
+              return !isTargetExecutable(binary_memory,
+                                         *frontier.canonical_target_va);
+            }
+            return !isTargetExecutable(binary_memory, *frontier.target_pc);
+        }
+        return false;
+      };
+
   for (const auto &root_handler : handlers) {
     if (!root_handler.is_output_root || !root_handler.entry_va.has_value())
       continue;
@@ -6599,15 +8578,17 @@ static void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
     VirtualRootSliceSummary slice;
     slice.root_va = *root_handler.entry_va;
     std::set<std::string> reachable_names;
+    std::set<std::string> queued_names;
     std::vector<const VirtualHandlerSummary *> worklist;
-    enqueue_handler(&root_handler, worklist, reachable_names);
+    enqueue_handler(&root_handler, worklist, queued_names, reachable_names);
 
     while (!worklist.empty()) {
       const auto *handler = worklist.back();
       worklist.pop_back();
 
       bool traverse_direct_callees =
-          handler->is_output_root || handler->is_candidate ||
+          handler->entry_va.has_value() || handler->is_output_root ||
+          handler->is_candidate || has_lifted_direct_callee(*handler) ||
           !handler->dispatches.empty() || !handler->called_boundaries.empty() ||
           llvm::any_of(handler->callsites, [](const VirtualCallSiteSummary &cs) {
             return cs.continuation_pc.has_value();
@@ -6616,7 +8597,7 @@ static void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
         for (const auto &callee_name : handler->direct_callees) {
           auto it = handler_by_name.find(callee_name);
           if (it != handler_by_name.end())
-            enqueue_handler(it->second, worklist, reachable_names);
+            enqueue_handler(it->second, worklist, queued_names, reachable_names);
         }
       }
 
@@ -6629,7 +8610,7 @@ static void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
           if (it != handler_by_pc.end())
             target = it->second;
           if (target) {
-            enqueue_handler(target, worklist, reachable_names);
+            enqueue_handler(target, worklist, queued_names, reachable_names);
           } else {
             auto reason = std::string("call_target_not_executable");
             std::optional<uint64_t> recovered_entry_pc;
@@ -6673,7 +8654,8 @@ static void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
               continue;
 
             if (recovered_target && recovered_target->entry_va.has_value())
-              enqueue_handler(recovered_target, worklist, reachable_names);
+              enqueue_handler(recovered_target, worklist, queued_names,
+                              reachable_names);
 
             slice.frontier_edges.push_back(VirtualRootSliceSummary::FrontierEdge{
                 VirtualRootFrontierKind::kCall,
@@ -6718,7 +8700,7 @@ static void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
                   target = it->second;
               }
               if (target) {
-                enqueue_handler(target, worklist, reachable_names);
+                enqueue_handler(target, worklist, queued_names, reachable_names);
               } else {
                 slice.frontier_edges.push_back(
                     VirtualRootSliceSummary::FrontierEdge{
@@ -6739,7 +8721,7 @@ static void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
                   target = it->second;
               }
               if (target) {
-                enqueue_handler(target, worklist, reachable_names);
+                enqueue_handler(target, worklist, queued_names, reachable_names);
               } else {
                 slice.frontier_edges.push_back(
                     VirtualRootSliceSummary::FrontierEdge{
@@ -6753,6 +8735,21 @@ static void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
               break;
             }
             case VirtualSuccessorKind::kUnknown:
+              if (successor.target_pc != 0) {
+                auto classification = classifyUnknownDispatchFrontier(
+                    binary_memory, successor.target_pc, target_arch);
+                slice.frontier_edges.push_back(
+                    VirtualRootSliceSummary::FrontierEdge{
+                        VirtualRootFrontierKind::kDispatch,
+                        handler->function_name,
+                        static_cast<unsigned>(dispatch_index),
+                        0,
+                        std::move(classification.reason),
+                        successor.target_pc,
+                        classification.canonical_target_va,
+                        std::nullopt});
+                break;
+              }
               slice.frontier_edges.push_back(
                   VirtualRootSliceSummary::FrontierEdge{
                       VirtualRootFrontierKind::kDispatch,
@@ -6798,7 +8795,7 @@ static void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
             target = it->second;
         }
         if (target)
-          enqueue_handler(target, worklist, reachable_names);
+          enqueue_handler(target, worklist, queued_names, reachable_names);
 
         if (is_semantically_localized_callsite(*handler, callsite))
           continue;
@@ -6822,7 +8819,7 @@ static void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
           continue;
         auto it = handler_by_pc.find(*boundary->target_va);
         if (it != handler_by_pc.end()) {
-          enqueue_handler(it->second, worklist, reachable_names);
+          enqueue_handler(it->second, worklist, queued_names, reachable_names);
           continue;
         }
         slice.frontier_edges.push_back(VirtualRootSliceSummary::FrontierEdge{
@@ -6848,7 +8845,9 @@ static void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
           return !handler->specialization_root_va.has_value() ||
                  *handler->specialization_root_va == slice.root_va;
         }));
-    slice.is_closed = slice.frontier_edges.empty();
+    slice.is_closed =
+        slice.frontier_edges.empty() ||
+        llvm::all_of(slice.frontier_edges, is_terminal_frontier);
     root_slices.push_back(std::move(slice));
   }
 }
@@ -7105,6 +9104,13 @@ std::string renderVirtualValueExpr(const VirtualValueExpr &expr) {
       return "stack(slot(" + base + render_offset(base_offset) + ")" +
              render_offset(cell_offset) + ")";
     }
+    case VirtualExprKind::kMemoryRead:
+      if (expr.operands.size() != 1)
+        return "mem(?)";
+      return "mem(" + renderVirtualValueExpr(expr.operands.front()) + ")";
+    case VirtualExprKind::kZExt:
+    case VirtualExprKind::kSExt:
+    case VirtualExprKind::kTrunc:
     case VirtualExprKind::kAdd:
     case VirtualExprKind::kSub:
     case VirtualExprKind::kMul:
@@ -7190,6 +9196,15 @@ std::string renderVirtualValueExpr(const VirtualValueExpr &expr) {
           break;
         case VirtualExprKind::kPhi:
           op = "phi";
+          break;
+        case VirtualExprKind::kZExt:
+          op = "zext";
+          break;
+        case VirtualExprKind::kSExt:
+          op = "sext";
+          break;
+        case VirtualExprKind::kTrunc:
+          op = "trunc";
           break;
         default:
           break;
@@ -7295,7 +9310,11 @@ VirtualMachineModel::candidateHandlers() const {
 VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
     llvm::Module &M, llvm::ModuleAnalysisManager &MAM) {
   VirtualMachineModel model;
+  vmModelStageDebugLog("run: begin");
   const auto &binary_memory = MAM.getResult<BinaryMemoryAnalysis>(M);
+  vmModelStageDebugLog("run: binary-memory-ready");
+  const auto run_begin = std::chrono::steady_clock::now();
+  auto &module_cache = virtualModelSummaryCaches()[&M];
 
   for (auto &F : M) {
     if (!isBoundaryFunction(F))
@@ -7313,49 +9332,84 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
     model.boundaries_.push_back(std::move(info));
   }
 
-  std::map<std::string, llvm::SmallVector<std::string, 8>> direct_callees;
-  for (auto &F : M) {
-    if (F.isDeclaration())
-      continue;
-    auto &callees = direct_callees[F.getName().str()];
-    for (auto &BB : F) {
-      for (auto &I : BB) {
-        auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
-        if (!call)
-          continue;
-        auto *callee = call->getCalledFunction();
-        if (!callee || callee->isDeclaration() ||
-            callee->hasFnAttribute("omill.localized_continuation_shim")) {
-          continue;
-        }
-        if (!llvm::is_contained(callees, callee->getName().str()))
-          callees.push_back(callee->getName().str());
-      }
+  auto get_direct_callees = [&](llvm::Function &F)
+      -> const llvm::SmallVector<std::string, 8> & {
+    llvm::stable_hash fingerprint = llvm::StructuralHash(F, /*DetailedHash=*/true);
+    std::string function_name = F.getName().str();
+    auto cache_it = module_cache.direct_callees.find(function_name);
+    if (cache_it != module_cache.direct_callees.end() &&
+        cache_it->second.fingerprint == fingerprint) {
+      return cache_it->second.callees;
     }
-  }
+    auto callees = collectDirectCalleesForFunction(F);
+    auto inserted = module_cache.direct_callees.insert_or_assign(
+        function_name, CachedDirectCalleeEntry{fingerprint, std::move(callees)});
+    return inserted.first->second.callees;
+  };
 
   std::set<std::string> interesting_handlers;
-  std::vector<std::string> worklist;
-  for (auto &F : M) {
-    if (!isLiftedOrHelperSeedFunction(F))
-      continue;
-    auto inserted = interesting_handlers.insert(F.getName().str()).second;
-    if (inserted)
-      worklist.push_back(F.getName().str());
+  std::vector<std::pair<std::string, unsigned>> worklist;
+  std::map<std::string, unsigned> helper_chain_depths;
+  constexpr unsigned kMaxClosedSliceHelperClosureDepth = 2;
+  auto enqueue_interesting = [&](llvm::StringRef name, unsigned helper_depth) {
+    std::string key = name.str();
+    auto [it, inserted_depth] =
+        helper_chain_depths.emplace(key, helper_depth);
+    if (!inserted_depth) {
+      if (helper_depth >= it->second)
+        return;
+      it->second = helper_depth;
+    }
+    bool inserted_handler = interesting_handlers.insert(key).second;
+    if (!inserted_handler && !inserted_depth)
+      worklist.emplace_back(std::move(key), helper_depth);
+    else if (inserted_handler)
+      worklist.emplace_back(std::move(key), helper_depth);
+  };
+  const bool closed_slice_scope = isClosedRootSliceScopedModule(M);
+  if (closed_slice_scope) {
+    for (auto &F : M) {
+      if (F.isDeclaration() || !isClosedRootSliceFunction(F) ||
+          !isVirtualModelCodeBearingFunction(F)) {
+        continue;
+      }
+      enqueue_interesting(F.getName(), /*helper_depth=*/0);
+    }
+  }
+  if (interesting_handlers.empty()) {
+    for (auto &F : M) {
+      if (!isVirtualModelInitialSeedFunction(F))
+        continue;
+      enqueue_interesting(F.getName(), /*helper_depth=*/0);
+    }
   }
 
   while (!worklist.empty()) {
-    auto current = worklist.back();
+    auto [current, helper_depth] = worklist.back();
     worklist.pop_back();
-    auto it = direct_callees.find(current);
-    if (it == direct_callees.end())
+    auto *current_fn = M.getFunction(current);
+    if (!current_fn || current_fn->isDeclaration())
       continue;
-    for (const auto &callee_name : it->second) {
-      if (interesting_handlers.insert(callee_name).second)
-        worklist.push_back(callee_name);
+    for (const auto &callee_name : get_direct_callees(*current_fn)) {
+      auto *callee = M.getFunction(callee_name);
+      bool callee_code_bearing =
+          callee && isVirtualModelCodeBearingFunction(*callee);
+      unsigned next_helper_depth = callee_code_bearing ? 0u : helper_depth + 1u;
+      if (closed_slice_scope && !callee_code_bearing &&
+          next_helper_depth > kMaxClosedSliceHelperClosureDepth) {
+        continue;
+      }
+      enqueue_interesting(callee_name, next_helper_depth);
     }
   }
 
+  vmModelStageDebugLog("run: summarize-handlers-begin");
+  const auto summarize_begin = std::chrono::steady_clock::now();
+  auto &summary_cache = module_cache;
+  std::set<std::string> live_summary_names;
+  unsigned summarized_handlers = 0;
+  unsigned cached_summary_hits = 0;
+  unsigned cached_summary_misses = 0;
   for (auto &F : M) {
     if (F.isDeclaration())
       continue;
@@ -7365,15 +9419,98 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
         !interesting_handlers.count(F.getName().str())) {
       continue;
     }
-    model.handlers_.push_back(summarizeFunction(F));
+    if (vmModelStageDebugEnabled() && (summarized_handlers % 64u) == 0u) {
+      vmModelStageDebugLog(
+          (llvm::Twine("run: summarizing ") + F.getName()).str());
+    }
+    std::string function_name = F.getName().str();
+    live_summary_names.insert(function_name);
+    llvm::stable_hash fingerprint = summaryRelevantFunctionFingerprint(F);
+    auto cache_it = summary_cache.summaries.find(function_name);
+    if (cache_it != summary_cache.summaries.end() &&
+        cache_it->second.fingerprint == fingerprint) {
+      model.handlers_.push_back(cache_it->second.summary);
+      ++cached_summary_hits;
+    } else {
+      auto summary = summarizeFunction(F);
+      summary_cache.summaries[function_name] =
+          CachedHandlerSummaryEntry{fingerprint, summary};
+      model.handlers_.push_back(std::move(summary));
+      ++cached_summary_misses;
+    }
+    ++summarized_handlers;
   }
+  for (auto it = summary_cache.summaries.begin();
+       it != summary_cache.summaries.end();) {
+    if (live_summary_names.count(it->first) != 0)
+      ++it;
+    else
+      it = summary_cache.summaries.erase(it);
+  }
+  for (auto it = summary_cache.propagation_entries.begin();
+       it != summary_cache.propagation_entries.end();) {
+    if (live_summary_names.count(it->first) != 0)
+      ++it;
+    else
+      it = summary_cache.propagation_entries.erase(it);
+  }
+  vmModelStageDebugLog("run: summarize-handlers-done count=" +
+                       llvm::Twine(summarized_handlers).str() + " ms=" +
+                       llvm::Twine(elapsedMilliseconds(
+                           summarize_begin, std::chrono::steady_clock::now()))
+                           .str());
+  vmModelStageDebugLog("run: summarize-handlers-cache hits=" +
+                       llvm::Twine(cached_summary_hits).str() + " misses=" +
+                       llvm::Twine(cached_summary_misses).str());
 
+  vmModelStageDebugLog("run: canonicalize-begin");
+  const auto canonicalize_begin = std::chrono::steady_clock::now();
   canonicalizeVirtualState(model);
-  propagateVirtualStateFacts(M, model, binary_memory);
+  vmModelStageDebugLog("run: canonicalize-done ms=" +
+                       llvm::Twine(elapsedMilliseconds(
+                           canonicalize_begin,
+                           std::chrono::steady_clock::now()))
+                           .str());
+  vmModelStageDebugLog("run: propagate-begin");
+  const auto propagate_begin = std::chrono::steady_clock::now();
+  propagateVirtualStateFacts(M, model, binary_memory, &module_cache);
+  vmModelStageDebugLog("run: propagate-done ms=" +
+                       llvm::Twine(elapsedMilliseconds(
+                           propagate_begin, std::chrono::steady_clock::now()))
+                           .str());
+  vmModelStageDebugLog("run: regions-begin");
+  const auto regions_begin = std::chrono::steady_clock::now();
   summarizeVirtualRegions(model, binary_memory);
+  vmModelStageDebugLog("run: regions-done ms=" +
+                       llvm::Twine(elapsedMilliseconds(
+                           regions_begin, std::chrono::steady_clock::now()))
+                           .str());
+  vmModelStageDebugLog("run: dispatch-begin");
+  const auto dispatch_begin = std::chrono::steady_clock::now();
   summarizeDispatchSuccessors(M, model, binary_memory);
+  vmModelStageDebugLog("run: dispatch-done ms=" +
+                       llvm::Twine(elapsedMilliseconds(
+                           dispatch_begin, std::chrono::steady_clock::now()))
+                           .str());
+  vmModelStageDebugLog("run: callsites-begin");
+  const auto callsites_begin = std::chrono::steady_clock::now();
   summarizeCallSites(M, model, binary_memory);
+  vmModelStageDebugLog("run: callsites-done ms=" +
+                       llvm::Twine(elapsedMilliseconds(
+                           callsites_begin, std::chrono::steady_clock::now()))
+                           .str());
+  vmModelStageDebugLog("run: root-slices-begin");
+  const auto root_slices_begin = std::chrono::steady_clock::now();
   summarizeRootSlices(M, model, binary_memory);
+  vmModelStageDebugLog("run: root-slices-done ms=" +
+                       llvm::Twine(elapsedMilliseconds(
+                           root_slices_begin,
+                           std::chrono::steady_clock::now()))
+                           .str());
+  vmModelStageDebugLog("run: done ms=" +
+                       llvm::Twine(elapsedMilliseconds(
+                           run_begin, std::chrono::steady_clock::now()))
+                           .str());
 
   return model;
 }

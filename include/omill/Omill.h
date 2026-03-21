@@ -103,6 +103,11 @@ struct PipelineOptions {
   /// Indicates the driver requested no-ABI output shape.
   bool no_abi_mode = false;
 
+  /// Suppress the closed-slice missing-block lifting sweep during a scoped
+  /// rerun. Used by the late driver-side missing-block wave to avoid
+  /// recursively re-chasing unrelated constant targets.
+  bool skip_closed_slice_missing_block_lift = false;
+
   /// Merge block functions only after the discovery epoch converges.
   bool merge_block_functions_after_fixpoint = true;
 

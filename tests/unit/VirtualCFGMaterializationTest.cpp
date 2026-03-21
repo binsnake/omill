@@ -802,11 +802,8 @@ TEST_F(VirtualCFGMaterializationTest,
   auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
   auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
                                             false);
-  auto *boundary_ty =
-      llvm::FunctionType::get(i64_ty, std::vector<llvm::Type *>(12, i64_ty),
-                              false);
 
-  auto *boundary = llvm::Function::Create(boundary_ty,
+  auto *boundary = llvm::Function::Create(lifted_ty,
                                           llvm::Function::ExternalLinkage,
                                           "vm_entry_180042ba4", *M);
   boundary->addFnAttr("omill.protection_boundary");
@@ -1150,6 +1147,282 @@ TEST_F(VirtualCFGMaterializationTest,
 
   EXPECT_EQ(dispatch_calls, 0u);
   EXPECT_EQ(direct_calls, 1u);
+}
+
+TEST_F(VirtualCFGMaterializationTest,
+       MaterializesDispatchAfterHelperByteWriteToOverlappingWideSlot) {
+  auto M = createModule();
+  auto *i8_ty = llvm::Type::getInt8Ty(Ctx);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+  auto *helper_store_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, ptr_ty, i8_ty}, false);
+  auto *helper_jump_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, ptr_ty, i64_ty, ptr_ty}, false);
+
+  auto *dispatch = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "__omill_dispatch_jump", *M);
+
+  auto *target = llvm::Function::Create(lifted_ty,
+                                        llvm::Function::ExternalLinkage,
+                                        "blk_180008420", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target->getArg(0));
+  }
+
+  auto *store_byte_helper = llvm::Function::Create(
+      helper_store_ty, llvm::Function::ExternalLinkage,
+      "helper_store_byte_slot", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", store_byte_helper);
+    llvm::IRBuilder<> B(entry);
+    auto *byte_slot =
+        B.CreateGEP(i8_ty, store_byte_helper->getArg(1), B.getInt64(0x120));
+    B.CreateStore(store_byte_helper->getArg(2), byte_slot);
+    B.CreateRet(store_byte_helper->getArg(0));
+  }
+
+  auto *jump_helper = llvm::Function::Create(
+      helper_jump_ty, llvm::Function::ExternalLinkage, "helper_write_next_pc",
+      *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", jump_helper);
+    llvm::IRBuilder<> B(entry);
+    B.CreateStore(jump_helper->getArg(2), jump_helper->getArg(3));
+    B.CreateRet(jump_helper->getArg(0));
+  }
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::Function::ExternalLinkage,
+                                      "sub_180008400", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *next_pc = B.CreateAlloca(i64_ty, nullptr, "NEXT_PC");
+    auto *wide_slot = B.CreateGEP(i8_ty, root->getArg(0), B.getInt64(0x120));
+    B.CreateStore(B.getInt64(0x180008400ULL), wide_slot);
+    (void) B.CreateLoad(i8_ty, wide_slot);
+    B.CreateCall(store_byte_helper,
+                 {root->getArg(2), root->getArg(0), B.getInt8(0x20)});
+    auto *loaded_reg = B.CreateLoad(i64_ty, wide_slot);
+    B.CreateCall(jump_helper,
+                 {root->getArg(2), root->getArg(0), loaded_reg, next_pc});
+    auto *loaded_next_pc = B.CreateLoad(i64_ty, next_pc);
+    auto *call =
+        B.CreateCall(dispatch, {root->getArg(0), loaded_next_pc, root->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  runPass(*M);
+
+  unsigned dispatch_calls = 0;
+  unsigned direct_calls = 0;
+  for (auto &BB : *root) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *callee = CI->getCalledFunction();
+      if (!callee)
+        continue;
+      if (callee->getName() == "__omill_dispatch_jump")
+        ++dispatch_calls;
+      if (callee == target)
+        ++direct_calls;
+    }
+  }
+
+  EXPECT_EQ(dispatch_calls, 0u);
+  EXPECT_EQ(direct_calls, 1u);
+}
+
+TEST_F(VirtualCFGMaterializationTest,
+       MaterializesDispatchFromHelperMaskedLowByteReconstruction) {
+  auto M = createModule();
+  auto *i8_ty = llvm::Type::getInt8Ty(Ctx);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+
+  auto *dispatch = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "__omill_dispatch_jump", *M);
+
+  auto *target = llvm::Function::Create(lifted_ty,
+                                        llvm::Function::ExternalLinkage,
+                                        "blk_180008520", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target->getArg(0));
+  }
+
+  auto *helper = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "blk_180008500", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", helper);
+    llvm::IRBuilder<> B(entry);
+    auto *state = helper->getArg(0);
+    auto *vip_slot = B.CreateGEP(i8_ty, state, B.getInt64(0x120));
+    auto *target_slot = B.CreateGEP(i8_ty, state, B.getInt64(0x190));
+    auto *vip = B.CreateLoad(i64_ty, vip_slot);
+    auto *masked_high = B.CreateAnd(vip, B.getInt64(0xFFFFFFFFFFFFFF00ULL));
+    auto *masked_low =
+        B.CreateAnd(B.CreateZExt(B.CreateTrunc(vip, i8_ty), i64_ty),
+                    B.getInt64(0xFF));
+    B.CreateStore(B.CreateOr(masked_high, masked_low), target_slot);
+    B.CreateRet(state);
+  }
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::Function::ExternalLinkage,
+                                      "sub_1800084f0", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *state = root->getArg(0);
+    auto *vip_slot = B.CreateGEP(i8_ty, state, B.getInt64(0x120));
+    auto *target_slot = B.CreateGEP(i8_ty, state, B.getInt64(0x190));
+    B.CreateStore(B.getInt64(0x180008520ULL), vip_slot);
+    B.CreateCall(helper, {state, root->getArg(1), root->getArg(2)});
+    auto *loaded_target = B.CreateLoad(i64_ty, target_slot);
+    auto *call = B.CreateCall(dispatch,
+                              {state, loaded_target, root->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  runPass(*M);
+
+  unsigned dispatch_calls = 0;
+  unsigned direct_calls = 0;
+  for (auto &BB : *root) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *callee = CI->getCalledFunction();
+      if (!callee)
+        continue;
+      if (callee->getName() == "__omill_dispatch_jump")
+        ++dispatch_calls;
+      if (callee == target)
+        ++direct_calls;
+    }
+  }
+
+  EXPECT_EQ(dispatch_calls, 0u);
+  EXPECT_EQ(direct_calls, 1u);
+}
+
+TEST_F(VirtualCFGMaterializationTest,
+       MaterializesDispatchFromNestedMaskedPhiReconstruction) {
+  auto M = createModule();
+  auto *i8_ty = llvm::Type::getInt8Ty(Ctx);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+
+  auto *dispatch = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "__omill_dispatch_jump", *M);
+
+  auto *target0 = llvm::Function::Create(lifted_ty,
+                                         llvm::Function::ExternalLinkage,
+                                         "blk_180061a0e", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target0);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target0->getArg(0));
+  }
+
+  auto *target1 = llvm::Function::Create(lifted_ty,
+                                         llvm::Function::ExternalLinkage,
+                                         "blk_18006a04d", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target1);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target1->getArg(0));
+  }
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::GlobalValue::ExternalLinkage,
+                                      "sub_18000f100", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    auto *then_bb = llvm::BasicBlock::Create(Ctx, "then", root);
+    auto *else_bb = llvm::BasicBlock::Create(Ctx, "else", root);
+    auto *merge_bb = llvm::BasicBlock::Create(Ctx, "merge", root);
+
+    llvm::IRBuilder<> B(entry);
+    auto *flag_slot = B.CreateGEP(i8_ty, root->getArg(0), B.getInt64(0x811));
+    auto *flag = B.CreateLoad(i8_ty, flag_slot);
+    B.CreateCondBr(B.CreateICmpNE(flag, B.getInt8(0)), then_bb, else_bb);
+
+    B.SetInsertPoint(then_bb);
+    B.CreateBr(merge_bb);
+
+    B.SetInsertPoint(else_bb);
+    B.CreateBr(merge_bb);
+
+    B.SetInsertPoint(merge_bb);
+    auto *wide_phi = B.CreatePHI(i64_ty, 2);
+    wide_phi->addIncoming(B.getInt64(0x18005C2F4ULL), then_bb);
+    wide_phi->addIncoming(B.getInt64(0x180064933ULL), else_bb);
+    auto *low8_phi = B.CreatePHI(i64_ty, 2);
+    low8_phi->addIncoming(B.getInt64(0xF4), then_bb);
+    low8_phi->addIncoming(B.getInt64(0x33), else_bb);
+    auto *low16_phi = B.CreatePHI(i64_ty, 2);
+    low16_phi->addIncoming(B.getInt64(0xC2F4), then_bb);
+    low16_phi->addIncoming(B.getInt64(0x4933), else_bb);
+
+    auto *inner = B.CreateOr(
+        B.CreateAnd(wide_phi, B.getInt64(0xFFFFFFFFFFFFFF00ULL)),
+        B.CreateAnd(low8_phi, B.getInt64(0xFF)));
+    auto *outer = B.CreateOr(
+        B.CreateAnd(inner, B.getInt64(0xFFFFFFFFFFFF0000ULL)),
+        B.CreateAnd(low16_phi, B.getInt64(0xFFFF)));
+    auto *target_pc = B.CreateAdd(outer, B.getInt64(0x571A));
+    auto *call =
+        B.CreateCall(dispatch, {root->getArg(0), target_pc, root->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  runPass(*M);
+
+  unsigned dispatch_calls = 0;
+  unsigned direct_target0_calls = 0;
+  unsigned direct_target1_calls = 0;
+  unsigned switch_count = 0;
+  for (auto &BB : *root) {
+    if (llvm::isa<llvm::SwitchInst>(BB.getTerminator()))
+      ++switch_count;
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *callee = CI->getCalledFunction();
+      if (!callee)
+        continue;
+      if (callee->getName() == "__omill_dispatch_jump")
+        ++dispatch_calls;
+      if (callee == target0)
+        ++direct_target0_calls;
+      if (callee == target1)
+        ++direct_target1_calls;
+    }
+  }
+
+  EXPECT_EQ(dispatch_calls, 0u);
+  EXPECT_EQ(direct_target0_calls, 1u);
+  EXPECT_EQ(direct_target1_calls, 1u);
+  EXPECT_EQ(switch_count, 1u);
 }
 
 TEST_F(VirtualCFGMaterializationTest,
@@ -3499,6 +3772,197 @@ TEST_F(VirtualCFGMaterializationTest,
   EXPECT_EQ(direct_target0_calls, 1u);
   EXPECT_EQ(direct_target1_calls, 1u);
   EXPECT_EQ(switch_count, 1u);
+}
+
+TEST_F(VirtualCFGMaterializationTest,
+       MaterializesDispatchFromSingleBitMaskedSlotChoices) {
+  auto M = createModule();
+  auto *i8_ty = llvm::Type::getInt8Ty(Ctx);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+
+  auto *dispatch = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "__omill_dispatch_jump", *M);
+
+  auto *target0 = llvm::Function::Create(lifted_ty,
+                                         llvm::Function::ExternalLinkage,
+                                         "blk_18000d300", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target0);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target0->getArg(0));
+  }
+
+  auto *target1 = llvm::Function::Create(lifted_ty,
+                                         llvm::Function::ExternalLinkage,
+                                         "blk_18000d301", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target1);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target1->getArg(0));
+  }
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::Function::ExternalLinkage,
+                                      "sub_18000d280", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *slot = B.CreateGEP(i8_ty, root->getArg(0), B.getInt64(0x8F8));
+    auto *value = B.CreateLoad(i64_ty, slot);
+    auto *shifted = B.CreateLShr(value, B.getInt64(62));
+    auto *bit = B.CreateAnd(B.CreateTrunc(shifted, i8_ty), B.getInt8(1));
+    auto *bit64 = B.CreateZExt(bit, i64_ty);
+    auto *target_pc = B.CreateAdd(B.getInt64(0x18000D300ULL), bit64);
+    auto *call =
+        B.CreateCall(dispatch, {root->getArg(0), target_pc, root->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  runPass(*M);
+
+  unsigned dispatch_calls = 0;
+  unsigned direct_target0_calls = 0;
+  unsigned direct_target1_calls = 0;
+  unsigned switch_count = 0;
+  for (auto &BB : *root) {
+    if (llvm::isa<llvm::SwitchInst>(BB.getTerminator()))
+      ++switch_count;
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *callee = CI->getCalledFunction();
+      if (!callee)
+        continue;
+      if (callee->getName() == "__omill_dispatch_jump")
+        ++dispatch_calls;
+      if (callee == target0)
+        ++direct_target0_calls;
+      if (callee == target1)
+        ++direct_target1_calls;
+    }
+  }
+
+  EXPECT_EQ(dispatch_calls, 0u);
+  EXPECT_EQ(direct_target0_calls, 1u);
+  EXPECT_EQ(direct_target1_calls, 1u);
+  EXPECT_EQ(switch_count, 1u);
+}
+
+TEST_F(VirtualCFGMaterializationTest,
+       MaterializesDispatchToNearbyRecoveredLiftedEntry) {
+  auto M = createModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+
+  auto *dispatch = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "__omill_dispatch_jump", *M);
+
+  auto *target = llvm::Function::Create(lifted_ty,
+                                        llvm::Function::ExternalLinkage,
+                                        "blk_18000e240", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target->getArg(0));
+  }
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::Function::ExternalLinkage,
+                                      "sub_18000e200", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *call =
+        B.CreateCall(dispatch, {root->getArg(0), B.getInt64(0x18000E245ULL),
+                                root->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  runPass(*M);
+
+  unsigned dispatch_calls = 0;
+  unsigned direct_calls = 0;
+  for (auto &BB : *root) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *callee = CI->getCalledFunction();
+      if (!callee)
+        continue;
+      if (callee->getName() == "__omill_dispatch_jump")
+        ++dispatch_calls;
+      if (callee == target)
+        ++direct_calls;
+    }
+  }
+
+  EXPECT_EQ(dispatch_calls, 0u);
+  EXPECT_EQ(direct_calls, 1u);
+}
+
+TEST_F(VirtualCFGMaterializationTest,
+       MaterializesDispatchToExtendedNearbyRecoveredLiftedEntry) {
+  auto M = createModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+
+  auto *dispatch = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "__omill_dispatch_jump", *M);
+
+  auto *target = llvm::Function::Create(lifted_ty,
+                                        llvm::Function::ExternalLinkage,
+                                        "blk_18000e440", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target->getArg(0));
+  }
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::Function::ExternalLinkage,
+                                      "sub_18000e400", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *call =
+        B.CreateCall(dispatch, {root->getArg(0), B.getInt64(0x18000E45BULL),
+                                root->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  runPass(*M);
+
+  unsigned dispatch_calls = 0;
+  unsigned direct_calls = 0;
+  for (auto &BB : *root) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *callee = CI->getCalledFunction();
+      if (!callee)
+        continue;
+      if (callee->getName() == "__omill_dispatch_jump")
+        ++dispatch_calls;
+      if (callee == target)
+        ++direct_calls;
+    }
+  }
+
+  EXPECT_EQ(dispatch_calls, 0u);
+  EXPECT_EQ(direct_calls, 1u);
 }
 
 }  // namespace

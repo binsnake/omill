@@ -47,6 +47,14 @@ class ConstantMemoryFoldingTest : public ::testing::Test {
     return fn;
   }
 
+  llvm::Function *declareRemillRead64(llvm::Module &M) {
+    auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+    auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+    auto *fn_ty = llvm::FunctionType::get(i64_ty, {ptr_ty, i64_ty}, false);
+    return llvm::cast<llvm::Function>(
+        M.getOrInsertFunction("__remill_read_memory_64", fn_ty).getCallee());
+  }
+
   /// Run the pass with the given memory map.
   void runPass(llvm::Module &M, omill::BinaryMemoryMap map) {
     llvm::PassBuilder PB;
@@ -117,6 +125,78 @@ TEST_F(ConstantMemoryFoldingTest, LoadFromUnmappedAddressUnchanged) {
   ASSERT_NE(ret, nullptr);
   // Should still be a load, not a constant.
   EXPECT_TRUE(llvm::isa<llvm::LoadInst>(ret->getReturnValue()));
+}
+
+TEST_F(ConstantMemoryFoldingTest, RemillReadFromConstantAddressFolded) {
+  auto M = createModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *read_mem = declareRemillRead64(*M);
+
+  auto *fn_ty = llvm::FunctionType::get(i64_ty, {}, false);
+  auto *fn = llvm::Function::Create(fn_ty, llvm::Function::ExternalLinkage,
+                                    "test_fn", *M);
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", fn);
+  llvm::IRBuilder<> B(entry);
+  auto *value = B.CreateCall(
+      read_mem, {llvm::ConstantPointerNull::get(ptr_ty),
+                 llvm::ConstantInt::get(i64_ty, 0x1800)});
+  B.CreateRet(value);
+
+  uint8_t data[8] = {0x44, 0x33, 0x22, 0x11, 0xef, 0xbe, 0xad, 0xde};
+  omill::BinaryMemoryMap map;
+  map.addRegion(0x1800, data, 8, /*read_only=*/true);
+
+  runPass(*M, std::move(map));
+
+  auto *ret = llvm::dyn_cast<llvm::ReturnInst>(entry->getTerminator());
+  ASSERT_NE(ret, nullptr);
+  auto *ci = llvm::dyn_cast<llvm::ConstantInt>(ret->getReturnValue());
+  ASSERT_NE(ci, nullptr);
+  EXPECT_EQ(ci->getZExtValue(), 0xDEADBEEF11223344ULL);
+}
+
+TEST_F(ConstantMemoryFoldingTest,
+       RemillReadFromLocalConstantAllocaAddressFolded) {
+  auto M = createModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *read_mem = declareRemillRead64(*M);
+
+  auto *fn_ty = llvm::FunctionType::get(i64_ty, {}, false);
+  auto *fn = llvm::Function::Create(fn_ty, llvm::Function::ExternalLinkage,
+                                    "test_fn", *M);
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", fn);
+  llvm::IRBuilder<> B(entry);
+
+  auto *next_pc = B.CreateAlloca(i64_ty, nullptr, "NEXT_PC");
+  B.CreateStore(llvm::ConstantInt::get(i64_ty, 0x1000), next_pc);
+  B.CreateStore(llvm::ConstantInt::get(i64_ty, 0x1005), next_pc);
+  auto *base = B.CreateLoad(i64_ty, next_pc);
+  auto *addr = B.CreateAdd(base, llvm::ConstantInt::get(i64_ty, 3));
+  auto *value =
+      B.CreateCall(read_mem, {llvm::ConstantPointerNull::get(ptr_ty), addr});
+  B.CreateRet(value);
+
+  uint8_t data[16] = {};
+  data[8] = 0x78;
+  data[9] = 0x56;
+  data[10] = 0x34;
+  data[11] = 0x12;
+  data[12] = 0xef;
+  data[13] = 0xcd;
+  data[14] = 0xab;
+  data[15] = 0x90;
+  omill::BinaryMemoryMap map;
+  map.addRegion(0x1000, data, sizeof(data), /*read_only=*/true);
+
+  runPass(*M, std::move(map));
+
+  auto *ret = llvm::dyn_cast<llvm::ReturnInst>(entry->getTerminator());
+  ASSERT_NE(ret, nullptr);
+  auto *ci = llvm::dyn_cast<llvm::ConstantInt>(ret->getReturnValue());
+  ASSERT_NE(ci, nullptr);
+  EXPECT_EQ(ci->getZExtValue(), 0x90ABCDEF12345678ULL);
 }
 
 TEST_F(ConstantMemoryFoldingTest, GEPChainResolved) {
