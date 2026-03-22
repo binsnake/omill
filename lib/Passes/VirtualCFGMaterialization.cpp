@@ -19,7 +19,7 @@
 #include <map>
 #include <set>
 
-#include "omill/Analysis/VirtualMachineModel.h"
+#include "omill/Analysis/VirtualModel/Analysis.h"
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/IterativeLiftingSession.h"
 #include "omill/BC/BlockLifterAnalysis.h"
@@ -622,9 +622,27 @@ static bool lowerChoiceDispatchToSwitch(
   if (!dispatch_call || !dispatch_call->getParent() || !dispatch_value ||
       !dispatch_value->getType()->isIntegerTy() || targets.size() < 2)
     return false;
+  llvm::SmallVector<ResolvedTarget, 4> unique_targets;
+  unique_targets.reserve(targets.size());
   for (const auto &target : targets) {
     if (!target.function)
       return false;
+    auto it = llvm::find_if(unique_targets, [&](const ResolvedTarget &existing) {
+      return existing.pc == target.pc;
+    });
+    if (it == unique_targets.end()) {
+      unique_targets.push_back(target);
+    } else {
+      it->store_pc_to_state |= target.store_pc_to_state;
+    }
+  }
+  if (unique_targets.size() < 2) {
+    auto *callee = dispatch_call->getCalledFunction();
+    bool is_jump =
+        callee && callee->getName() == "__omill_dispatch_jump";
+    const auto &target = unique_targets.front();
+    return lowerToDirectCall(dispatch_call, target.function, target.pc, is_jump,
+                             target.store_pc_to_state);
   }
 
   auto *orig_bb = dispatch_call->getParent();
@@ -638,15 +656,15 @@ static bool lowerChoiceDispatchToSwitch(
 
   llvm::IRBuilder<> entry_builder(orig_bb);
   auto *switch_inst = entry_builder.CreateSwitch(
-      dispatch_value, default_bb, static_cast<unsigned>(targets.size()));
+      dispatch_value, default_bb, static_cast<unsigned>(unique_targets.size()));
 
   llvm::SmallVector<llvm::CallInst *, 4> case_calls;
   llvm::SmallVector<llvm::BasicBlock *, 4> case_blocks;
-  case_calls.reserve(targets.size());
-  case_blocks.reserve(targets.size());
+  case_calls.reserve(unique_targets.size());
+  case_blocks.reserve(unique_targets.size());
   auto *pc_ty = llvm::Type::getInt64Ty(ctx);
 
-  for (const auto &target : targets) {
+  for (const auto &target : unique_targets) {
     auto *case_bb = llvm::BasicBlock::Create(
         ctx, orig_bb->getName() + ".case", parent_fn, after_bb);
     llvm::IRBuilder<> builder(case_bb);
@@ -665,7 +683,7 @@ static bool lowerChoiceDispatchToSwitch(
   if (!dispatch_call->getType()->isVoidTy()) {
     llvm::IRBuilder<> after_builder(&after_bb->front());
     auto *phi = after_builder.CreatePHI(dispatch_call->getType(),
-                                        static_cast<unsigned>(targets.size()));
+                                        static_cast<unsigned>(unique_targets.size()));
     for (size_t i = 0; i < case_calls.size(); ++i)
       phi->addIncoming(case_calls[i], case_blocks[i]);
     dispatch_call->replaceAllUsesWith(phi);
@@ -2322,6 +2340,9 @@ static MaterializationResult runMaterialization(llvm::Module &M,
               case VirtualDispatchResolutionSource::kHelperArgumentSpecialization:
                 os << "helper_argument_specialization";
                 break;
+              case VirtualDispatchResolutionSource::kPreludeLocalization:
+                os << "prelude_localization";
+                break;
             }
             os << " expr="
                << renderVirtualValueExpr(dispatch.specialized_target) << "\n";
@@ -2368,6 +2389,9 @@ static MaterializationResult runMaterialization(llvm::Module &M,
               case VirtualDispatchResolutionSource::kHelperArgumentSpecialization:
                 os << "helper_argument_specialization";
                 break;
+              case VirtualDispatchResolutionSource::kPreludeLocalization:
+                os << "prelude_localization";
+                break;
             }
             os << " pc=0x" << llvm::utohexstr(successor.target_pc);
             if (successor.target_function_name.has_value())
@@ -2408,6 +2432,9 @@ static MaterializationResult runMaterialization(llvm::Module &M,
               break;
             case VirtualDispatchResolutionSource::kHelperArgumentSpecialization:
               os << "helper_argument_specialization";
+              break;
+            case VirtualDispatchResolutionSource::kPreludeLocalization:
+              os << "prelude_localization";
               break;
           }
           os << " expr=" << renderVirtualValueExpr(callsite.specialized_target)

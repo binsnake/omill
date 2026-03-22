@@ -16,7 +16,29 @@ add_library(omill STATIC
   Analysis/IterativeLiftingSession.cpp
   Analysis/RemillIntrinsicAnalysis.cpp
   Analysis/StateFieldAccessAnalysis.cpp
-  Analysis/VirtualMachineModel.cpp
+  Analysis/VirtualModel/CallSites.cpp
+  Analysis/VirtualModel/CallState.cpp
+  Analysis/VirtualModel/Core.cpp
+  Analysis/VirtualModel/Dispatch.cpp
+  Analysis/VirtualModel/DirectCallees.cpp
+  Analysis/VirtualModel/Driver.cpp
+  Analysis/VirtualModel/Facts.cpp
+  Analysis/VirtualModel/Imports.cpp
+  Analysis/VirtualModel/LocalizedCalls.cpp
+  Analysis/VirtualModel/Localization.cpp
+  Analysis/VirtualModel/Model.cpp
+  Analysis/VirtualModel/PropagationCache.cpp
+  Analysis/VirtualModel/Propagation.cpp
+  Analysis/VirtualModel/Replay.cpp
+  Analysis/VirtualModel/Regions.cpp
+  Analysis/VirtualModel/Render.cpp
+      Analysis/VirtualModel/RootSlices.cpp
+      Analysis/VirtualModel/StateFacts.cpp
+      Analysis/VirtualModel/Specialization.cpp
+      Analysis/VirtualModel/Summary.cpp
+      Analysis/VirtualModel/Targets.cpp
+  Analysis/VirtualModel/Transfers.cpp
+  Analysis/VirtualModel/ValueExprs.cpp
   Analysis/ExceptionInfo.cpp
   Analysis/SegmentsAA.cpp
   Analysis/VirtualCalleeRegistry.cpp

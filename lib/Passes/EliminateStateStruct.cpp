@@ -19,21 +19,50 @@ bool shouldProcessClosedRootSliceFunction(const llvm::Function &F) {
   return isClosedRootSliceFunction(F);
 }
 
+bool shouldPreserveLiftedOutputRootBoundary(const llvm::Function &F) {
+  if (!F.hasFnAttribute("omill.output_root"))
+    return false;
+  if (isClosedRootSliceRoot(F))
+    return false;
+
+  return F.hasFnAttribute("omill.vm_wrapper") ||
+         F.hasFnAttribute("omill.vm_handler") ||
+         F.getFnAttribute("omill.vm_demerged_clone").isValid() ||
+         F.getFnAttribute("omill.vm_outlined_virtual_call").isValid() ||
+         F.getFnAttribute("omill.trace_native_target").isValid();
+}
+
+bool shouldInternalizeLiftedHelperWithoutWrapper(const llvm::Function &F) {
+  if (!isLiftedFunction(F))
+    return false;
+  if (F.hasFnAttribute("omill.output_root"))
+    return false;
+  return true;
+}
+
 /// For functions that have been fully recovered (have a _native wrapper),
 /// internalize the original lifted function so it can be inlined and DCE'd.
 void internalizeRecoveredFunctions(llvm::Module &M) {
   for (auto &F : M) {
     if (F.isDeclaration()) continue;
-    if (!shouldProcessClosedRootSliceFunction(F))
-      continue;
     std::string native_name = F.getName().str() + "_native";
-    if (M.getFunction(native_name)) {
+    const bool has_native_wrapper = M.getFunction(native_name) != nullptr;
+    const bool internalize_dead_lifted_helper =
+        !has_native_wrapper && shouldInternalizeLiftedHelperWithoutWrapper(F);
+    if (!internalize_dead_lifted_helper &&
+        !shouldProcessClosedRootSliceFunction(F))
+      continue;
+
+    if (has_native_wrapper || internalize_dead_lifted_helper) {
       F.setLinkage(llvm::GlobalValue::InternalLinkage);
-      if (F.hasFnAttribute("omill.output_root") &&
-          !isClosedRootSliceRoot(F)) {
-        // Keeping the exported lifted root as a call boundary avoids
-        // force-inlining the whole stateful body into the public wrapper,
-        // which can collapse the concrete success path into the fastfail arm.
+      if (!has_native_wrapper)
+        continue;
+
+      if (shouldPreserveLiftedOutputRootBoundary(F)) {
+        // Keep VM-oriented output roots as a boundary when they are still not
+        // on a closed recovered slice. Plain lifted roots should inline into
+        // the native wrapper so ABI cleanup can collapse ordinary block-lifted
+        // helper graphs too.
         F.removeFnAttr(llvm::Attribute::AlwaysInline);
         F.addFnAttr(llvm::Attribute::NoInline);
       } else {

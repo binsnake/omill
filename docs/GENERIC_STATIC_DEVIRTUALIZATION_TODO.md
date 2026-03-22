@@ -2030,3 +2030,680 @@ Next required architectural change:
   - End-to-end from the earlier stable baseline (`fresh_relift_fix73`) to `fresh_relift_fix90`, compact runtime dropped from about `1137.3s` to about `67.8s`, a total savings of roughly `1069.5s` / `94.0%`.
   - Stage evidence: after the first VM-model run, later runs restore most handlers directly (`restored-state handlers=80+` in the late compact iterations), and many of those reruns now spend only `~0.1s-2.5s` in propagation unless a newly lifted frontier target forces a real wave through the slice.
   - Semantic impact: the compact root slice remains unchanged at `reachable=38 frontier=2 closed=false`, with the same `blk_180055365` call frontier and `blk_180026dce` dispatch frontier.
+- 2026-03-21: Started structural cleanup of the generic VM model code layout.
+  - Added a dedicated public folder under `include/omill/Analysis/VirtualModel/`:
+    - `Types.h` for the public VM model enums / summaries / fact structs
+    - `Analysis.h` for `VirtualMachineModel` and `VirtualMachineModelAnalysis`
+  - Converted `include/omill/Analysis/VirtualMachineModel.h` into a compatibility umbrella that includes the new headers, so existing call sites do not need to move immediately.
+  - Split stable, non-analysis implementation out of the old monolithic source into:
+    - `lib/Analysis/VirtualModel/Render.cpp`
+    - `lib/Analysis/VirtualModel/Model.cpp`
+  - Validation: `omill-unit-tests` rebuilds cleanly, and the focused VM/pipeline regression set remains green (`7/7`).
+  - Cleanup status: this is the first stage only. The heavy analysis implementation still lives in `lib/Analysis/VirtualMachineModel.cpp`, but the public types/API boundary is now isolated enough to continue decomposing propagation, replay, and root-slice logic without churning every include site.
+- 2026-03-21: Split the VM-model analysis driver from the remaining monolithic implementation.
+  - Added `lib/Analysis/VirtualModel/Internal.h` as the shared internal boundary for:
+    - per-module VM-model cache state
+    - localized replay/cache record types
+    - analysis-driver-visible helper declarations
+  - Moved `VirtualMachineModelAnalysis::Key` and `VirtualMachineModelAnalysis::run` into `lib/Analysis/VirtualModel/Driver.cpp`.
+  - Converted the remaining VM-model implementation in `lib/Analysis/VirtualMachineModel.cpp` into the `omill::virtual_model::detail` namespace, so the file now has a real internal namespace boundary instead of a single anonymous-namespace blob.
+  - Validation: full `omill-unit-tests` rebuild succeeded, and the focused VM/pipeline regression set remained green (`7/7`).
+  - Cleanup status: the remaining monolith is now mostly analysis-core logic rather than mixed public API + driver + rendering + caches. The next clean split point is one of:
+    - propagation/caching
+    - helper-local replay
+    - successor/root-slice/region summarization
+- 2026-03-21: Split root-slice summarization into its own VM-model file.
+  - Added `lib/Analysis/VirtualModel/RootSlices.cpp` for:
+    - root-slice reachability walk
+    - call/dispatch frontier classification at the slice layer
+    - terminal-frontier closure logic
+  - Extended `lib/Analysis/VirtualModel/Internal.h` with the small internal API that root-slice summarization needs from the core analysis file:
+    - entry-prelude direct-call detection
+    - executable/decodable target checks
+    - target-architecture query
+    - nearby executable entry recovery
+  - Removed the old `summarizeRootSlices` implementation from `lib/Analysis/VirtualMachineModel.cpp`, and deleted the now-dead duplicate frontier helper left behind in the monolith.
+  - Validation: full `omill-unit-tests` rebuild succeeded, and the focused VM/pipeline regression set remained green (`7/7`).
+  - Cleanup status: the remaining monolith is smaller again and no longer owns the root-slice closure layer. The next reasonable split points are `summarizeVirtualRegions`, `summarizeDispatchSuccessors`, or the propagation/cache engine.
+- 2026-03-21: Split region summarization into its own VM-model file.
+  - Added `lib/Analysis/VirtualModel/Regions.cpp` for:
+    - region component construction
+    - boundary-adjacent region membership
+    - region-level incoming/outgoing fact aggregation
+  - Extended `lib/Analysis/VirtualModel/Internal.h` with the minimal additional internal API needed by region summarization:
+    - `evaluateVirtualExpr`
+    - `mergeIncomingExpr`
+    - `unknownExpr`
+    - `resolveBoundaryNameForTarget`
+  - Removed the old `summarizeVirtualRegions` implementation from `lib/Analysis/VirtualMachineModel.cpp`.
+  - Validation: full `omill-unit-tests` rebuild succeeded, and the focused VM/pipeline regression set remained green (`7/7`).
+  - Cleanup status: the remaining monolith now holds mostly:
+    - propagation/caching
+    - helper-local replay and call import
+    - dispatch/callsite summarization
+    - low-level expression/fact utilities
+  - Next clean split points are `summarizeDispatchSuccessors` or the propagation/cache engine.
+- 2026-03-21: Split dispatch-successor summarization into its own VM-model file.
+  - Added `lib/Analysis/VirtualModel/Dispatch.cpp` for:
+    - dispatch target specialization against handler/region facts
+    - protected-boundary dispatch successor classification
+    - nearby lifted-entry dispatch recovery
+  - Removed the old `summarizeDispatchSuccessors` implementation and its dispatch-only helper cluster from `lib/Analysis/VirtualMachineModel.cpp`.
+  - Kept the generic fact-map helpers in `lib/Analysis/VirtualMachineModel.cpp` for the remaining callsite summarization path, so this split does not force a larger callsite refactor yet.
+  - Validation: `omill-unit-tests` rebuild succeeded, and the focused VM/pipeline regression set remained green (`7/7`).
+  - Cleanup status: the remaining monolith is now mostly:
+    - propagation/caching
+    - helper-local replay and direct-callee/callsite import
+    - callsite summarization
+    - low-level expression/fact utilities
+  - Next clean split points are `summarizeCallSites` or the propagation/cache engine.
+- 2026-03-21: Split shared fact-conversion helpers into their own VM-model file.
+  - Added `lib/Analysis/VirtualModel/Facts.cpp` for the common conversions between:
+    - slot fact vectors and slot-ID maps
+    - stack fact vectors and cell-ID maps
+    - argument fact vectors and argument-ID maps
+  - Promoted those helpers through `lib/Analysis/VirtualModel/Internal.h`, so both `Dispatch.cpp` and the remaining monolith use the same internal API instead of carrying duplicate local definitions.
+  - Removed the duplicate fact-conversion helpers from `lib/Analysis/VirtualMachineModel.cpp` and `lib/Analysis/VirtualModel/Dispatch.cpp`.
+  - Validation: `omill-unit-tests` rebuild succeeded, and the focused VM/pipeline regression set remained green (`7/7`).
+  - Cleanup status: the remaining monolith is now more concentrated on:
+    - propagation/caching
+    - helper-local replay and direct-callee/callsite import
+    - callsite summarization
+    - low-level expression/fact evaluation and canonicalization
+  - Next clean split point remains `summarizeCallSites`; after that, the largest remaining chunk is the propagation/cache engine.
+- 2026-03-21: Split shared target/state lookup helpers out of the monolith.
+  - Added `lib/Analysis/VirtualModel/Targets.cpp` for:
+    - lifted-call continuation inference
+    - handler lookup by entry VA
+    - executable/mapped/decodable target classification
+    - nearby lifted-entry / executable-entry recovery
+  - Extended `lib/Analysis/VirtualModel/Facts.cpp` with the slot-info and stack-cell-info map builders that were previously private to `lib/Analysis/VirtualMachineModel.cpp`.
+  - Promoted those shared helpers through `lib/Analysis/VirtualModel/Internal.h`, so dispatch, root-slice, and the remaining callsite code use the same internal target/state lookup API.
+  - Removed the corresponding duplicate target helper implementations from `lib/Analysis/VirtualMachineModel.cpp` and the duplicate nearby-entry helper from `lib/Analysis/VirtualModel/Dispatch.cpp`.
+  - Validation: `omill-unit-tests` rebuild succeeded, and the focused VM/pipeline regression set remained green (`7/7`).
+  - Cleanup status: the remaining monolith is now more clearly concentrated on:
+    - propagation/caching
+    - helper-local replay and direct-callee import
+    - callsite/localized-return summarization
+    - low-level expression/fact evaluation and canonicalization
+  - Next clean split point is still the callsite/localized-return layer; this target/state extraction was the prerequisite that makes that split smaller and less coupled.
+- 2026-03-21: Split callsite summarization into its own VM-model file.
+  - Added `lib/Analysis/VirtualModel/CallSites.cpp` for:
+    - the `summarizeCallSites` pass
+    - pass-local `NEXT_PC`/`RETURN_PC` fallback matching helpers used only by that pass
+  - Promoted the small shared callsite summary surface through `lib/Analysis/VirtualModel/Internal.h`:
+    - `ResolvedCallSiteInfo`
+    - `LocalCallSiteState`
+    - `computeLocalFactsBeforeCall`
+    - `resolveCallSiteInfo`
+    - `computeResolvedCallTargetOutgoingFacts`
+    - `normalizeLocalizedExprForCaller`
+  - Also promoted the shared debug/transfer helpers needed by the new file:
+    - `vmModelImportDebugLog`
+    - `isBoundedLocalizedTransferExpr`
+    - `rebaseWrittenStackCellIds`
+  - Removed the old `summarizeCallSites` implementation and its pass-local helper block from `lib/Analysis/VirtualMachineModel.cpp`.
+  - Validation: `omill-unit-tests` rebuild succeeded, and the focused VM/pipeline regression set remained green (`7/7`).
+  - Cleanup status: the remaining monolith is now primarily:
+    - propagation/caching
+    - helper-local replay and direct-callee/localized-import machinery
+    - low-level expression/fact evaluation and canonicalization
+  - Next clean split points are now:
+    - the direct-callee/localized-import layer
+    - or the propagation/cache engine
+- Refactor: moved shared transfer/rebasing helpers out of `VirtualMachineModel.cpp` into `lib/Analysis/VirtualModel/Transfers.cpp`, including localized-transfer bounding, argument detection, stack-cell rebasing, and fact-map merge helpers. Focused VM/pipeline regression set stayed green after the split.
+- Refactor: moved summary key/lookup helpers and propagation-cache capture/restore helpers out of `VirtualMachineModel.cpp` into `lib/Analysis/VirtualModel/Facts.cpp` and `lib/Analysis/VirtualModel/PropagationCache.cpp`. The monolith now carries less VM data plumbing and the focused regression set stayed green after both splits.
+- Refactor: moved caller/callee remap and import-normalization helpers out of `VirtualMachineModel.cpp` into `lib/Analysis/VirtualModel/Imports.cpp`, including structural slot/stack remap, caller-local normalization, and mapped caller slot/stack-cell lookup. Promoted the shared remap/import surface through `lib/Analysis/VirtualModel/Internal.h`, added the new file to `lib/CMakeLists.txt`, and kept the focused VM/pipeline regression set green (`7/7`).
+- Refactor: moved pre-call state reconstruction and specialized call-argument helpers out of `VirtualMachineModel.cpp` into `lib/Analysis/VirtualModel/CallState.cpp`, including `computeLocalFactsBeforeCall`, `summarizeSpecializedCallArg`, and `buildSpecializedCallArgumentMap`. Promoted the fixpoint-specialization helpers through `lib/Analysis/VirtualModel/Internal.h`, wired the new file in `lib/CMakeLists.txt`, and kept the focused VM/pipeline regression set green (`7/7`).
+- Refactor: moved the shared localization/local-replay support layer out of `VirtualMachineModel.cpp` into `lib/Analysis/VirtualModel/Localization.cpp`, including:
+  - read-only binary constant reads for replay/evaluation
+  - localized replay block collection and gating
+  - state-slot / stack-cell expression builders
+  - caller-state argument detection and recursive localization bounds
+  - specialized constant resolution and call-continuation stack seeding helpers
+  - promoted the local-replay debug wrappers and localization depth cap through `lib/Analysis/VirtualModel/Internal.h`
+  - added the new file to `lib/CMakeLists.txt`
+  - validation: `omill-unit-tests` rebuild succeeded and the focused VM/pipeline regression set stayed green (`7/7`)
+- Refactor: moved direct callsite target resolution out of `VirtualMachineModel.cpp` into `lib/Analysis/VirtualModel/CallSites.cpp`, including the local `RETURN_PC` seeding helper and the `resolveCallSiteInfo` implementation. This keeps callsite-resolution logic with the existing callsite summarization pass and trimmed the monolith again. Validation remained green on the focused VM/pipeline regression set (`7/7`).
+- Refactor: moved the direct-callee import/application layer out of `VirtualMachineModel.cpp` into `lib/Analysis/VirtualModel/DirectCallees.cpp`, including:
+  - direct-callee per-call import
+  - caller-local slot/stack remap and merge for imported callee outputs
+  - call-root import path for resolved call targets
+  - the public `applyDirectCalleeEffects` / `applyDirectCalleeEffectsImpl` internal entry points
+  - validation: `omill-unit-tests` rebuild succeeded and the focused VM/pipeline regression set stayed green (`7/7`)
+- Refactor: moved the localized call-return / call-root continuation layer out of `VirtualMachineModel.cpp` into `lib/Analysis/VirtualModel/LocalizedCalls.cpp`, including:
+  - localized callsite outgoing-state import
+  - resolved call-target continuation import
+  - localized call-return effect application
+  - entry-prelude target localization
+  - promoted the replay-entry and entry-prelude hooks through `lib/Analysis/VirtualModel/Internal.h`
+  - wired the new file into `lib/CMakeLists.txt`
+  - validation: `omill-unit-tests` rebuild succeeded and the focused VM/pipeline regression set stayed green (`7/7`)
+- Refactor: moved the low-level state-fact / expression utility cluster out of `VirtualMachineModel.cpp` into `lib/Analysis/VirtualModel/StateFacts.cpp`, including:
+  - bit-width casting for state expressions
+  - masked low-bit reconstruction simplification
+  - low-bit merge into wider aliased state slots
+  - aliased state-slot write propagation
+  - bounded argument/state fact classification
+  - identity/remappable/global-mergeable fact predicates
+  - caller-local alloca-state detection
+  - added the shared surface to `lib/Analysis/VirtualModel/Internal.h`
+  - wired the new file into `lib/CMakeLists.txt`
+  - validation: `omill-unit-tests` rebuild succeeded and the focused VM/pipeline regression set stayed green (`7/7`)
+- Refactor: moved the helper-local replay engine out of `VirtualMachineModel.cpp` into `lib/Analysis/VirtualModel/Replay.cpp`, including:
+  - `computeLocalizedSingleBlockOutgoingFacts`
+  - sequential local slot/stack/value replay for single-block helpers
+  - bounded read-memory constant folding and tracked stack-cell replay
+  - direct-callee replay integration and written slot/cell tracking
+  - wired the new file into `lib/CMakeLists.txt`
+  - validation: `omill-unit-tests` rebuild succeeded and the focused VM/pipeline regression set stayed green (`7/7`)
+- Refactor: moved the propagation/caching flow out of `VirtualMachineModel.cpp` into `lib/Analysis/VirtualModel/Propagation.cpp`, including:
+  - `canonicalizeVirtualState`
+  - `propagateVirtualStateFacts`
+  - propagation-local outgoing-fact cache helpers and map comparison helpers
+  - canonicalization-local slot/stack live-in collection helpers
+  - added the shared referenced-slot collector to `lib/Analysis/VirtualModel/Internal.h`
+  - wired the new file into `lib/CMakeLists.txt`
+  - validation: `omill-unit-tests` rebuild succeeded and the focused VM/pipeline regression set stayed green (`7/7`)
+- VM-model refactor status:
+  - the previous “remaining categories” list is now cleared
+  - `lib/Analysis/VirtualMachineModel.cpp` is down to about `1570` lines and now mainly holds the core summary/value-evaluation implementation rather than the model driver, propagation engine, or helper replay/import layers
+- Refactor: moved the function-summary / candidate-classification layer out of `VirtualMachineModel.cpp` into `lib/Analysis/VirtualModel/Summary.cpp`, including:
+  - specialization-attribute parsing helpers
+  - summary-relevant function fingerprinting
+  - boundary/helper/code-bearing classification helpers
+  - `summarizeFunction`
+  - `collectDirectCalleesForFunction`
+  - wired the new file into `lib/CMakeLists.txt`
+  - validation: `omill-unit-tests` rebuild succeeded and the focused VM/pipeline regression set stayed green (`7/7`)
+- Refactor: moved the expression-evaluation / specialization core out of `VirtualMachineModel.cpp` into `lib/Analysis/VirtualModel/Core.cpp`, including:
+  - `isCallSiteHelper`
+  - recursive `evaluateVirtualExpr` folding
+  - slot/stack annotation and memory-read canonicalization helpers
+  - expression equality / unknown classification / symbolic-ref counting
+  - finite target/value choice collection
+  - specialization and outgoing-fact construction helpers
+  - boolean-flag slot/expr-key builders
+  - entry-prelude direct-call detection
+  - wired the new file into `lib/CMakeLists.txt`
+  - validation: `omill-unit-tests` rebuild succeeded and the focused VM/pipeline regression set stayed green (`7/7`)
+- VM-model refactor status:
+  - `lib/Analysis/VirtualMachineModel.cpp` is now down to about `241` lines
+  - it mainly holds the shared debug/cache wrappers plus boundary-name resolution glue
+- Refactor: moved the final glue out of `VirtualMachineModel.cpp` and completed the folder split:
+  - moved shared debug/cache wrapper definitions into `lib/Analysis/VirtualModel/Driver.cpp`
+  - moved boundary-name resolution glue into `lib/Analysis/VirtualModel/Targets.cpp`
+  - removed `lib/Analysis/VirtualMachineModel.cpp` from `lib/CMakeLists.txt` and deleted the file
+  - validation: `omill-unit-tests` rebuild succeeded and the focused VM/pipeline regression set stayed green (`7/7`)
+- VM-model refactor status:
+  - the implementation now lives entirely under `lib/Analysis/VirtualModel/`
+  - the public surface lives under `include/omill/Analysis/VirtualModel/`
+  - `include/omill/Analysis/VirtualMachineModel.h` remains as a compatibility umbrella
+- Refactor: switched internal consumers off the compatibility umbrella and onto the new public VM-model surface:
+  - `lib/Analysis/VirtualModel/Internal.h` now includes `omill/Analysis/VirtualModel/Analysis.h`
+  - internal consumers like `lib/Pipeline.cpp`, `lib/Passes/VirtualCFGMaterialization.cpp`, and `tests/unit/VirtualMachineModelTest.cpp` now include the `VirtualModel` headers directly
+  - `include/omill/Analysis/VirtualMachineModel.h` remains only as a compatibility include
+  - validation: `omill-unit-tests` rebuild succeeded and the focused VM/pipeline regression set stayed green (`7/7`)
+- Refactor: split the internal VM-model declaration surface so `lib/Analysis/VirtualModel/Internal.h` is now only an umbrella:
+  - `lib/Analysis/VirtualModel/DetailTypes.h` now carries the internal cache/key/state structs
+  - `lib/Analysis/VirtualModel/DetailDecls.h` now carries the internal function declarations
+  - `lib/Analysis/VirtualModel/Internal.h` now just includes those two headers
+  - validation: `omill-unit-tests` rebuild succeeded and the focused VM/pipeline regression set stayed green (`7/7`)
+- Refactor: split the internal declaration umbrella into categories:
+  - `lib/Analysis/VirtualModel/CoreDecls.h` now carries the core/shared declaration surface
+  - `lib/Analysis/VirtualModel/FlowDecls.h` now carries the analysis-flow / localization / target declarations
+  - `lib/Analysis/VirtualModel/DetailDecls.h` is now only an umbrella over those category headers
+  - validation: `omill-unit-tests` rebuild succeeded and the focused VM/pipeline regression set stayed green (`7/7`)
+- Refactor: split the remaining specialization / evaluated-choice cluster out of `lib/Analysis/VirtualModel/Core.cpp` into `lib/Analysis/VirtualModel/Specialization.cpp`, including:
+  - bounded target-choice collection
+  - bounded value-choice collection
+  - expression specialization and fixpoint helpers
+  - outgoing slot/stack fact construction
+  - boolean-flag slot/key builders
+  - validation: `omill-unit-tests` rebuild succeeded and the focused VM/pipeline regression set stayed green (`7/7`)
+- Corpus rerun / devirtualization follow-up after the VM-model folder split:
+  - tightened localized replay caller-stack lookup in `lib/Analysis/VirtualModel/Replay.cpp` so the remapped helper path now uses the same exact/equivalent/rebased lookup logic as the direct path
+  - threaded fallback caller slot/stack facts through nested localized direct-callee replay (`FlowDecls.h`, `LocalizedCalls.cpp`, `DirectCallees.cpp`, `Replay.cpp`) so nested helper replay can still consult outer caller-local VM-stack state
+  - validation: focused regressions stayed green:
+    - `VirtualMachineModelTest.InvalidatesCachedHandlerSummaryAfterBodyChange`
+    - `VirtualMachineModelTest.InvalidatesCachedOutgoingFactsAfterCalleeBodyChange`
+    - `VirtualMachineModelTest.DoesNotSeedClosedSliceTaggedVmSemanticsHelpersIntoModel`
+    - `VirtualMachineModelTest.TracksVmStackFactsAcrossHelperPushPopChain`
+    - `VirtualMachineModelTest.RemapsHelperRelativeVmStackFactsIntoCallerLocalNextPc`
+    - `PipelineTest.NoAbiPostCleanupRebuildDropsClosedSliceTagFromSemanticHelpers`
+  - compact rerun artifact: `build-remill/test_obf/corpus/lifted/rerun_refactor_20260321_fixreplay1/compact.model.txt`
+    - root slice improved from `reachable=38 frontier=3 closed=false` to `reachable=32 frontier=1 closed=false`
+    - eliminated the `blk_180055365` call frontier and the `blk_180026dce` dispatch frontier
+    - remaining frontier is only `blk_180060f01` with `dynamic_target`
+  - compact impact:
+    - `blk_180064933` now produces caller-local `NEXT_PC = add(stack(slot(arg0+0x908)-0x40), 0x571a)`
+    - `blk_180060f01` still stops at `dispatch jump target=slot(NEXT_PC+0x0)` with `specialized_target=add(slot(NEXT_PC+0x0), 0x2)`
+    - no specialization clone is created yet (`specializations=0`)
+  - remaining compact frontier shape:
+    - localized replay does recover some `POPI` reads to constants (`0x18005c2f4`, `0x18005c2e3`)
+    - the final unresolved path uses a caller-specialized structural stack cell `stack(slot(arg0+0x908)-0x40)` that has no canonical stack-cell id in the current model, so helper-local replay can carry it symbolically but cannot fold/export it as a normal tracked stack fact yet
+  - default rerun remains unstable:
+    - `CorpusVMP.default.dll` still exits with `0xC0000005`
+- Compact follow-up after the structural stack carry work:
+  - landed the actual-cell remap fix in:
+    - `lib/Analysis/VirtualModel/Imports.cpp`
+    - `lib/Analysis/VirtualModel/DirectCallees.cpp`
+    - `lib/Analysis/VirtualModel/LocalizedCalls.cpp`
+  - those paths now preserve argument-relative stack-cell base offsets when remapping helper-local expressions through caller operands
+  - landed a narrow propagation improvement in `lib/Analysis/VirtualModel/Propagation.cpp`:
+    - direct-callee import now treats stack/slot ids referenced by specialized dispatch/callsite targets as dynamic live-ins for the callee
+    - this stayed stable on the compact corpus; a broader outgoing-fact dependency promotion was tried and reverted because it blew up memory
+  - validation:
+    - `VirtualMachineModelTest.RemapsHelperRelativeVmStackFactsIntoCallerLocalNextPc`
+    - `VirtualMachineModelTest.TracksVmStackFactsAcrossHelperPushPopChain`
+    - `VirtualMachineModelTest.AddsPreludeDirectCallTargetAsRootSliceFrontier`
+    - `VirtualMachineModelTest.SeedsMidBlockEntryFromPreludeDirectCallReturnFacts`
+    - `PipelineTest.NoAbiPostCleanupRebuildDropsClosedSliceTagFromSemanticHelpers`
+  - stable compact rerun artifact: `build-remill/test_obf/corpus/lifted/rerun_refactor_20260321_fixstruct7/compact.model.txt`
+    - root slice remains `reachable=32 frontier=1 closed=false`
+    - remaining frontier is still only `blk_180060f01`
+    - the bad helper-relative import form `stack(slot(arg0+0x0)+0x0)` is gone; the target path is now the correct caller-local form `stack(slot(arg0+0x908)+0x0)`
+  - current blocker diagnosis:
+    - `0x180060F01` is reached by a real binary prelude direct call from `0x180058CD1`, with continuation entry `0x180058CD6`
+    - the current prelude-localization path seeds continuation facts for `blk_180058cd6`, but it does not attach the prelude target `blk_180060f01` into the root slice with predecessor-specific facts
+    - `blk_180060f01` therefore still evaluates its dispatch from `slot(NEXT_PC)` without the needed entry stack fact, even though the underlying caller-local stack expression is now correct
+  - rejected experiment:
+    - suppressing semantically localized prelude targets from root-slice traversal was not sound enough; it reopened multiple `call_target_unlifted` frontiers on compact and was reverted
+- Compact follow-up after predecessor-localized prelude-target dispatch recovery:
+  - landed a new dispatch-resolution source `prelude_localization` in:
+    - `include/omill/Analysis/VirtualModel/Types.h`
+    - `lib/Analysis/VirtualModel/Dispatch.cpp`
+    - `lib/Passes/VirtualCFGMaterialization.cpp`
+  - unresolved dispatch summarization now recognizes when the current handler is itself a lifted prelude target of some predecessor continuation handler and re-specializes the target expression through `computeEntryPreludeCallOutgoingFacts(...)`
+  - added focused regressions:
+    - `VirtualMachineModelTest.ResolvesPreludeTargetDispatchFromPredecessorLocalizedFacts`
+    - `VirtualCFGMaterializationTest.MaterializesPreludeTargetDispatchFromPredecessorLocalizedFacts`
+  - validation:
+    - direct `gtest` execution of the prelude-localization regressions stayed green
+    - broader focused VM/pipeline regressions also stayed green, including:
+      - `VirtualMachineModelTest.RemapsHelperRelativeVmStackFactsIntoCallerLocalNextPc`
+      - `VirtualMachineModelTest.AddsPreludeDirectCallTargetAsRootSliceFrontier`
+      - `VirtualMachineModelTest.SeedsMidBlockEntryFromPreludeDirectCallReturnFacts`
+      - `PipelineTest.NoAbiPostCleanupRebuildDropsClosedSliceTagFromSemanticHelpers`
+  - compact impact before pipeline follow-up:
+    - with `OMILL_SKIP_NOABI_POST_CLEANUP_MATERIALIZATION=1`, the compact rerun artifact `build-remill/test_obf/corpus/lifted/rerun_refactor_20260321_preludetarget2_skip95/compact.model.txt` now reports:
+      - `root-slice root=0x180001850 reachable=35 frontier=0 closed=true`
+      - `blk_180060f01` is present with `dispatches=0`
+    - this proved the remaining compact frontier was closed semantically by the new prelude-target localization and that the regression had moved to the late no-ABI cleanup pipeline instead
+- No-ABI late-pipeline follow-up after the compact prelude-target closure:
+  - added a phase-3.95 work gate in `lib/Pipeline.cpp`:
+    - `NoAbiPostCleanupMaterializationPass` now runs only when a closed-root-slice-scoped module still has real post-cleanup materialization work
+    - the gate only considers:
+      - direct calls to `__omill_dispatch_call` / `__omill_dispatch_jump` in closed-slice reachable functions
+      - declared synthetic `blk_*` / `block_*` continuation calls in closed-slice reachable functions
+  - this prevents the late no-ABI post-cleanup materialization pass from reopening an already closed compact slice just because the module still carries the closed-slice scope metadata
+  - compact rerun artifact after the gate:
+    - `build-remill/test_obf/corpus/lifted/rerun_refactor_20260321_preludetarget3/compact.model.txt`
+    - `build-remill/test_obf/corpus/lifted/rerun_refactor_20260321_preludetarget3/compact.ll`
+  - compact result:
+    - `root-slice root=0x180001850 reachable=35 frontier=0 closed=true`
+    - `blk_180060f01` remains in-slice and now has `dispatches=0`
+    - the emitted no-ABI IR contains:
+      - zero `__omill_dispatch_call`
+      - zero `__omill_dispatch_jump`
+      - zero declared `blk_*`
+      - one remaining internal defined helper block `blk_180064933`, reached only by direct internal calls
+    - `llc -filetype=obj -O2` succeeds on the emitted compact IR
+  - current interpretation:
+    - the compact root is semantically closed again in no-ABI mode
+    - the remaining `blk_180064933` calls are readability / cleanup leftovers, not a live generic-static-devirtualization frontier
+    - the next devirtualization work item should move back to `CorpusVMP.default.dll` stability or to no-ABI readability cleanup of already-closed internal `blk_*` helpers, not more compact target recovery for `blk_180060f01`
+- Default follow-up after prelude-target root-slice suppression and late-rerun triage:
+  - landed a root-slice classification fix in `lib/Analysis/VirtualModel/RootSlices.cpp`:
+    - executable/decodable prelude or callsite targets no longer stay as `call_target_unlifted` frontiers when the current handler already semantically localizes that edge through caller-visible `RETURN_PC` state and code-bearing direct callees
+  - added focused regression coverage in `tests/unit/VirtualMachineModelTest.cpp`:
+    - `SkipsPreludeDirectCallFrontierWhenSemanticallyLocalized`
+    - updated the undecodable-prelude frontier expectation to accept the current nearby-entry recovery classification
+  - validation:
+    - focused prelude regressions stayed green:
+      - `AddsPreludeDirectCallTargetAsRootSliceFrontier`
+      - `SkipsPreludeDirectCallFrontierWhenSemanticallyLocalized`
+      - `MarksUndecodablePreludeDirectCallTargetAsRootSliceFrontier`
+      - `SeedsMidBlockEntryFromPreludeDirectCallReturnFacts`
+      - `ResolvesPreludeTargetDispatchFromPredecessorLocalizedFacts`
+  - corpus rerun findings:
+    - `CorpusVMP.default.dll` now reaches a closed root slice semantically:
+      - artifact: `build-remill/test_obf/corpus/lifted/rerun_refactor_20260321_default_frontierfix7/default.model.txt`
+      - result: `root-slice root=0x180001850 reachable=1 frontier=0 closed=true`
+    - `CorpusVMP.compact.dll` stays closed on the same tree:
+      - artifact: `build-remill/test_obf/corpus/lifted/rerun_refactor_20260321_compact_frontierfix7/compact.model.txt`
+      - result: `root-slice root=0x180001850 reachable=31 frontier=0 closed=true`
+  - no-ABI late-rerun stability fix:
+    - isolated the remaining `default` driver crash to `rerunLateContinuationPipeline()` in `tools/omill-lift/main.cpp`
+    - verified that both `default` and `compact` still close cleanly with `OMILL_SKIP_LATE_CONTINUATION_RERUN=1`
+    - changed the no-ABI late continuation rerun to be opt-in via `OMILL_ENABLE_NOABI_LATE_CONTINUATION_RERUN`
+    - rationale:
+      - the current generic path already closes these corpus roots before that rerun
+      - reopening the graph there was destabilizing `default` and not improving closure on either sample
+  - fresh no-ABI output artifacts after the driver fix:
+    - `build-remill/test_obf/corpus/lifted/rerun_refactor_20260321_default_frontierfix7/default.ll`
+    - `build-remill/test_obf/corpus/lifted/rerun_refactor_20260321_compact_frontierfix7/compact.ll`
+  - fresh no-ABI IR shape:
+    - default:
+      - `dispatch_call=0`
+      - `dispatch_jump=0`
+      - `vm_entry=0`
+      - `declare_blk=0`
+      - `call_blk=4`
+      - `missing_block=0`
+    - compact:
+      - `dispatch_call=0`
+      - `dispatch_jump=0`
+      - `vm_entry=0`
+      - `declare_blk=0`
+      - `call_blk=3`
+      - `missing_block=0`
+    - both fresh `.ll` files compile with `llc -filetype=obj -O2`
+  - current interpretation:
+    - both corpus roots are semantically closed again in no-ABI mode on this tree
+    - the remaining `blk_*` calls in fresh `default` / `compact` no-ABI IR are cleanup/readability leftovers, not live devirtualization frontiers
+    - the next useful work item is no-ABI readability cleanup of internal closed-slice `blk_*` helpers, or expanding validation to more roots / samples, not more target-recovery work on these two roots
+- No-ABI readability cleanup follow-up:
+  - tried a full extra closed-slice cleanup rerun after phase 3.95 and rejected it:
+    - it perturbed `default` in the wrong direction by lifting/reintroducing different internal `blk_*` helpers
+    - conclusion: the remaining issue is not “run the whole cleanup stack again”, it is “do one more narrow inline-only collapse”
+  - landed a narrow final no-ABI inline sweep in `lib/Pipeline.cpp`:
+    - after phase 3.95, rerun only:
+      - `MarkReachableClosedRootSliceFunctionsPass`
+      - `MarkClosedRootSliceHelpersForInliningPass`
+      - `RepairBeforeInlinePass`
+      - `AlwaysInlinerPass`
+      - `GlobalDCEPass`
+    - no extra continuation lifting or missing-block lifting is done in this sweep
+  - added focused regression coverage in `tests/unit/PipelineTest.cpp`:
+    - `ClosedSliceNoAbiCleanupCollapsesInternalBlkChain`
+  - validation:
+    - focused no-ABI cleanup regressions stayed green:
+      - `ClosedSliceNoAbiCleanupCollapsesSingleUseBlkMustTailFallback`
+      - `ClosedSliceNoAbiCleanupCollapsesInternalBlkChain`
+      - `ClosedSliceNoAbiCleanupKeepsBlkMustTailFallbackWhenDispatchLives`
+      - `NoAbiPostCleanupRebuildDropsClosedSliceTagFromSemanticHelpers`
+  - fresh artifacts after the narrow inline sweep:
+    - `build-remill/test_obf/corpus/lifted/rerun_refactor_20260322_default_cleanup2/default.model.txt`
+    - `build-remill/test_obf/corpus/lifted/rerun_refactor_20260322_default_cleanup2/default.ll`
+    - `build-remill/test_obf/corpus/lifted/rerun_refactor_20260322_compact_cleanup2/compact.model.txt`
+    - `build-remill/test_obf/corpus/lifted/rerun_refactor_20260322_compact_cleanup2/compact.ll`
+  - current no-ABI status:
+    - `default`:
+      - `root-slice root=0x180001850 reachable=1 frontier=0 closed=true`
+      - `dispatch_call=0`
+      - `dispatch_jump=0`
+      - `vm_entry=0`
+      - `declare_blk=0`
+      - `call_blk=2` (improved from `4`)
+      - `missing_block=0`
+    - `compact`:
+      - `root-slice root=0x180001850 reachable=31 frontier=0 closed=true`
+      - `dispatch_call=0`
+      - `dispatch_jump=0`
+      - `vm_entry=0`
+      - `declare_blk=0`
+      - `call_blk=3` (unchanged)
+      - `missing_block=0`
+    - both fresh `.ll` files still compile with `llc -filetype=obj -O2`
+  - remaining readability leftovers:
+    - `default` now retains only `blk_1801f7733` with `2` direct callsites
+    - `compact` retains only `blk_180064933` with `3` direct callsites
+  - current interpretation:
+    - the generic devirtualization work is done for these two roots; the remaining work is purely late readability shaping
+    - the last helpers are not tiny single-use wrappers anymore, so another blanket inline-budget increase is unlikely to be the right next step
+    - the next cleanup pass should be a more structural transform for repeated internal closed-slice `blk_*` helpers, not another whole-pipeline rerun
+- Fresh no-ABI readability follow-up after the narrow final inline sweep:
+  - identified that `default` and `compact` had diverged:
+    - replaying the emitted `default.ll` through `omill-opt --block-lift --no-abi-mode` removed the remaining `blk_*` chain
+    - replaying the emitted `compact.ll` did not change the remaining `blk_180064933`
+  - conclusion:
+    - `default` was not missing more VM devirtualization
+    - it needed one bounded post-main cleanup replay over already-emitted closed-slice no-ABI IR
+    - `compact` still needs a separate structural cleanup for the recursive `blk_180064933` helper
+  - landed driver-side replay in `tools/omill-lift/main.cpp`:
+    - after `Main pipeline complete`, when all of the following hold:
+      - `--no-abi`
+      - module flag `omill.closed_root_slice_scope=1`
+      - no live `__omill_dispatch_call` / `__omill_dispatch_jump`
+      - no live `vm_entry_*`
+      - at least one internal defined `blk_*` / `block_*` call remains
+    - rerun `buildPipeline` once more with:
+      - `generic_static_devirtualize=false`
+      - `resolve_indirect_targets=false`
+      - `interprocedural_const_prop=false`
+      - `deobfuscate=false`
+      - `recover_abi=false`
+      - `use_block_lifting=false`
+      - `no_abi_mode=true`
+      - `preserve_lifted_semantics=false`
+    - added skip knob:
+      - `OMILL_SKIP_NOABI_POST_MAIN_CLEANUP_REPLAY`
+  - tightened phase 3.97 in `lib/Pipeline.cpp`:
+    - final no-ABI sweep now reruns:
+      - `RelaxClosedSliceMustTailMissingBlockPass`
+      - helper marking / `AlwaysInliner`
+      - `CollapseSyntheticBlockContinuationCallsPass(rewrite_to_missing_block=true, only_when_noabi_mode=true)`
+      - `RewriteConstantMissingBlockCallsPass(only_when_noabi_mode=true)`
+      - `GlobalDCE`
+  - added focused regression coverage in `tests/unit/PipelineTest.cpp`:
+    - `ClosedSliceNoAbiCleanupCollapsesRepeatedBlkMustTailFallback`
+  - validation:
+    - focused cleanup regressions stayed green:
+      - `ClosedSliceNoAbiCleanupCollapsesSingleUseBlkMustTailFallback`
+      - `ClosedSliceNoAbiCleanupCollapsesRepeatedBlkMustTailFallback`
+      - `ClosedSliceNoAbiCleanupCollapsesInternalBlkChain`
+      - `ClosedSliceNoAbiCleanupKeepsBlkMustTailFallbackWhenDispatchLives`
+      - `NoAbiPostCleanupRebuildDropsClosedSliceTagFromSemanticHelpers`
+  - fresh binary-backed reruns:
+    - `default`:
+      - model: `build-remill/test_obf/corpus/lifted/default_cleanup_fix5/default.model.txt`
+      - IR: `build-remill/test_obf/corpus/lifted/default_cleanup_fix5/default.ll`
+      - result:
+        - `root-slice root=0x180001850 reachable=1 frontier=0 closed=true`
+        - `dispatch_call=0`
+        - `dispatch_jump=0`
+        - `vm_entry=0`
+        - `declare_blk=0`
+        - `call_blk=0`
+        - `missing_block_handler=2`
+      - interpretation:
+        - the last repeated internal `blk_1801f7733` chain is gone in fresh no-ABI output
+        - the root now ends in explicit terminal boundary handlers only
+    - `compact`:
+      - model: `build-remill/test_obf/corpus/lifted/compact_cleanup_fix5/compact.model.txt`
+      - IR: `build-remill/test_obf/corpus/lifted/compact_cleanup_fix5/compact.ll`
+      - result:
+        - `root-slice root=0x180001850 reachable=31 frontier=0 closed=true`
+        - `dispatch_call=0`
+        - `dispatch_jump=0`
+        - `vm_entry=0`
+        - `declare_blk=0`
+        - `call_blk=3`
+        - `missing_block_handler=0`
+      - interpretation:
+        - the new replay does not perturb compact semantics
+        - the remaining no-ABI cleanup issue is still only the recursive internal helper `blk_180064933`
+  - codegen verification:
+    - both fresh artifacts still compile with `llc -filetype=obj -O2`
+  - next cleanup target:
+    - implement a structural transform for closed-slice self-recursive internal `blk_*` helpers
+    - most likely direction:
+      - recognize terminal self-recursive call patterns in `blk_*`
+      - rewrite them into local loops / non-recursive block chains before the final inline sweep
+
+- Closed-slice self-recursive `blk_*` cleanup landed in `Pipeline.cpp`:
+  - added `LoopifyClosedSliceSelfRecursiveBlockHelpersPass`
+  - scope:
+    - closed-root-slice modules only
+    - no-ABI mode only
+    - internal synthetic `blk_*` / `block_*` helpers only
+  - transform:
+    - split helper entry after allocas
+    - recognize terminal self-recursive calls that reuse the original state and
+      memory arguments and a stable program-counter argument
+    - rewrite those recursive tail sites into backedges to the post-alloca loop
+      header
+    - remove unreachable blocks after the rewrite
+  - scheduling:
+    - phase 3.9 closed-slice cleanup
+    - phase 3.97 final closed-slice collapse sweep
+  - diagnostics:
+    - `OMILL_DEBUG_SELFREC_LOOPIFY=1` prints transform/skip reasons
+    - `OMILL_DEBUG_SELFREC_LOOPIFY_DUMP=1` additionally dumps the transformed helper
+  - focused regression added in `tests/unit/PipelineTest.cpp`:
+    - `ClosedSliceNoAbiCleanupLoopifiesSelfRecursiveBlkHelper`
+  - validation:
+    - focused no-ABI cleanup regressions are green:
+      - `ClosedSliceNoAbiCleanupLoopifiesSelfRecursiveBlkHelper`
+      - `ClosedSliceNoAbiCleanupCollapsesRepeatedBlkMustTailFallback`
+      - `ClosedSliceNoAbiCleanupCollapsesInternalBlkChain`
+      - `ClosedSliceNoAbiCleanupKeepsBlkMustTailFallbackWhenDispatchLives`
+  - fresh binary-backed no-ABI reruns:
+    - `compact`:
+      - model: `build-remill/test_obf/corpus/lifted/compact_cleanup_fix6/compact.model.txt`
+      - IR: `build-remill/test_obf/corpus/lifted/compact_cleanup_fix6/compact.ll`
+      - result:
+        - `root-slice root=0x180001850 reachable=31 frontier=0 closed=true`
+        - `dispatch_call=0`
+        - `dispatch_jump=0`
+        - `vm_entry=0`
+        - `declare_blk=0`
+        - `define_blk=0`
+        - `call_blk=0`
+        - `missing_block_handler=0`
+      - interpretation:
+        - the remaining recursive helper `blk_180064933` is gone from fresh no-ABI output
+        - compact no longer retains any synthetic block helpers in the emitted root slice
+    - `default`:
+      - model: `build-remill/test_obf/corpus/lifted/default_cleanup_fix6/default.model.txt`
+      - IR: `build-remill/test_obf/corpus/lifted/default_cleanup_fix6/default.ll`
+      - result:
+        - `root-slice root=0x180001850 reachable=1 frontier=0 closed=true`
+        - `dispatch_call=0`
+        - `dispatch_jump=0`
+        - `vm_entry=0`
+        - `declare_blk=0`
+        - `define_blk=0`
+        - `call_blk=0`
+        - `missing_block_handler=2`
+      - interpretation:
+        - no regression from the self-recursive helper cleanup
+        - default remains on the same clean no-ABI shape as before
+  - codegen verification:
+    - both fresh artifacts compile with `llc -filetype=obj -O2`
+  - export-level semantic verification after the self-recursive cleanup:
+    - validated directly against the original corpus DLL exports:
+      - `Corpus.dll`
+      - `CorpusVMP.compact.dll`
+      - `CorpusVMP.default.dll`
+    - used the real binary ABI:
+      - `TvmpGetAbiVersion() -> u32`
+      - `TvmpGetCorpusDescriptor(CorpusDescriptor*)`
+      - `TvmpGroundTruthDigest() -> u64`
+      - `TvmpRunDigestScenario(void *out_48_bytes) -> u64`
+    - result:
+      - all three returned:
+        - `abi=1`
+        - descriptor `(abi=1, exports=9, flags=31)`
+        - `ground_truth_digest=13920182619479303470`
+        - `scenario_digest=13920182619479303470`
+        - identical `48`-byte scenario output:
+          - `febbfc32df06af0fd0f43c96afc31555aed1783211b1d697f1c7c692534a57546cf5b57f801b95a02e65a112576c2ec1`
+    - interpretation:
+      - the self-recursive compact cleanup changed IR shape only
+      - the protected compact/default corpora still match the unprotected baseline behavior
+  - follow-up triage on the remaining default no-ABI terminal boundary:
+    - fresh default no-ABI output now has one live `__omill_missing_block_handler`
+      callsite in `default_cleanup_fix6/default.ll`
+    - that target is `0x1801F77DD`
+    - binary inspection around:
+      - `0x1801F77D7`
+      - `0x1801F77DD`
+      - nearby earlier candidates such as `0x18036A6B9`, `0x1802181F4`,
+        `0x180371172`
+      does not show a clean decodable function entry or obvious block boundary;
+      the bytes are consistent with mid-block / data-like / non-recoverable
+      continuation targets rather than a missed normal lifted target
+    - interpretation:
+      - the next useful change for `default` is probably better explicit
+        terminal-boundary classification/reporting, not more aggressive lifting
+
+- 2026-03-22: plain Corpus ABI cleanup for ordinary output roots
+  - scope:
+    - stop treating the non-VM `Corpus.dll` root as a preserved lifted call
+      boundary once a `_native` wrapper exists
+    - reuse the post-ABI inline/cleanup machinery for ordinary `omill.output_root`
+      helper chains, not only closed root slices
+  - landed:
+    - `EliminateStateStructPass` now preserves the lifted boundary only for
+      VM-oriented output roots (`vm_wrapper` / handler-like traced roots), while
+      ordinary plain output roots become `AlwaysInline`
+    - added generic output-root native-helper and semantic-helper inline
+      marking in the ABI post-inline cleanup path
+    - added neutralization of inlined `__remill_function_return` calls after
+      helper inlining so native wrappers do not keep dead state/return
+      scaffolding
+  - focused regressions added/updated:
+    - `EliminateStateStructTest.PlainOutputRootBecomesAlwaysInline`
+    - `EliminateStateStructTest.VmOutputRootStaysNoInlineBoundary`
+    - `PipelineTest.AbiPipelineRemovesOutputRootNativeBlockChain`
+    - `PipelineTest.AbiPipelineNeutralizesInlinedFunctionReturnsInOutputRootHelpers`
+  - validation:
+    - focused `EliminateStateStructTest.*`, `LowerFunctionReturnTest.*`,
+      `LowerRemillIntrinsicsTest.*`, and the new `PipelineTest.*` regressions
+      pass
+  - binary-backed result on `Corpus.dll --va 0x180001850 --block-lift --generic-static-devirtualize`:
+    - fresh artifact:
+      - `build-remill/test_obf/corpus/lifted/corpus_cleanup_probe7/Corpus.va180001850.abi.ll`
+    - current shape:
+      - `dispatch=0`
+      - `declare_blk=0`
+      - `define_blk=1`
+      - `call_blk=3`
+      - `alloca_state=0`
+      - `remill_read=0`
+      - `remill_write=0`
+      - `remill_return=0`
+      - `missing_block_handler=0`
+      - `llc -filetype=obj -O2` succeeds
+    - interpretation:
+      - the plain non-VM root is now largely cleaned and no longer carries
+        lifted-state / Remill scaffolding
+      - one shared large helper `blk_180001910_native` still survives as an
+        internal aggregate-return helper called three times
+      - the next plain-corpus step is to decide whether to inline or
+        structurally reclassify that final helper, rather than continuing VM
+        devirtualization work on this root
+## 2026-03-22: Plain Corpus dead lifted-helper cleanup and replay validation
+
+Status:
+- landed
+
+What changed:
+- `EliminateStateStructPass` now also internalizes non-output-root lifted helpers without `_native` wrappers.
+- closed-slice-scoped modules no longer block that dead-helper internalization case.
+- late lift-infrastructure cleanup now internalizes dead lifted helpers before `GlobalDCE`, so replayed ABI artifacts can shed dead lifted remnants even when the ABI-stage internalization did not touch them.
+
+Coverage:
+- `EliminateStateStructTest.InternalizesNonOutputLiftedHelpersWithoutNativeWrapper`
+- `EliminateStateStructTest.ClosedSliceScopeStillInternalizesDeadLiftedHelpersWithoutWrappers`
+- `PipelineTest.AbiCleanupDcesDeadInternalizedLiftedHelpersWithoutNativeWrappers`
+- `PipelineTest.LiftInfrastructureCleanupDcesDeadExternalLiftedHelpers`
+
+Replay impact on saved plain `Corpus.dll` ABI artifacts:
+- `TvmpSimpleArithmetic`: `remill_read 687 -> 0`, `call_blk 93 -> 5`
+- `TvmpRecursiveChecksum`: `remill_read 506 -> 0`, `call_blk 35 -> 3`
+- `TvmpBytecodeVm`: unchanged semantically-clean shape, still `define_blk=1`, `call_blk=3`
+- `TvmpInterprocPipeline`: no live remill/state residue, still `define_blk=3`, `call_blk=57`
+- `TvmpGetAbiVersion`, `TvmpGetCorpusDescriptor`, `TvmpFlattenedStateMachine`: clean
+- `TvmpGroundTruthDigest`, `TvmpRunDigestScenario`: still terminal boundary stubs
+
+Conclusion:
+- the suspected plain-corpus pipeline issue was real, but narrower than “memory lowering failed”.
+- the live plain `_native` code was mostly clean already; the large residual `__remill_read_memory_*` counts came from dead lifted helpers surviving the final artifact.
+- after the dead-helper cleanup fix, the remaining plain-corpus work is structural helper collapse (`blk_*_native`), not remill/state elimination.
+
+Follow-up in progress:
+- added `LoopifySelfRecursiveNativeBlockHelpersPass` and ABI regression `PipelineTest.AbiPipelineLoopifiesSelfRecursiveNativeBlockHelper`.
+- the synthetic regression passes, but replay over the saved plain artifacts has not moved yet, so the remaining helper residue still needs a tighter artifact-backed collapse step.

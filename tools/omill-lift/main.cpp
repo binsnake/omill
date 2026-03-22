@@ -3796,38 +3796,6 @@ int main(int argc, char **argv) {
     }
   };
 
-  auto rerunLateContinuationPipeline = [&]() {
-    if (!opts.generic_static_devirtualize || !BlockLift ||
-        parseBoolEnv("OMILL_SKIP_LATE_CONTINUATION_RERUN").value_or(false)) {
-      return;
-    }
-
-    // In no-ABI mode the first late continuation rerun is useful, but
-    // additional rounds tend to explode the reopened block graph and have been
-    // observed to crash on the compact corpus after the root slice is already
-    // closed. Keep the no-ABI path bounded to one follow-up round and reserve
-    // deeper continuation chasing for ABI mode.
-    runLateContinuationRounds(/*max_rounds=*/NoABI ? 1u : 3u);
-
-    if (NoABI ||
-        parseBoolEnv("OMILL_SKIP_LATE_MISSING_BLOCK_RERUN").value_or(false)) {
-      return;
-    }
-
-    auto missing_targets = collectClosedSliceMissingBlockTargets();
-    if (missing_targets.empty())
-      return;
-
-    constexpr unsigned kMaxMissingTargets = 4;
-    llvm::SmallVector<uint64_t, 8> ordered_missing_targets(
-        missing_targets.begin(), missing_targets.end());
-    llvm::sort(ordered_missing_targets);
-    if (ordered_missing_targets.size() > kMaxMissingTargets)
-      ordered_missing_targets.resize(kMaxMissingTargets);
-
-    liftLateTargets(ordered_missing_targets);
-  };
-
   auto hasClosedSlicePendingOpaqueEdges = [&]() {
     for (auto &F : *module) {
       if (F.isDeclaration() || !F.hasFnAttribute("omill.closed_root_slice"))
@@ -3853,6 +3821,44 @@ int main(int argc, char **argv) {
       }
     }
     return false;
+  };
+
+  auto rerunLateContinuationPipeline = [&]() {
+    if (!opts.generic_static_devirtualize || !BlockLift ||
+        parseBoolEnv("OMILL_SKIP_LATE_CONTINUATION_RERUN").value_or(false)) {
+      return;
+    }
+
+    // Keep the no-ABI late continuation wave opt-in. The current generic path
+    // already closes the corpus roots without it, and reopening the graph here
+    // can destabilize large samples after the slice is already semantically
+    // closed. Use the env knob when explicitly experimenting on unresolved
+    // cases.
+    if (NoABI &&
+        !parseBoolEnv("OMILL_ENABLE_NOABI_LATE_CONTINUATION_RERUN")
+             .value_or(false)) {
+      return;
+    }
+
+    runLateContinuationRounds(/*max_rounds=*/NoABI ? 1u : 3u);
+
+    if (NoABI ||
+        parseBoolEnv("OMILL_SKIP_LATE_MISSING_BLOCK_RERUN").value_or(false)) {
+      return;
+    }
+
+    auto missing_targets = collectClosedSliceMissingBlockTargets();
+    if (missing_targets.empty())
+      return;
+
+    constexpr unsigned kMaxMissingTargets = 4;
+    llvm::SmallVector<uint64_t, 8> ordered_missing_targets(
+        missing_targets.begin(), missing_targets.end());
+    llvm::sort(ordered_missing_targets);
+    if (ordered_missing_targets.size() > kMaxMissingTargets)
+      ordered_missing_targets.resize(kMaxMissingTargets);
+
+    liftLateTargets(ordered_missing_targets);
   };
 
   auto rerunFinalClosedSlicePipeline = [&]() {
@@ -3896,6 +3902,101 @@ int main(int argc, char **argv) {
 
   rerunLateContinuationPipeline();
   rerunFinalClosedSlicePipeline();
+
+  auto moduleFlagEnabled = [&](llvm::StringRef flag_name) {
+    auto *md = module->getModuleFlag(flag_name);
+    auto *constant_md = llvm::dyn_cast_or_null<llvm::ConstantAsMetadata>(md);
+    auto *constant_int =
+        constant_md
+            ? llvm::dyn_cast<llvm::ConstantInt>(constant_md->getValue())
+            : nullptr;
+    return constant_int && constant_int->isOne();
+  };
+
+  auto countInternalSyntheticBlockCalls = [&]() {
+    unsigned count = 0;
+    for (auto &F : *module) {
+      if (F.isDeclaration())
+        continue;
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+          if (!call)
+            continue;
+          auto *callee = call->getCalledFunction();
+          if (!callee || callee->isDeclaration())
+            continue;
+          auto name = callee->getName();
+          if (!name.starts_with("blk_") && !name.starts_with("block_"))
+            continue;
+          ++count;
+        }
+      }
+    }
+    return count;
+  };
+
+  auto hasLiveFunctionReference = [&](llvm::StringRef name) {
+    auto *F = module->getFunction(name);
+    return F && !F->use_empty();
+  };
+
+  auto hasLiveFunctionWithPrefix = [&](llvm::StringRef prefix) {
+    for (auto &F : *module) {
+      if (F.getName().starts_with(prefix) && !F.use_empty())
+        return true;
+    }
+    return false;
+  };
+
+  auto rerunNoAbiClosedSliceCleanupReplay = [&]() {
+    if (!NoABI ||
+        (std::getenv("OMILL_SKIP_NOABI_POST_MAIN_CLEANUP_REPLAY") != nullptr))
+      return;
+    if (!moduleFlagEnabled("omill.closed_root_slice_scope"))
+      return;
+    if (hasLiveFunctionReference("__omill_dispatch_call") ||
+        hasLiveFunctionReference("__omill_dispatch_jump"))
+      return;
+    if (hasLiveFunctionWithPrefix("vm_entry_") ||
+        hasLiveFunctionReference("__omill_dispatch"))
+      return;
+
+    const unsigned before_block_calls = countInternalSyntheticBlockCalls();
+    if (before_block_calls == 0)
+      return;
+
+    omill::PipelineOptions replay_opts = opts;
+    replay_opts.generic_static_devirtualize = false;
+    replay_opts.verify_generic_static_devirtualization = false;
+    replay_opts.resolve_indirect_targets = false;
+    replay_opts.interprocedural_const_prop = false;
+    replay_opts.deobfuscate = false;
+    replay_opts.recover_abi = false;
+    replay_opts.use_block_lifting = false;
+    replay_opts.no_abi_mode = true;
+    replay_opts.preserve_lifted_semantics = false;
+
+    events.emitInfo("noabi_cleanup_replay_started",
+                    "post-main no-abi cleanup replay started",
+                    {{"internal_blk_calls_before",
+                      static_cast<int64_t>(before_block_calls)}});
+    MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+    {
+      ModulePassManager ReplayMPM;
+      omill::buildPipeline(ReplayMPM, replay_opts);
+      ReplayMPM.run(*module, MAM);
+    }
+    const unsigned after_block_calls = countInternalSyntheticBlockCalls();
+    events.emitInfo("noabi_cleanup_replay_completed",
+                    "post-main no-abi cleanup replay completed",
+                    {{"internal_blk_calls_before",
+                      static_cast<int64_t>(before_block_calls)},
+                     {"internal_blk_calls_after",
+                      static_cast<int64_t>(after_block_calls)}});
+  };
+
+  rerunNoAbiClosedSliceCleanupReplay();
 
   if (VerifyEach && verifyModule(*module, nullptr)) {
     errs() << "ERROR: module verification failed after main pipeline\n";
