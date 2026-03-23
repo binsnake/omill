@@ -3570,57 +3570,6 @@ int main(int argc, char **argv) {
       clearLiftRoundAttr(attr_name);
   };
 
-  auto collectContinuationTargetsForScope =
-      [&](llvm::function_ref<bool(const llvm::Function &)> include_fn) {
-    llvm::DenseSet<uint64_t> targets;
-
-    auto parseContinuationPC = [&](llvm::StringRef name) -> std::optional<uint64_t> {
-      if (name.starts_with("blk_")) {
-        uint64_t pc = 0;
-        if (!name.drop_front(4).getAsInteger(16, pc))
-          return pc;
-        return std::nullopt;
-      }
-      if (name.starts_with("block_")) {
-        uint64_t pc = 0;
-        if (!name.drop_front(6).getAsInteger(16, pc))
-          return pc;
-      }
-      return std::nullopt;
-    };
-
-    for (auto &F : *module) {
-      if (F.isDeclaration() || !include_fn(F))
-        continue;
-      for (auto &BB : F) {
-        for (auto &I : BB) {
-          auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
-          if (!call || call->arg_size() < 2)
-            continue;
-          auto *callee = call->getCalledFunction();
-          if (!callee || !callee->isDeclaration())
-            continue;
-          auto maybe_pc = parseContinuationPC(callee->getName());
-          if (!maybe_pc)
-            continue;
-          auto *pc_arg =
-              llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
-          if (!pc_arg || pc_arg->getZExtValue() != *maybe_pc)
-            continue;
-          targets.insert(*maybe_pc);
-        }
-      }
-    }
-
-    return targets;
-  };
-
-  auto collectClosedSliceContinuationTargets = [&]() {
-    return collectContinuationTargetsForScope([](const llvm::Function &F) {
-      return F.hasFnAttribute("omill.closed_root_slice");
-    });
-  };
-
   auto isInCode = [&](uint64_t target) {
     if (RawBinary)
       return target >= BaseAddress && target < BaseAddress + raw_code.size();
@@ -3690,6 +3639,69 @@ int main(int argc, char **argv) {
     }
 
     return false;
+  };
+
+  auto collectContinuationTargetsForScope =
+      [&](llvm::function_ref<bool(const llvm::Function &)> include_fn) {
+    llvm::DenseSet<uint64_t> targets;
+    const bool debug_continuation_lifts =
+        parseBoolEnv("OMILL_DEBUG_CONTINUATION_LIFTS").value_or(false);
+
+    auto parseContinuationPC =
+        [&](llvm::StringRef name) -> std::optional<uint64_t> {
+      if (name.starts_with("blk_")) {
+        uint64_t pc = 0;
+        if (!name.drop_front(4).getAsInteger(16, pc))
+          return pc;
+        return std::nullopt;
+      }
+      if (name.starts_with("block_")) {
+        uint64_t pc = 0;
+        if (!name.drop_front(6).getAsInteger(16, pc))
+          return pc;
+      }
+      return std::nullopt;
+    };
+
+    for (auto &F : *module) {
+      if (F.isDeclaration() || !include_fn(F))
+        continue;
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+          if (!call || call->arg_size() < 2)
+            continue;
+          auto *callee = call->getCalledFunction();
+          if (!callee || !callee->isDeclaration())
+            continue;
+          auto maybe_pc = parseContinuationPC(callee->getName());
+          if (!maybe_pc)
+            continue;
+          auto *pc_arg =
+              llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+          if (!pc_arg || pc_arg->getZExtValue() != *maybe_pc)
+            continue;
+          const bool accepted = looksLikeLateMissingBlockRoot(*maybe_pc);
+          if (debug_continuation_lifts) {
+            errs() << "[late-continuation-candidate] pc=0x"
+                   << llvm::Twine::utohexstr(*maybe_pc)
+                   << " caller=" << F.getName()
+                   << " accepted=" << (accepted ? 1 : 0) << "\n";
+          }
+          if (!accepted)
+            continue;
+          targets.insert(*maybe_pc);
+        }
+      }
+    }
+
+    return targets;
+  };
+
+  auto collectClosedSliceContinuationTargets = [&]() {
+    return collectContinuationTargetsForScope([](const llvm::Function &F) {
+      return F.hasFnAttribute("omill.closed_root_slice");
+    });
   };
 
   auto collectClosedSliceMissingBlockTargets = [&]() {

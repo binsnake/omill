@@ -2707,3 +2707,569 @@ Conclusion:
 Follow-up in progress:
 - added `LoopifySelfRecursiveNativeBlockHelpersPass` and ABI regression `PipelineTest.AbiPipelineLoopifiesSelfRecursiveNativeBlockHelper`.
 - the synthetic regression passes, but replay over the saved plain artifacts has not moved yet, so the remaining helper residue still needs a tighter artifact-backed collapse step.
+
+## 2026-03-22: Plain `TvmpInterprocPipeline` late helper-family blocker
+
+Status:
+- investigated; not resolved yet
+
+Current real-artifact state:
+- fresh merged plain-corpus output for `Corpus.dll --va 0x180001d70 --block-lift --generic-static-devirtualize` still ends at:
+  - `define_blk=2`
+  - `call_blk=32`
+  - `remill_read=0`
+  - `remill_write=0`
+  - `remill_return=0`
+  - `alloca_state=0`
+  - `missing_block_handler=0`
+- the surviving family is still:
+  - `blk_180001e80_native`
+  - `blk_180001e94_native`
+
+What the late diagnostics proved:
+- this is no longer a Remill/state-lowering problem
+- early ABI cleanup sees and loopifies self-recursive sites in both helpers:
+  - `blk_180001e80_native recursive_sites=9`
+  - `blk_180001e94_native recursive_sites=8`
+- but the final emitted ABI artifact still contains an alternating two-helper call family:
+  - `blk_180001e80_native -> blk_180001e94_native` (`8` direct calls)
+  - `blk_180001e94_native -> blk_180001e80_native` (`8` direct calls)
+- the final late-stage callee sets in the emitted `.ll` are exactly the peer pair; there is no remaining Remill/state residue hidden behind them
+
+Attempted next step:
+- added a bounded `CanonicalizeMutualRecursiveNativeBlockHelpersPass` that tries to merge a block-like native helper pair into one canonical helper before the existing self-recursive loopify/inlining cleanup
+- kept the synthetic regression scaffold, but it is currently disabled because the canonicalized helper still needs a stable post-inline shape before it can be asserted cleanly
+
+Conclusion:
+- the remaining plain-corpus blocker is a late-emitted alternating `blk_*_native` SCC in `TvmpInterprocPipeline`
+- the next effective step is not more lowering work; it is to make the pair canonicalization match the actual *late* helper-family shape (or to run an artifact-backed pair collapse after the final inline/repair stage where that pair reappears)
+
+Update after bounded pair canonicalization:
+- the late helper-family pass now fires on the real artifact:
+  - `blk_180001e80_native + blk_180001e94_native -> blk_180001e80_pair_native`
+  - the pair helper then loopifies its `16` self-recursive transition sites
+- fresh full plain-corpus export sweep:
+  - `build-remill/test_obf/corpus/lifted/corpus_export_refresh_merged_20260322_mutrec1/summary.json`
+  - `9/9` exports still lift and compile to objects
+  - `TvmpInterprocPipeline` improved from:
+    - `define_blk=2`, `call_blk=32`
+    - to `define_blk=1`, `call_blk=16`
+  - all other plain exports are unchanged semantically/structurally from the prior merged baseline
+
+Current plain-corpus state:
+- clean:
+  - `TvmpBytecodeVm`
+  - `TvmpFlattenedStateMachine`
+  - `TvmpGetAbiVersion`
+  - `TvmpGetCorpusDescriptor`
+  - `TvmpRecursiveChecksum`
+  - `TvmpSimpleArithmetic`
+- terminal boundary stubs only:
+  - `TvmpGroundTruthDigest`
+  - `TvmpRunDigestScenario`
+- remaining structural helper residue:
+  - `TvmpInterprocPipeline`: one internal `blk_180001e80_pair_native`, `call_blk=16`
+
+Next plain-corpus cleanup step:
+- decide whether that last `blk_180001e80_pair_native` should be:
+  - accepted as the final ordinary internal helper for this root, or
+  - collapsed further with a dedicated single-helper/root-local structural rewrite
+
+## 2026-03-22: Plain `Corpus.dll` structural helper cleanup is now clean
+
+Status:
+- resolved for the non-terminal plain-corpus exports
+
+What changed:
+- added late ABI helper-family forcing for large single-caller native block helpers
+- the force-inline path is now aware of canonicalized helper-family names such as:
+  - `blk_<pc>_pair_native`
+- this is intentionally ABI-late and output-root-scoped; it does not reopen the VM/generic devirtualization path
+
+Implementation:
+- `Pipeline.cpp`
+  - broadened native block-helper classification to include canonicalized `*_pair_native` helpers
+  - added `ForceInlineSingleCallerCommonContinuationNativeHelpersPass`
+  - scheduled it in the late output-root ABI helper-collapse rounds, after mutual-recursive pair canonicalization becomes visible
+- `PipelineTest.cpp`
+  - added `PipelineTest.AbiPipelineForceInlinesSingleCallerCommonContinuationNativeHelper`
+  - existing self-recursive and mutual-recursive helper-collapse regressions remain green
+
+Focused verification:
+- `PipelineTest.AbiPipelineLoopifiesSelfRecursiveNativeBlockHelper`
+- `PipelineTest.AbiPipelineCollapsesMultiSiteAggregateSelfRecursiveNativeBlockHelper`
+- `PipelineTest.AbiPipelineCanonicalizesMutualRecursiveNativeBlockHelperPair`
+- `PipelineTest.AbiPipelineForceInlinesSingleCallerCommonContinuationNativeHelper`
+- result: `4/4` passing
+
+Real binary-backed result:
+- fresh `Corpus.dll --va 0x180001d70 --block-lift --generic-static-devirtualize`
+  - artifact:
+    - `build-remill/test_obf/corpus/lifted/interproc_commoncont_inline5/TvmpInterprocPipeline.va180001d70.ll`
+  - metrics:
+    - `define_blk=0`
+    - `call_blk=0`
+    - `declare_blk=0`
+    - `alloca_state=0`
+    - `remill_read=0`
+    - `remill_write=0`
+    - `remill_return=0`
+    - `missing_block=0`
+  - object code generation succeeds with `llc -O2`
+
+Fresh full plain-corpus sweep:
+- `build-remill/test_obf/corpus/lifted/corpus_export_refresh_merged_20260322_commoncont1/summary.json`
+- `9/9` exports lift successfully
+- `9/9` emitted `.ll` files compile to objects
+
+Current plain-corpus state:
+- fully clean:
+  - `TvmpBytecodeVm`
+  - `TvmpFlattenedStateMachine`
+  - `TvmpGetAbiVersion`
+  - `TvmpGetCorpusDescriptor`
+  - `TvmpInterprocPipeline`
+  - `TvmpRecursiveChecksum`
+  - `TvmpSimpleArithmetic`
+- terminal-boundary stubs only:
+  - `TvmpGroundTruthDigest`
+  - `TvmpRunDigestScenario`
+
+Conclusion:
+- the remaining plain-corpus issue is no longer generic cleanup or Remill/state lowering
+- the plain non-VMP path is clean except for the two explicit terminal-boundary exports
+- the next plain-corpus work, if we want complete cleanliness, is to understand or reclassify those boundary-stub roots rather than continuing structural helper cleanup
+
+## 2026-03-23: Fresh plain Corpus.dll sweep on current tree is fully clean
+
+Fresh full plain-corpus sweep on the current merged tree:
+- `build-remill/test_obf/corpus/lifted/corpus_export_refresh_current_20260323/summary.json`
+- command shape used for each export:
+  - `omill-lift.exe Corpus.dll --va <va> --block-lift --deobfuscate -o <out.ll>`
+- object codegen verified with:
+  - `C:\Program Files\LLVM21\bin\llc.exe -filetype=obj -O2`
+
+Current plain-corpus result:
+- `9/9` exports lift successfully
+- `9/9` emitted `.ll` files compile to objects
+- all `9/9` exports are structurally clean:
+  - `dispatch_call=0`
+  - `dispatch_jump=0`
+  - `vm_entry=0`
+  - `declare_blk=0`
+  - `define_blk=0`
+  - `call_blk=0`
+  - `remill_read=0`
+  - `remill_write=0`
+  - `remill_return=0`
+  - `alloca_state=0`
+  - `missing_block=0`
+
+Exports:
+- `TvmpGetAbiVersion`
+- `TvmpFlattenedStateMachine`
+- `TvmpGetCorpusDescriptor`
+- `TvmpGroundTruthDigest`
+- `TvmpInterprocPipeline`
+- `TvmpRecursiveChecksum`
+- `TvmpRunDigestScenario`
+- `TvmpSimpleArithmetic`
+- `TvmpBytecodeVm`
+
+Conclusion:
+- the plain `Corpus.dll` path is no longer the blocker
+- the next devirtualization effort should move back to `CorpusVMP.compact.dll` and `CorpusVMP.default.dll`
+
+## 2026-03-23: Fresh VMP ABI root artifacts are clean on the current tree
+
+Issue fixed:
+- fresh ABI relifts for `CorpusVMP.default.dll --va 0x180001850` were crashing
+  after `Main pipeline complete`
+- the crash was in the post-main late continuation driver, not ABI recovery
+  itself
+- debug logging showed the bad late target:
+  - `0x1800b9d57`
+  - inside the `.7ir` section
+  - decodes as garbage and immediately fails at `0x1800b9d5c`
+
+Root cause:
+- the late continuation collector in `tools/omill-lift/main.cpp` accepted
+  declaration-only `blk_*` targets blindly
+- ABI mode then tried to block-lift bogus continuation PCs that are not valid
+  late code roots
+
+Fix:
+- filter late continuation candidates through the same bounded
+  `looksLikeLateMissingBlockRoot` decodability probe already used for late
+  missing-block targets
+- this keeps the late rerun from reopening `.7ir` junk while still allowing
+  real late continuation roots
+
+Validation:
+- rebuilt `omill-lift`
+- fresh default ABI relift now succeeds:
+  - `build-remill/test_obf/corpus/lifted/vmp_abi_current_20260323_default_fixlate1/default.ll`
+  - metrics:
+    - `dispatch_call=0`
+    - `dispatch_jump=0`
+    - `declare_blk=0`
+    - `define_blk=0`
+    - `call_blk=0`
+    - `remill_read=0`
+    - `remill_write=0`
+    - `remill_return=0`
+    - `alloca_state=0`
+    - `missing_block=0`
+  - `llc -filetype=obj -O2` succeeds
+- fresh compact ABI relift still succeeds and stays clean:
+  - `build-remill/test_obf/corpus/lifted/vmp_abi_current_20260323_compact_fixlate1/compact.ll`
+  - metrics:
+    - `dispatch_call=0`
+    - `dispatch_jump=0`
+    - `declare_blk=0`
+    - `define_blk=0`
+    - `call_blk=0`
+    - `remill_read=0`
+    - `remill_write=0`
+    - `remill_return=0`
+    - `alloca_state=0`
+    - `missing_block=0`
+  - `llc -filetype=obj -O2` succeeds
+
+Current takeaway:
+- plain `Corpus.dll`: clean across all 9 exports
+- `CorpusVMP.compact.dll` root `0x180001850`: fresh ABI output clean
+- `CorpusVMP.default.dll` root `0x180001850`: fresh ABI output clean
+- the next work is no longer this late ABI driver crash
+
+## 2026-03-23: Export-level VMP sweep after late-target and native-loopify fixes
+
+Fresh export sweeps:
+- compact:
+  - `build-remill/test_obf/corpus/lifted/compact_export_refresh_current_20260323/summary.json`
+- default:
+  - `build-remill/test_obf/corpus/lifted/default_export_refresh_current_20260323_fixloop1/summary.json`
+
+Additional cleanup landed:
+- broadened native self-recursive helper loopify to accept
+  `call self; [optional asm "int3"]; ret`
+- this cleaned `CorpusVMP.default.dll!TvmpInterprocPipeline`
+
+Current export-level state:
+- `CorpusVMP.default.dll`
+  - clean:
+    - `TvmpGetAbiVersion`
+    - `TvmpGetCorpusDescriptor`
+    - `TvmpGroundTruthDigest`
+    - `TvmpInterprocPipeline`
+    - `TvmpRecursiveChecksum`
+    - `TvmpRunDigestScenario`
+    - `TvmpSimpleArithmetic`
+    - `TvmpBytecodeVm`
+  - remaining residual:
+    - `TvmpFlattenedStateMachine`
+      - `declare_blk=1`
+      - `call_blk=1`
+      - `alloca_state=1`
+      - no dispatch/vm_entry/remill residue
+- `CorpusVMP.compact.dll`
+  - clean:
+    - `TvmpGetAbiVersion`
+    - `TvmpGetCorpusDescriptor`
+    - `TvmpGroundTruthDigest`
+    - `TvmpInterprocPipeline`
+    - `TvmpRecursiveChecksum`
+    - `TvmpRunDigestScenario`
+    - `TvmpSimpleArithmetic`
+    - `TvmpBytecodeVm`
+  - remaining residual:
+    - `TvmpFlattenedStateMachine`
+      - only `missing_block=2`
+      - no dispatch/vm_entry/remill residue
+
+Tests / validation:
+- focused ABI helper cleanup regressions pass, including:
+  - `PipelineTest.AbiPipelineLoopifiesSelfRecursiveNativeBlockHelper`
+  - `PipelineTest.AbiPipelineLoopifiesTrapTerminatedSelfRecursiveNativeBlockHelper`
+  - `PipelineTest.AbiPipelineCollapsesMultiSiteAggregateSelfRecursiveNativeBlockHelper`
+- fresh ABI artifacts for compact/default `TvmpBytecodeVm` compile with
+  `llc -filetype=obj -O2`
+- all exports in the two new sweep summaries compile to objects
+
+Next target:
+- `TvmpFlattenedStateMachine` in compact/default
+- default is now down to a single declared `blk_18030f17a` continuation keeping
+  one `%struct.State` wrapper alive
+- compact is already terminalized to an explicit boundary for the corresponding
+  export
+
+## 2026-03-23: Default flattened continuation cleanup on actual export VAs
+
+Targeted fix:
+- the remaining `CorpusVMP.default.dll!TvmpFlattenedStateMachine` residue was a
+  self-looping output-root tail calling declaration-only `@blk_18030f17a` with
+  `ptr poison`
+- the late terminal synthetic-block rewrite already recognized the shape, but
+  it rejected suffix instructions that were still present before final cleanup:
+  - `llvm.lifetime.end`
+  - pure arithmetic / `inttoptr`
+  - local frame stores built from that suffix-local pointer chain
+
+Implementation:
+- kept env-gated diagnostics in `RewriteTerminalSyntheticBlockCallsToMissingBlockHandlerPass`
+- broadened loop-suffix matching so terminal self-loop rewriting accepts:
+  - pure suffix-local instruction chains
+  - stores whose pointer operand is local to the suffix or entry-frame-backed
+- added regression:
+  - `PipelineTest.AbiPipelineTerminalizesSelfLoopPoisonMemoryBlockContinuationWithDeadPureSuffix`
+
+Targeted validation:
+- fresh relift:
+  - `build-remill/test_obf/corpus/lifted/default_flattened_fix13.ll`
+- metrics:
+  - `dispatch_call=0`
+  - `dispatch_jump=0`
+  - `declare_blk=0`
+  - `define_blk=0`
+  - `call_blk=0`
+  - `alloca_state=0`
+  - `remill_read=0`
+  - `remill_write=0`
+  - `remill_return=0`
+  - `missing_block=2`
+- `llc -filetype=obj -O2` succeeds
+
+Important correction:
+- the earlier default export sweep reused a stale VA list for several exports
+- reran the full sweep using the actual DLL export table from
+  `llvm-readobj --coff-exports`
+
+Actual-export sweep:
+- artifact:
+  - `build-remill/test_obf/corpus/lifted/default_export_refresh_current_20260323_actual1/summary.json`
+- result:
+  - all `9/9` exports lift successfully
+  - all `9/9` emitted `.ll` files compile with `llc -filetype=obj -O2`
+
+Current `CorpusVMP.default.dll` export state using actual export VAs:
+- clean (`dispatch=0`, `blk*=0`, `alloca_state=0`, `missing_block=0`):
+  - `TvmpBytecodeVm`
+  - `TvmpGetAbiVersion`
+  - `TvmpGetCorpusDescriptor`
+  - `TvmpInterprocPipeline`
+  - `TvmpRecursiveChecksum`
+  - `TvmpSimpleArithmetic`
+- terminal-boundary-only (`missing_block=2`, all other tracked cleanup metrics `0`):
+  - `TvmpFlattenedStateMachine`
+  - `TvmpGroundTruthDigest`
+  - `TvmpRunDigestScenario`
+
+Takeaway:
+- the remaining default export residue is no longer structural
+- all remaining non-clean outputs are explicit terminal boundary stubs only
+
+Next:
+- rerun the compact export sweep against the actual export table as well
+- then decide whether the terminal-boundary-only exports should be treated as
+  acceptable final ABI artifacts or need further late boundary recovery
+
+## 2026-03-23: Compact digest-wrapper cleanup after actual export sweep
+
+Context:
+- the actual compact export sweep (`compact_export_refresh_current_20260323_actual1`)
+  corrected stale VA assumptions
+- it showed two additional non-clean exports that were not visible in the old
+  cached summary:
+  - `TvmpGroundTruthDigest` at `0x180002400`
+  - `TvmpRunDigestScenario` at `0x1800023F0`
+- both had the same residual shape:
+  - `declare_blk=4`
+  - `call_blk=4`
+  - `alloca_state=4`
+  - no dispatch/vm_entry/remill residue
+
+Root cause:
+- these were not terminal self-loop tails
+- they were isolated declaration-only synthetic `blk_*` calls that consumed
+  fresh local wrapper state, had unused returns, and were followed only by
+  wrapper teardown
+- they should be erased so late DCE/SROA can drop the wrapper scaffolding,
+  not rewritten to `__omill_missing_block_handler`
+
+Implementation:
+- added `EraseIsolatedSyntheticBlockWrapperCallsPass`
+- scheduled it beside late terminal synthetic-block cleanup in ABI recovery
+- added focused regression:
+  - `PipelineTest.AbiPipelineErasesIsolatedSyntheticBlockWrapperCall`
+
+Targeted validation:
+- `TvmpGroundTruthDigest`:
+  - artifact:
+    - `build-remill/test_obf/corpus/lifted/compact_gtd_fix4.ll`
+  - metrics:
+    - `declare_blk=0`
+    - `define_blk=0`
+    - `call_blk=0`
+    - `alloca_state=0`
+    - `missing_block=0`
+    - `remill_read=0`
+  - `llc -filetype=obj -O2` succeeds
+- `TvmpRunDigestScenario`:
+  - artifact:
+    - `build-remill/test_obf/corpus/lifted/compact_rds_fix1.ll`
+  - metrics:
+    - `declare_blk=0`
+    - `define_blk=0`
+    - `call_blk=0`
+    - `alloca_state=0`
+    - `missing_block=0`
+    - `remill_read=0`
+  - `llc -filetype=obj -O2` succeeds
+
+Current compact status after targeted fixes:
+- clean:
+  - `TvmpBytecodeVm`
+  - `TvmpGetAbiVersion`
+  - `TvmpGetCorpusDescriptor`
+  - `TvmpGroundTruthDigest`
+  - `TvmpInterprocPipeline`
+  - `TvmpRecursiveChecksum`
+  - `TvmpRunDigestScenario`
+  - `TvmpSimpleArithmetic`
+- terminal-boundary-only:
+  - `TvmpFlattenedStateMachine` (`missing_block=2`, all other tracked metrics `0`)
+
+Next:
+- rerun the full compact actual-export sweep to refresh the summary on disk
+- then decide whether to stop at the compact/default terminal-boundary-only
+  exports or pursue more aggressive late boundary recovery for those paths
+
+## 2026-03-23: Compact actual-export sweep refreshed after digest-wrapper cleanup
+
+Refreshed artifact:
+- `build-remill/test_obf/corpus/lifted/compact_export_refresh_current_20260323_actual2/summary.json`
+
+Result:
+- all `9/9` compact exports lift successfully
+- all `9/9` emitted `.ll` files compile with `llc -filetype=obj -O2`
+
+Current `CorpusVMP.compact.dll` export state using actual export VAs:
+- clean (`dispatch=0`, `blk*=0`, `alloca_state=0`, `missing_block=0`):
+  - `TvmpBytecodeVm`
+  - `TvmpGetAbiVersion`
+  - `TvmpGetCorpusDescriptor`
+  - `TvmpGroundTruthDigest`
+  - `TvmpInterprocPipeline`
+  - `TvmpRecursiveChecksum`
+  - `TvmpRunDigestScenario`
+  - `TvmpSimpleArithmetic`
+- terminal-boundary-only (`missing_block=2`, all other tracked metrics `0`):
+  - `TvmpFlattenedStateMachine`
+
+Takeaway:
+- compact is now strictly cleaner than default at export level
+- the only remaining compact non-clean export is a terminal boundary stub, not a
+  structural cleanup failure
+
+Next:
+- decide whether to accept terminal-boundary-only exports as the final ABI
+  endpoint for compact/default
+- or pursue late boundary recovery specifically for:
+  - `CorpusVMP.default.dll`:
+    - `TvmpFlattenedStateMachine`
+    - `TvmpGroundTruthDigest`
+    - `TvmpRunDigestScenario`
+  - `CorpusVMP.compact.dll`:
+    - `TvmpFlattenedStateMachine`
+
+## 2026-03-23: Remaining terminal-boundary targets are not cheap recovery candidates
+
+Boundary PCs:
+- default terminal-boundary-only exports all converge to:
+  - `0x18030f17a` in `.7ir`
+- compact terminal-boundary-only export converges to:
+  - `0x1800233a3` in `.cdS`
+
+Binary-backed evidence:
+- `0x18030f17a` disassembles inside `.7ir` and does look like executable code,
+  but not a clean ordinary lifted entry
+- `0x1800233a3` is inside `.cdS`, also inside the obfuscation section rather
+  than `.text`
+
+Standalone recovery probes:
+- default:
+  - `omill-lift CorpusVMP.default.dll --va 0x18030f17a --block-lift ...`
+  - fails with `LLVM ERROR: out of memory`
+  - crash occurs in ABI cleanup `AlwaysInlinerPass`
+- compact:
+  - `omill-lift CorpusVMP.compact.dll --va 0x1800233a3 --block-lift ...`
+  - fails with `LLVM ERROR: out of memory`
+  - crash occurs in `MergeBlockFunctionsPass`
+
+Takeaway:
+- these targets are not “one more late continuation edge” in the ordinary
+  sense
+- direct standalone lifting of the boundary PCs is currently pathological
+- that makes the remaining terminal-boundary-only exports reasonable stopping
+  points for the current ABI cleanup pipeline
+
+Practical recommendation:
+- treat the current terminal-boundary-only exports as acceptable final ABI
+  artifacts for now
+- if we want to push further, the next project is not generic cleanup; it is a
+  bounded mid-block / obfuscation-section boundary-recovery effort with its own
+  budget and guardrails
+
+## 2026-03-23: Explicit terminal-boundary annotation landed; default still has a separate self-loop collapse path
+
+Implemented:
+- late ABI terminal-boundary classification in `lib/Pipeline.cpp`
+  - surviving `__omill_missing_block_handler(i64 pc)` callsites now carry
+    call metadata `!omill.terminal_boundary`
+  - the module now emits named metadata `!omill.terminal_boundaries`
+  - callers with a single surviving terminal boundary now get:
+    - `omill.terminal_boundary_count`
+    - `omill.terminal_boundary_kind`
+    - `omill.terminal_boundary_target_va`
+    - `omill.terminal_boundary_summary`
+- focused `PipelineTest` coverage for:
+  - explicit terminal-boundary annotation
+  - rewriting trivial loopified output-root self-loops to explicit
+    `__omill_missing_block_handler`
+  - lifted-to-native propagation of terminal-boundary candidate PCs
+
+Validated:
+- compact flattened export now carries explicit terminal-boundary reporting in:
+  - `build-remill/test_obf/corpus/lifted/terminal_boundary_annotate4/compact_flattened.ll`
+- current compact flattened classification is:
+  - target `0x1800233a3`
+  - kind `in_image_executable_decodable_target`
+- `llc -O2` succeeds on the annotated compact artifact
+
+Remaining issue:
+- fresh targeted ABI relifts for default:
+  - `TvmpFlattenedStateMachine`
+  - `TvmpGroundTruthDigest`
+  - `TvmpRunDigestScenario`
+  still end as trivial self-loops in:
+  - `build-remill/test_obf/corpus/lifted/terminal_boundary_annotate4/default_flattened.ll`
+  - `build-remill/test_obf/corpus/lifted/terminal_boundary_annotate4/default_groundtruth.ll`
+  - `build-remill/test_obf/corpus/lifted/terminal_boundary_annotate4/default_rundigest.ll`
+- those outputs have:
+  - no `__omill_missing_block_handler`
+  - no terminal-boundary attrs/metadata
+  - only the minimal `entry -> selfrec.loop -> selfrec.loop` shape
+
+Conclusion:
+- terminal-boundary reporting is solved for the explicit-handler endpoint
+- compact uses that endpoint correctly
+- default still has one remaining late output-root collapse path that bypasses
+  the explicit-handler form entirely
+
+Next step:
+- trace the exact late ABI pass that transforms the default terminal wrapper
+  from `before_abi.ll`'s `musttail call @blk_18030f17a` shape into the final
+  trivial self-loop, then either:
+  - stop that rewrite for output roots, or
+  - carry explicit target provenance through that rewrite so the final
+    terminal-boundary pass can recover the handler call

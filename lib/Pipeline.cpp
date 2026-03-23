@@ -33,6 +33,7 @@
 #include <llvm/Transforms/Scalar/LoopUnrollPass.h>
 #include <llvm/Transforms/Scalar/LoopPassManager.h>
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
+#include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/Local.h>
 #include <llvm/Transforms/Utils/ModuleUtils.h>
 
@@ -109,7 +110,9 @@
 #include "omill/Passes/MergeBytePhis.h"
 #include "omill/Passes/RecoverAllocaPointers.h"
 #include "omill/Analysis/TargetArchAnalysis.h"
+#include "omill/Analysis/VMTraceEmulator.h"
 #include "omill/Utils/LiftedNames.h"
+#include "omill/Utils/ProtectedBoundaryUtils.h"
 
 namespace omill {
 
@@ -352,6 +355,172 @@ bool envBoolEnabled(const char *name) {
     return false;
   auto sv = llvm::StringRef(v).lower();
   return !(sv == "0" || sv == "false" || sv == "off" || sv == "no");
+}
+
+static constexpr llvm::StringLiteral kLoopifiedTerminalPcMetadata =
+    "omill.loopified_terminal_pc";
+static constexpr llvm::StringLiteral kLoopifiedTerminalPcAttr =
+    "omill.loopified_terminal_pc";
+static constexpr llvm::StringLiteral kTerminalBoundaryCandidatePcAttr =
+    "omill.terminal_boundary_candidate_pc";
+
+TargetArch targetArchForModule(llvm::Module &M) {
+  TargetArch arch = TargetArch::kX86_64;
+  if (auto *md = M.getModuleFlag("omill.target_arch")) {
+    if (auto *ci = llvm::mdconst::dyn_extract<llvm::ConstantInt>(md))
+      arch = static_cast<TargetArch>(ci->getZExtValue());
+  }
+  return arch;
+}
+
+bool isTargetMapped(const BinaryMemoryMap &binary_memory, uint64_t target_pc) {
+  if (target_pc == 0)
+    return false;
+  uint8_t byte = 0;
+  return binary_memory.read(target_pc, &byte, 1);
+}
+
+bool isTargetExecutable(const BinaryMemoryMap &binary_memory,
+                        uint64_t target_pc) {
+  if (target_pc == 0)
+    return false;
+  return binary_memory.isExecutable(target_pc, 1);
+}
+
+std::optional<bool> isTargetDecodableEntry(
+    const BinaryMemoryMap &binary_memory, uint64_t target_pc,
+    TargetArch arch) {
+  if (!isTargetExecutable(binary_memory, target_pc))
+    return std::nullopt;
+
+  switch (arch) {
+    case TargetArch::kAArch64: {
+      if (target_pc & 0x3)
+        return false;
+      uint8_t buf[4] = {};
+      return binary_memory.read(target_pc, buf, sizeof(buf));
+    }
+    case TargetArch::kX86_64:
+    default:
+      return canDecodeX86InstructionAt(binary_memory, target_pc);
+  }
+}
+
+std::optional<uint64_t> findNearbyExecutableEntry(
+    const BinaryMemoryMap &binary_memory, uint64_t target_pc,
+    TargetArch arch) {
+  if (!isTargetExecutable(binary_memory, target_pc))
+    return std::nullopt;
+
+  switch (arch) {
+    case TargetArch::kAArch64: {
+      auto aligned = target_pc & ~uint64_t(0x3);
+      if (aligned == target_pc)
+        return std::nullopt;
+      auto decodable = isTargetDecodableEntry(binary_memory, aligned, arch);
+      if (decodable.has_value() && *decodable)
+        return aligned;
+      return std::nullopt;
+    }
+    case TargetArch::kX86_64:
+    default: {
+      constexpr uint64_t kWindow = 64;
+      uint64_t start = (target_pc > kWindow) ? (target_pc - kWindow) : 1;
+      for (uint64_t candidate = target_pc; candidate > start; --candidate) {
+        uint64_t pc = candidate - 1;
+        if (!isTargetExecutable(binary_memory, pc))
+          continue;
+        auto decodable = isTargetDecodableEntry(binary_memory, pc, arch);
+        if (decodable.has_value() && *decodable)
+          return pc;
+      }
+      return std::nullopt;
+    }
+  }
+}
+
+bool isInImageRange(const BinaryMemoryMap &binary_memory, uint64_t target_pc) {
+  const auto image_base = binary_memory.imageBase();
+  const auto image_size = binary_memory.imageSize();
+  if (!image_base || !image_size)
+    return false;
+  return target_pc >= image_base && target_pc < (image_base + image_size);
+}
+
+struct TerminalBoundaryClassification {
+  uint64_t target_pc = 0;
+  std::string kind;
+  bool in_image = false;
+  bool mapped = false;
+  bool executable = false;
+  std::optional<bool> decodable_entry;
+  std::optional<uint64_t> nearby_entry_pc;
+};
+
+TerminalBoundaryClassification classifyTerminalBoundaryTarget(
+    llvm::Module &M, const BinaryMemoryMap &binary_memory, uint64_t target_pc) {
+  TerminalBoundaryClassification info;
+  info.target_pc = target_pc;
+  info.in_image = isInImageRange(binary_memory, target_pc);
+  info.mapped = isTargetMapped(binary_memory, target_pc);
+  info.executable = isTargetExecutable(binary_memory, target_pc);
+
+  if (classifyProtectedBoundary(binary_memory, target_pc)) {
+    info.kind = "protected_boundary_target";
+    return info;
+  }
+
+  if (!info.mapped) {
+    info.kind = info.in_image ? "in_image_unmapped_target"
+                              : "out_of_image_unmapped_target";
+    return info;
+  }
+
+  if (!info.executable) {
+    info.kind = info.in_image ? "in_image_non_executable_target"
+                              : "mapped_non_executable_target";
+    return info;
+  }
+
+  auto arch = targetArchForModule(M);
+  info.decodable_entry = isTargetDecodableEntry(binary_memory, target_pc, arch);
+  if (info.decodable_entry.has_value() && *info.decodable_entry) {
+    info.kind = info.in_image ? "in_image_executable_decodable_target"
+                              : "mapped_executable_decodable_target";
+    return info;
+  }
+
+  info.nearby_entry_pc = findNearbyExecutableEntry(binary_memory, target_pc,
+                                                   arch);
+  if (info.nearby_entry_pc.has_value()) {
+    info.kind = info.in_image ? "in_image_executable_nearby_entry_target"
+                              : "mapped_executable_nearby_entry_target";
+    return info;
+  }
+
+  info.kind = info.in_image ? "in_image_executable_undecodable_target"
+                            : "mapped_executable_undecodable_target";
+  return info;
+}
+
+void annotateLoopifiedTerminalBranch(llvm::BranchInst &br, uint64_t target_pc) {
+  auto &ctx = br.getContext();
+  auto *i64_ty = llvm::Type::getInt64Ty(ctx);
+  br.setMetadata(kLoopifiedTerminalPcMetadata,
+                 llvm::MDTuple::get(
+                     ctx, {llvm::ConstantAsMetadata::get(
+                              llvm::ConstantInt::get(i64_ty, target_pc))}));
+}
+
+std::optional<uint64_t> getLoopifiedTerminalBranchPc(const llvm::BranchInst &br) {
+  auto *md = br.getMetadata(kLoopifiedTerminalPcMetadata);
+  if (!md || md->getNumOperands() != 1)
+    return std::nullopt;
+  if (auto *ci =
+          llvm::mdconst::dyn_extract<llvm::ConstantInt>(md->getOperand(0))) {
+    return ci->getZExtValue();
+  }
+  return std::nullopt;
 }
 
 bool emitInlineDiagMarkers() {
@@ -855,6 +1024,26 @@ unsigned countNonDebugInstructions(const llvm::Function &F) {
   return inst_count;
 }
 
+bool isSyntheticBlockLikeNativeHelperName(llvm::StringRef name) {
+  if (isSyntheticBlockLikeFunctionName(name))
+    return true;
+  if (!name.ends_with("_native"))
+    return false;
+
+  auto stem = name.drop_back(7);
+  if (stem.ends_with("_pair"))
+    stem = stem.drop_back(5);
+
+  if (stem.starts_with("blk_")) {
+    uint64_t pc = 0;
+    return !stem.drop_front(4).getAsInteger(16, pc);
+  }
+  if (stem.starts_with("block_"))
+    return extractBlockPC(stem) != 0;
+
+  return false;
+}
+
 bool shouldPreserveOutlinedWrapper(
     const llvm::Function &F,
     const VirtualCalleeRegistry *virtual_callees = nullptr) {
@@ -904,7 +1093,8 @@ bool maybeMarkClosedRootSliceHelperForInlining(
     debug_skip("native_mismatch");
     return false;
   }
-  const bool is_block_like = isSyntheticBlockLikeFunctionName(F.getName());
+  const bool is_block_like =
+      isSyntheticBlockLikeNativeHelperName(F.getName());
   const bool is_native_sub_helper =
       native_helper && isClosedRootSliceNativeSubHelperName(F.getName()) &&
       !F.hasFnAttribute("omill.output_root");
@@ -931,10 +1121,15 @@ bool maybeMarkClosedRootSliceHelperForInlining(
     // Late continuation discovery can produce a few larger closed-slice
     // blk_*_native wrappers with a single remaining caller. Allow a wider
     // inline budget in that case so the root wrapper still collapses.
-    if (F.hasOneUse())
+    if (is_block_like && F.hasOneUse())
+      inline_budget = std::max(inline_budget, 1024u);
+    else if (is_block_like && F.getNumUses() <= 2)
+      inline_budget = std::max(inline_budget, 512u);
+    else if (F.hasOneUse())
       inline_budget = std::max(inline_budget, 384u);
     else if (F.getNumUses() <= 2)
       inline_budget = std::max(inline_budget, 192u);
+
   } else if (enableClosedSliceContinuationDiscovery()) {
     // The experimental continuation discovery path exposes a few larger
     // lifted blk_* continuations before ABI recovery. Inline single-caller
@@ -1245,7 +1440,8 @@ bool maybeMarkOutputRootNativeHelperForInlining(
   if (isOutputRootNativeFunction(F))
     return false;
 
-  const bool is_block_like = isSyntheticBlockLikeFunctionName(F.getName());
+  const bool is_block_like =
+      isSyntheticBlockLikeNativeHelperName(F.getName());
   const bool is_native_sub_helper =
       isClosedRootSliceNativeSubHelperName(F.getName()) &&
       !F.hasFnAttribute("omill.output_root");
@@ -1258,9 +1454,11 @@ bool maybeMarkOutputRootNativeHelperForInlining(
 
   unsigned inline_budget = max_inst_count;
   if (F.hasOneUse())
-    inline_budget = std::max(inline_budget, 384u);
+    inline_budget = std::max(inline_budget,
+                             is_block_like ? 1024u : 384u);
   else if (F.getNumUses() <= 2)
-    inline_budget = std::max(inline_budget, 192u);
+    inline_budget = std::max(inline_budget,
+                             is_block_like ? 512u : 192u);
   else if (is_block_like && F.getNumUses() <= 3)
     inline_budget = std::max(inline_budget, 1024u);
 
@@ -1656,18 +1854,78 @@ struct RelaxClosedSliceMustTailMissingBlockPass
   static bool isRequired() { return true; }
 };
 
+static bool isEntryAllocaBackedInteger(const llvm::Value *V,
+                                       const llvm::Function &F,
+                                       unsigned depth);
+
 static bool isEntryAllocaBackedPointer(const llvm::Value *V,
-                                       const llvm::Function &F) {
-  auto *obj = llvm::getUnderlyingObject(V->stripPointerCasts());
+                                       const llvm::Function &F,
+                                       unsigned depth = 0) {
+  if (!V || depth > 8)
+    return false;
+  auto *stripped = V->stripPointerCasts();
+  auto *obj = llvm::getUnderlyingObject(stripped);
   auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(obj);
-  return alloca && alloca->getFunction() == &F &&
-         alloca->getParent() == &F.getEntryBlock();
+  if (alloca && alloca->getFunction() == &F &&
+      alloca->getParent() == &F.getEntryBlock()) {
+    return true;
+  }
+
+  if (auto *gep = llvm::dyn_cast<llvm::GEPOperator>(stripped))
+    return isEntryAllocaBackedPointer(gep->getPointerOperand(), F, depth + 1);
+
+  if (auto *i2p = llvm::dyn_cast<llvm::Operator>(stripped);
+      i2p && i2p->getOpcode() == llvm::Instruction::IntToPtr) {
+    return isEntryAllocaBackedInteger(i2p->getOperand(0), F, depth + 1);
+  }
+
+  return false;
+}
+
+static bool isEntryAllocaBackedInteger(const llvm::Value *V,
+                                       const llvm::Function &F,
+                                       unsigned depth) {
+  if (!V || depth > 8)
+    return false;
+  auto *stripped = V->stripPointerCasts();
+
+  if (auto *p2i = llvm::dyn_cast<llvm::Operator>(stripped);
+      p2i && p2i->getOpcode() == llvm::Instruction::PtrToInt) {
+    return isEntryAllocaBackedPointer(p2i->getOperand(0), F, depth + 1);
+  }
+
+  auto recurse_binop = [&](const llvm::Value *lhs, const llvm::Value *rhs) {
+    return isEntryAllocaBackedInteger(lhs, F, depth + 1) ||
+           isEntryAllocaBackedInteger(rhs, F, depth + 1);
+  };
+
+  if (auto *op = llvm::dyn_cast<llvm::Operator>(stripped)) {
+    switch (op->getOpcode()) {
+      case llvm::Instruction::Add:
+      case llvm::Instruction::Sub:
+      case llvm::Instruction::Or:
+        return recurse_binop(op->getOperand(0), op->getOperand(1));
+      default:
+        break;
+    }
+  }
+
+  return false;
 }
 
 static bool isLoopifiableRecursiveTailSuffixInst(const llvm::Instruction &I,
                                                  const llvm::Function &F) {
   if (llvm::isa<llvm::DbgInfoIntrinsic>(I) || llvm::isa<llvm::FreezeInst>(I))
     return true;
+
+  if (auto *call = llvm::dyn_cast<llvm::CallBase>(&I)) {
+    auto *asm_target = llvm::dyn_cast<llvm::InlineAsm>(
+        call->getCalledOperand()->stripPointerCasts());
+    if (asm_target && call->use_empty() &&
+        asm_target->getAsmString().trim() == "int3") {
+      return true;
+    }
+  }
 
   if (auto *intr = llvm::dyn_cast<llvm::IntrinsicInst>(&I)) {
     switch (intr->getIntrinsicID()) {
@@ -1684,6 +1942,10 @@ static bool isLoopifiableRecursiveTailSuffixInst(const llvm::Instruction &I,
 
   if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&I))
     return isEntryAllocaBackedPointer(store->getPointerOperand(), F);
+
+  if (I.use_empty() && !I.mayHaveSideEffects() &&
+      !I.isTerminator() && !llvm::isa<llvm::PHINode>(I))
+    return true;
 
   return false;
 }
@@ -1757,9 +2019,447 @@ static bool isLoopifiableNativeRecursiveTailSuffixInst(
   return isLoopifiableRecursiveTailSuffixInst(I, F);
 }
 
+static bool isTerminalSyntheticMemoryArgValue(llvm::Value *V) {
+  auto *C = llvm::dyn_cast<llvm::Constant>(V);
+  if (!C)
+    return false;
+  return C->isNullValue() || llvm::isa<llvm::PoisonValue>(C) ||
+         llvm::isa<llvm::UndefValue>(C);
+}
+
+struct SingleCallerCommonContinuationNativeHelperShape {
+  llvm::Function *caller = nullptr;
+  llvm::BasicBlock *continuation = nullptr;
+  llvm::SmallVector<llvm::CallInst *, 16> callsites;
+};
+
+static bool matchSingleCallerCommonContinuationNativeHelperShape(
+    llvm::Function &helper,
+    SingleCallerCommonContinuationNativeHelperShape &shape,
+    bool debug = false) {
+  auto debug_skip = [&](llvm::StringRef reason) {
+    if (!debug)
+      return;
+    llvm::errs() << "[native-common-cont] skip " << helper.getName()
+                 << " reason=" << reason << "\n";
+  };
+  if (helper.isDeclaration() || !helper.hasLocalLinkage() ||
+      !helper.getName().ends_with("_native") ||
+      !isSyntheticBlockLikeNativeHelperName(helper.getName()) ||
+      helper.hasFnAttribute("omill.output_root")) {
+    debug_skip("helper-shape");
+    return false;
+  }
+
+  llvm::DenseSet<llvm::Function *> callers;
+  for (auto *U : helper.users()) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(U);
+    if (!call || call->getCalledFunction() != &helper) {
+      debug_skip("non-direct-call-user");
+      return false;
+    }
+    callers.insert(call->getFunction());
+  }
+  if (callers.size() != 1) {
+    debug_skip("not-single-caller");
+    return false;
+  }
+
+  shape.caller = *callers.begin();
+  if (!shape.caller || shape.caller == &helper) {
+    debug_skip("invalid-caller");
+    return false;
+  }
+
+  llvm::BasicBlock *continuation = nullptr;
+  for (auto *U : helper.users()) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(U);
+    if (!call || call->getFunction() != shape.caller) {
+      debug_skip("callsite-caller-mismatch");
+      return false;
+    }
+
+    auto *term = call->getParent()->getTerminator();
+    auto *br = llvm::dyn_cast<llvm::BranchInst>(term);
+    if (!br || !br->isUnconditional()) {
+      debug_skip("callsite-no-common-branch");
+      return false;
+    }
+
+    auto *succ = br->getSuccessor(0);
+    if (!continuation)
+      continuation = succ;
+    else if (continuation != succ) {
+      debug_skip("different-continuations");
+      return false;
+    }
+
+    shape.callsites.push_back(call);
+  }
+
+  if (!continuation || shape.callsites.empty()) {
+    debug_skip("missing-continuation");
+    return false;
+  }
+
+  shape.continuation = continuation;
+  return true;
+}
+
+struct ForceInlineSingleCallerCommonContinuationNativeHelpersPass
+    : llvm::PassInfoMixin<
+          ForceInlineSingleCallerCommonContinuationNativeHelpersPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &) {
+    if (isClosedRootSliceScopedModule(M))
+      return llvm::PreservedAnalyses::all();
+
+    const bool debug = envEnabled("OMILL_DEBUG_SELFREC_LOOPIFY");
+    bool changed = false;
+    constexpr unsigned kMaxCallSites = 32;
+    constexpr unsigned kMaxInstructionCount = 8192;
+
+    for (auto &F : M) {
+      SingleCallerCommonContinuationNativeHelperShape shape;
+      if (!matchSingleCallerCommonContinuationNativeHelperShape(F, shape, debug))
+        continue;
+      if (!shape.caller || !isOutputRootNativeFunction(*shape.caller))
+        continue;
+
+      const unsigned inst_count = countNonDebugInstructions(F);
+      if (shape.callsites.size() > kMaxCallSites ||
+          inst_count > kMaxInstructionCount) {
+        if (debug) {
+          llvm::errs() << "[native-common-cont] skip " << F.getName()
+                       << " reason=budget callsites=" << shape.callsites.size()
+                       << " insts=" << inst_count << "\n";
+        }
+        continue;
+      }
+
+      bool local_change = false;
+      if (F.hasFnAttribute(llvm::Attribute::OptimizeNone)) {
+        F.removeFnAttr(llvm::Attribute::OptimizeNone);
+        local_change = true;
+      }
+      if (F.hasFnAttribute(llvm::Attribute::NoInline)) {
+        F.removeFnAttr(llvm::Attribute::NoInline);
+        local_change = true;
+      }
+      if (!F.hasFnAttribute(llvm::Attribute::AlwaysInline)) {
+        F.addFnAttr(llvm::Attribute::AlwaysInline);
+        local_change = true;
+      }
+      if (!F.hasLocalLinkage()) {
+        F.setLinkage(llvm::GlobalValue::InternalLinkage);
+        local_change = true;
+      }
+
+      if (local_change && debug) {
+        llvm::errs() << "[native-common-cont] force-inline " << F.getName()
+                     << " caller=" << shape.caller->getName()
+                     << " callsites=" << shape.callsites.size()
+                     << " insts=" << inst_count << "\n";
+      }
+      changed |= local_change;
+    }
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+};
+
+static bool isCanonicalizableMutualNativeBlockHelper(
+    const llvm::Function &F) {
+  return !F.isDeclaration() &&
+         !F.hasFnAttribute("omill.output_root") &&
+         F.getName().ends_with("_native") &&
+         isSyntheticBlockLikeFunctionName(F.getName());
+}
+
+static void collectDirectSyntheticBlockLikeNativeCallees(
+    llvm::Function &F, llvm::SmallPtrSetImpl<llvm::Function *> &callees) {
+  for (auto &BB : F) {
+    for (auto &I : BB) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!call)
+        continue;
+      auto *callee = call->getCalledFunction();
+      if (!callee || callee->isDeclaration() ||
+          !callee->getName().ends_with("_native") ||
+          !isSyntheticBlockLikeFunctionName(callee->getName())) {
+        continue;
+      }
+      callees.insert(callee);
+    }
+  }
+}
+
+static llvm::Function *getSingleSyntheticBlockLikeNativePeerCallee(
+    llvm::Function &F) {
+  llvm::SmallPtrSet<llvm::Function *, 4> callees;
+  collectDirectSyntheticBlockLikeNativeCallees(F, callees);
+  llvm::Function *peer = nullptr;
+  for (auto *callee : callees) {
+    if (callee == &F)
+      continue;
+    if (peer && peer != callee)
+      return nullptr;
+    peer = callee;
+  }
+  return peer;
+}
+
+static bool hasOnlySelfAndPeerSyntheticBlockLikeNativeCallees(
+    llvm::Function &F, llvm::Function &peer) {
+  llvm::SmallPtrSet<llvm::Function *, 4> callees;
+  collectDirectSyntheticBlockLikeNativeCallees(F, callees);
+  if (!callees.contains(&peer))
+    return false;
+  for (auto *callee : callees) {
+    if (callee != &F && callee != &peer)
+      return false;
+  }
+  return true;
+}
+
+static bool collectTailLikeCallsToCallee(
+    llvm::Function &caller, llvm::Function &callee,
+    llvm::SmallVectorImpl<llvm::CallInst *> &calls, bool debug = false) {
+  for (auto &BB : caller) {
+    for (auto &I : BB) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!call || call->getCalledFunction() != &callee)
+        continue;
+
+      auto *term = call->getParent()->getTerminator();
+      auto *br = llvm::dyn_cast<llvm::BranchInst>(term);
+      if (!br || !br->isUnconditional()) {
+        if (debug)
+          llvm::errs() << "[native-mutrec-loopify] skip " << caller.getName()
+                       << "->" << callee.getName()
+                       << " reason=non-uncond-tail\n";
+        return false;
+      }
+
+      bool safe_suffix = true;
+      for (auto *next = call->getNextNode(); next; next = next->getNextNode()) {
+        if (next == term)
+          break;
+        if (!isLoopifiableNativeRecursiveTailSuffixInst(*next, *call, caller)) {
+          safe_suffix = false;
+          if (debug)
+            llvm::errs() << "[native-mutrec-loopify] skip " << caller.getName()
+                         << "->" << callee.getName()
+                         << " reason=unsafe-suffix inst="
+                         << next->getOpcodeName() << "\n";
+          break;
+        }
+      }
+      if (!safe_suffix)
+        return false;
+
+      auto *successor = br->getSuccessor(0);
+      for (auto *U : call->users()) {
+        auto *user_inst = llvm::dyn_cast<llvm::Instruction>(U);
+        auto *ev = llvm::dyn_cast<llvm::ExtractValueInst>(U);
+        auto *phi = llvm::dyn_cast<llvm::PHINode>(U);
+        const bool same_block_extract =
+            user_inst && ev && user_inst->getParent() == call->getParent();
+        const bool successor_phi =
+            phi && phi->getParent() == successor &&
+            phi->getBasicBlockIndex(call->getParent()) >= 0 &&
+            phi->getIncomingValueForBlock(call->getParent()) == call;
+        if (!same_block_extract && !successor_phi) {
+          if (debug)
+            llvm::errs() << "[native-mutrec-loopify] skip " << caller.getName()
+                         << "->" << callee.getName()
+                         << " reason=unsupported-call-user\n";
+          return false;
+        }
+      }
+
+      calls.push_back(call);
+    }
+  }
+
+  return !calls.empty();
+}
+
+static llvm::Function *canonicalizeMutualRecursiveNativeBlockHelperPair(
+    llvm::Function &A, llvm::Function &B, bool debug = false) {
+  if (A.getCallingConv() != B.getCallingConv())
+    return nullptr;
+  if (A.isVarArg() || B.isVarArg())
+    return nullptr;
+  if (A.getReturnType() != B.getReturnType())
+    return nullptr;
+
+  const unsigned max_args = std::max(A.arg_size(), B.arg_size());
+  llvm::SmallVector<llvm::Type *, 8> union_arg_types;
+  union_arg_types.reserve(max_args);
+  for (unsigned i = 0; i < max_args; ++i) {
+    llvm::Type *ty = nullptr;
+    if (i < A.arg_size())
+      ty = A.getArg(i)->getType();
+    if (i < B.arg_size()) {
+      if (!ty)
+        ty = B.getArg(i)->getType();
+      else if (ty != B.getArg(i)->getType())
+        return nullptr;
+    }
+    if (!ty)
+      return nullptr;
+    union_arg_types.push_back(ty);
+  }
+
+  auto &M = *A.getParent();
+  auto &Ctx = M.getContext();
+  llvm::SmallVector<llvm::Type *, 8> dispatcher_arg_types;
+  dispatcher_arg_types.push_back(llvm::Type::getInt1Ty(Ctx));
+  dispatcher_arg_types.append(union_arg_types.begin(), union_arg_types.end());
+
+  llvm::StringRef a_name = A.getName();
+  llvm::StringRef a_base =
+      a_name.ends_with("_native") ? a_name.drop_back(7) : a_name;
+  std::string merged_name = (a_base + "_pair_native").str();
+  while (M.getFunction(merged_name))
+    merged_name += "_m";
+
+  auto *dispatcher = llvm::Function::Create(
+      llvm::FunctionType::get(A.getReturnType(), dispatcher_arg_types, false),
+      llvm::GlobalValue::InternalLinkage, merged_name, M);
+  dispatcher->setCallingConv(A.getCallingConv());
+  dispatcher->setVisibility(A.getVisibility());
+  dispatcher->setUnnamedAddr(A.getUnnamedAddr());
+  dispatcher->setDSOLocal(true);
+  if (A.hasFnAttribute("omill.closed_root_slice") ||
+      B.hasFnAttribute("omill.closed_root_slice")) {
+    dispatcher->addFnAttr("omill.closed_root_slice", "1");
+  }
+  dispatcher->addFnAttr(llvm::Attribute::NoInline);
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", dispatcher);
+  auto *dispatch_entry =
+      llvm::BasicBlock::Create(Ctx, "dispatch.entry", dispatcher);
+
+  auto clone_into_dispatcher = [&](llvm::Function &Src, bool dispatch_to_b)
+      -> llvm::BasicBlock * {
+    llvm::ValueToValueMapTy vmap;
+    for (unsigned i = 0; i < Src.arg_size(); ++i)
+      vmap[Src.getArg(i)] = dispatcher->getArg(i + 1);
+
+    llvm::SmallVector<llvm::BasicBlock *, 32> cloned_blocks;
+    cloned_blocks.reserve(Src.size());
+    for (auto &BB : Src) {
+      auto *cloned =
+          llvm::CloneBasicBlock(&BB, vmap, "." + Src.getName().str(), dispatcher);
+      vmap[&BB] = cloned;
+      cloned_blocks.push_back(cloned);
+    }
+
+    for (auto *cloned : cloned_blocks) {
+      for (auto &I : *cloned)
+        llvm::RemapInstruction(&I, vmap,
+                               llvm::RF_NoModuleLevelChanges |
+                                   llvm::RF_IgnoreMissingLocals);
+    }
+
+    for (auto *cloned : cloned_blocks) {
+      for (auto it = cloned->begin(); it != cloned->end();) {
+        auto &I = *it++;
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+        if (!call)
+          continue;
+        auto *callee = call->getCalledFunction();
+        if (callee != &A && callee != &B)
+          continue;
+
+        llvm::IRBuilder<> Bld(call);
+        llvm::SmallVector<llvm::Value *, 8> args;
+        args.push_back(llvm::ConstantInt::get(llvm::Type::getInt1Ty(Ctx),
+                                              callee == &B));
+        for (unsigned i = 0; i < max_args; ++i) {
+          if (i < call->arg_size()) {
+            args.push_back(call->getArgOperand(i));
+          } else {
+            args.push_back(llvm::PoisonValue::get(union_arg_types[i]));
+          }
+        }
+
+        auto *replacement = Bld.CreateCall(dispatcher, args);
+        replacement->setCallingConv(dispatcher->getCallingConv());
+        replacement->setTailCallKind(call->getTailCallKind());
+        call->replaceAllUsesWith(replacement);
+        call->eraseFromParent();
+      }
+    }
+
+    (void)dispatch_to_b;
+    return llvm::cast<llvm::BasicBlock>(vmap[&Src.getEntryBlock()]);
+  };
+
+  auto *a_entry = clone_into_dispatcher(A, false);
+  auto *b_entry = clone_into_dispatcher(B, true);
+
+  llvm::IRBuilder<> EntryBuilder(entry);
+  EntryBuilder.CreateFreeze(dispatcher->getArg(0), "dispatch.seed");
+  EntryBuilder.CreateBr(dispatch_entry);
+
+  llvm::IRBuilder<> Bld(dispatch_entry);
+  Bld.CreateCondBr(dispatcher->getArg(0), b_entry, a_entry);
+
+  auto rewrite_external_calls = [&](llvm::Function &Src, bool dispatch_to_b) {
+    llvm::SmallVector<llvm::CallBase *, 16> calls;
+    for (auto *U : Src.users()) {
+      auto *CB = llvm::dyn_cast<llvm::CallBase>(U);
+      if (!CB || CB->getCalledFunction() != &Src)
+        continue;
+      calls.push_back(CB);
+    }
+
+    for (auto *CB : calls) {
+      llvm::IRBuilder<> CallBuilder(CB);
+      llvm::SmallVector<llvm::Value *, 8> args;
+      args.push_back(
+          llvm::ConstantInt::get(llvm::Type::getInt1Ty(Ctx), dispatch_to_b));
+      for (unsigned i = 0; i < max_args; ++i) {
+        if (i < CB->arg_size()) {
+          args.push_back(CB->getArgOperand(i));
+        } else {
+          args.push_back(llvm::PoisonValue::get(union_arg_types[i]));
+        }
+      }
+
+      auto *replacement = CallBuilder.CreateCall(dispatcher, args);
+      replacement->setCallingConv(dispatcher->getCallingConv());
+      if (auto *old_call = llvm::dyn_cast<llvm::CallInst>(CB))
+        replacement->setTailCallKind(old_call->getTailCallKind());
+      CB->replaceAllUsesWith(replacement);
+      CB->eraseFromParent();
+    }
+  };
+
+  rewrite_external_calls(A, false);
+  rewrite_external_calls(B, true);
+
+  if (!A.use_empty() || !B.use_empty()) {
+    dispatcher->eraseFromParent();
+    return nullptr;
+  }
+
+  if (debug)
+    llvm::errs() << "[native-mutrec-loopify] canonicalized " << A.getName()
+                 << " + " << B.getName() << " -> " << dispatcher->getName()
+                 << "\n";
+
+  A.eraseFromParent();
+  B.eraseFromParent();
+  return dispatcher;
+}
+
 static bool loopifyTailRecursiveNativeBlockHelper(llvm::Function &F,
                                                   bool debug = false) {
-  if (F.isDeclaration() || !F.hasLocalLinkage() || F.hasFnAttribute("omill.output_root") ||
+  if (F.isDeclaration() || F.hasFnAttribute("omill.output_root") ||
       !F.getName().ends_with("_native") ||
       !isSyntheticBlockLikeFunctionName(F.getName())) {
     return false;
@@ -1773,14 +2473,24 @@ static bool loopifyTailRecursiveNativeBlockHelper(llvm::Function &F,
         recursive_calls.push_back(call);
     }
   }
+  if (debug)
+    llvm::errs() << "[native-selfrec-loopify] scan " << F.getName()
+                 << " recursive_sites=" << recursive_calls.size() << "\n";
   if (recursive_calls.empty())
     return false;
+
+  const auto loopified_terminal_pc = parseSyntheticBlockLikePC(F.getName());
+  if (loopified_terminal_pc.has_value())
+    F.addFnAttr(kLoopifiedTerminalPcAttr,
+                llvm::utohexstr(*loopified_terminal_pc));
 
   llvm::SmallVector<llvm::CallInst *, 4> loopifiable_calls;
   for (auto *call : recursive_calls) {
     auto *term = call->getParent()->getTerminator();
     auto *br = llvm::dyn_cast<llvm::BranchInst>(term);
-    if (!br || !br->isUnconditional()) {
+    const bool terminal_tail =
+        llvm::isa<llvm::ReturnInst>(term) || llvm::isa<llvm::UnreachableInst>(term);
+    if ((!br || !br->isUnconditional()) && !terminal_tail) {
       if (debug)
         llvm::errs() << "[native-selfrec-loopify] skip " << F.getName()
                      << " reason=non-uncond-tail\n";
@@ -1803,13 +2513,32 @@ static bool loopifyTailRecursiveNativeBlockHelper(llvm::Function &F,
     if (!safe_suffix)
       return false;
 
+    auto *successor = br ? br->getSuccessor(0) : nullptr;
     for (auto *U : call->users()) {
       auto *user_inst = llvm::dyn_cast<llvm::Instruction>(U);
       auto *ev = llvm::dyn_cast<llvm::ExtractValueInst>(U);
-      if (!user_inst || !ev || user_inst->getParent() != call->getParent()) {
+      auto *phi = llvm::dyn_cast<llvm::PHINode>(U);
+      const bool same_block_extract =
+          user_inst && ev && user_inst->getParent() == call->getParent();
+      const bool successor_phi =
+          successor && phi && phi->getParent() == successor &&
+          phi->getBasicBlockIndex(call->getParent()) >= 0 &&
+          phi->getIncomingValueForBlock(call->getParent()) == call;
+      if (!same_block_extract && !successor_phi) {
         if (debug)
           llvm::errs() << "[native-selfrec-loopify] skip " << F.getName()
-                       << " reason=unsupported-call-user\n";
+                       << " reason=unsupported-call-user user=";
+        if (debug) {
+          if (user_inst) {
+            llvm::errs() << user_inst->getOpcodeName()
+                         << " block=" << user_inst->getParent()->getName();
+          } else {
+            llvm::errs() << "<non-inst>";
+          }
+          llvm::errs() << "\n";
+          if (envEnabled("OMILL_DEBUG_SELFREC_LOOPIFY_DUMP"))
+            F.print(llvm::errs());
+        }
         return false;
       }
     }
@@ -1849,9 +2578,11 @@ static bool loopifyTailRecursiveNativeBlockHelper(llvm::Function &F,
   bool changed = false;
   for (auto *call : loopifiable_calls) {
     auto *BB = call->getParent();
-    auto *old_term = llvm::cast<llvm::BranchInst>(BB->getTerminator());
-    auto *succ = old_term->getSuccessor(0);
-    succ->removePredecessor(BB);
+    auto *old_term = BB->getTerminator();
+    if (auto *old_br = llvm::dyn_cast<llvm::BranchInst>(old_term)) {
+      auto *succ = old_br->getSuccessor(0);
+      succ->removePredecessor(BB);
+    }
 
     llvm::SmallVector<llvm::Value *, 8> actuals(call->args());
     for (size_t i = 0; i < actuals.size() && i < arg_phis.size(); ++i)
@@ -1866,7 +2597,9 @@ static bool loopifyTailRecursiveNativeBlockHelper(llvm::Function &F,
       (*it)->eraseFromParent();
 
     llvm::IRBuilder<> B(BB);
-    B.CreateBr(loop_header);
+    auto *new_br = B.CreateBr(loop_header);
+    if (loopified_terminal_pc.has_value())
+      annotateLoopifiedTerminalBranch(*new_br, *loopified_terminal_pc);
     changed = true;
   }
 
@@ -1879,6 +2612,96 @@ static bool loopifyTailRecursiveNativeBlockHelper(llvm::Function &F,
 
   return changed;
 }
+
+struct CanonicalizeMutualRecursiveNativeBlockHelpersPass
+    : llvm::PassInfoMixin<CanonicalizeMutualRecursiveNativeBlockHelpersPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &) {
+    const bool debug = envEnabled("OMILL_DEBUG_SELFREC_LOOPIFY");
+    bool changed = false;
+
+    llvm::SmallVector<llvm::Function *, 32> functions;
+    for (auto &F : M)
+      functions.push_back(&F);
+
+    llvm::SmallPtrSet<llvm::Function *, 16> handled;
+    for (auto *F : functions) {
+      if (!F || handled.contains(F) ||
+          !isCanonicalizableMutualNativeBlockHelper(*F)) {
+        continue;
+      }
+
+      auto *G = getSingleSyntheticBlockLikeNativePeerCallee(*F);
+      if (!G || G == F || handled.contains(G) ||
+          !isCanonicalizableMutualNativeBlockHelper(*G)) {
+        if (debug && G &&
+            (F->getName() == "blk_180001e80_native" ||
+             F->getName() == "blk_180001e94_native")) {
+          llvm::errs() << "[native-mutrec-loopify] skip " << F->getName()
+                       << " reason=peer-candidate peer="
+                       << (G ? G->getName() : llvm::StringRef("<none>"))
+                       << "\n";
+        }
+        continue;
+      }
+      if (F->getName() >= G->getName())
+        continue;
+
+      if (getSingleSyntheticBlockLikeNativePeerCallee(*G) != F ||
+          !hasOnlySelfAndPeerSyntheticBlockLikeNativeCallees(*F, *G) ||
+          !hasOnlySelfAndPeerSyntheticBlockLikeNativeCallees(*G, *F)) {
+        if (debug &&
+            (F->getName() == "blk_180001e80_native" ||
+             F->getName() == "blk_180001e94_native" ||
+             G->getName() == "blk_180001e80_native" ||
+             G->getName() == "blk_180001e94_native")) {
+          llvm::errs() << "[native-mutrec-loopify] skip " << F->getName()
+                       << " + " << G->getName()
+                       << " reason=callee-shape\n";
+        }
+        continue;
+      }
+
+      llvm::SmallVector<llvm::CallInst *, 8> fg_calls;
+      llvm::SmallVector<llvm::CallInst *, 8> gf_calls;
+      if (!collectTailLikeCallsToCallee(*F, *G, fg_calls, debug) ||
+          !collectTailLikeCallsToCallee(*G, *F, gf_calls, debug)) {
+        if (debug &&
+            (F->getName() == "blk_180001e80_native" ||
+             F->getName() == "blk_180001e94_native" ||
+             G->getName() == "blk_180001e80_native" ||
+             G->getName() == "blk_180001e94_native")) {
+          llvm::errs() << "[native-mutrec-loopify] skip " << F->getName()
+                       << " + " << G->getName()
+                       << " reason=tail-shape\n";
+        }
+        continue;
+      }
+
+      auto *dispatcher =
+          canonicalizeMutualRecursiveNativeBlockHelperPair(*F, *G, debug);
+      if (!dispatcher) {
+        if (debug &&
+            (F->getName() == "blk_180001e80_native" ||
+             F->getName() == "blk_180001e94_native" ||
+             G->getName() == "blk_180001e80_native" ||
+             G->getName() == "blk_180001e94_native")) {
+          llvm::errs() << "[native-mutrec-loopify] skip " << F->getName()
+                       << " + " << G->getName()
+                       << " reason=canonicalize-failed\n";
+        }
+        continue;
+      }
+
+      handled.insert(F);
+      handled.insert(G);
+      handled.insert(dispatcher);
+      changed = true;
+    }
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+};
 
 struct LoopifyClosedSliceSelfRecursiveBlockHelpersPass
     : llvm::PassInfoMixin<LoopifyClosedSliceSelfRecursiveBlockHelpersPass> {
@@ -2449,6 +3272,8 @@ struct RewriteTerminalSyntheticBlockCallsToMissingBlockHandlerPass
       return llvm::PreservedAnalyses::all();
 
     const bool scoped = isClosedRootSliceScopedModule(M);
+    static const bool debug_terminal_synth_blocks =
+        (std::getenv("OMILL_DEBUG_TERMINAL_SYNTH_BLOCKS") != nullptr);
     llvm::Function *missing_block_handler = nullptr;
     bool changed = false;
 
@@ -2464,20 +3289,133 @@ struct RewriteTerminalSyntheticBlockCallsToMissingBlockHandlerPass
       return missing_block_handler;
     };
 
-    auto isTerminalSyntheticMemoryArg = [](llvm::Value *V) {
-      auto *C = llvm::dyn_cast<llvm::Constant>(V);
-      if (!C)
-        return false;
-      return C->isNullValue() || llvm::isa<llvm::PoisonValue>(C) ||
-             llvm::isa<llvm::UndefValue>(C);
-    };
-
     auto nextNonDebug = [](llvm::Instruction *I) -> llvm::Instruction * {
       for (auto *next = I->getNextNode(); next; next = next->getNextNode()) {
         if (!llvm::isa<llvm::DbgInfoIntrinsic>(next))
           return next;
       }
       return nullptr;
+    };
+
+    auto isTerminalSyntheticLoopSuffix = [&](llvm::CallInst *call) {
+      auto *BB = call->getParent();
+      auto *term = BB->getTerminator();
+      auto *br = llvm::dyn_cast<llvm::BranchInst>(term);
+      if (!br || !br->isUnconditional() || br->getSuccessor(0) != BB) {
+        if (debug_terminal_synth_blocks) {
+          llvm::errs() << "[term-synth] loop-suffix reject reason=terminator";
+          if (term)
+            llvm::errs() << " term=" << term->getOpcodeName();
+          llvm::errs() << "\n";
+        }
+        return false;
+      }
+
+      llvm::SmallVector<llvm::Instruction *, 8> suffix_insts;
+      llvm::DenseSet<const llvm::Instruction *> suffix_set;
+      for (auto *next = call->getNextNode(); next; next = next->getNextNode()) {
+        if (next == term)
+          break;
+        suffix_insts.push_back(next);
+        suffix_set.insert(next);
+      }
+
+      auto isAllowedSuffixInst = [&](llvm::Instruction *inst) {
+        std::function<bool(const llvm::Value *, unsigned)> isLocalSuffixInteger;
+        std::function<bool(const llvm::Value *, unsigned)> isLocalSuffixPointer;
+
+        isLocalSuffixPointer = [&](const llvm::Value *V, unsigned depth) {
+          if (!V || depth > 8)
+            return false;
+          if (isEntryAllocaBackedPointer(V, *call->getFunction()))
+            return true;
+          auto *stripped = V->stripPointerCasts();
+          if (auto *inst_v = llvm::dyn_cast<llvm::Instruction>(stripped);
+              inst_v && suffix_set.contains(inst_v)) {
+            return true;
+          }
+          if (auto *gep = llvm::dyn_cast<llvm::GEPOperator>(stripped))
+            return isLocalSuffixPointer(gep->getPointerOperand(), depth + 1);
+          if (auto *op = llvm::dyn_cast<llvm::Operator>(stripped)) {
+            if (op->getOpcode() == llvm::Instruction::IntToPtr)
+              return isLocalSuffixInteger(op->getOperand(0), depth + 1);
+          }
+          return false;
+        };
+
+        isLocalSuffixInteger = [&](const llvm::Value *V, unsigned depth) {
+          if (!V || depth > 8)
+            return false;
+          if (llvm::isa<llvm::ConstantInt>(V))
+            return true;
+          auto *stripped = V->stripPointerCasts();
+          if (auto *inst_v = llvm::dyn_cast<llvm::Instruction>(stripped);
+              inst_v && suffix_set.contains(inst_v)) {
+            return true;
+          }
+          if (auto *op = llvm::dyn_cast<llvm::Operator>(stripped)) {
+            switch (op->getOpcode()) {
+              case llvm::Instruction::PtrToInt:
+                return isLocalSuffixPointer(op->getOperand(0), depth + 1);
+              case llvm::Instruction::Add:
+              case llvm::Instruction::Sub:
+              case llvm::Instruction::Or:
+                return isLocalSuffixInteger(op->getOperand(0), depth + 1) &&
+                       isLocalSuffixInteger(op->getOperand(1), depth + 1);
+              case llvm::Instruction::Trunc:
+              case llvm::Instruction::ZExt:
+              case llvm::Instruction::SExt:
+              case llvm::Instruction::And:
+                return isLocalSuffixInteger(op->getOperand(0), depth + 1) &&
+                       (op->getNumOperands() == 1 ||
+                        isLocalSuffixInteger(op->getOperand(1), depth + 1));
+              default:
+                break;
+            }
+          }
+          return false;
+        };
+
+        if (isLoopifiableRecursiveTailSuffixInst(*inst, *call->getFunction()))
+          return true;
+        if (auto *store = llvm::dyn_cast<llvm::StoreInst>(inst))
+          return isLocalSuffixPointer(store->getPointerOperand(), 0);
+        if (inst->mayHaveSideEffects() || inst->isTerminator() ||
+            llvm::isa<llvm::PHINode>(inst))
+          return false;
+        for (auto *user : inst->users()) {
+          auto *user_inst = llvm::dyn_cast<llvm::Instruction>(user);
+          if (!user_inst || !suffix_set.contains(user_inst))
+            return false;
+        }
+        return true;
+      };
+
+      for (auto *next : suffix_insts) {
+        const bool allowed = isAllowedSuffixInst(next);
+        if (debug_terminal_synth_blocks) {
+          llvm::errs() << "[term-synth] loop-suffix inspect opcode="
+                       << next->getOpcodeName();
+          if (auto *callee =
+                  llvm::dyn_cast<llvm::CallBase>(next)
+                      ? llvm::dyn_cast<llvm::CallBase>(next)->getCalledFunction()
+                      : nullptr) {
+            llvm::errs() << " callee=" << callee->getName();
+          }
+          if (auto *store = llvm::dyn_cast<llvm::StoreInst>(next)) {
+            llvm::errs() << " ptr=";
+            store->getPointerOperand()->printAsOperand(llvm::errs(), false);
+            llvm::errs() << " entry_alloca_backed="
+                         << isEntryAllocaBackedPointer(
+                                store->getPointerOperand(),
+                                *call->getFunction());
+          }
+          llvm::errs() << " allowed=" << allowed << "\n";
+        }
+        if (!allowed)
+          return false;
+      }
+      return true;
     };
 
     for (auto &F : M) {
@@ -2487,14 +3425,35 @@ struct RewriteTerminalSyntheticBlockCallsToMissingBlockHandlerPass
         continue;
 
       for (auto &BB : F) {
+        bool rewrote_block = false;
         for (auto &I : llvm::make_early_inc_range(BB)) {
           auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
-          if (!call || call->arg_size() < 3 || !call->use_empty())
+          if (!call)
             continue;
+          if (debug_terminal_synth_blocks && call->getCalledFunction() &&
+              parseSyntheticBlockLikePC(call->getCalledFunction()->getName())) {
+            llvm::errs() << "[term-synth] inspect caller=" << F.getName()
+                         << " block=" << BB.getName()
+                         << " callee=" << call->getCalledFunction()->getName()
+                         << " args=" << call->arg_size()
+                         << " use_empty=" << call->use_empty() << "\n";
+          }
+          if (call->arg_size() < 3 || !call->use_empty()) {
+            if (debug_terminal_synth_blocks && call->getCalledFunction() &&
+                parseSyntheticBlockLikePC(call->getCalledFunction()->getName())) {
+              llvm::errs() << "[term-synth] skip reason=shape\n";
+            }
+            continue;
+          }
 
           auto *callee = call->getCalledFunction();
-          if (!callee || !callee->isDeclaration())
+          if (!callee || !callee->isDeclaration()) {
+            if (debug_terminal_synth_blocks && callee &&
+                parseSyntheticBlockLikePC(callee->getName())) {
+              llvm::errs() << "[term-synth] skip reason=callee-not-decl\n";
+            }
             continue;
+          }
 
           auto continuation_pc = parseSyntheticBlockLikePC(callee->getName());
           if (!continuation_pc)
@@ -2502,23 +3461,74 @@ struct RewriteTerminalSyntheticBlockCallsToMissingBlockHandlerPass
 
           auto *pc_arg =
               llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
-          if (!pc_arg || pc_arg->getZExtValue() != *continuation_pc)
+          if (!pc_arg || pc_arg->getZExtValue() != *continuation_pc) {
+            if (debug_terminal_synth_blocks) {
+              llvm::errs() << "[term-synth] skip reason=pc-mismatch";
+              if (pc_arg)
+                llvm::errs() << " arg=0x"
+                             << llvm::Twine::utohexstr(pc_arg->getZExtValue());
+              llvm::errs() << " callee_pc=0x"
+                           << llvm::Twine::utohexstr(*continuation_pc) << "\n";
+            }
             continue;
-          if (!isTerminalSyntheticMemoryArg(call->getArgOperand(2)))
+          }
+          if (!isTerminalSyntheticMemoryArgValue(call->getArgOperand(2))) {
+            if (debug_terminal_synth_blocks) {
+              llvm::errs() << "[term-synth] skip reason=memory-arg\n";
+            }
             continue;
+          }
 
           auto *next = nextNonDebug(call);
-          if (!next || !llvm::isa<llvm::UnreachableInst>(next))
+          const bool is_terminal_unreachable =
+              next && llvm::isa<llvm::UnreachableInst>(next);
+          const bool is_terminal_self_loop = isTerminalSyntheticLoopSuffix(call);
+          if (!is_terminal_unreachable && !is_terminal_self_loop) {
+            if (debug_terminal_synth_blocks) {
+              llvm::errs() << "[term-synth] skip reason=terminal-shape";
+              if (next)
+                llvm::errs() << " next=" << next->getOpcodeName();
+              else
+                llvm::errs() << " next=<null>";
+              llvm::errs() << "\n";
+            }
             continue;
+          }
+
+          if (debug_terminal_synth_blocks) {
+            llvm::errs() << "[term-synth] rewrite caller=" << F.getName()
+                         << " block=" << BB.getName()
+                         << " callee=" << callee->getName()
+                         << " self_loop=" << is_terminal_self_loop
+                         << " unreachable=" << is_terminal_unreachable << "\n";
+          }
 
           llvm::IRBuilder<> B(call);
           B.CreateCall(getOrCreateMissingBlockHandler(),
                        {llvm::ConstantInt::get(
                            llvm::Type::getInt64Ty(M.getContext()),
                            *continuation_pc)});
-          call->eraseFromParent();
+          if (is_terminal_self_loop) {
+            auto *call_bb = call->getParent();
+            llvm::SmallVector<llvm::Instruction *, 8> erase_list;
+            for (auto it = llvm::BasicBlock::iterator(call), end = call_bb->end();
+                 it != end; ++it) {
+              erase_list.push_back(&*it);
+            }
+            for (auto *inst : erase_list)
+              inst->eraseFromParent();
+            llvm::IRBuilder<> TailB(call_bb);
+            TailB.CreateUnreachable();
+            rewrote_block = true;
+          } else {
+            call->eraseFromParent();
+          }
           changed = true;
+          if (rewrote_block)
+            break;
         }
+        if (rewrote_block)
+          continue;
       }
     }
 
@@ -2536,6 +3546,525 @@ struct RewriteTerminalSyntheticBlockCallsToMissingBlockHandlerPass
 
     return changed ? llvm::PreservedAnalyses::none()
                    : llvm::PreservedAnalyses::all();
+  }
+
+  static bool isRequired() { return true; }
+};
+
+struct EraseIsolatedSyntheticBlockWrapperCallsPass
+    : llvm::PassInfoMixin<EraseIsolatedSyntheticBlockWrapperCallsPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &) {
+    if (isNoABIModeModule(M))
+      return llvm::PreservedAnalyses::all();
+
+    static const bool debug_erase_synth_wrappers =
+        (std::getenv("OMILL_DEBUG_ERASE_SYNTH_WRAPPERS") != nullptr);
+    bool changed = false;
+    for (auto &F : M) {
+      if (F.isDeclaration())
+        continue;
+
+      for (auto &BB : F) {
+        for (auto it = BB.begin(); it != BB.end();) {
+          auto *call = llvm::dyn_cast<llvm::CallInst>(&*it++);
+          if (!call || !call->use_empty() || call->arg_size() < 3)
+            continue;
+
+          auto *callee = call->getCalledFunction();
+          if (!callee || !callee->isDeclaration() ||
+              !parseSyntheticBlockLikePC(callee->getName()))
+            continue;
+          if (!isTerminalSyntheticMemoryArgValue(call->getArgOperand(2)))
+            continue;
+          if (!isEntryAllocaBackedPointer(call->getArgOperand(0), F))
+            continue;
+
+          if (debug_erase_synth_wrappers) {
+            llvm::errs() << "[erase-synth] candidate caller=" << F.getName()
+                         << " block=" << BB.getName()
+                         << " callee=" << callee->getName() << "\n";
+          }
+
+          llvm::SmallVector<llvm::Instruction *, 8> erase_list;
+          erase_list.push_back(call);
+          bool only_wrapper_teardown = true;
+          for (auto *next = call->getNextNode(); next; next = next->getNextNode()) {
+            if (llvm::isa<llvm::DbgInfoIntrinsic>(next))
+              continue;
+            auto *intr = llvm::dyn_cast<llvm::IntrinsicInst>(next);
+            if (!intr || intr->getIntrinsicID() != llvm::Intrinsic::lifetime_end)
+              break;
+            if (!isEntryAllocaBackedPointer(intr->getArgOperand(1), F)) {
+              only_wrapper_teardown = false;
+              break;
+            }
+            erase_list.push_back(next);
+          }
+          if (!only_wrapper_teardown)
+            continue;
+
+          if (debug_erase_synth_wrappers)
+            llvm::errs() << "[erase-synth] erase_count=" << erase_list.size()
+                         << "\n";
+          auto *resume = erase_list.back()->getNextNode();
+          for (auto *inst : erase_list)
+            inst->eraseFromParent();
+          if (resume)
+            it = resume->getIterator();
+          changed = true;
+        }
+      }
+    }
+
+    if (changed) {
+      llvm::SmallVector<llvm::Function *, 16> dead_decls;
+      for (auto &F : M) {
+        if (!F.isDeclaration())
+          continue;
+        if (!parseSyntheticBlockLikePC(F.getName()))
+          continue;
+        if (F.use_empty())
+          dead_decls.push_back(&F);
+      }
+      if (debug_erase_synth_wrappers)
+        llvm::errs() << "[erase-synth] dead_decl_count=" << dead_decls.size()
+                     << "\n";
+      for (auto *F : dead_decls)
+        F->eraseFromParent();
+    }
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+
+  static bool isRequired() { return true; }
+};
+
+struct SeedTerminalSyntheticBoundaryCandidatesPass
+    : llvm::PassInfoMixin<SeedTerminalSyntheticBoundaryCandidatesPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &) {
+    bool changed = false;
+
+    for (auto &F : M) {
+      if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
+        continue;
+      if (F.hasFnAttribute(kTerminalBoundaryCandidatePcAttr))
+        continue;
+
+      std::optional<uint64_t> candidate_pc;
+      bool conflict = false;
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+          if (!CB || CB->arg_size() < 3)
+            continue;
+          auto *callee = CB->getCalledFunction();
+          if (!callee || !callee->isDeclaration())
+            continue;
+          auto continuation_pc = parseSyntheticBlockLikePC(callee->getName());
+          if (!continuation_pc)
+            continue;
+          auto *pc_arg =
+              llvm::dyn_cast<llvm::ConstantInt>(CB->getArgOperand(1));
+          if (!pc_arg || pc_arg->getZExtValue() != *continuation_pc)
+            continue;
+          if (!isTerminalSyntheticMemoryArgValue(CB->getArgOperand(2)))
+            continue;
+
+          if (!candidate_pc.has_value()) {
+            candidate_pc = *continuation_pc;
+          } else if (*candidate_pc != *continuation_pc) {
+            conflict = true;
+            break;
+          }
+        }
+        if (conflict)
+          break;
+      }
+
+      if (!conflict && candidate_pc.has_value()) {
+        F.addFnAttr(kTerminalBoundaryCandidatePcAttr,
+                    llvm::utohexstr(*candidate_pc));
+        changed = true;
+      }
+    }
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+
+  static bool isRequired() { return true; }
+};
+
+struct PropagateLoopifiedTerminalBoundaryAttrsPass
+    : llvm::PassInfoMixin<PropagateLoopifiedTerminalBoundaryAttrsPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &) {
+    bool changed = false;
+    bool local_change = true;
+
+    while (local_change) {
+      local_change = false;
+      for (auto &F : M) {
+        if (F.isDeclaration())
+          continue;
+        if (F.hasFnAttribute(kLoopifiedTerminalPcAttr))
+          continue;
+
+        std::optional<std::string> loopified_pc;
+        bool conflict = false;
+        for (auto &BB : F) {
+          for (auto &I : BB) {
+            auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+            if (!CB)
+              continue;
+            auto *callee = CB->getCalledFunction();
+            if (!callee || callee->isDeclaration())
+              continue;
+            auto attr = callee->getFnAttribute(kLoopifiedTerminalPcAttr);
+            if (!attr.isValid())
+              continue;
+            auto pc = attr.getValueAsString().str();
+            if (!loopified_pc.has_value()) {
+              loopified_pc = pc;
+            } else if (*loopified_pc != pc) {
+              conflict = true;
+              break;
+            }
+          }
+          if (conflict)
+            break;
+        }
+
+        if (!conflict && loopified_pc.has_value()) {
+          F.addFnAttr(kLoopifiedTerminalPcAttr, *loopified_pc);
+          local_change = true;
+          changed = true;
+        }
+      }
+    }
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+
+  static bool isRequired() { return true; }
+};
+
+struct PropagateTerminalBoundaryAttrsToNativeRootsPass
+    : llvm::PassInfoMixin<PropagateTerminalBoundaryAttrsToNativeRootsPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &) {
+    bool changed = false;
+    for (auto &F : M) {
+      if (F.isDeclaration())
+        continue;
+      if (!F.getName().ends_with("_native"))
+        continue;
+      if (F.hasFnAttribute(kTerminalBoundaryCandidatePcAttr))
+        continue;
+
+      auto lifted_name = F.getName().drop_back(7);
+      auto *lifted = M.getFunction(lifted_name);
+      if (!lifted || lifted->isDeclaration())
+        continue;
+
+      auto candidate_attr = lifted->getFnAttribute(kTerminalBoundaryCandidatePcAttr);
+      if (candidate_attr.isValid()) {
+        F.addFnAttr(kTerminalBoundaryCandidatePcAttr,
+                    candidate_attr.getValueAsString());
+        changed = true;
+      }
+
+      if (!F.hasFnAttribute(kLoopifiedTerminalPcAttr)) {
+        auto loopified_attr = lifted->getFnAttribute(kLoopifiedTerminalPcAttr);
+        if (loopified_attr.isValid()) {
+          F.addFnAttr(kLoopifiedTerminalPcAttr,
+                      loopified_attr.getValueAsString());
+          changed = true;
+        }
+      }
+    }
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+
+  static bool isRequired() { return true; }
+};
+
+struct RewriteLoopifiedTerminalBoundaryOutputRootsPass
+    : llvm::PassInfoMixin<RewriteLoopifiedTerminalBoundaryOutputRootsPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &) {
+    llvm::Function *missing_block_handler = nullptr;
+    bool changed = false;
+
+    auto getOrCreateMissingBlockHandler = [&]() -> llvm::Function * {
+      if (missing_block_handler)
+        return missing_block_handler;
+      auto &ctx = M.getContext();
+      auto *handler_ty = llvm::FunctionType::get(
+          llvm::Type::getVoidTy(ctx), {llvm::Type::getInt64Ty(ctx)}, false);
+      missing_block_handler = llvm::cast<llvm::Function>(
+          M.getOrInsertFunction("__omill_missing_block_handler", handler_ty)
+              .getCallee());
+      return missing_block_handler;
+    };
+
+    auto isTrivialLoopifyBlock =
+        [&](llvm::BasicBlock &BB,
+            std::optional<uint64_t> &target_pc) -> bool {
+      auto *br = llvm::dyn_cast<llvm::BranchInst>(BB.getTerminator());
+      if (!br || !br->isUnconditional() || br->getSuccessor(0) != &BB)
+        return false;
+      target_pc = getLoopifiedTerminalBranchPc(*br);
+
+      for (auto &I : BB) {
+        if (&I == br || llvm::isa<llvm::DbgInfoIntrinsic>(&I))
+          continue;
+        if (auto *phi = llvm::dyn_cast<llvm::PHINode>(&I)) {
+          for (auto i = 0u; i < phi->getNumIncomingValues(); ++i) {
+            if (phi->getIncomingBlock(i) == &BB)
+              return false;
+          }
+          continue;
+        }
+        return false;
+      }
+      return true;
+    };
+
+    for (auto &F : M) {
+      if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
+        continue;
+
+      uint64_t target_pc = 0;
+      llvm::BasicBlock *loop_block = nullptr;
+      bool skip_function = false;
+      for (auto &BB : F) {
+        std::optional<uint64_t> block_pc;
+        if (!isTrivialLoopifyBlock(BB, block_pc))
+          continue;
+        if (loop_block) {
+          skip_function = true;
+          break;
+        }
+        loop_block = &BB;
+        if (block_pc.has_value())
+          target_pc = *block_pc;
+      }
+
+      if (skip_function || !loop_block)
+        continue;
+
+      if (!target_pc) {
+        auto attr = F.getFnAttribute(kTerminalBoundaryCandidatePcAttr);
+        if (attr.isValid()) {
+          uint64_t parsed_pc = 0;
+          if (!attr.getValueAsString().getAsInteger(16, parsed_pc))
+            target_pc = parsed_pc;
+        }
+      }
+
+      if (!target_pc) {
+        auto attr = F.getFnAttribute(kLoopifiedTerminalPcAttr);
+        if (attr.isValid()) {
+          uint64_t parsed_pc = 0;
+          if (!attr.getValueAsString().getAsInteger(16, parsed_pc))
+            target_pc = parsed_pc;
+        }
+      }
+
+      if (!target_pc)
+        continue;
+
+      for (auto &BB : F) {
+        if (&BB == loop_block)
+          continue;
+        for (auto &I : BB) {
+          if (llvm::isa<llvm::DbgInfoIntrinsic>(&I))
+            continue;
+          auto *br = llvm::dyn_cast<llvm::BranchInst>(&I);
+          if (br && br->isUnconditional() && br->getSuccessor(0) == loop_block)
+            continue;
+          skip_function = true;
+          break;
+        }
+        if (skip_function)
+          break;
+      }
+
+      if (skip_function)
+        continue;
+
+      for (auto &BB : llvm::make_early_inc_range(F))
+        BB.dropAllReferences();
+      while (!F.empty())
+        F.begin()->eraseFromParent();
+
+      auto *entry = llvm::BasicBlock::Create(M.getContext(), "entry", &F);
+      llvm::IRBuilder<> B(entry);
+      B.CreateCall(getOrCreateMissingBlockHandler(),
+                   {llvm::ConstantInt::get(
+                       llvm::Type::getInt64Ty(M.getContext()), target_pc)});
+      if (F.getReturnType()->isVoidTy()) {
+        B.CreateRetVoid();
+      } else {
+        B.CreateRet(llvm::Constant::getNullValue(F.getReturnType()));
+      }
+      changed = true;
+    }
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+
+  static bool isRequired() { return true; }
+};
+
+struct AnnotateTerminalBoundaryHandlersPass
+    : llvm::PassInfoMixin<AnnotateTerminalBoundaryHandlersPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &MAM) {
+    static const bool debug_terminal_boundaries =
+        (std::getenv("OMILL_DEBUG_TERMINAL_BOUNDARIES") != nullptr);
+    static constexpr llvm::StringLiteral kNamedMetadata =
+        "omill.terminal_boundaries";
+    static constexpr llvm::StringLiteral kCallMetadata =
+        "omill.terminal_boundary";
+    static constexpr llvm::StringLiteral kCountAttr =
+        "omill.terminal_boundary_count";
+    static constexpr llvm::StringLiteral kSummaryAttr =
+        "omill.terminal_boundary_summary";
+    static constexpr llvm::StringLiteral kKindAttr =
+        "omill.terminal_boundary_kind";
+    static constexpr llvm::StringLiteral kTargetAttr =
+        "omill.terminal_boundary_target_va";
+    static constexpr llvm::StringLiteral kNearbyAttr =
+        "omill.terminal_boundary_nearby_entry_va";
+
+    if (auto *old_md = M.getNamedMetadata(kNamedMetadata))
+      M.eraseNamedMetadata(old_md);
+
+    for (auto &F : M) {
+      F.removeFnAttr(kCountAttr);
+      F.removeFnAttr(kSummaryAttr);
+      F.removeFnAttr(kKindAttr);
+      F.removeFnAttr(kTargetAttr);
+      F.removeFnAttr(kNearbyAttr);
+    }
+
+    const auto &binary_memory = MAM.getResult<BinaryMemoryAnalysis>(M);
+    auto &ctx = M.getContext();
+    auto *i1_ty = llvm::Type::getInt1Ty(ctx);
+    auto *i64_ty = llvm::Type::getInt64Ty(ctx);
+    auto *named_md = M.getOrInsertNamedMetadata(kNamedMetadata);
+
+    llvm::DenseMap<llvm::Function *,
+                   llvm::SmallVector<TerminalBoundaryClassification, 4>>
+        classifications_by_function;
+
+    for (auto &F : M) {
+      if (F.isDeclaration())
+        continue;
+
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+          if (!call)
+            continue;
+          auto *callee = call->getCalledFunction();
+          if (!callee || callee->getName() != "__omill_missing_block_handler")
+            continue;
+          auto *pc_arg =
+              llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(0));
+          if (!pc_arg)
+            continue;
+
+          auto info = classifyTerminalBoundaryTarget(M, binary_memory,
+                                                     pc_arg->getZExtValue());
+          classifications_by_function[&F].push_back(info);
+
+          llvm::SmallVector<llvm::Metadata *, 12> fields;
+          fields.push_back(llvm::MDString::get(ctx, "kind"));
+          fields.push_back(llvm::MDString::get(ctx, info.kind));
+          fields.push_back(llvm::MDString::get(ctx, "target_pc"));
+          fields.push_back(llvm::ConstantAsMetadata::get(
+              llvm::ConstantInt::get(i64_ty, info.target_pc)));
+          fields.push_back(llvm::MDString::get(ctx, "in_image"));
+          fields.push_back(llvm::ConstantAsMetadata::get(
+              llvm::ConstantInt::get(i1_ty, info.in_image)));
+          fields.push_back(llvm::MDString::get(ctx, "mapped"));
+          fields.push_back(llvm::ConstantAsMetadata::get(
+              llvm::ConstantInt::get(i1_ty, info.mapped)));
+          fields.push_back(llvm::MDString::get(ctx, "executable"));
+          fields.push_back(llvm::ConstantAsMetadata::get(
+              llvm::ConstantInt::get(i1_ty, info.executable)));
+          if (info.decodable_entry.has_value()) {
+            fields.push_back(llvm::MDString::get(ctx, "decodable_entry"));
+            fields.push_back(llvm::ConstantAsMetadata::get(
+                llvm::ConstantInt::get(i1_ty, *info.decodable_entry)));
+          }
+          if (info.nearby_entry_pc.has_value()) {
+            fields.push_back(llvm::MDString::get(ctx, "nearby_entry_pc"));
+            fields.push_back(llvm::ConstantAsMetadata::get(
+                llvm::ConstantInt::get(i64_ty, *info.nearby_entry_pc)));
+          }
+
+          auto *call_md = llvm::MDTuple::get(ctx, fields);
+          call->setMetadata(kCallMetadata, call_md);
+
+          named_md->addOperand(llvm::MDTuple::get(
+              ctx, {llvm::MDString::get(ctx, F.getName()),
+                    llvm::ConstantAsMetadata::get(
+                        llvm::ConstantInt::get(i64_ty, info.target_pc)),
+                    llvm::MDString::get(ctx, info.kind)}));
+
+          if (debug_terminal_boundaries) {
+            llvm::errs() << "[terminal-boundary] caller=" << F.getName()
+                         << " target=0x" << llvm::Twine::utohexstr(info.target_pc)
+                         << " kind=" << info.kind;
+            if (info.nearby_entry_pc.has_value())
+              llvm::errs() << " nearby=0x"
+                           << llvm::Twine::utohexstr(*info.nearby_entry_pc);
+            llvm::errs() << "\n";
+          }
+        }
+      }
+    }
+
+    if (named_md->getNumOperands() == 0) {
+      M.eraseNamedMetadata(named_md);
+      return llvm::PreservedAnalyses::all();
+    }
+
+    for (auto &[F, infos] : classifications_by_function) {
+      F->addFnAttr(kCountAttr, std::to_string(infos.size()));
+
+      llvm::SmallVector<std::string, 4> summary_parts;
+      summary_parts.reserve(infos.size());
+      for (const auto &info : infos) {
+        auto entry = std::string("0x") + llvm::utohexstr(info.target_pc) + ":" +
+                     info.kind;
+        if (info.nearby_entry_pc.has_value())
+          entry += "@0x" + llvm::utohexstr(*info.nearby_entry_pc);
+        summary_parts.push_back(std::move(entry));
+      }
+      F->addFnAttr(kSummaryAttr, llvm::join(summary_parts, ","));
+
+      if (infos.size() == 1) {
+        const auto &info = infos.front();
+        F->addFnAttr(kKindAttr, info.kind);
+        F->addFnAttr(kTargetAttr, llvm::utohexstr(info.target_pc));
+        if (info.nearby_entry_pc.has_value())
+          F->addFnAttr(kNearbyAttr, llvm::utohexstr(*info.nearby_entry_pc));
+      }
+    }
+
+    return llvm::PreservedAnalyses::none();
   }
 
   static bool isRequired() { return true; }
@@ -3180,9 +4709,11 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
                        : llvm::PreservedAnalyses::all();
       }
       static bool isRequired() { return true; }
-    };
+      };
     MPM.addPass(SetTargetCPUPass{});
   }
+
+  MPM.addPass(SeedTerminalSyntheticBoundaryCandidatesPass{});
 
   addPhaseMarker(MPM, "ABI: initial SROA+InstCombine");
   // Stack frame recovery runs per-function.
@@ -3648,6 +5179,8 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
       MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
     }
 
+    MPM.addPass(SeedTerminalSyntheticBoundaryCandidatesPass{});
+
     if (!envDisabled("OMILL_SKIP_POST_ABI_INLINE")) {
       struct PreserveOutlinedWrappersPass
           : llvm::PassInfoMixin<PreserveOutlinedWrappersPass> {
@@ -3673,7 +5206,12 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
       };
 
       MPM.addPass(PreserveOutlinedWrappersPass{});
+      MPM.addPass(CanonicalizeMutualRecursiveNativeBlockHelpersPass{});
+      MPM.addPass(ForceInlineSingleCallerCommonContinuationNativeHelpersPass{});
       MPM.addPass(LoopifySelfRecursiveNativeBlockHelpersPass{});
+      MPM.addPass(PropagateLoopifiedTerminalBoundaryAttrsPass{});
+      MPM.addPass(RewriteTerminalSyntheticBlockCallsToMissingBlockHandlerPass{});
+      MPM.addPass(EraseIsolatedSyntheticBlockWrapperCallsPass{});
       MPM.addPass(MarkOutputRootNativeHelpersForInliningPass());
       MPM.addPass(MarkOutputRootSemanticHelpersForInliningPass());
       MPM.addPass(MarkClosedRootSliceNativeHelpersForInliningPass());
@@ -3725,7 +5263,12 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
       // helper that was not materialized until the earlier wrappers
       // collapsed. Run one bounded second round to flatten that last layer for
       // ordinary output-root cleanup without reopening the full ABI pipeline.
+      MPM.addPass(CanonicalizeMutualRecursiveNativeBlockHelpersPass{});
+      MPM.addPass(ForceInlineSingleCallerCommonContinuationNativeHelpersPass{});
       MPM.addPass(LoopifySelfRecursiveNativeBlockHelpersPass{});
+      MPM.addPass(PropagateLoopifiedTerminalBoundaryAttrsPass{});
+      MPM.addPass(RewriteTerminalSyntheticBlockCallsToMissingBlockHandlerPass{});
+      MPM.addPass(EraseIsolatedSyntheticBlockWrapperCallsPass{});
       MPM.addPass(MarkOutputRootNativeHelpersForInliningPass());
       MPM.addPass(MarkOutputRootSemanticHelpersForInliningPass());
       MPM.addPass(RepairBeforeInlinePass{});
@@ -3769,7 +5312,12 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
     addPhaseMarker(
         MPM, "ABI: terminalize unresolved blk continuations (late)");
     MPM.addPass(RewriteTerminalSyntheticBlockCallsToMissingBlockHandlerPass{});
+    MPM.addPass(EraseIsolatedSyntheticBlockWrapperCallsPass{});
+    MPM.addPass(CanonicalizeMutualRecursiveNativeBlockHelpersPass{});
+    MPM.addPass(ForceInlineSingleCallerCommonContinuationNativeHelpersPass{});
     MPM.addPass(LoopifySelfRecursiveNativeBlockHelpersPass{});
+    MPM.addPass(PropagateLoopifiedTerminalBoundaryAttrsPass{});
+    MPM.addPass(RewriteTerminalSyntheticBlockCallsToMissingBlockHandlerPass{});
     MPM.addPass(MarkOutputRootNativeHelpersForInliningPass());
     MPM.addPass(MarkOutputRootSemanticHelpersForInliningPass());
     MPM.addPass(RepairBeforeInlinePass{});
@@ -3792,6 +5340,58 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
                                   shouldRunClosedRootSliceScopedPass));
     }
     MPM.addPass(llvm::GlobalDCEPass());
+
+    addPhaseMarker(MPM, "ABI: final native helper collapse sweep");
+    MPM.addPass(CanonicalizeMutualRecursiveNativeBlockHelpersPass{});
+    MPM.addPass(ForceInlineSingleCallerCommonContinuationNativeHelpersPass{});
+    MPM.addPass(LoopifySelfRecursiveNativeBlockHelpersPass{});
+    MPM.addPass(PropagateLoopifiedTerminalBoundaryAttrsPass{});
+    MPM.addPass(RewriteTerminalSyntheticBlockCallsToMissingBlockHandlerPass{});
+    MPM.addPass(EraseIsolatedSyntheticBlockWrapperCallsPass{});
+    MPM.addPass(MarkOutputRootNativeHelpersForInliningPass());
+    MPM.addPass(MarkOutputRootSemanticHelpersForInliningPass());
+    MPM.addPass(RepairBeforeInlinePass{});
+    if (!envDisabled("OMILL_SKIP_ABI_ALWAYS_INLINE"))
+      MPM.addPass(llvm::AlwaysInlinerPass());
+    llvm::InlineParams final_native_cleanup_params = llvm::getInlineParams(50);
+    MPM.addPass(llvm::ModuleInlinerWrapperPass(final_native_cleanup_params));
+    MPM.addPass(NeutralizeInlinedFunctionReturnsPass{});
+    {
+      llvm::FunctionPassManager FPM;
+      if (!envDisabled("OMILL_SKIP_ABI_DEAD_STATE_STORE_DSE"))
+        FPM.addPass(DeadStateStoreDSEPass());
+      if (!envDisabled("OMILL_SKIP_ABI_SROA"))
+        FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::GVNPass());
+      FPM.addPass(llvm::ADCEPass());
+      FPM.addPass(llvm::SimplifyCFGPass());
+      MPM.addPass(createScopedFPM(std::move(FPM),
+                                  shouldRunClosedRootSliceScopedPass));
+    }
+    MPM.addPass(CanonicalizeMutualRecursiveNativeBlockHelpersPass{});
+    MPM.addPass(ForceInlineSingleCallerCommonContinuationNativeHelpersPass{});
+    MPM.addPass(LoopifySelfRecursiveNativeBlockHelpersPass{});
+    MPM.addPass(PropagateLoopifiedTerminalBoundaryAttrsPass{});
+    MPM.addPass(RewriteTerminalSyntheticBlockCallsToMissingBlockHandlerPass{});
+    MPM.addPass(EraseIsolatedSyntheticBlockWrapperCallsPass{});
+    {
+      llvm::FunctionPassManager FPM;
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::GVNPass());
+      FPM.addPass(llvm::ADCEPass());
+      FPM.addPass(llvm::SimplifyCFGPass());
+      MPM.addPass(createScopedFPM(std::move(FPM),
+                                  shouldRunClosedRootSliceScopedPass));
+    }
+    MPM.addPass(RewriteTerminalSyntheticBlockCallsToMissingBlockHandlerPass{});
+    MPM.addPass(EraseIsolatedSyntheticBlockWrapperCallsPass{});
+    if (!envDisabled("OMILL_SKIP_INTERNALIZE_DEAD_NATIVE_HELPERS"))
+      MPM.addPass(InternalizeDeadNativeHelpersPass{});
+    MPM.addPass(llvm::GlobalDCEPass());
+    MPM.addPass(PropagateTerminalBoundaryAttrsToNativeRootsPass{});
+    MPM.addPass(RewriteLoopifiedTerminalBoundaryOutputRootsPass{});
+    MPM.addPass(AnnotateTerminalBoundaryHandlersPass{});
     addClosedSliceShapeProbe(MPM, "abi-final");
   }
 }
