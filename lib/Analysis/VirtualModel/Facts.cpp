@@ -20,6 +20,22 @@ StackCellKey stackCellKeyForSummary(const VirtualStackCellSummary &cell) {
       cell.offset, cell.width};
 }
 
+EquivalentStackCellGroupKey equivalentStackCellGroupKeyForSummary(
+    const VirtualStackCellSummary &cell) {
+  return EquivalentStackCellGroupKey{
+      cell.base_from_argument ? std::string() : cell.base_name, cell.base_offset,
+      cell.base_width, cell.base_from_argument, cell.base_from_alloca,
+      cell.offset, cell.width};
+}
+
+EquivalentStackCellGroupKey equivalentStackCellGroupKeyForInfo(
+    const VirtualStackCellInfo &cell) {
+  return EquivalentStackCellGroupKey{
+      cell.base_from_argument ? std::string() : cell.base_name, cell.base_offset,
+      cell.base_width, cell.base_from_argument, cell.base_from_alloca,
+      cell.cell_offset, cell.width};
+}
+
 std::optional<unsigned> findEquivalentArgumentStackCellId(
     int64_t base_offset, unsigned base_width, bool base_from_argument,
     bool base_from_alloca, int64_t cell_offset, unsigned width,
@@ -126,6 +142,14 @@ std::map<unsigned, const VirtualStackCellInfo *> buildStackCellInfoMap(
   for (const auto &cell : model.stackCells())
     cell_info.emplace(cell.id, &cell);
   return cell_info;
+}
+
+std::map<EquivalentStackCellGroupKey, llvm::SmallVector<unsigned, 4>>
+buildEquivalentStackCellGroupMap(const VirtualMachineModel &model) {
+  std::map<EquivalentStackCellGroupKey, llvm::SmallVector<unsigned, 4>> groups;
+  for (const auto &cell : model.stackCells())
+    groups[equivalentStackCellGroupKeyForInfo(cell)].push_back(cell.id);
+  return groups;
 }
 
 std::optional<unsigned> lookupStackCellIdForSummary(

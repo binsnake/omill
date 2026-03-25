@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <string>
 
@@ -7,6 +8,10 @@
 #include <llvm/IR/PassManager.h>
 
 #include "omill/Arch/ArchABI.h"
+
+namespace llvm {
+class Module;
+}
 
 namespace omill {
 
@@ -17,6 +22,23 @@ enum class CleanupProfile {
   kPostInline,
   kBoundary,
   kFinal,
+};
+
+enum class TerminalBoundaryRecoveryStatus {
+  kClosedCandidate,
+  kVmLikeOpen,
+  kLargeOpen,
+  kTimeout,
+  kImported,
+};
+
+struct TerminalBoundaryRecoveryMetrics {
+  uint32_t define_blk = 0;
+  uint32_t declare_blk = 0;
+  uint32_t call_blk = 0;
+  uint32_t dispatch_jump = 0;
+  uint32_t dispatch_call = 0;
+  uint32_t missing_block_handler = 0;
 };
 
 /// Configuration for the omill optimization pipeline.
@@ -173,6 +195,45 @@ void buildIntToPtrClosurePipeline(llvm::ModulePassManager &MPM);
 /// Includes module inlining and core scalar cleanup passes.
 void buildPostPatchCleanupPipeline(llvm::ModulePassManager &MPM,
                                    unsigned inline_threshold = 80);
+
+/// Return true when the lifted module contains VM-like signals that justify
+/// running the generic static devirtualization pipeline.
+bool moduleHasGenericStaticDevirtualizationCandidates(const llvm::Module &M);
+
+/// Return true when driver-side policy should auto-disable generic static
+/// devirtualization for the requested root.
+bool shouldAutoSkipGenericStaticDevirtualizationForRoot(
+    const llvm::Module &M, bool vm_mode, bool requested_root_is_export,
+    bool force_generic_static_devirtualize,
+    bool root_local_generic_static_devirtualization_shape);
+
+/// Return true when driver-side policy should prefer the stable non-GSD path
+/// for large export roots whose normal GSD path is known to be unstable.
+bool shouldUseStableNoGsdExportRootFallback(
+    bool vm_mode, bool requested_root_is_export, bool use_block_lifting,
+    bool generic_static_devirtualize_requested,
+    bool force_generic_static_devirtualize,
+    uint64_t largest_executable_section_size);
+
+/// Return true when driver-side policy should auto-suppress the inliner for a
+/// root after generic static devirtualization was skipped based on root-local
+/// shape.
+bool shouldAutoSkipAlwaysInlineForRoot(
+    bool vm_mode, bool requested_root_is_export,
+    bool generic_static_devirtualize_requested,
+    bool generic_static_devirtualize_enabled,
+    bool root_local_generic_static_devirtualization_shape);
+
+llvm::StringRef terminalBoundaryRecoveryStatusName(
+    TerminalBoundaryRecoveryStatus status);
+
+TerminalBoundaryRecoveryStatus classifyTerminalBoundaryRecoveryMetrics(
+    const TerminalBoundaryRecoveryMetrics &metrics);
+
+std::string summarizeTerminalBoundaryRecoveryMetrics(
+    const TerminalBoundaryRecoveryMetrics &metrics);
+
+void refreshTerminalBoundaryRecoveryMetadata(llvm::Module &M);
 
 /// Register all omill function-level analyses.
 void registerAnalyses(llvm::FunctionAnalysisManager &FAM);

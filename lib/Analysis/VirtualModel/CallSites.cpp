@@ -334,7 +334,14 @@ void summarizeCallSites(llvm::Module &M, VirtualMachineModel &model,
         callsite_summary.is_executable_in_image =
             isTargetExecutable(binary_memory, *resolved.target_pc);
         if (!callsite_summary.is_executable_in_image) {
-          callsite_summary.unresolved_reason = "call_target_not_executable";
+          if (lookupImportTarget(binary_memory, *resolved.target_pc)) {
+            callsite_summary.unresolved_reason = "call_target_import_pointer";
+          } else {
+            callsite_summary.unresolved_reason =
+                isTargetMapped(binary_memory, *resolved.target_pc)
+                    ? "call_target_not_executable_in_image"
+                    : "call_target_out_of_image";
+          }
           continue;
         }
 
@@ -344,30 +351,32 @@ void summarizeCallSites(llvm::Module &M, VirtualMachineModel &model,
             lookupHandlerByEntryVA(model, *resolved.target_pc);
         std::optional<uint64_t> nearby_entry_pc;
         const VirtualHandlerSummary *nearby_summary = nullptr;
+        if (!target_summary) {
+          nearby_summary = findNearbyLiftedHandlerEntry(
+              model, *resolved.target_pc, target_arch);
+          if (nearby_summary && nearby_summary->entry_va.has_value()) {
+            nearby_entry_pc = nearby_summary->entry_va;
+            callsite_summary.recovered_target_function_name =
+                nearby_summary->function_name;
+          }
+        }
         if (target_summary) {
           callsite_summary.is_decodable_entry = true;
         } else if (decodable_entry.has_value()) {
           callsite_summary.is_decodable_entry = *decodable_entry;
-          if (!*decodable_entry) {
-            nearby_summary = findNearbyLiftedHandlerEntry(
-                model, *resolved.target_pc, target_arch);
-            if (nearby_summary && nearby_summary->entry_va.has_value()) {
-              nearby_entry_pc = nearby_summary->entry_va;
-              callsite_summary.recovered_target_function_name =
-                  nearby_summary->function_name;
-            } else {
-              nearby_entry_pc = findNearbyExecutableEntry(
-                  binary_memory, *resolved.target_pc, target_arch);
-              if (nearby_entry_pc) {
-                nearby_summary = lookupHandlerByEntryVA(model, *nearby_entry_pc);
-                if (nearby_summary) {
-                  callsite_summary.recovered_target_function_name =
-                      nearby_summary->function_name;
-                }
+          if (!nearby_summary && !*decodable_entry) {
+            nearby_entry_pc = findNearbyExecutableEntry(
+                binary_memory, *resolved.target_pc, target_arch);
+            if (nearby_entry_pc) {
+              nearby_summary = lookupHandlerByEntryVA(model, *nearby_entry_pc);
+              if (nearby_summary) {
+                callsite_summary.recovered_target_function_name =
+                    nearby_summary->function_name;
               }
             }
-            callsite_summary.recovered_entry_pc = nearby_entry_pc;
           }
+          if (nearby_entry_pc)
+            callsite_summary.recovered_entry_pc = nearby_entry_pc;
         }
         if (!target_summary && !nearby_summary) {
           if (nearby_entry_pc) {

@@ -248,18 +248,108 @@ static bool stackFactMapEquals(const std::map<unsigned, VirtualValueExpr> &lhs,
 }
 
 struct OutgoingFactsCacheState {
-  std::map<std::string, CachedOutgoingFactsEntry> entries;
+  std::map<CachedOutgoingFactsKey, CachedOutgoingFactsEntry> entries;
   unsigned hits = 0;
   unsigned misses = 0;
 };
 
-static void appendExprMapCacheKey(
-    llvm::raw_ostream &os, const std::map<unsigned, VirtualValueExpr> &facts,
-    llvm::StringRef label) {
-  os << label << "{";
+static llvm::stable_hash hashOptionalString(
+    const std::optional<std::string> &value) {
+  if (!value.has_value())
+    return llvm::stable_hash_combine(0, 0);
+  return llvm::stable_hash_combine(1, llvm::stable_hash_name(*value));
+}
+
+static llvm::stable_hash hashOptionalUnsigned(
+    const std::optional<unsigned> &value) {
+  if (!value.has_value())
+    return llvm::stable_hash_combine(0, 0);
+  return llvm::stable_hash_combine(1, *value);
+}
+
+static llvm::stable_hash hashOptionalUInt64(
+    const std::optional<uint64_t> &value) {
+  if (!value.has_value())
+    return llvm::stable_hash_combine(0, 0);
+  return llvm::stable_hash_combine(1, *value);
+}
+
+static llvm::stable_hash hashOptionalInt64(
+    const std::optional<int64_t> &value) {
+  if (!value.has_value())
+    return llvm::stable_hash_combine(0, 0);
+  return llvm::stable_hash_combine(1, static_cast<uint64_t>(*value));
+}
+
+static llvm::stable_hash hashVirtualValueExpr(const VirtualValueExpr &expr) {
+  llvm::stable_hash hash =
+      llvm::stable_hash_combine(static_cast<unsigned>(expr.kind),
+                                expr.bit_width, expr.complete ? 1u : 0u);
+  hash = llvm::stable_hash_combine(hash, hashOptionalUInt64(expr.constant),
+                                   hashOptionalUnsigned(expr.argument_index),
+                                   hashOptionalUnsigned(expr.slot_id));
+  hash = llvm::stable_hash_combine(hash, hashOptionalString(expr.state_base_name),
+                                   hashOptionalInt64(expr.state_offset),
+                                   hashOptionalUnsigned(expr.stack_cell_id));
+  hash = llvm::stable_hash_combine(hash, hashOptionalInt64(expr.stack_offset),
+                                   static_cast<unsigned>(expr.operands.size()));
+  for (const auto &operand : expr.operands)
+    hash = llvm::stable_hash_combine(hash, hashVirtualValueExpr(operand));
+  return hash;
+}
+
+static llvm::stable_hash hashExprMap(
+    const std::map<unsigned, VirtualValueExpr> &facts) {
+  llvm::stable_hash hash = 0;
   for (const auto &[id, value] : facts)
-    os << id << "=" << renderVirtualValueExpr(value) << ";";
-  os << "}";
+    hash = llvm::stable_hash_combine(hash, id, hashVirtualValueExpr(value));
+  return hash;
+}
+
+static llvm::stable_hash hashExprMapSubset(
+    const std::map<unsigned, VirtualValueExpr> &facts,
+    llvm::ArrayRef<unsigned> static_ids,
+    const std::set<unsigned> &dynamic_ids = {}) {
+  llvm::stable_hash hash = 0;
+  size_t static_index = 0;
+  auto dynamic_it = dynamic_ids.begin();
+  auto append_id = [&](unsigned id) {
+    auto fact_it = facts.find(id);
+    if (fact_it == facts.end()) {
+      hash = llvm::stable_hash_combine(hash, id, 0u);
+      return;
+    }
+    hash = llvm::stable_hash_combine(hash, id, 1u,
+                                     hashVirtualValueExpr(fact_it->second));
+  };
+
+  while (static_index < static_ids.size() || dynamic_it != dynamic_ids.end()) {
+    bool take_static = dynamic_it == dynamic_ids.end();
+    if (!take_static && static_index < static_ids.size())
+      take_static = static_ids[static_index] <= *dynamic_it;
+
+    if (take_static) {
+      unsigned id = static_ids[static_index++];
+      append_id(id);
+      if (dynamic_it != dynamic_ids.end() && *dynamic_it == id)
+        ++dynamic_it;
+      continue;
+    }
+
+    append_id(*dynamic_it);
+    ++dynamic_it;
+  }
+
+  return hash;
+}
+
+static llvm::stable_hash hashOutgoingFacts(
+    const std::map<unsigned, VirtualValueExpr> &outgoing_slots,
+    const std::map<unsigned, VirtualValueExpr> &outgoing_stack,
+    bool stack_memory_budget_exceeded) {
+  return llvm::stable_hash_combine(hashExprMap(outgoing_slots),
+                                   hashExprMap(outgoing_stack),
+                                   stack_memory_budget_exceeded ? 1u : 0u);
 }
 
 void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
@@ -288,6 +378,8 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
   const auto slot_info = buildSlotInfoMap(model);
   const auto stack_cell_ids = buildStackCellIdMap(model);
   const auto stack_cell_info = buildStackCellInfoMap(model);
+  const auto equivalent_stack_cell_groups =
+      buildEquivalentStackCellGroupMap(model);
   vmModelStageDebugLog("propagate: maps-built handlers=" +
                        llvm::Twine(handlers.size()).str() + " slots=" +
                        llvm::Twine(slot_ids.size()).str() + " stack_cells=" +
@@ -336,6 +428,73 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
                        llvm::Twine(handlers_with_direct_callees.size()).str() +
                        " prelude_handlers=" +
                        llvm::Twine(handlers_with_prelude.size()).str());
+  std::vector<llvm::SmallVector<unsigned, 16>> relevant_outgoing_slot_ids(
+      handlers.size());
+  std::vector<llvm::SmallVector<unsigned, 16>> relevant_outgoing_stack_cell_ids(
+      handlers.size());
+  const auto &dl = M.getDataLayout();
+  for (size_t i = 0; i < handlers.size(); ++i) {
+    std::set<unsigned> relevant_slot_ids(handlers[i].live_in_slot_ids.begin(),
+                                         handlers[i].live_in_slot_ids.end());
+    std::set<unsigned> relevant_stack_ids(
+        handlers[i].live_in_stack_cell_ids.begin(),
+        handlers[i].live_in_stack_cell_ids.end());
+    auto *caller_fn = M.getFunction(handlers[i].function_name);
+    if (!caller_fn) {
+      relevant_outgoing_slot_ids[i].assign(relevant_slot_ids.begin(),
+                                           relevant_slot_ids.end());
+      relevant_outgoing_stack_cell_ids[i].assign(relevant_stack_ids.begin(),
+                                                 relevant_stack_ids.end());
+      continue;
+    }
+
+    for (auto &BB : *caller_fn) {
+      for (auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+        if (!call)
+          continue;
+        auto *callee = call->getCalledFunction();
+        if (!callee)
+          continue;
+        auto callee_it = handler_index.find(callee->getName().str());
+        if (callee_it == handler_index.end())
+          continue;
+
+        for (llvm::Value *arg : call->args()) {
+          auto arg_expr = summarizeValueExpr(arg, dl);
+          annotateExprSlots(arg_expr, slot_ids);
+          annotateExprStackCells(arg_expr, stack_cell_ids, slot_ids);
+          collectExprSlotIds(arg_expr, relevant_slot_ids);
+          collectExprStackCellIds(arg_expr, relevant_stack_ids);
+        }
+
+        const auto &callee_summary = handlers[callee_it->second];
+        for (unsigned callee_slot_id : callee_summary.live_in_slot_ids) {
+          auto info_it = slot_info.find(callee_slot_id);
+          if (info_it == slot_info.end())
+            continue;
+          auto mapped_slot_id =
+              lookupMappedCallerSlotId(*call, *info_it->second, slot_ids, dl);
+          if (mapped_slot_id.has_value())
+            relevant_slot_ids.insert(*mapped_slot_id);
+        }
+        for (unsigned callee_cell_id : callee_summary.live_in_stack_cell_ids) {
+          auto info_it = stack_cell_info.find(callee_cell_id);
+          if (info_it == stack_cell_info.end())
+            continue;
+          auto mapped_cell_id = lookupMappedCallerStackCellId(
+              *call, *info_it->second, slot_ids, stack_cell_ids, dl);
+          if (mapped_cell_id.has_value())
+            relevant_stack_ids.insert(*mapped_cell_id);
+        }
+      }
+    }
+
+    relevant_outgoing_slot_ids[i].assign(relevant_slot_ids.begin(),
+                                         relevant_slot_ids.end());
+    relevant_outgoing_stack_cell_ids[i].assign(relevant_stack_ids.begin(),
+                                               relevant_stack_ids.end());
+  }
 
   std::vector<std::map<unsigned, VirtualValueExpr>> incoming_maps(
       handlers.size());
@@ -356,42 +515,77 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
   OutgoingFactsCacheState outgoing_facts_cache;
   auto *persistent_top_level_replay_cache =
       module_cache ? &module_cache->localized_top_level_replays : nullptr;
+  auto *persistent_callsite_replay_cache =
+      module_cache ? &module_cache->localized_callsite_replays : nullptr;
+  auto *persistent_specialized_call_arg_cache =
+      module_cache ? &module_cache->specialized_call_arg_replays : nullptr;
+  auto *persistent_precall_state_cache =
+      module_cache ? &module_cache->precall_state_entries : nullptr;
   auto *persistent_outgoing_facts_cache =
       module_cache ? &module_cache->outgoing_facts : nullptr;
   auto *persistent_propagation_entries =
       module_cache ? &module_cache->propagation_entries : nullptr;
-  auto build_handler_outgoing_cache_key =
-      [&](size_t handler_index_value, const llvm::Function *handler_fn,
-          bool include_callees) {
-        std::string key_storage;
-        llvm::raw_string_ostream os(key_storage);
-        os << handlers[handler_index_value].function_name << "|fp="
-           << (handler_fn ? summaryRelevantFunctionFingerprint(*handler_fn) : 0)
-           << "|";
-        appendExprMapCacheKey(os, incoming_maps[handler_index_value], "in");
-        appendExprMapCacheKey(os, incoming_stack_maps[handler_index_value],
-                              "stack");
-        appendExprMapCacheKey(os, incoming_argument_maps[handler_index_value],
-                              "args");
-        if (include_callees) {
-          os << "callees{";
-          for (const auto &callee_name :
-               handlers[handler_index_value].direct_callees) {
-            auto callee_it = handler_index.find(callee_name);
-            if (callee_it == handler_index.end())
-              continue;
-            os << callee_name << ":";
-            appendExprMapCacheKey(os, outgoing_maps[callee_it->second], "out");
-            appendExprMapCacheKey(os, outgoing_stack_maps[callee_it->second],
-                                  "ostack");
-          }
-          os << "}";
-        }
-        os.flush();
-        return key_storage;
-      };
+  localized_replay_cache.persistent_top_level_entries =
+      persistent_top_level_replay_cache;
+  localized_replay_cache.persistent_callsite_entries =
+      persistent_callsite_replay_cache;
+  localized_replay_cache.persistent_specialized_call_arg_entries =
+      persistent_specialized_call_arg_cache;
+  localized_replay_cache.persistent_precall_state_entries =
+      persistent_precall_state_cache;
+  localized_replay_cache.slot_info = &slot_info;
+  localized_replay_cache.stack_cell_info = &stack_cell_info;
+  localized_replay_cache.equivalent_stack_cell_groups =
+      &equivalent_stack_cell_groups;
   std::vector<llvm::stable_hash> handler_fingerprints(handlers.size(), 0);
+  std::vector<llvm::stable_hash> outgoing_fact_fingerprints(handlers.size(), 0);
+  std::vector<llvm::stable_hash> last_outgoing_input_fingerprints(
+      handlers.size(), 0);
+  std::vector<uint8_t> have_last_outgoing_input_fingerprints(handlers.size(),
+                                                             0);
   std::vector<uint8_t> restored_propagation_state(handlers.size(), 0);
+  auto build_callee_outgoing_fingerprint = [&](size_t handler_index_value) {
+    llvm::stable_hash hash = 0;
+    for (const auto &callee_name : handlers[handler_index_value].direct_callees) {
+      auto callee_it = handler_index.find(callee_name);
+      if (callee_it == handler_index.end())
+        continue;
+      hash = llvm::stable_hash_combine(
+          hash, llvm::stable_hash_name(callee_name),
+          outgoing_fact_fingerprints[callee_it->second]);
+    }
+    return hash;
+  };
+  auto build_handler_outgoing_cache_key =
+      [&](size_t handler_index_value, llvm::stable_hash handler_fingerprint,
+          bool include_callees) {
+        CachedOutgoingFactsKey key;
+        key.function_name = handlers[handler_index_value].function_name;
+        key.handler_fingerprint = handler_fingerprint;
+        key.incoming_fingerprint = hashExprMapSubset(
+            incoming_maps[handler_index_value],
+            relevant_outgoing_slot_ids[handler_index_value],
+            dynamic_live_in_slot_ids[handler_index_value]);
+        key.incoming_stack_fingerprint = hashExprMapSubset(
+            incoming_stack_maps[handler_index_value],
+            relevant_outgoing_stack_cell_ids[handler_index_value],
+            dynamic_live_in_stack_cell_ids[handler_index_value]);
+        key.incoming_argument_fingerprint =
+            hashExprMap(incoming_argument_maps[handler_index_value]);
+        if (include_callees)
+          key.callee_outgoing_fingerprint =
+              build_callee_outgoing_fingerprint(handler_index_value);
+        return key;
+      };
+  auto build_handler_outgoing_input_fingerprint =
+      [&](const CachedOutgoingFactsKey &key) {
+        auto hash = llvm::stable_hash_combine(
+            llvm::stable_hash_name(key.function_name), key.handler_fingerprint,
+            key.incoming_fingerprint, key.incoming_stack_fingerprint);
+        return llvm::stable_hash_combine(hash,
+                                         key.incoming_argument_fingerprint,
+                                         key.callee_outgoing_fingerprint);
+      };
 
   for (size_t i = 0; i < handlers.size(); ++i) {
     auto *handler_fn = M.getFunction(handlers[i].function_name);
@@ -429,6 +623,11 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
       incoming_argument_maps[i][1] =
           constantExpr(*handlers[i].entry_va, /*bits=*/64);
     }
+  }
+  for (size_t i = 0; i < handlers.size(); ++i) {
+    outgoing_fact_fingerprints[i] = hashOutgoingFacts(
+        outgoing_maps[i], outgoing_stack_maps[i],
+        handlers[i].stack_memory_budget_exceeded);
   }
   vmModelStageDebugLog("propagate: initial-facts-seeded restored=" +
                        llvm::Twine(std::count(restored_propagation_state.begin(),
@@ -493,10 +692,30 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
           !dirty_prelude_handlers.empty()) &&
          iterations++ < 16) {
     const auto iteration_begin = std::chrono::steady_clock::now();
+    uint64_t outgoing_phase_ms = 0;
+    uint64_t callsite_import_phase_ms = 0;
+    uint64_t prelude_phase_ms = 0;
+    const uint64_t iteration_top_level_localized_ms_begin =
+        localized_replay_cache.top_level_localized_compute_ms;
+    const uint64_t iteration_localized_single_block_ms_begin =
+        localized_replay_cache.localized_single_block_compute_ms;
+    const uint64_t iteration_direct_callee_effects_ms_begin =
+        localized_replay_cache.direct_callee_effects_ms;
+    const uint64_t iteration_callsite_localized_ms_begin =
+        localized_replay_cache.callsite_localized_compute_ms;
+    const uint64_t iteration_specialized_call_arg_build_ms_begin =
+        localized_replay_cache.specialized_call_arg_build_ms;
+    const uint64_t iteration_precall_state_build_ms_begin =
+        localized_replay_cache.precall_state_build_ms;
+    const uint64_t iteration_direct_callee_key_build_ms_begin =
+        localized_replay_cache.direct_callee_key_build_ms;
+    const uint64_t iteration_callsite_key_build_ms_begin =
+        localized_replay_cache.callsite_key_build_ms;
     bool changed = false;
     unsigned localized_attempts = 0;
     unsigned localized_successes = 0;
     unsigned summary_recomputes = 0;
+    unsigned outgoing_fingerprint_skips = 0;
     llvm::SmallVector<size_t, 32> next_dirty_handlers;
     llvm::SmallVector<size_t, 32> next_dirty_call_sources;
     llvm::SmallVector<size_t, 16> next_dirty_preludes;
@@ -544,17 +763,32 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
     vmModelStageDebugLog("propagate: iteration=" +
                          llvm::Twine(iterations).str() + " phase=begin");
 
+    const auto outgoing_begin = std::chrono::steady_clock::now();
     for (size_t i : dirty_handlers) {
       vmModelStageDebugLog("propagate: iteration=" +
                            llvm::Twine(iterations).str() +
                            " phase=outgoing handler=" +
                            handlers[i].function_name);
+      auto *caller_fn = M.getFunction(handlers[i].function_name);
+      auto outgoing_cache_key = build_handler_outgoing_cache_key(
+          i, handler_fingerprints[i], /*include_callees=*/true);
+      auto outgoing_input_fingerprint =
+          build_handler_outgoing_input_fingerprint(outgoing_cache_key);
+      if (have_last_outgoing_input_fingerprints[i] &&
+          last_outgoing_input_fingerprints[i] == outgoing_input_fingerprint) {
+        ++outgoing_fingerprint_skips;
+        continue;
+      }
+      last_outgoing_input_fingerprints[i] = outgoing_input_fingerprint;
+      have_last_outgoing_input_fingerprints[i] = 1;
       std::map<unsigned, VirtualValueExpr> outgoing_map;
       std::map<unsigned, VirtualValueExpr> outgoing_stack_map;
       bool used_localized = false;
       bool have_cached_outgoing = false;
+      bool outgoing_stack_rebased = false;
+      bool outgoing_stack_trimmed = false;
       bool budget_exceeded = false;
-      if (auto *caller_fn = M.getFunction(handlers[i].function_name)) {
+      if (caller_fn) {
         vmModelStageDebugLog("propagate: iteration=" +
                              llvm::Twine(iterations).str() +
                              " phase=outgoing handler=" +
@@ -570,31 +804,29 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
                                llvm::Twine(handlers[i].direct_callees.size())
                                    .str());
           ++localized_attempts;
-          auto cache_key = build_handler_outgoing_cache_key(
-              i, caller_fn, /*include_callees=*/true);
           vmModelStageDebugLog("propagate: iteration=" +
                                llvm::Twine(iterations).str() +
                                " phase=outgoing handler=" +
                                handlers[i].function_name +
                                " step=localized-cache-lookup");
           auto cache_it =
-              localized_replay_cache.top_level_entries.find(cache_key);
+              localized_replay_cache.top_level_entries.find(outgoing_cache_key);
           std::optional<CallsiteLocalizedOutgoingFacts> localized;
           if (cache_it != localized_replay_cache.top_level_entries.end()) {
             ++localized_replay_cache.top_level_hits;
             localized = cache_it->second;
           } else if (persistent_top_level_replay_cache) {
             auto persistent_it =
-                persistent_top_level_replay_cache->find(cache_key);
+                persistent_top_level_replay_cache->find(outgoing_cache_key);
             if (persistent_it != persistent_top_level_replay_cache->end()) {
               ++localized_replay_cache.top_level_hits;
               localized = persistent_it->second;
-              localized_replay_cache.top_level_entries.emplace(cache_key,
-                                                               localized);
+              localized_replay_cache.top_level_entries.emplace(
+                  outgoing_cache_key, localized);
             }
           }
           if (!localized.has_value() &&
-              localized_replay_cache.top_level_entries.find(cache_key) ==
+              localized_replay_cache.top_level_entries.find(outgoing_cache_key) ==
                   localized_replay_cache.top_level_entries.end()) {
             vmModelStageDebugLog("propagate: iteration=" +
                                  llvm::Twine(iterations).str() +
@@ -604,6 +836,7 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
             ++localized_replay_cache.top_level_misses;
             llvm::SmallPtrSet<const llvm::Function *, 8> visiting;
             visiting.insert(caller_fn);
+            const auto localized_begin = std::chrono::steady_clock::now();
             localized = computeLocalizedSingleBlockOutgoingFacts(
                 *caller_fn, model, handlers[i], slot_ids, stack_cell_ids,
                 incoming_maps[i], incoming_stack_maps[i],
@@ -611,6 +844,9 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
                 outgoing_stack_maps, binary_memory, /*depth=*/0, visiting,
                 nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                 &localized_replay_cache);
+            localized_replay_cache.top_level_localized_compute_ms +=
+                elapsedMilliseconds(localized_begin,
+                                    std::chrono::steady_clock::now());
             vmModelStageDebugLog("propagate: iteration=" +
                                  llvm::Twine(iterations).str() +
                                  " phase=outgoing handler=" +
@@ -618,10 +854,10 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
                                  " step=localized-compute-done success=" +
                                  llvm::Twine(localized.has_value()).str());
             localized_replay_cache.top_level_entries.emplace(
-                std::move(cache_key), localized);
+                outgoing_cache_key, localized);
             if (persistent_top_level_replay_cache) {
               persistent_top_level_replay_cache->insert_or_assign(
-                  cache_key, localized);
+                  outgoing_cache_key, localized);
             }
           }
           if (localized) {
@@ -650,6 +886,7 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
               outgoing_stack_map.emplace(cell_id, value);
             }
             used_localized = true;
+            outgoing_stack_rebased = true;
           }
         }
         if (!used_localized) {
@@ -658,27 +895,30 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
                                " phase=outgoing handler=" +
                                handlers[i].function_name +
                                " step=summary-path");
-          auto cache_key = build_handler_outgoing_cache_key(
-              i, caller_fn, /*include_callees=*/true);
-          auto cache_it = outgoing_facts_cache.entries.find(cache_key);
+          auto cache_it =
+              outgoing_facts_cache.entries.find(outgoing_cache_key);
           if (cache_it != outgoing_facts_cache.entries.end()) {
             ++outgoing_facts_cache.hits;
             outgoing_map = cache_it->second.outgoing_slots;
             outgoing_stack_map = cache_it->second.outgoing_stack;
             budget_exceeded = cache_it->second.stack_memory_budget_exceeded;
             have_cached_outgoing = true;
+            outgoing_stack_rebased = true;
+            outgoing_stack_trimmed = true;
           } else if (persistent_outgoing_facts_cache) {
             auto persistent_it =
-                persistent_outgoing_facts_cache->find(cache_key);
+                persistent_outgoing_facts_cache->find(outgoing_cache_key);
             if (persistent_it != persistent_outgoing_facts_cache->end()) {
               ++outgoing_facts_cache.hits;
               outgoing_map = persistent_it->second.outgoing_slots;
               outgoing_stack_map = persistent_it->second.outgoing_stack;
               budget_exceeded =
                   persistent_it->second.stack_memory_budget_exceeded;
-              outgoing_facts_cache.entries.emplace(cache_key,
+              outgoing_facts_cache.entries.emplace(outgoing_cache_key,
                                                   persistent_it->second);
               have_cached_outgoing = true;
+              outgoing_stack_rebased = true;
+              outgoing_stack_trimmed = true;
             }
           }
           if (!have_cached_outgoing) {
@@ -689,38 +929,44 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
                                  " phase=outgoing handler=" +
                                  handlers[i].function_name +
                                  " step=compute-outgoing-begin");
-            auto new_outgoing =
-                computeOutgoingFacts(handlers[i], incoming_maps[i],
-                                     incoming_stack_maps[i],
-                                     incoming_argument_maps[i]);
+            vmModelStageDebugLog("propagate: iteration=" +
+                                 llvm::Twine(iterations).str() +
+                                 " phase=outgoing handler=" +
+                                 handlers[i].function_name +
+                                 " step=compute-outgoing-maps-begin");
+            computeOutgoingFactMaps(handlers[i], incoming_maps[i],
+                                    incoming_stack_maps[i],
+                                    incoming_argument_maps[i], outgoing_map,
+                                    outgoing_stack_map);
             vmModelStageDebugLog("propagate: iteration=" +
                                  llvm::Twine(iterations).str() +
                                  " phase=outgoing handler=" +
                                  handlers[i].function_name +
                                  " step=compute-outgoing-done count=" +
-                                 llvm::Twine(new_outgoing.size()).str());
-            auto new_outgoing_stack = computeOutgoingStackFacts(
-                handlers[i], incoming_maps[i], incoming_stack_maps[i],
-                incoming_argument_maps[i]);
+                                 llvm::Twine(outgoing_map.size()).str());
             vmModelStageDebugLog("propagate: iteration=" +
                                  llvm::Twine(iterations).str() +
                                  " phase=outgoing handler=" +
                                  handlers[i].function_name +
                                  " step=compute-outgoing-stack-done count=" +
-                                 llvm::Twine(new_outgoing_stack.size()).str());
-            for (const auto &fact : new_outgoing)
-              outgoing_map[fact.slot_id] = fact.value;
-            for (const auto &fact : new_outgoing_stack)
-              outgoing_stack_map[fact.cell_id] = fact.value;
+                                 llvm::Twine(outgoing_stack_map.size()).str());
             vmModelStageDebugLog("propagate: iteration=" +
                                  llvm::Twine(iterations).str() +
                                  " phase=outgoing handler=" +
                                  handlers[i].function_name +
                                  " step=direct-callee-effects-begin");
+            const auto direct_callee_effects_begin =
+                std::chrono::steady_clock::now();
             applyDirectCalleeEffects(*caller_fn, model, handler_index,
                                      outgoing_maps, outgoing_stack_maps,
                                      incoming_argument_maps[i], outgoing_map,
-                                     outgoing_stack_map, binary_memory);
+                                     outgoing_stack_map, binary_memory,
+                                     &localized_replay_cache,
+                                     relevant_outgoing_slot_ids[i],
+                                     relevant_outgoing_stack_cell_ids[i]);
+            localized_replay_cache.direct_callee_effects_ms +=
+                elapsedMilliseconds(direct_callee_effects_begin,
+                                    std::chrono::steady_clock::now());
             vmModelStageDebugLog("propagate: iteration=" +
                                  llvm::Twine(iterations).str() +
                                  " phase=outgoing handler=" +
@@ -739,41 +985,40 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
               while (outgoing_stack_map.size() > kMaxTrackedStackCells)
                 outgoing_stack_map.erase(std::prev(outgoing_stack_map.end()));
             }
+            outgoing_stack_rebased = true;
+            outgoing_stack_trimmed = true;
             CachedOutgoingFactsEntry cache_entry;
             cache_entry.outgoing_slots = outgoing_map;
             cache_entry.outgoing_stack = outgoing_stack_map;
             cache_entry.stack_memory_budget_exceeded = budget_exceeded;
-            outgoing_facts_cache.entries.emplace(cache_key, cache_entry);
+            outgoing_facts_cache.entries.emplace(outgoing_cache_key, cache_entry);
             if (persistent_outgoing_facts_cache) {
-              persistent_outgoing_facts_cache->insert_or_assign(cache_key,
+              persistent_outgoing_facts_cache->insert_or_assign(outgoing_cache_key,
                                                                 cache_entry);
             }
           }
         }
       } else {
         ++summary_recomputes;
-        auto new_outgoing =
-            computeOutgoingFacts(handlers[i], incoming_maps[i],
-                                 incoming_stack_maps[i],
-                                 incoming_argument_maps[i]);
-        auto new_outgoing_stack = computeOutgoingStackFacts(
-            handlers[i], incoming_maps[i], incoming_stack_maps[i],
-            incoming_argument_maps[i]);
-        for (const auto &fact : new_outgoing)
-          outgoing_map[fact.slot_id] = fact.value;
-        for (const auto &fact : new_outgoing_stack)
-          outgoing_stack_map[fact.cell_id] = fact.value;
+        computeOutgoingFactMaps(handlers[i], incoming_maps[i],
+                                incoming_stack_maps[i],
+                                incoming_argument_maps[i], outgoing_map,
+                                outgoing_stack_map);
       }
-      if (!have_cached_outgoing) {
+      if (!outgoing_stack_rebased) {
         outgoing_stack_map =
             rebaseOutgoingStackFacts(model, outgoing_map, outgoing_stack_map);
+      }
+      if (!outgoing_stack_trimmed) {
         budget_exceeded = outgoing_stack_map.size() > kMaxTrackedStackCells;
         if (budget_exceeded) {
           while (outgoing_stack_map.size() > kMaxTrackedStackCells)
             outgoing_stack_map.erase(std::prev(outgoing_stack_map.end()));
         }
       }
-      if (handlers[i].stack_memory_budget_exceeded != budget_exceeded) {
+      bool budget_flag_changed =
+          handlers[i].stack_memory_budget_exceeded != budget_exceeded;
+      if (budget_flag_changed) {
         handlers[i].stack_memory_budget_exceeded = budget_exceeded;
         changed = true;
       }
@@ -845,6 +1090,11 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
         outgoing_stack_maps[i] = std::move(outgoing_stack_map);
         changed = true;
       }
+      if (outgoing_changed || budget_flag_changed) {
+        outgoing_fact_fingerprints[i] = hashOutgoingFacts(
+            outgoing_maps[i], outgoing_stack_maps[i],
+            handlers[i].stack_memory_budget_exceeded);
+      }
       if (outgoing_changed) {
         if (!active_call_source_flags[i] && has_direct_callees[i]) {
           active_call_source_flags[i] = 1;
@@ -862,6 +1112,8 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
         }
       }
     }
+    outgoing_phase_ms = elapsedMilliseconds(outgoing_begin,
+                                            std::chrono::steady_clock::now());
     vmModelStageDebugLog("propagate: iteration=" +
                          llvm::Twine(iterations).str() +
                          " phase=outgoing-done");
@@ -899,6 +1151,7 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
     vmModelStageDebugLog("propagate: iteration=" +
                          llvm::Twine(iterations).str() +
                          " phase=callsite-import-begin");
+    const auto callsite_import_begin = std::chrono::steady_clock::now();
     for (size_t i : active_call_sources) {
       vmModelStageDebugLog("propagate: iteration=" +
                            llvm::Twine(iterations).str() +
@@ -1045,6 +1298,9 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
         }
       }
     }
+    callsite_import_phase_ms =
+        elapsedMilliseconds(callsite_import_begin,
+                            std::chrono::steady_clock::now());
     vmModelStageDebugLog("propagate: iteration=" +
                          llvm::Twine(iterations).str() +
                          " phase=callsite-import-done");
@@ -1052,6 +1308,7 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
     vmModelStageDebugLog("propagate: iteration=" +
                          llvm::Twine(iterations).str() +
                          " phase=prelude-begin");
+    const auto prelude_begin = std::chrono::steady_clock::now();
     for (size_t i : active_prelude_handlers) {
       vmModelStageDebugLog("propagate: iteration=" +
                            llvm::Twine(iterations).str() +
@@ -1105,6 +1362,8 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
         }
       }
     }
+    prelude_phase_ms = elapsedMilliseconds(prelude_begin,
+                                           std::chrono::steady_clock::now());
     vmModelStageDebugLog("propagate: iteration=" +
                          llvm::Twine(iterations).str() +
                          " phase=prelude-done");
@@ -1119,7 +1378,44 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
         " dirty_preludes=" + llvm::Twine(dirty_prelude_handlers.size()).str() +
         " localized_attempts=" + llvm::Twine(localized_attempts).str() +
         " localized_successes=" + llvm::Twine(localized_successes).str() +
+        " outgoing_fingerprint_skips=" +
+        llvm::Twine(outgoing_fingerprint_skips).str() +
         " summary_recomputes=" + llvm::Twine(summary_recomputes).str() +
+        " outgoing_ms=" + llvm::Twine(outgoing_phase_ms).str() +
+        " callsite_import_ms=" + llvm::Twine(callsite_import_phase_ms).str() +
+        " prelude_ms=" + llvm::Twine(prelude_phase_ms).str() +
+        " top_level_localized_ms=" +
+        llvm::Twine(localized_replay_cache.top_level_localized_compute_ms -
+                    iteration_top_level_localized_ms_begin)
+            .str() +
+        " localized_single_block_ms=" +
+        llvm::Twine(localized_replay_cache.localized_single_block_compute_ms -
+                    iteration_localized_single_block_ms_begin)
+            .str() +
+        " direct_callee_effects_ms=" +
+        llvm::Twine(localized_replay_cache.direct_callee_effects_ms -
+                    iteration_direct_callee_effects_ms_begin)
+            .str() +
+        " callsite_localized_ms=" +
+        llvm::Twine(localized_replay_cache.callsite_localized_compute_ms -
+                    iteration_callsite_localized_ms_begin)
+            .str() +
+        " specialized_arg_build_ms=" +
+        llvm::Twine(localized_replay_cache.specialized_call_arg_build_ms -
+                    iteration_specialized_call_arg_build_ms_begin)
+            .str() +
+        " precall_state_build_ms=" +
+        llvm::Twine(localized_replay_cache.precall_state_build_ms -
+                    iteration_precall_state_build_ms_begin)
+            .str() +
+        " direct_callee_key_build_ms=" +
+        llvm::Twine(localized_replay_cache.direct_callee_key_build_ms -
+                    iteration_direct_callee_key_build_ms_begin)
+            .str() +
+        " callsite_key_build_ms=" +
+        llvm::Twine(localized_replay_cache.callsite_key_build_ms -
+                    iteration_callsite_key_build_ms_begin)
+            .str() +
         " ms=" +
         llvm::Twine(elapsedMilliseconds(iteration_begin,
                                         std::chrono::steady_clock::now()))
@@ -1175,10 +1471,54 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
                        " misses=" +
                        llvm::Twine(localized_replay_cache.top_level_misses)
                            .str());
+  vmModelStageDebugLog("propagate: callsite-localized-replay-cache hits=" +
+                       llvm::Twine(localized_replay_cache.callsite_hits).str() +
+                       " misses=" +
+                       llvm::Twine(localized_replay_cache.callsite_misses)
+                           .str());
+  vmModelStageDebugLog("propagate: specialized-call-arg-cache hits=" +
+                       llvm::Twine(localized_replay_cache.specialized_call_arg_hits)
+                           .str() +
+                       " misses=" +
+                       llvm::Twine(localized_replay_cache.specialized_call_arg_misses)
+                           .str());
+  vmModelStageDebugLog("propagate: precall-state-cache hits=" +
+                       llvm::Twine(localized_replay_cache.precall_state_hits).str() +
+                       " misses=" +
+                       llvm::Twine(localized_replay_cache.precall_state_misses)
+                           .str());
   vmModelStageDebugLog("propagate: outgoing-fact-cache hits=" +
                        llvm::Twine(outgoing_facts_cache.hits).str() +
                        " misses=" +
                        llvm::Twine(outgoing_facts_cache.misses).str());
+  vmModelStageDebugLog("propagate: top-level-localized-ms=" +
+                       llvm::Twine(localized_replay_cache
+                                       .top_level_localized_compute_ms)
+                           .str());
+  vmModelStageDebugLog("propagate: localized-single-block-ms=" +
+                       llvm::Twine(localized_replay_cache
+                                       .localized_single_block_compute_ms)
+                           .str());
+  vmModelStageDebugLog("propagate: direct-callee-effects-ms=" +
+                       llvm::Twine(localized_replay_cache.direct_callee_effects_ms)
+                           .str());
+  vmModelStageDebugLog("propagate: callsite-localized-ms=" +
+                       llvm::Twine(localized_replay_cache
+                                       .callsite_localized_compute_ms)
+                           .str());
+  vmModelStageDebugLog("propagate: specialized-call-arg-build-ms=" +
+                       llvm::Twine(localized_replay_cache
+                                       .specialized_call_arg_build_ms)
+                           .str());
+  vmModelStageDebugLog("propagate: precall-state-build-ms=" +
+                       llvm::Twine(localized_replay_cache.precall_state_build_ms)
+                           .str());
+  vmModelStageDebugLog("propagate: direct-callee-key-build-ms=" +
+                       llvm::Twine(localized_replay_cache.direct_callee_key_build_ms)
+                           .str());
+  vmModelStageDebugLog("propagate: callsite-key-build-ms=" +
+                       llvm::Twine(localized_replay_cache.callsite_key_build_ms)
+                           .str());
   vmModelStageDebugLog("propagate: restored-state handlers=" +
                        llvm::Twine(std::count(restored_propagation_state.begin(),
                                               restored_propagation_state.end(),

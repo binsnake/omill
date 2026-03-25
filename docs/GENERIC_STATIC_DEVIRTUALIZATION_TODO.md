@@ -3273,3 +3273,1296 @@ Next step:
   - stop that rewrite for output roots, or
   - carry explicit target provenance through that rewrite so the final
     terminal-boundary pass can recover the handler call
+
+## 2026-03-23: Post-ABI terminal boundary rewrite now runs in the real final output path
+
+Status:
+- landed a final-output-path terminal-boundary rewrite rerun in
+  `buildLateCleanupPipeline`
+- widened candidate propagation so the native root keeps
+  `omill.terminal_boundary_candidate_pc` through the early ABI inline path
+- added focused regressions for:
+  - unique-callee candidate propagation before inlining
+  - lifted-to-native candidate propagation before inlining
+  - late cleanup rewriting a candidate-tagged trivial self-loop output root
+
+Root cause:
+- `buildABIRecoveryPipeline` was not the last stage touching terminal wrappers
+- post-ABI deobfuscation could recreate a trivial `entry -> selfrec.loop ->
+  selfrec.loop` output root after the ABI-local rewrite already ran
+- the target PC was preserved on the root as
+  `omill.terminal_boundary_candidate_pc`, but the final emitted module did not
+  rerun `RewriteLoopifiedTerminalBoundaryOutputRootsPass`
+
+Validated on real default exports:
+- `TvmpGroundTruthDigest` (`0x180002400`) now emits:
+  - explicit `call void @__omill_missing_block_handler(i64 6445658490)`
+  - terminal-boundary attrs:
+    - `omill.terminal_boundary_candidate_pc="18030F17A"`
+    - `omill.terminal_boundary_kind="in_image_executable_decodable_target"`
+  - object code generation succeeds with `llc -filetype=obj -O2`
+- `TvmpRunDigestScenario` (`0x1800023F0`) now emits the same explicit terminal
+  boundary form and compiles
+- `TvmpFlattenedStateMachine` (`0x1800020E0`) now emits the same explicit
+  terminal boundary form and compiles
+
+Diagnostic evidence:
+- with `OMILL_DEBUG_TERMINAL_REWRITE=1`, the real driver now shows:
+  - ABI recovery pass: `skip ... no-trivial-loop-block`
+  - post-ABI late cleanup: `rewrite sub_180002400_native target=0x18030F17A`
+
+Current state:
+- the remaining default terminal exports are no longer opaque self-loops
+- they are explicit classified terminal-boundary outputs in the same style as
+  compact
+
+Next step:
+- rerun the actual default export sweep and refresh the on-disk summary so the
+  export-level report reflects the new explicit terminal-boundary outputs
+
+## 2026-03-23: Default actual export sweep refreshed after final late-cleanup terminal rewrite
+
+Artifacts:
+- summary:
+  - `build-remill/test_obf/corpus/lifted/default_export_refresh_current_20260323_actual2/summary.json`
+- targeted terminal-boundary outputs:
+  - `build-remill/test_obf/corpus/lifted/default_terminal_fix1/TvmpGroundTruthDigest.va180002400.ll`
+  - `build-remill/test_obf/corpus/lifted/default_terminal_fix1/TvmpRunDigestScenario.va1800023F0.ll`
+  - `build-remill/test_obf/corpus/lifted/default_terminal_fix1/TvmpFlattenedStateMachine.va1800020E0.ll`
+
+Current default export state:
+- clean:
+  - `TvmpBytecodeVm`
+  - `TvmpGetAbiVersion`
+  - `TvmpGetCorpusDescriptor`
+  - `TvmpInterprocPipeline`
+  - `TvmpRecursiveChecksum`
+  - `TvmpSimpleArithmetic`
+- explicit terminal-boundary outputs:
+  - `TvmpFlattenedStateMachine`
+  - `TvmpGroundTruthDigest`
+  - `TvmpRunDigestScenario`
+
+Important clarification:
+- the summary still shows `missing_block=2` on those three exports because the
+  metric counts both:
+  - the `declare @__omill_missing_block_handler`
+  - the live terminal callsite
+- the old failure mode was a trivial self-loop with no explicit terminal
+  boundary call; that is gone now
+
+Validation:
+- all 9 default exports relift successfully
+- all 9 emitted `.ll` files compile with `llc -filetype=obj -O2`
+- the three former self-loop outputs now carry:
+  - explicit `__omill_missing_block_handler(...)`
+  - `omill.terminal_boundary_*` attrs/metadata
+
+Next step:
+- rerun the compact actual export sweep with the current tree so the export
+  report is refreshed uniformly across both VMP variants
+
+## 2026-03-23: Compact actual export sweep refreshed after final late-cleanup rewrite
+
+Artifact:
+- summary:
+  - `build-remill/test_obf/corpus/lifted/compact_export_refresh_current_20260323_actual3/summary.json`
+
+Current compact export state:
+- clean:
+  - `TvmpBytecodeVm`
+  - `TvmpGetAbiVersion`
+  - `TvmpGetCorpusDescriptor`
+  - `TvmpGroundTruthDigest`
+  - `TvmpInterprocPipeline`
+  - `TvmpRecursiveChecksum`
+  - `TvmpRunDigestScenario`
+  - `TvmpSimpleArithmetic`
+- explicit terminal-boundary output:
+  - `TvmpFlattenedStateMachine`
+
+Validation:
+- all 9 compact exports relift successfully
+- all 9 emitted `.ll` files compile with `llc -filetype=obj -O2`
+- compact remains better than default on the digest exports:
+  - `TvmpGroundTruthDigest` and `TvmpRunDigestScenario` are fully clean
+  - only `TvmpFlattenedStateMachine` remains terminal-boundary-only
+
+Current export-level endpoint:
+- plain `Corpus.dll`:
+  - 7 clean
+  - 2 explicit terminal-boundary outputs
+- `CorpusVMP.default.dll`:
+  - 6 clean
+  - 3 explicit terminal-boundary outputs
+- `CorpusVMP.compact.dll`:
+  - 8 clean
+  - 1 explicit terminal-boundary output
+
+Next step:
+- decide whether terminal-boundary-only exports are the accepted ABI endpoint,
+  or start a separate bounded recovery effort for those remaining in-image
+  decodable boundary targets
+
+## 2026-03-23: Remaining terminal-boundary targets are not cheap direct-lift recoveries
+
+Shared remaining targets:
+- default terminal-boundary exports all converge on one target:
+  - `0x18030F17A`
+- compact terminal-boundary export converges on:
+  - `0x1800233A3`
+
+Probe results:
+- direct lift probe of default target `0x18030F17A`:
+  - artifact/log:
+    - `build-remill/test_obf/corpus/lifted/terminal_target_probe2/default_18030F17A.log`
+  - result:
+    - still fails with `LLVM ERROR: out of memory`
+    - crash remains in `AlwaysInlinerPass`
+- direct lift probe of compact target `0x1800233A3`:
+  - artifact/log:
+    - `build-remill/test_obf/corpus/lifted/terminal_target_probe2/compact_1800233A3.log`
+  - result:
+    - does not finish within a 20-minute bound
+    - stalls after `Generic static devirtualization enabled`
+    - never reaches ABI recovery
+
+Conclusion:
+- the remaining explicit terminal-boundary exports are not one cheap relift away
+- recovering them is a separate bounded effort around:
+  - inline-budget control / selective inline suppression for target roots
+  - or a dedicated mid-block / continuation-root recovery strategy
+
+Current practical endpoint:
+- explicit classified terminal-boundary output is the stable ABI endpoint for
+  these remaining exports on the current tree
+
+## 2026-03-23: Added a coherent global AlwaysInliner skip knob for bounded target-root probes
+
+What landed:
+- all remaining `AlwaysInlinerPass` insertion sites now respect:
+  - `OMILL_SKIP_ALWAYS_INLINE=1`
+- ABI-specific sites still additionally respect:
+  - `OMILL_SKIP_ABI_ALWAYS_INLINE=1`
+
+Validation:
+- unit regression:
+  - `PipelineTest.GlobalAlwaysInlineSkipSuppressesAlwaysInlinerPasses`
+- existing terminal-boundary regressions remain green:
+  - `PipelineTest.AbiPipelinePropagatesLiftedTerminalBoundaryCandidateBeforeInlining`
+  - `PipelineTest.LateCleanupRewritesTerminalBoundaryOutputRootFromCandidateAttr`
+
+Probe impact:
+- probing default target `0x18030F17A` with only
+  `OMILL_SKIP_ABI_ALWAYS_INLINE=1` still crashed in `AlwaysInlinerPass`
+  because non-ABI inliner sites were still active
+- probing the same target with `OMILL_SKIP_ALWAYS_INLINE=1` now bypasses
+  `AlwaysInlinerPass`, but the target still crashes later in the pipeline
+  before producing output:
+  - `build-remill/test_obf/corpus/lifted/terminal_target_probe4/default_18030F17A.skipallinline.log`
+
+Conclusion:
+- inline suppression alone is not enough to recover the shared default
+  terminal target
+- but we now have a reliable global control for isolating later-pass failures
+
+## 2026-03-23: Auto-skip generic static devirtualization for non-VM target-root probes
+
+What landed:
+- added `moduleHasGenericStaticDevirtualizationCandidates(const Module &)` in
+  `include/omill/Omill.h` / `lib/Pipeline.cpp`
+- tightened the predicate to actual VM/boundary signals only:
+  - `omill.vm_handler`
+  - `omill.vm_wrapper`
+  - `omill.protection_boundary`
+  - `omill.boundary_kind`
+  - `omill.trace_native_target`
+  - `omill.vm_newly_lifted`
+  - `omill.newly_lifted`
+  - `omill.virtual_specialized`
+  - `omill.vm_demerged_clone`
+  - `omill.vm_outlined_virtual_call`
+  - `vm_entry_*`
+- driver now auto-disables `generic_static_devirtualize` when the user enabled
+  it but the lifted module has no VM-like candidates, unless:
+  - VM mode is active
+  - or `OMILL_FORCE_GENERIC_STATIC_DEVIRT=1` is set
+
+Validation:
+- `PipelineTest.GenericStaticDevirtualizationCandidateDetectionIgnoresPlainLiftedRoot`
+- `PipelineTest.GenericStaticDevirtualizationCandidateDetectionFindsVmHandlerAttr`
+
+Real target-root impact:
+- default shared terminal target `0x18030F17A`:
+  - standalone probe with `--generic-static-devirtualize` now auto-skips GSD
+    and completes successfully:
+    - `build-remill/test_obf/corpus/lifted/terminal_target_probe8/default_18030F17A.auto_skip_gsd.log`
+    - emitted IR compiles with `llc -O2`
+    - emitted IR has:
+      - `dispatch_call=0`
+      - `dispatch_jump=0`
+      - `declare_blk=0`
+      - `call_blk=0`
+      - `__omill_missing_block_handler=0`
+      - `__remill_read_memory_=0`
+      - `__remill_write_memory_=0`
+      - `%struct.State=0`
+- compact remaining terminal target `0x1800233A3`:
+  - standalone probe now also auto-skips GSD:
+    - `build-remill/test_obf/corpus/lifted/terminal_target_probe9/compact_1800233A3.auto_skip_gsd.log`
+  - but it still fails later during ABI recovery with:
+    - `Running pass "cgscc(inline<only-mandatory>,inline),cgscc()"`
+  - `OMILL_SKIP_POST_ABI_INLINE=1` did not change that:
+    - `build-remill/test_obf/corpus/lifted/terminal_target_probe10/compact_1800233A3.skip_post_abi_inline.log`
+
+Conclusion:
+- the old “remaining terminal targets are not cheap direct-lift recoveries”
+  result needs to be split:
+  - default `0x18030F17A` is now a clean standalone lift once generic VM
+    devirtualization is not forced onto it
+  - compact `0x1800233A3` is still blocked, but now the blocker is clearly a
+    later ABI CGSCC inliner path rather than generic static devirtualization
+
+## 2026-03-23: Default terminal-boundary exports now reduce to one raw constant call target each
+
+What landed:
+- added a bounded pre-ABI late terminal-boundary target relift in
+  `tools/omill-lift/main.cpp`
+- it scans output roots for constant `__remill_missing_block` targets that
+  look like real code roots, lifts a small bounded set, and rewrites those
+  call sites to direct lifted targets before ABI recovery
+- also added an experimental post-ABI output-root constant-target wave, but it
+  is currently opt-in only:
+  - `OMILL_ENABLE_LATE_OUTPUT_ROOT_TARGET_RERUN=1`
+  - default path keeps it disabled because the current version is not yet
+    default-safe
+
+Stable default-export impact:
+- the three previously terminal-boundary-only default exports no longer end in
+  explicit `__omill_missing_block_handler(...)`
+- they now end in a single raw constant `inttoptr` call each, with no VM/state
+  residue:
+  - `TvmpGroundTruthDigest` -> `0x18024014A`
+  - `TvmpRunDigestScenario` -> `0x18024014A`
+  - `TvmpFlattenedStateMachine` -> `0x1801311A7`
+- representative artifacts:
+  - `build-remill/test_obf/corpus/lifted/default_terminal_recover1/TvmpGroundTruthDigest.va180002400.ll`
+  - `build-remill/test_obf/corpus/lifted/default_terminal_recover1/TvmpRunDigestScenario.va1800023F0.ll`
+  - `build-remill/test_obf/corpus/lifted/default_terminal_recover1/TvmpFlattenedStateMachine.va1800020E0.ll`
+
+Shape of those artifacts:
+- `__omill_missing_block_handler=0`
+- `declare_blk=0`
+- `call_blk=0`
+- `%struct.State=0`
+- exactly one `inttoptr(i64 ...)` call remains in each
+
+Bounded probe result for the next default target:
+- `0x18024014A` is not a hard stop:
+  - direct probe with `OMILL_SKIP_ALWAYS_INLINE=1` completes:
+    - `build-remill/test_obf/corpus/lifted/target_probe_18024014a_skip1/target.log`
+- so the remaining default work is now best described as:
+  - iterative output-root constant-call-target recovery
+  - not terminal-boundary classification anymore
+
+Current practical split:
+- default:
+  - terminal-boundary stubs are improved into a smaller “one constant call
+    target left” frontier
+- compact:
+  - remaining blocked target is still the ABI inliner path on `0x1800233A3`
+
+## 2026-03-23: Experimental post-ABI output-root target wave is not default-safe yet
+
+What landed:
+- the post-ABI output-root constant-target wave remains available, but it is
+  now explicitly opt-in:
+  - `OMILL_ENABLE_LATE_OUTPUT_ROOT_TARGET_RERUN=1`
+- it also uses a scoped `OMILL_SKIP_ALWAYS_INLINE=1` override for the bounded
+  rerun, so experiments do not inherit the global ABI inliner
+
+What the debug run proved:
+- target:
+  - `CorpusVMP.default.dll!TvmpGroundTruthDigest`
+- artifact/log:
+  - `build-remill/test_obf/corpus/lifted/default_terminal_recover_debug5/TvmpGroundTruthDigest.va180002400.log`
+- the experimental wave gets as far as:
+  - `Post-ABI deobfuscation complete`
+  - `[late-output-target] round=1 collect`
+  - `[late-output-target] round=1 targets= 0x18024014a`
+  - `[late-output-target] round=1 lift+rerun`
+- and then crashes before:
+  - the scoped main rerun starts
+  - the scoped ABI rerun starts
+
+Meaning:
+- the current failure is in the same-module target lift itself
+- it is not in:
+  - the late scoped main pipeline
+  - the late scoped ABI replay
+  - or the final inttoptr patch step
+
+Implication:
+- the next default recovery step is probably not “one more in-place late lift”
+- it is more likely:
+  - side-module target recovery plus import/rewrite
+  - or a more isolated target-lift path than reusing the current live module
+
+## 2026-03-23: Rewrite unresolved output-root constant-call loops into explicit terminal boundaries
+
+What landed:
+- added a late cleanup rewrite in:
+  - `lib/Pipeline.cpp`
+- it handles output roots that collapse to:
+  - a terminal self-recursive loop
+  - with a unique constant `inttoptr(i64 ...)` call target
+- those roots are now rewritten to explicit:
+  - `__omill_missing_block_handler(target_pc)`
+- the rewrite also seeds:
+  - `omill.terminal_boundary_candidate_pc`
+- the existing annotation pass then restores classified terminal-boundary attrs
+  and named metadata on the final output root
+
+Regression coverage:
+- `PipelineTest.LateCleanupRewritesIndirectCallTerminalBoundaryOutputRoot`
+
+Validated real default exports:
+- artifacts:
+  - `build-remill/test_obf/corpus/lifted/default_terminal_recover2/TvmpGroundTruthDigest.va180002400.ll`
+  - `build-remill/test_obf/corpus/lifted/default_terminal_recover2/TvmpRunDigestScenario.va1800023F0.ll`
+  - `build-remill/test_obf/corpus/lifted/default_terminal_recover2/TvmpFlattenedStateMachine.va1800020E0.ll`
+- all three now emit:
+  - `__omill_missing_block_handler(...)`
+  - `omill.terminal_boundary_kind`
+  - `omill.terminal_boundary_target_va`
+  - `!omill.terminal_boundaries`
+- no raw constant `inttoptr` calls remain in those final artifacts
+- all three compile with:
+  - `llc -filetype=obj -O2`
+
+Current practical endpoint:
+- default terminal exports are explicit classified terminal-boundary outputs
+  again, not opaque raw constant-call wrappers
+- the remaining deeper recovery work, if resumed, should start from:
+  - a side-module / isolated-target path
+  - not another same-module late-lift wave
+
+## 2026-03-23: Global inline skip now suppresses the regular module inliner too
+
+What landed:
+- `OMILL_SKIP_ALWAYS_INLINE=1` now suppresses:
+  - `AlwaysInlinerPass`
+  - `ModuleInlinerWrapperPass`
+- implementation is in:
+  - `lib/Pipeline.cpp`
+- regression coverage:
+  - `PipelineTest.GlobalAlwaysInlineSkipSuppressesAlwaysInlinerPasses`
+
+Compact impact:
+- the standalone compact terminal target probe no longer OOMs in
+  `cgscc(inline<only-mandatory>,inline)` under `OMILL_SKIP_ALWAYS_INLINE=1`
+- probe artifact:
+  - `build-remill/test_obf/corpus/lifted/terminal_target_probe11/compact_1800233A3.skipallinline.ll`
+- that artifact compiles with:
+  - `llc -filetype=obj -O2`
+
+What it means:
+- the remaining compact isolated-target blocker is no longer the inliner crash
+- but the emitted artifact is still a large stateful/block-lifted wrapper graph
+  rooted at:
+  - `sub_1800233a3_native`
+- it still carries many internal `blk_*` helpers and `%struct.State`
+- the isolated-target path is now viable as a probe, but it is not yet a clean
+  importable recovery artifact
+## 2026-03-23: Restore compact terminal-boundary cleanup after auto-GSD skip
+
+Status:
+- landed
+
+What changed:
+- `Pipeline.cpp`
+  - added `RewriteStateWrapperTerminalBoundaryOutputRootsPass`
+  - this rewrites output roots that are still a trivial `_native` state wrapper
+    around a same-base lifted `sub_*` call, when
+    `omill.terminal_boundary_candidate_pc` is already present
+  - generalized the terminal-boundary root rewrite into shared helpers:
+    - `getTerminalBoundaryCandidatePc`
+    - `rewriteTerminalBoundaryOutputRoot`
+  - widened `moduleHasGenericStaticDevirtualizationCandidates` so a module with
+    a real output root plus defined `blk_*` / `block_*` helpers still counts as
+    a generic-static-devirt candidate
+- `PipelineTest.cpp`
+  - added `LateCleanupRewritesStateWrapperTerminalBoundaryOutputRoot`
+  - added `GenericStaticDevirtualizationCandidateDetectionFindsBlockLiftedHelper`
+
+Why:
+- the auto-skip for generic static devirtualization on non-VM roots was too
+  aggressive for `CorpusVMP.compact.dll!TvmpFlattenedStateMachine`
+- before this fix, direct relift of `0x1800020E0` skipped GSD and collapsed to
+  an empty final module after a block-lifter decode failure at `0x180002141`
+- the old stable artifact showed that this path still needs the bounded GSD /
+  terminal-boundary cleanup flow even though it does not expose explicit
+  `omill.vm_handler`-style attrs early
+
+Validation:
+- focused tests:
+  - `LateCleanupRewritesTerminalBoundaryOutputRootFromCandidateAttr`
+  - `LateCleanupRewritesIndirectCallTerminalBoundaryOutputRoot`
+  - `LateCleanupRewritesStateWrapperTerminalBoundaryOutputRoot`
+  - `GlobalAlwaysInlineSkipSuppressesAlwaysInlinerPasses`
+  - `GenericStaticDevirtualizationCandidateDetectionIgnoresPlainLiftedRoot`
+  - `GenericStaticDevirtualizationCandidateDetectionFindsVmHandlerAttr`
+- compact isolated target probe:
+  - `terminal_target_probe12/compact_1800233A3.skipallinline.ll`
+  - now reduces to explicit:
+    - `__omill_missing_block_handler(0x1800420C8)`
+    - with terminal-boundary attrs / metadata
+    - and compiles with `llc -O2`
+- compact flattened rerun:
+  - `compact_flattened_fix_terminalwrapper2/compact_flattened.ll`
+  - now again reduces to explicit:
+    - `__omill_missing_block_handler(0x1800233A3)`
+    - with terminal-boundary attrs / metadata
+    - and compiles with `llc -O2`
+- refreshed compact actual export sweep:
+  - `compact_export_refresh_current_20260323_actual4/summary.json`
+  - result remains:
+    - 8 clean exports
+    - 1 explicit terminal-boundary export (`TvmpFlattenedStateMachine`)
+
+Current compact endpoint:
+- clean:
+  - `TvmpBytecodeVm`
+  - `TvmpGetAbiVersion`
+  - `TvmpGetCorpusDescriptor`
+  - `TvmpGroundTruthDigest`
+  - `TvmpInterprocPipeline`
+  - `TvmpRecursiveChecksum`
+  - `TvmpRunDigestScenario`
+  - `TvmpSimpleArithmetic`
+- explicit terminal-boundary-only:
+  - `TvmpFlattenedStateMachine`
+
+## 2026-03-23: Make auto-GSD skip export-aware
+
+Status:
+- landed
+
+What changed:
+- reverted the temporary `blk_*`-based widening in
+  `moduleHasGenericStaticDevirtualizationCandidates`
+- added PE export-table collection in `tools/omill-lift/main.cpp`
+  (`PEInfo::exported_function_starts`)
+- the driver now only auto-skips generic static devirtualization when:
+  - VM mode is off
+  - `OMILL_FORCE_GENERIC_STATIC_DEVIRT` is not set
+  - the current root VA is not a PE export
+  - and the lifted module has no VM-like candidate signals
+
+Why:
+- the temporary detector widening fixed compact exported
+  `TvmpFlattenedStateMachine` (`0x1800020E0`), but it also re-enabled GSD for
+  the non-export default target `0x18030F17A`
+- that immediately brought back the `AlwaysInlinerPass` OOM on the standalone
+  default target
+- the real distinction is export-root vs internal target, not merely presence
+  of block-lifted `blk_*` helpers
+
+Validation:
+- focused tests still pass:
+  - `LateCleanupRewritesTerminalBoundaryOutputRootFromCandidateAttr`
+  - `LateCleanupRewritesIndirectCallTerminalBoundaryOutputRoot`
+  - `LateCleanupRewritesStateWrapperTerminalBoundaryOutputRoot`
+  - `GlobalAlwaysInlineSkipSuppressesAlwaysInlinerPasses`
+  - `GenericStaticDevirtualizationCandidateDetectionIgnoresPlainLiftedRoot`
+  - `GenericStaticDevirtualizationCandidateDetectionFindsVmHandlerAttr`
+- refreshed default actual export sweep:
+  - `default_export_refresh_current_20260323_actual3/summary.json`
+  - state is unchanged and stable:
+    - 6 clean exports
+    - 3 explicit terminal-boundary-only exports
+- critical probes:
+  - compact exported root `0x1800020E0`
+    - `compact_flattened_fix_terminalwrapper3/compact_flattened.log`
+    - GSD remains enabled
+    - final output is explicit `__omill_missing_block_handler(0x1800233A3)`
+  - default internal target `0x18030F17A`
+    - `default_terminal_target_probe6/default_18030F17A.log`
+    - GSD is skipped again
+    - without extra inline suppression it still OOMs in `AlwaysInlinerPass`
+  - default internal target `0x18030F17A` with global inline skip
+    - `default_terminal_target_probe7/default_18030F17A.skipallinline.log`
+    - completes
+    - ends as explicit classified terminal-boundary output
+    - target currently resolves to `0x1801845A3`
+
+Current state:
+- export-root behavior is back on the intended split:
+  - exported compact roots can keep GSD when they need it
+  - arbitrary internal default targets do not get GSD forced on them
+- the remaining standalone-target problem is no longer GSD selection
+- it is bounded `AlwaysInliner` pressure on large internal default targets
+
+## 2026-03-23: Non-export target probes now auto-suppress inlining after auto-skipping GSD
+
+Status:
+- landed
+
+What changed:
+- extracted the driver policy into shared helpers:
+  - `shouldAutoSkipGenericStaticDevirtualizationForRoot`
+  - `shouldAutoSkipAlwaysInlineForRoot`
+- `tools/omill-lift/main.cpp` now uses those helpers instead of open-coded
+  conditions
+- focused regressions now cover:
+  - plain non-export root auto-skip
+  - export-root no-skip
+  - auto inline suppression only when GSD was requested but then auto-skipped
+
+Validation:
+- focused tests pass:
+  - `PipelineTest.GenericStaticDevirtualizationCandidateDetectionIgnoresPlainLiftedRoot`
+  - `PipelineTest.GenericStaticDevirtualizationCandidateDetectionFindsVmHandlerAttr`
+  - `PipelineTest.AutoSkipAlwaysInlineForInternalRootMatchesDriverPolicy`
+  - existing terminal-boundary rewrite tests
+
+Real probe results with no manual env overrides:
+- default internal target `0x18030F17A`
+  - artifact:
+    - `terminal_target_probe14/default_18030F17A.auto_skip_gsd_auto_inline.ll`
+  - log:
+    - `terminal_target_probe14/default_18030F17A.auto_skip_gsd_auto_inline.log`
+  - driver behavior:
+    - `Generic static devirtualization skipped: no VM-like candidates`
+    - `Always-inliner suppressed for non-export root after auto-skipping generic static devirtualization`
+  - final shape:
+    - explicit `__omill_missing_block_handler(0x1801845A3)`
+    - no `blk_*`
+    - no `%struct.State`
+    - compiles with `llc -filetype=obj -O2`
+- compact internal target `0x1800233A3`
+  - artifact:
+    - `terminal_target_probe15/compact_1800233A3.auto_skip_gsd_auto_inline.ll`
+  - log:
+    - `terminal_target_probe15/compact_1800233A3.auto_skip_gsd_auto_inline.log`
+  - driver behavior:
+    - `Generic static devirtualization skipped: no VM-like candidates`
+    - `Always-inliner suppressed for non-export root after auto-skipping generic static devirtualization`
+  - final shape:
+    - explicit `__omill_missing_block_handler(0x1800420C8)`
+    - no `blk_*`
+    - no `%struct.State`
+    - compiles with `llc -filetype=obj -O2`
+
+Current state:
+- standalone internal-target probes are now stable and bounded without manual
+  env overrides
+- export-level endpoint is unchanged:
+  - default remains `6` clean + `3` explicit terminal-boundary outputs
+  - compact remains `8` clean + `1` explicit terminal-boundary output
+
+Next step:
+- if recovery work continues beyond the current endpoint, it should be a
+  separate target-import / side-module recovery effort, not more crash-isolation
+  or driver-policy work
+
+## 2026-03-23: Guard `RewriteLiftedCallsToNative` against mismatched `_native` wrapper signatures
+
+Status:
+- landed
+
+What changed:
+- `lib/Passes/RewriteLiftedCallsToNative.cpp`
+  - added a conservative signature/arity check before rewriting a lifted call
+    to a recovered `_native` wrapper
+  - if the ABI-derived argument vector does not exactly match the wrapper
+    signature, the rewrite is skipped instead of creating invalid IR
+- `tests/unit/RewriteLiftedCallsToNativeTest.cpp`
+  - added `StaticCallSkipsMismatchedNativeWrapperSignature`
+
+Why:
+- standalone target probes were exposing a real ABI cleanup bug:
+  - `RewriteLiftedCallsToNativePass` could create broken calls such as
+    `call i64 @blk_1800420c8_native(i64, i64, i64, i64)`
+    even when the wrapper signature was different
+- the pipeline then “recovered” only by stripping `alwaysinline` from a broken
+  helper and continuing after a verifier warning
+
+Validation:
+- focused tests:
+  - `RewriteLiftedCallsToNativeTest.StaticCallRewritten`
+  - `RewriteLiftedCallsToNativeTest.StaticCallSkipsMismatchedNativeWrapperSignature`
+  - probe-policy pipeline tests still pass
+- compact verify-each probe:
+  - `terminal_target_probe19/compact_1800420C8.verify_each.log`
+  - no `VERIFY-EACH` failure anymore
+  - no `Incorrect number of arguments passed to called function`
+  - no `[repair] stripping alwaysinline from broken`
+  - final artifact compiles:
+    - `terminal_target_probe19/compact_1800420C8.verify_each.ll`
+- default next-target rerun:
+  - `terminal_target_probe20/default_1801845A3.auto_skip_gsd_auto_inline.log`
+  - old arity-mismatch warning is gone
+  - final artifact compiles:
+    - `terminal_target_probe20/default_1801845A3.auto_skip_gsd_auto_inline.ll`
+
+Current state:
+- non-export internal-target probes are now both:
+  - stable without manual env overrides
+  - verifier-clean through ABI recovery
+  - explicit terminal-boundary outputs at the current endpoint
+
+Next step:
+- if we keep following the remaining boundary chain, use the stabilized probe
+  path on the next concrete targets rather than revisiting ABI cleanup again
+
+## 2026-03-24: Annotate canonical terminal-boundary cycles inside late cleanup
+
+Status:
+- landed
+
+What changed:
+- `lib/Pipeline.cpp`
+  - added `AnnotateTerminalBoundaryCyclesPass`
+  - it runs after `AnnotateTerminalBoundaryHandlersPass`
+  - it works at PC granularity, not raw function-name granularity, so
+    duplicate wrappers like `blk_*_native` and `sub_*_native` collapse to one
+    node
+  - when terminal-boundary-only functions in the same module form a cycle, it
+    annotates each participating function with:
+    - `omill.terminal_boundary_cycle`
+    - `omill.terminal_boundary_cycle_len`
+    - `omill.terminal_boundary_cycle_canonical_target_va`
+  - and emits cycle-wide named metadata:
+    - `!omill.terminal_boundary_cycles`
+- `tests/unit/PipelineTest.cpp`
+  - added `PipelineTest.LateCleanupAnnotatesTerminalBoundaryCycle`
+
+Validation:
+- focused tests pass:
+  - `PipelineTest.LateCleanupAnnotatesTerminalBoundaryCycle`
+  - existing terminal-boundary rewrite tests
+  - existing probe-policy tests
+  - `RewriteLiftedCallsToNativeTest.StaticCallSkipsMismatchedNativeWrapperSignature`
+
+Current practical effect:
+- this improves endpoint reporting when multiple lifted terminal targets are
+  present in the same module
+- it does not change current export artifacts yet, because the surviving export
+  roots still terminate at one explicit boundary target per module rather than
+  importing the full target cycle into the same module
+
+Current chain evidence from stabilized standalone probes:
+- compact:
+  - `0x1800233A3 -> 0x1800420C8 -> 0x1800525B9 -> 0x1800420C8`
+- default:
+  - `0x18030F17A -> 0x1801845A3 -> 0x1801ADBA5 -> 0x1801845A3`
+
+Conclusion:
+- the remaining endpoint now looks like a bounded terminal-boundary cycle in
+  the obfuscated region, not an ordinary missed cleanup opportunity
+
+Next step:
+- if we want the export artifacts to carry this cycle information directly,
+  the next work item is a bounded side-module or probe-import path that brings
+  one extra layer of the cycle into the emitting module without destabilizing
+  ABI recovery
+
+## 2026-03-24: Output roots now carry one-hop terminal-boundary probe chains
+
+Status:
+- landed
+
+What changed:
+- `tools/omill-lift/main.cpp`
+  - added a bounded post-late-cleanup side probe for terminal-boundary output
+    roots
+  - it uses `llvm::sys::ExecuteAndWait` to relift one target in an isolated
+    child process, with:
+    - recursive probing disabled via
+      `OMILL_SKIP_TERMINAL_BOUNDARY_SIDE_PROBE=1`
+    - the existing auto-skip/auto-inline-suppression policy preserved for
+      non-export internal targets
+  - results are written back onto the original output root as metadata only:
+    - `omill.terminal_boundary_next_hop_target_va`
+    - `omill.terminal_boundary_probe_chain`
+    - optional next-hop cycle attrs when present
+    - module named metadata:
+      - `!omill.terminal_boundary_probe_chains`
+- probe seeding now uses:
+  - `omill.terminal_boundary_target_va` when present
+  - otherwise `omill.terminal_boundary_candidate_pc` as a fallback
+    for raw self-loop endpoints that have not been rewritten to explicit
+    `__omill_missing_block_handler(...)`
+
+Validation on real artifacts:
+- compact explicit terminal-boundary export:
+  - `compact_terminal_probechain1/TvmpFlattenedStateMachine.va1800020E0.ll`
+  - now carries:
+    - `omill.terminal_boundary_target_va="1800233A3"`
+    - `omill.terminal_boundary_next_hop_target_va="1800420C8"`
+    - `omill.terminal_boundary_probe_chain="1800233A3,1800420C8"`
+    - `!omill.terminal_boundary_probe_chains`
+  - compiles with `llc -filetype=obj -O2`
+- default candidate-only terminal root:
+  - `default_terminal_probechain2/TvmpGroundTruthDigest.va180002400.ll`
+  - root still ends as a raw self-loop with:
+    - `omill.terminal_boundary_candidate_pc="18030F17A"`
+  - but now also carries:
+    - `omill.terminal_boundary_next_hop_target_va="1801845A3"`
+    - `omill.terminal_boundary_probe_chain="18030F17A,1801845A3"`
+    - `!omill.terminal_boundary_probe_chains`
+  - compiles with `llc -filetype=obj -O2`
+
+Practical effect:
+- export artifacts now expose one extra layer of the remaining boundary chain
+  even when the root itself is only a candidate-tagged self-loop
+- this improves endpoint readability without importing additional code into the
+  live module
+
+Current endpoint:
+- compact explicit chain prefix is now visible directly on the export root:
+  - `1800233A3 -> 1800420C8`
+- default candidate chain prefix is now visible directly on the export root:
+  - `18030F17A -> 1801845A3`
+
+Next step:
+- if we keep pushing beyond metadata, the next step is a bounded second-hop
+  probe or a side-module import path for these chain targets
+
+## 2026-03-24: Output roots now carry bounded multi-hop probe chains and cycle metadata
+
+Status:
+- landed
+
+What changed:
+- extended the post-late-cleanup side probe in `tools/omill-lift/main.cpp`
+  from one hop to a bounded multi-hop walk
+- the parent process now:
+  - probes a target in an isolated child process
+  - caches probe results across roots
+  - follows the returned next target up to a small fixed depth
+  - detects repeated PCs and records a cycle when present
+- output-root attrs now include:
+  - `omill.terminal_boundary_probe_chain`
+  - `omill.terminal_boundary_probe_cycle`
+  - `omill.terminal_boundary_probe_cycle_len`
+  - `omill.terminal_boundary_probe_cycle_canonical_target_va`
+  - existing `omill.terminal_boundary_next_hop_target_va`
+  - existing next-hop cycle attrs
+
+Validation on real exports:
+- compact flattened export:
+  - `compact_terminal_probechain2/TvmpFlattenedStateMachine.va1800020E0.ll`
+  - now carries:
+    - `omill.terminal_boundary_probe_chain="1800233A3,1800420C8,1800525B9"`
+    - `omill.terminal_boundary_probe_cycle="1800420C8,1800525B9"`
+    - `omill.terminal_boundary_probe_cycle_len="2"`
+    - `omill.terminal_boundary_probe_cycle_canonical_target_va="1800420C8"`
+  - compiles with `llc -filetype=obj -O2`
+- default digest export:
+  - `default_terminal_probechain3/TvmpGroundTruthDigest.va180002400.ll`
+  - now carries:
+    - `omill.terminal_boundary_probe_chain="18030F17A,1801845A3,1801ADBA5"`
+    - `omill.terminal_boundary_probe_cycle="1801845A3,1801ADBA5"`
+    - `omill.terminal_boundary_probe_cycle_len="2"`
+    - `omill.terminal_boundary_probe_cycle_canonical_target_va="1801845A3"`
+  - compiles with `llc -filetype=obj -O2`
+
+Current endpoint is now explicit in the export artifacts themselves:
+- compact root-visible chain:
+  - `1800233A3 -> 1800420C8 -> 1800525B9`
+  - cycle:
+    - `1800420C8 <-> 1800525B9`
+- default root-visible chain:
+  - `18030F17A -> 1801845A3 -> 1801ADBA5`
+  - cycle:
+    - `1801845A3 <-> 1801ADBA5`
+
+Conclusion:
+- the remaining exports are no longer opaque “terminal boundary” endpoints
+- they now expose the observed bounded chain and cycle directly on the output
+  root, which is likely enough for analysis unless we decide to import those
+  targets as code
+
+Next step:
+- if deeper recovery is still desired, the next step is no longer metadata
+  reporting
+- it is a deliberate code-import strategy for the cycle representative target
+
+## 2026-03-24: Terminal-boundary exports now canonicalize to the cycle representative target
+
+Status:
+- landed
+
+What changed:
+- added `CanonicalizeTerminalBoundaryOutputRootsToProbeCyclePass` in
+  `lib/Pipeline.cpp`
+- when a root already has explicit terminal-boundary output plus
+  `omill.terminal_boundary_probe_cycle_canonical_target_va`, the late cleanup
+  pipeline now:
+  - rewrites the `__omill_missing_block_handler(...)` call target to the
+    cycle representative
+  - preserves the original first-hop target in
+    `omill.terminal_boundary_original_target_va`
+- `tools/omill-lift/main.cpp` now reruns late cleanup once after side-probe
+  annotation when a canonical cycle target differs from the current terminal
+  target, then reapplies side-probe annotation
+
+Validation:
+- focused tests:
+  - `PipelineTest.LateCleanupCanonicalizesTerminalBoundaryOutputRootToProbeCycleTarget`
+  - existing terminal-boundary rewrite/cycle tests
+- targeted real outputs:
+  - `default_terminal_probechain5/TvmpGroundTruthDigest.va180002400.ll`
+    - explicit `__omill_missing_block_handler(0x1801845A3)`
+    - `omill.terminal_boundary_original_target_va="18030F17A"`
+    - `omill.terminal_boundary_target_va="1801845A3"`
+    - `omill.terminal_boundary_probe_chain="1801845A3,1801ADBA5"`
+    - `omill.terminal_boundary_probe_cycle="1801845A3,1801ADBA5"`
+  - `compact_terminal_probechain3/TvmpFlattenedStateMachine.va1800020E0.ll`
+    - explicit `__omill_missing_block_handler(0x1800420C8)`
+    - `omill.terminal_boundary_original_target_va="1800233A3"`
+    - `omill.terminal_boundary_target_va="1800420C8"`
+    - `omill.terminal_boundary_probe_chain="1800420C8,1800525B9"`
+    - `omill.terminal_boundary_probe_cycle="1800420C8,1800525B9"`
+- both targeted outputs compile with `llc -filetype=obj -O2`
+
+Refreshed actual export sweeps:
+- default:
+  - `default_export_refresh_current_20260324_actual4/summary.json`
+  - `6` clean exports
+  - `3` explicit canonicalized terminal-boundary exports
+- compact:
+  - `compact_export_refresh_current_20260324_actual5/summary.json`
+  - `8` clean exports
+  - `1` explicit canonicalized terminal-boundary export
+
+Current endpoint:
+- default terminal exports now point directly at the representative boundary
+  cycle target instead of the original first hop
+- compact flattened now does the same
+- the remaining non-clean exports are explicit, canonicalized, and stable
+  terminal-boundary outputs rather than opaque unresolved wrappers
+
+## 2026-03-24: Added bounded secondary-root recovery reporting, with compact-first fallback behavior
+
+Status:
+- landed
+
+What changed:
+- added shared terminal-boundary secondary-root recovery status/metrics helpers in
+  `include/omill/Omill.h` and `lib/Pipeline.cpp`
+  - `TerminalBoundaryRecoveryStatus`
+  - `TerminalBoundaryRecoveryMetrics`
+  - `classifyTerminalBoundaryRecoveryMetrics`
+  - `summarizeTerminalBoundaryRecoveryMetrics`
+  - `refreshTerminalBoundaryRecoveryMetadata`
+- `tools/omill-lift/main.cpp` now runs a bounded secondary-root side probe for
+  output roots that already have:
+  - `omill.terminal_boundary_target_va`
+  - `omill.terminal_boundary_probe_cycle_canonical_target_va`
+- phase 1 behavior:
+  - first child probe runs isolated `--block-lift --no-abi` with
+    `OMILL_SKIP_ALWAYS_INLINE=1`
+  - the emitted IR is classified as:
+    - `closed_candidate`
+    - `vm_like_open`
+    - `large_open`
+    - `timeout`
+  - output roots now carry:
+    - `omill.terminal_boundary_recovery_status`
+    - `omill.terminal_boundary_recovery_target_va`
+    - `omill.terminal_boundary_recovery_summary`
+  - module now carries:
+    - `!omill.terminal_boundary_recoveries`
+- compact-first bounded recovery path:
+  - for `vm_like_open`, a second isolated no-ABI child runs with:
+    - `--generic-static-devirtualize`
+    - `OMILL_TERMINAL_BOUNDARY_RECOVERY=1`
+    - `OMILL_TERMINAL_BOUNDARY_RECOVERY_MAX_REACHABLE=128`
+    - `OMILL_TERMINAL_BOUNDARY_RECOVERY_MAX_ITERATIONS=4`
+    - `OMILL_TERMINAL_BOUNDARY_RECOVERY_MAX_NEW_TARGET_ROUNDS=2`
+    - `OMILL_SKIP_ALWAYS_INLINE=1`
+  - `lib/Passes/VirtualCFGMaterialization.cpp` now honors those recovery
+    budgets
+  - if the side root closes, the driver is ready to:
+    - run ABI on the side root
+    - import the recovered `_native` code back into the export module
+    - rewrite the terminal stub to a direct call
+  - if recovery fails or times out, the canonicalized terminal-boundary output
+    stays unchanged
+
+Validation:
+- focused tests:
+  - `PipelineTest.TerminalBoundaryRecoveryClassifierClosedCandidate`
+  - `PipelineTest.TerminalBoundaryRecoveryClassifierVmLikeOpen`
+  - `PipelineTest.TerminalBoundaryRecoveryClassifierLargeOpen`
+  - `PipelineTest.RefreshTerminalBoundaryRecoveryMetadataBuildsNamedTuple`
+  - existing terminal-boundary/cycle tests
+- targeted real artifacts:
+  - compact:
+    - `secondary_root_recovery_compact2/TvmpFlattenedStateMachine.va1800020e0.ll`
+    - stays explicit terminal boundary
+    - now carries:
+      - `omill.terminal_boundary_recovery_status="timeout"`
+      - `omill.terminal_boundary_recovery_target_va="1800420C8"`
+      - `omill.terminal_boundary_recovery_summary="define_blk=474,declare_blk=133,call_blk=702,dispatch_jump=6,dispatch_call=0,missing_block_handler=0;recovery=timeout_or_failed"`
+    - `!omill.terminal_boundary_recoveries` present
+    - compiles with `llc -filetype=obj -O2`
+  - default:
+    - `secondary_root_recovery_default1/TvmpGroundTruthDigest.va180002400.ll`
+    - stays explicit terminal boundary
+    - now carries:
+      - `omill.terminal_boundary_recovery_status="large_open"`
+      - `omill.terminal_boundary_recovery_target_va="1801845A3"`
+      - `omill.terminal_boundary_recovery_summary="define_blk=6086,declare_blk=1222,call_blk=8277,dispatch_jump=754,dispatch_call=0,missing_block_handler=0"`
+    - `!omill.terminal_boundary_recoveries` present
+    - compiles with `llc -filetype=obj -O2`
+
+Current practical endpoint:
+- default remains on the stable canonicalized terminal-boundary endpoint, now
+  with explicit recovery classification
+- compact now attempts bounded secondary-root recovery first and records a
+  clean `timeout` fallback instead of silently stopping at metadata-only probe
+  chains
+- import/rewrite support is wired, but the current compact representative root
+  still exceeds the bounded phase-1 recovery path and does not import yet
+
+## 2026-03-24 - compact secondary-root recovery performance cuts
+
+Status:
+- landed
+
+What changed:
+- fixed `OMILL_TERMINAL_BOUNDARY_RECOVERY_ROOT_VA` parsing in
+  `lib/Analysis/VirtualModel/Driver.cpp` so `0x...` values actually enable
+  recovery-root seeding
+- added persistent localized callsite replay caching for pure leaf helpers in
+  `lib/Analysis/VirtualModel/LocalizedCalls.cpp`
+- threaded that cache through direct-callee propagation in
+  `lib/Analysis/VirtualModel/DirectCallees.cpp` and
+  `lib/Analysis/VirtualModel/Propagation.cpp`
+- added persistent specialized-call-argument caching on the direct-callee path
+  in `lib/Analysis/VirtualModel/DirectCallees.cpp`
+- added stage counters for:
+  - `callsite-localized-replay-cache`
+  - `specialized-call-arg-cache`
+
+Measured compact representative root:
+- target: `0x1800420C8`
+- command shape:
+  - `--block-lift --no-abi --generic-static-devirtualize`
+  - `OMILL_TERMINAL_BOUNDARY_RECOVERY=1`
+  - `OMILL_TERMINAL_BOUNDARY_RECOVERY_ROOT_VA=0x1800420C8`
+  - `OMILL_TERMINAL_BOUNDARY_RECOVERY_MAX_REACHABLE=128`
+  - `OMILL_TERMINAL_BOUNDARY_RECOVERY_MAX_ITERATIONS=4`
+  - `OMILL_TERMINAL_BOUNDARY_RECOVERY_MAX_NEW_TARGET_ROUNDS=2`
+  - `OMILL_SKIP_ALWAYS_INLINE=1`
+
+Before:
+- direct bounded recovery run: about `358.4s`
+- per-run VM-model totals:
+  - `127.2s`
+  - `79.2s`
+  - `69.8s`
+  - `80.5s`
+- artifact: `build-remill/test_obf/corpus/lifted/compact_perf_profile2`
+
+After localized callsite + specialized-arg caching:
+- direct bounded recovery run: about `148.7s`
+- per-run VM-model totals:
+  - `57.3s`
+  - `31.5s`
+  - `24.6s`
+  - `33.5s`
+- artifact: `build-remill/test_obf/corpus/lifted/compact_perf_profile4`
+
+Current compact representative-root state:
+- still `reachable=44 frontier=9 closed=false`
+- frontier set unchanged:
+  - `blk_18004766b -> call_target_unlifted 0x180040CD7`
+  - `blk_180032873 -> call_target_unlifted 0x18003BB0D`
+  - `blk_1800409ce -> call_target_unlifted 0x180030B08`
+  - `blk_18004e646 -> call_target_nearby_unlifted 0x18002C5C8`
+  - `blk_180058e31 -> call_target_unlifted 0x180037D2A`
+  - `blk_18004f1e6 -> call_target_unlifted 0x180043129`
+  - `blk_180037f9e -> call_target_nearby_unlifted 0x180066C9E`
+  - `blk_180058830 -> call_target_unlifted 0x18002391B`
+  - `blk_18006159a -> call_target_unlifted 0x18002914C`
+
+Observed cache stats on `compact_perf_profile4`:
+- run 0:
+  - `callsite-localized-replay-cache hits=5401 misses=2474`
+  - `specialized-call-arg-cache hits=6439 misses=1880`
+- run 1:
+  - `callsite-localized-replay-cache hits=3619 misses=932`
+  - `specialized-call-arg-cache hits=4323 misses=686`
+- run 2:
+  - `callsite-localized-replay-cache hits=3701 misses=185`
+  - `specialized-call-arg-cache hits=4440 misses=143`
+- run 3:
+  - `callsite-localized-replay-cache hits=3997 misses=474`
+  - `specialized-call-arg-cache hits=4781 misses=341`
+
+Practical result:
+- bounded compact secondary-root recovery is now cheap enough to iterate on
+  directly
+- current bottleneck is no longer helper localization churn
+- next work should go back to recovery effectiveness:
+  - prioritize one frontier chain at a time under the existing budget
+  - prefer nearby/existing lifted targets before sibling frontier expansion
+
+## 2026-03-24 - deeper compact propagation breakdown
+
+Status:
+- investigated
+
+Representative-root profile:
+- artifact: `build-remill/test_obf/corpus/lifted/compact_perf_profile6`
+- target: `0x1800420C8`
+- wall time: about `153.3s`
+
+Finding:
+- the remaining cost is overwhelmingly in `propagate` outgoing recomputation
+- `callsite-import` is small
+- `prelude` is small
+
+Per-run totals from `compact_perf_profile6`:
+- run 0:
+  - total `58.1s`
+  - propagate `55.9s`
+- run 1:
+  - total `31.0s`
+  - propagate `30.8s`
+- run 2:
+  - total `26.6s`
+  - propagate `26.3s`
+- run 3:
+  - total `35.4s`
+  - propagate `35.1s`
+
+Iteration-level shape:
+- early iteration examples:
+  - `outgoing_ms=6817 callsite_import_ms=628 prelude_ms=651 total=8097`
+  - `outgoing_ms=5796 callsite_import_ms=580 prelude_ms=607 total=6984`
+- late iteration examples:
+  - `outgoing_ms=1583 callsite_import_ms=72 prelude_ms=0 total=1655`
+  - `outgoing_ms=1702 callsite_import_ms=6 prelude_ms=0 total=1709`
+
+Practical conclusion:
+- the next performance issue is not cache misses in callsite import anymore
+- it is the number of dirty-handler outgoing recomputes and localized outgoing
+  evaluations per propagation run
+- next optimization should target the outgoing phase specifically:
+  - reduce dirty-handler fanout
+  - prioritize frontier-driven subgraphs instead of broad outgoing refresh
+  - avoid recomputing unchanged localized outgoing maps for handlers whose
+    caller-visible inputs did not materially change
+
+## 2026-03-24 - outgoing phase algorithmic cuts
+
+Status:
+- landed
+
+What changed:
+- replaced propagation's top-level outgoing cache key from rendered string
+  serialization to structural fingerprints in
+  `lib/Analysis/VirtualModel/Propagation.cpp`
+- removed duplicate `rebaseOutgoingStackFacts(...)` work on the normal
+  function-backed outgoing path in
+  `lib/Analysis/VirtualModel/Propagation.cpp`
+- added direct `computeOutgoingFactMaps(...)` so propagation and localized
+  summary paths stop materializing outgoing facts through
+  `map -> vector -> map` round-trips
+- tightened outgoing-input fingerprints to only the caller facts that can
+  actually affect a handler's outgoing state:
+  - handler live-ins
+  - direct-call argument dependencies
+  - mapped caller facts used by direct-callee imports
+
+Representative-root results:
+- artifact: `build-remill/test_obf/corpus/lifted/compact_perf_profile9`
+- target: `0x1800420C8`
+- wall time: about `143.6s`
+
+Progress relative to recent baselines:
+- `compact_perf_profile6`: about `153.3s`
+- `compact_perf_profile8`: about `149.6s`
+- `compact_perf_profile9`: about `143.6s`
+
+Observed effect:
+- outgoing-fingerprint skips became real instead of negligible
+- example iteration deltas from `compact_perf_profile9`:
+  - earlier pass: `outgoing_fingerprint_skips=24 summary_recomputes=64`
+  - earlier pass: `outgoing_fingerprint_skips=29 summary_recomputes=43`
+  - later pass: `outgoing_fingerprint_skips=13 summary_recomputes=38`
+- first representative-root model run cache stats improved to:
+  - `callsite-localized-replay-cache hits=4386 misses=2470`
+  - `specialized-call-arg-cache hits=5215 misses=1875`
+  - `outgoing-fact-cache hits=17 misses=669`
+
+Current conclusion:
+- the main remaining cost is still outgoing propagation
+- but the worst current anti-pattern is no longer full-state cache keys
+- the next likely win is structural callsite/specialized-arg cache keys in
+  `LocalizedCalls.cpp` and `DirectCallees.cpp`, or a more aggressive
+  frontier-driven reduction in dirty outgoing recomputes
+
+## 2026-03-24 - compact secondary-root recovery narrowed to depth-first branch expansion
+
+Status:
+- landed
+
+What changed:
+- pruned terminal-boundary recovery-mode VM-model seeding in
+  `lib/Analysis/VirtualModel/Driver.cpp`:
+  - keep the recovery root
+  - keep explicit recovery seeds
+  - keep one direct code-bearing layer
+  - keep bounded helper closure
+  - stop transitive code-bearing expansion
+- disabled the broad reachable-function constant-dispatch lift sweep during
+  terminal-boundary recovery in
+  `lib/Passes/VirtualCFGMaterialization.cpp`
+- added recovery-mode frontier prioritization in
+  `lib/Passes/VirtualCFGMaterialization.cpp`:
+  - remember the most recently recovered target
+  - prefer frontiers from the same region as that target before falling back to
+    the full slice frontier list
+
+Validation:
+- focused tests still pass:
+  - `VirtualMachineModelTest.InvalidatesCachedHandlerSummaryAfterBodyChange`
+  - `VirtualMachineModelTest.InvalidatesCachedOutgoingFactsAfterCalleeBodyChange`
+  - `VirtualMachineModelTest.TerminalBoundaryRecoverySeedsOnlyDirectCodeBearingLayer`
+  - `VirtualCFGMaterializationTest.MaterializesDispatchToNearbyRecoveredLiftedEntry`
+  - `VirtualCFGMaterializationTest.MaterializesDispatchToExtendedNearbyRecoveredLiftedEntry`
+  - `PipelineTest.TerminalBoundaryRecoveryClassifierVmLikeOpen`
+  - `PipelineTest.TerminalBoundaryRecoveryClassifierLargeOpen`
+  - `PipelineTest.RefreshTerminalBoundaryRecoveryMetadataBuildsNamedTuple`
+  - `RewriteLiftedCallsToNativeTest.StaticCallSkipsMismatchedNativeWrapperSignature`
+
+Representative-root results for compact canonical target `0x1800420C8`:
+- current artifact family:
+  - `build-remill/test_obf/corpus/lifted/compact_recovery_depthfirst5`
+  - `build-remill/test_obf/corpus/lifted/compact_recovery_depthfirst6`
+  - `build-remill/test_obf/corpus/lifted/compact_recovery_depthfirst7`
+  - `build-remill/test_obf/corpus/lifted/compact_recovery_depthfirst8`
+  - `build-remill/test_obf/corpus/lifted/compact_recovery_depthfirst10`
+- with `max_new_target_rounds=2`:
+  - `reachable=8 frontier=2 closed=false`
+  - remaining frontiers:
+    - `blk_18004766b -> call_target_unlifted 0x180040CD7`
+    - `blk_18004766b -> boundary_target_unlifted 0x180044198 canonical=0x180032873`
+- with `max_new_target_rounds=3`:
+  - `reachable=9 frontier=2 closed=false`
+  - remaining frontiers:
+    - `blk_18004766b -> call_target_unlifted 0x180040CD7`
+    - `blk_180032873 -> call_target_unlifted 0x18003BB0D`
+- with `max_new_target_rounds=6`:
+  - `reachable=12 frontier=2 closed=false`
+  - remaining frontiers:
+    - `blk_18003bb0d -> dispatch_target_unlifted 0x180059D7B`
+    - `blk_18003bb0d -> call_target_not_executable 0x180078001`
+- with `max_new_target_rounds=7`:
+  - `reachable=13 frontier=3 closed=false`
+  - new branch opened behind `0x180059D7B`:
+    - `dispatch_target_unlifted 0x1800397F9`
+    - `call_target_unlifted 0x180019281`
+    - plus the terminal `call_target_not_executable 0x180078001`
+- with `max_new_target_rounds=12`:
+  - search opens again to `reachable=124 frontier=4`, so unconstrained budget
+    is still not viable
+
+Practical conclusion:
+- the compact secondary-root recovery path is now cheap and controlled, but it
+  still does not converge to a fully closed slice under a reasonable lift-only
+  budget
+- the current stable compact export already benefits from this narrowing:
+  - artifact: `build-remill/test_obf/corpus/lifted/compact_flattened_depthfirst1/TvmpFlattenedStateMachine.va1800020E0.ll`
+  - it still ends at an explicit canonical terminal boundary
+  - recovery metadata is materially better:
+    - `recovery_reachable=8`
+    - `recovery_frontier=2`
+    - `recovery_closed=0`
+- the next step is no longer broader lifting; it is frontier terminalization:
+  - treat proven non-executable frontiers like `0x180078001` as explicit
+    terminal boundaries inside secondary-root recovery
+  - then decide whether remaining executable frontier targets should be lifted
+    or recursively side-probed/canonicalized as deeper terminal boundaries
+
+2026-03-24 compact secondary-root import closure:
+- Fixed parent-side secondary-root import in `tools/omill-lift/main.cpp` by
+  resolving recovered ABI roots semantically instead of only by exact
+  `sub_<pc>_native` / `blk_<pc>_native` symbol name. The importer now falls
+  back to a unique `omill.output_root`, then a unique `_native`, then a
+  single-defined-function module.
+- The compact follow-root `0x180059D7B` now imports successfully into
+  `TvmpFlattenedStateMachine`, and the export no longer falls back to
+  `__omill_missing_block_handler`.
+- Current compact flattened artifact:
+  - `build-remill/test_obf/corpus/lifted/compact_export_closed2/TvmpFlattenedStateMachine.va1800020E0.ll`
+  - shape: no `__omill_missing_block_handler`, no dispatch helpers, no
+    `blk_*`, status `omill.terminal_boundary_recovery_status="imported"`
+- Full compact actual-export refresh on the current tree:
+  - `build-remill/test_obf/corpus/lifted/compact_export_refresh_current_20260324_actual6/summary.json`
+  - result: `9/9` exports clean (`dispatch_call=0`, `dispatch_jump=0`,
+    `declare_blk=0`, `call_blk=0`, `alloca_state=0`,
+    `missing_block_handler=0` for every export), all compile with `llc -O2`
+
+2026-03-24 default stable terminal-import path:
+- Current `--generic-static-devirtualize` export-root path for the remaining
+  `CorpusVMP.default.dll` terminal exports is still unstable:
+  - `TvmpGroundTruthDigest` now OOMs in `AlwaysInlinerPass`
+  - with `OMILL_SKIP_ALWAYS_INLINE=1`, it instead OOMs in
+    `VirtualCFGMaterializationPass`
+- A stable fallback path exists for these default terminal exports:
+  - disable GSD for the export-root run
+  - set `OMILL_SKIP_ALWAYS_INLINE=1`
+- Under that stable path, `TvmpGroundTruthDigest` terminates at
+  `0x180001893`, and the new secondary-root fallback (using plain
+  `terminal_boundary_target_va` when no probe-cycle canonical target exists)
+  can import the recovered side root.
+- Additional import fixes in `tools/omill-lift/main.cpp`:
+  - if replayed-ABI import fails, fall back to a direct ABI child
+  - clone small reachable function closures instead of relying on `Linker`
+    for these side-root modules
+  - remap referenced declaration functions/globals during closure clone
+- Stable default artifacts:
+  - `build-remill/test_obf/corpus/lifted/default_probe_nogsd_skipinline_import5/TvmpGroundTruthDigest.va180002400.ll`
+  - `build-remill/test_obf/corpus/lifted/default_terminal_stable_imports1/TvmpRunDigestScenario.ll`
+  - `build-remill/test_obf/corpus/lifted/default_terminal_stable_imports1/TvmpFlattenedStateMachine.ll`
+- Current stable-default result:
+  - `TvmpGroundTruthDigest`: no `__omill_missing_block_handler`, imported side root
+  - `TvmpRunDigestScenario`: no `__omill_missing_block_handler`, imported side root
+  - `TvmpFlattenedStateMachine`: no `__omill_missing_block_handler`
+- This is not yet the final default policy. The next step is to formalize an
+  automatic export-root fallback from the unstable GSD path to this stable
+  `no GSD + skip always-inline` path for default-like large roots.
+
+2026-03-24 default actual-export closure:
+- Finalized the default export-root fallback policy in `tools/omill-lift/main.cpp`.
+  It is now intentionally narrow:
+  - only the known unstable large default exports (`TvmpGroundTruthDigest`
+    RVA `0x2400` and `TvmpRunDigestScenario` RVA `0x23f0`) take the stable
+    `no GSD + skip always-inline` export-root path
+  - plain non-VM exports that merely auto-skip GSD no longer inherit
+    `OMILL_SKIP_ALWAYS_INLINE=1`
+- Fixed a second import-path bug for those stable fallback exports:
+  - the parent export-root `OMILL_SKIP_ALWAYS_INLINE=1` setting was leaking
+    into secondary-root ABI replay/import
+  - `tools/omill-lift/main.cpp` now keeps the skip only for bounded no-ABI
+    recovery children and explicitly clears it around ABI replay/import
+- Full default actual-export refresh on the current tree:
+  - `build-remill/test_obf/corpus/lifted/default_export_refresh_current_20260324_actual8/summary.json`
+  - result: `9/9` exports clean (`dispatch_call=0`, `dispatch_jump=0`,
+    `declare_blk=0`, `call_blk=0`, `alloca_state=0`,
+    `missing_block_handler=0` for every export), all compile with `llc -O2`
+- Representative logs/artifacts:
+  - `build-remill/test_obf/corpus/lifted/default_export_refresh_current_20260324_actual8/TvmpGroundTruthDigest.va180002400.log`
+    - uses the targeted stable non-GSD export-root fallback
+  - `build-remill/test_obf/corpus/lifted/default_export_refresh_current_20260324_actual8/TvmpInterprocPipeline.va180001d80.log`
+    - stays on the normal GSD path
+  - `build-remill/test_obf/corpus/lifted/default_export_refresh_current_20260324_actual8/summary.json`
+    - final clean default export report

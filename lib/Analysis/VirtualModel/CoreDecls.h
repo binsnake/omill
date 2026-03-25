@@ -23,6 +23,10 @@ void collectExprReferencedStateSlots(
     std::vector<VirtualStateSlotSummary> &slots);
 SlotKey slotKeyForSummary(const VirtualStateSlotSummary &slot);
 StackCellKey stackCellKeyForSummary(const VirtualStackCellSummary &cell);
+EquivalentStackCellGroupKey equivalentStackCellGroupKeyForSummary(
+    const VirtualStackCellSummary &cell);
+EquivalentStackCellGroupKey equivalentStackCellGroupKeyForInfo(
+    const VirtualStackCellInfo &cell);
 std::optional<unsigned> findEquivalentArgumentStackCellId(
     int64_t base_offset, unsigned base_width, bool base_from_argument,
     bool base_from_alloca, int64_t cell_offset, unsigned width,
@@ -71,6 +75,13 @@ std::vector<VirtualSlotFact> computeOutgoingFacts(
     const std::map<unsigned, VirtualValueExpr> &incoming,
     const std::map<unsigned, VirtualValueExpr> &incoming_stack = {},
     const std::map<unsigned, VirtualValueExpr> &incoming_args = {});
+void computeOutgoingFactMaps(
+    const VirtualHandlerSummary &summary,
+    const std::map<unsigned, VirtualValueExpr> &incoming,
+    const std::map<unsigned, VirtualValueExpr> &incoming_stack,
+    const std::map<unsigned, VirtualValueExpr> &incoming_args,
+    std::map<unsigned, VirtualValueExpr> &outgoing,
+    std::map<unsigned, VirtualValueExpr> &outgoing_stack);
 std::vector<VirtualStackFact> computeOutgoingStackFacts(
     const VirtualHandlerSummary &summary,
     const std::map<unsigned, VirtualValueExpr> &incoming,
@@ -90,6 +101,8 @@ std::map<StackCellKey, unsigned> buildStackCellIdMap(
     const VirtualMachineModel &model);
 std::map<unsigned, const VirtualStackCellInfo *> buildStackCellInfoMap(
     const VirtualMachineModel &model);
+std::map<EquivalentStackCellGroupKey, llvm::SmallVector<unsigned, 4>>
+buildEquivalentStackCellGroupMap(const VirtualMachineModel &model);
 std::optional<unsigned> lookupStackCellIdForSummary(
     const VirtualStackCellSummary &summary,
     const std::map<StackCellKey, unsigned> &stack_cell_ids);

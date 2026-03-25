@@ -73,6 +73,25 @@ struct CallsiteLocalizedOutgoingFacts {
   std::set<StackCellKey> written_structural_stack_keys;
 };
 
+struct CachedOutgoingFactsKey {
+  std::string function_name;
+  llvm::stable_hash handler_fingerprint = 0;
+  llvm::stable_hash incoming_fingerprint = 0;
+  llvm::stable_hash incoming_stack_fingerprint = 0;
+  llvm::stable_hash incoming_argument_fingerprint = 0;
+  llvm::stable_hash callee_outgoing_fingerprint = 0;
+
+  auto tie() const {
+    return std::tie(function_name, handler_fingerprint, incoming_fingerprint,
+                    incoming_stack_fingerprint, incoming_argument_fingerprint,
+                    callee_outgoing_fingerprint);
+  }
+
+  bool operator<(const CachedOutgoingFactsKey &other) const {
+    return tie() < other.tie();
+  }
+};
+
 struct CachedOutgoingFactsEntry {
   std::map<unsigned, VirtualValueExpr> outgoing_slots;
   std::map<unsigned, VirtualValueExpr> outgoing_stack;
@@ -110,6 +129,8 @@ struct CachedDirectCalleeEntry {
 };
 
 using BooleanSlotExprKey = std::tuple<std::string, int64_t, bool, bool>;
+using EquivalentStackCellGroupKey =
+    std::tuple<std::string, int64_t, unsigned, bool, bool, int64_t, unsigned>;
 
 struct EntryPreludeCallInfo {
   uint64_t call_pc = 0;
@@ -133,17 +154,54 @@ struct LocalCallSiteState {
 struct CachedModuleHandlerSummaryState {
   std::map<std::string, CachedHandlerSummaryEntry> summaries;
   std::map<std::string, CachedDirectCalleeEntry> direct_callees;
-  std::map<std::string, std::optional<CallsiteLocalizedOutgoingFacts>>
+  std::map<CachedOutgoingFactsKey, std::optional<CallsiteLocalizedOutgoingFacts>>
       localized_top_level_replays;
-  std::map<std::string, CachedOutgoingFactsEntry> outgoing_facts;
+  std::map<std::string, std::optional<CallsiteLocalizedOutgoingFacts>>
+      localized_callsite_replays;
+  std::map<std::string, std::map<unsigned, VirtualValueExpr>>
+      specialized_call_arg_replays;
+  std::map<std::string, LocalCallSiteState> precall_state_entries;
+  std::map<CachedOutgoingFactsKey, CachedOutgoingFactsEntry> outgoing_facts;
   std::map<std::string, CachedPropagationEntry> propagation_entries;
 };
 
 struct LocalizedReplayCacheState {
-  std::map<std::string, std::optional<CallsiteLocalizedOutgoingFacts>>
+  std::map<CachedOutgoingFactsKey, std::optional<CallsiteLocalizedOutgoingFacts>>
       top_level_entries;
+  std::map<std::string, std::optional<CallsiteLocalizedOutgoingFacts>>
+      callsite_entries;
+  std::map<std::string, std::map<unsigned, VirtualValueExpr>>
+      specialized_call_arg_entries;
+  std::map<std::string, LocalCallSiteState> precall_state_entries;
+  std::map<CachedOutgoingFactsKey, std::optional<CallsiteLocalizedOutgoingFacts>>
+      *persistent_top_level_entries = nullptr;
+  std::map<std::string, std::optional<CallsiteLocalizedOutgoingFacts>>
+      *persistent_callsite_entries = nullptr;
+  std::map<std::string, std::map<unsigned, VirtualValueExpr>>
+      *persistent_specialized_call_arg_entries = nullptr;
+  std::map<std::string, LocalCallSiteState> *persistent_precall_state_entries =
+      nullptr;
+  const std::map<unsigned, const VirtualStateSlotInfo *> *slot_info = nullptr;
+  const std::map<unsigned, const VirtualStackCellInfo *> *stack_cell_info =
+      nullptr;
+  const std::map<EquivalentStackCellGroupKey, llvm::SmallVector<unsigned, 4>>
+      *equivalent_stack_cell_groups = nullptr;
   unsigned top_level_hits = 0;
   unsigned top_level_misses = 0;
+  unsigned callsite_hits = 0;
+  unsigned callsite_misses = 0;
+  unsigned specialized_call_arg_hits = 0;
+  unsigned specialized_call_arg_misses = 0;
+  unsigned precall_state_hits = 0;
+  unsigned precall_state_misses = 0;
+  uint64_t top_level_localized_compute_ms = 0;
+  uint64_t localized_single_block_compute_ms = 0;
+  uint64_t direct_callee_effects_ms = 0;
+  uint64_t callsite_localized_compute_ms = 0;
+  uint64_t specialized_call_arg_build_ms = 0;
+  uint64_t precall_state_build_ms = 0;
+  uint64_t direct_callee_key_build_ms = 0;
+  uint64_t callsite_key_build_ms = 0;
 };
 
 }  // namespace omill::virtual_model::detail

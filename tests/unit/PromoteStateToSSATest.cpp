@@ -270,6 +270,71 @@ TEST_F(PromoteStateToSSATest, FlushBeforeStateCall) {
   EXPECT_FALSE(llvm::verifyFunction(*test_fn, &llvm::errs()));
 }
 
+TEST_F(PromoteStateToSSATest, SkipsReloadAfterMustTailStateCall) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *fn_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *test_fn = llvm::Function::Create(
+      fn_ty, llvm::Function::ExternalLinkage, "test_func", *M);
+  auto *callee = llvm::Function::Create(
+      fn_ty, llvm::Function::ExternalLinkage, "__omill_dispatch_call", *M);
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", test_fn);
+  llvm::IRBuilder<> B(entry);
+
+  auto *state = test_fn->getArg(0);
+  auto *mem = test_fn->getArg(2);
+
+  auto *gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 16, "field_ptr");
+  B.CreateStore(B.getInt64(42), gep);
+
+  auto *call = B.CreateCall(callee, {state, B.getInt64(0), mem});
+  call->setTailCallKind(llvm::CallInst::TCK_MustTail);
+  B.CreateRet(call);
+
+  llvm::FunctionPassManager FPM;
+  FPM.addPass(omill::OptimizeStatePass(omill::OptimizePhases::Promote));
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+  FPM.run(*test_fn, FAM);
+
+  llvm::CallInst *musttail_call = nullptr;
+  for (auto &BB : *test_fn) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (CI && CI->getCalledFunction() == callee) {
+        musttail_call = CI;
+        break;
+      }
+    }
+    if (musttail_call)
+      break;
+  }
+
+  ASSERT_NE(musttail_call, nullptr);
+  EXPECT_TRUE(musttail_call->isMustTailCall());
+  ASSERT_NE(musttail_call->getNextNode(), nullptr);
+  EXPECT_TRUE(llvm::isa<llvm::ReturnInst>(musttail_call->getNextNode()));
+  EXPECT_FALSE(llvm::verifyFunction(*test_fn, &llvm::errs()));
+}
+
 TEST_F(PromoteStateToSSATest, MultipleFields) {
   // Three independent fields at offsets 16, 24, and 32 each get their own
   // alloca with independent values.

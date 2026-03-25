@@ -778,12 +778,14 @@ void specializeFactStateToFixpoint(
   }
 }
 
-std::vector<VirtualSlotFact> computeOutgoingFacts(
+void computeOutgoingFactMaps(
     const VirtualHandlerSummary &summary,
     const std::map<unsigned, VirtualValueExpr> &incoming_map,
     const std::map<unsigned, VirtualValueExpr> &incoming_stack_map,
-    const std::map<unsigned, VirtualValueExpr> &incoming_arg_map) {
-  std::map<unsigned, VirtualValueExpr> outgoing = incoming_map;
+    const std::map<unsigned, VirtualValueExpr> &incoming_arg_map,
+    std::map<unsigned, VirtualValueExpr> &outgoing,
+    std::map<unsigned, VirtualValueExpr> &outgoing_stack) {
+  outgoing = incoming_map;
   for (const auto &transfer : summary.state_transfers) {
     if (!transfer.target_slot.canonical_id.has_value())
       continue;
@@ -791,6 +793,26 @@ std::vector<VirtualSlotFact> computeOutgoingFacts(
         specializeExpr(transfer.value, incoming_map, &incoming_stack_map,
                        &incoming_arg_map);
   }
+
+  outgoing_stack = incoming_stack_map;
+  for (const auto &transfer : summary.stack_transfers) {
+    if (!transfer.target_cell.canonical_id.has_value())
+      continue;
+    outgoing_stack[*transfer.target_cell.canonical_id] =
+        specializeExpr(transfer.value, incoming_map, &incoming_stack_map,
+                       &incoming_arg_map);
+  }
+}
+
+std::vector<VirtualSlotFact> computeOutgoingFacts(
+    const VirtualHandlerSummary &summary,
+    const std::map<unsigned, VirtualValueExpr> &incoming_map,
+    const std::map<unsigned, VirtualValueExpr> &incoming_stack_map,
+    const std::map<unsigned, VirtualValueExpr> &incoming_arg_map) {
+  std::map<unsigned, VirtualValueExpr> outgoing;
+  std::map<unsigned, VirtualValueExpr> outgoing_stack;
+  computeOutgoingFactMaps(summary, incoming_map, incoming_stack_map,
+                          incoming_arg_map, outgoing, outgoing_stack);
 
   std::vector<VirtualSlotFact> facts;
   for (const auto &[slot_id, value] : outgoing)
@@ -803,17 +825,13 @@ std::vector<VirtualStackFact> computeOutgoingStackFacts(
     const std::map<unsigned, VirtualValueExpr> &incoming_map,
     const std::map<unsigned, VirtualValueExpr> &incoming_stack_map,
     const std::map<unsigned, VirtualValueExpr> &incoming_arg_map) {
-  std::map<unsigned, VirtualValueExpr> outgoing = incoming_stack_map;
-  for (const auto &transfer : summary.stack_transfers) {
-    if (!transfer.target_cell.canonical_id.has_value())
-      continue;
-    outgoing[*transfer.target_cell.canonical_id] =
-        specializeExpr(transfer.value, incoming_map, &incoming_stack_map,
-                       &incoming_arg_map);
-  }
+  std::map<unsigned, VirtualValueExpr> outgoing;
+  std::map<unsigned, VirtualValueExpr> outgoing_stack;
+  computeOutgoingFactMaps(summary, incoming_map, incoming_stack_map,
+                          incoming_arg_map, outgoing, outgoing_stack);
 
   std::vector<VirtualStackFact> facts;
-  for (const auto &[cell_id, value] : outgoing)
+  for (const auto &[cell_id, value] : outgoing_stack)
     facts.push_back(VirtualStackFact{cell_id, value});
   return facts;
 }

@@ -109,6 +109,20 @@ bool shouldRewriteClosedRootSliceFunction(const llvm::Function &F) {
   return isClosedRootSliceFunction(F);
 }
 
+bool nativeCallSignatureMatches(const llvm::Function &F,
+                                llvm::ArrayRef<llvm::Value *> args) {
+  auto *fn_ty = F.getFunctionType();
+  if (fn_ty->isVarArg())
+    return false;
+  if (fn_ty->getNumParams() != args.size())
+    return false;
+  for (unsigned i = 0; i < args.size(); ++i) {
+    if (fn_ty->getParamType(i) != args[i]->getType())
+      return false;
+  }
+  return true;
+}
+
 llvm::Value *normalizeJumpTargetPC(llvm::IRBuilder<> &Builder,
                                    llvm::Value *target_pc,
                                    const BinaryMemoryMap *map) {
@@ -438,6 +452,9 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
               Builder, cand.state_ptr, gpr_off,
               "extra_gpr_" + llvm::Twine(gpr_off)));
         }
+
+        if (!nativeCallSignatureMatches(*native_fn, args))
+          continue;
 
         auto *result = Builder.CreateCall(
             native_fn, args,

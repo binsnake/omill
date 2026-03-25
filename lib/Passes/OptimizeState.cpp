@@ -460,6 +460,9 @@ static bool promoteStateToSSA(llvm::Function &F, const llvm::DataLayout &DL) {
       }
 
       {
+        if (CI->isTailCall() || CI->isMustTailCall())
+          continue;
+
         llvm::IRBuilder<> Builder(CI->getNextNode());
         for (auto &[offset, info] : fields) {
           // Only reload fields that have loads — fields with no loads

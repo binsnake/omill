@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <limits>
 #include <map>
 #include <set>
 #include <utility>
@@ -57,6 +58,41 @@ static void vmModelLocalReplayDebugLogImpl(llvm::StringRef message) {
   if (!vmModelLocalReplayDebugEnabledImpl())
     return;
   llvm::errs() << "[omill.vm-model.local-replay] " << message << "\n";
+}
+
+static std::optional<uint64_t> terminalBoundaryRecoveryRootVA() {
+  const char *v = std::getenv("OMILL_TERMINAL_BOUNDARY_RECOVERY_ROOT_VA");
+  if (!v || v[0] == '\0')
+    return std::nullopt;
+  llvm::StringRef text(v);
+  if (text.consume_front("0x") || text.consume_front("0X")) {
+  }
+  uint64_t value = 0;
+  if (text.getAsInteger(16, value) || value == 0)
+    return std::nullopt;
+  return value;
+}
+
+static unsigned terminalBoundaryRecoveryMaxSeedHandlers() {
+  const char *v =
+      std::getenv("OMILL_TERMINAL_BOUNDARY_RECOVERY_MAX_REACHABLE");
+  if (!v || v[0] == '\0')
+    return 128u;
+  unsigned value = 0u;
+  if (llvm::StringRef(v).getAsInteger(10, value) || value == 0u)
+    return 128u;
+  return value;
+}
+
+static unsigned terminalBoundaryRecoveryGuaranteedCodeBearingDepth() {
+  const char *v =
+      std::getenv("OMILL_TERMINAL_BOUNDARY_RECOVERY_GUARANTEED_CODE_DEPTH");
+  if (!v || v[0] == '\0')
+    return 2u;
+  unsigned value = 0u;
+  if (llvm::StringRef(v).getAsInteger(10, value))
+    return 2u;
+  return value;
 }
 
 }  // namespace
@@ -159,43 +195,122 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
   };
 
   std::set<std::string> interesting_handlers;
-  std::vector<std::pair<std::string, unsigned>> worklist;
-  std::map<std::string, unsigned> helper_chain_depths;
+  struct InterestingWorkItem {
+    std::string name;
+    unsigned helper_depth = 0u;
+    unsigned code_bearing_depth = 0u;
+  };
+  std::vector<InterestingWorkItem> worklist;
+  std::map<std::string, std::pair<unsigned, unsigned>> worklist_depths;
   constexpr unsigned kMaxClosedSliceHelperClosureDepth = 2;
-  auto enqueue_interesting = [&](llvm::StringRef name, unsigned helper_depth) {
+  const auto recovery_root_va = terminalBoundaryRecoveryRootVA();
+  const bool terminal_boundary_recovery_mode = recovery_root_va.has_value();
+  const unsigned recovery_max_seed_handlers =
+      terminal_boundary_recovery_mode
+          ? terminalBoundaryRecoveryMaxSeedHandlers()
+          : 0u;
+  const unsigned recovery_guaranteed_code_bearing_depth =
+      terminal_boundary_recovery_mode
+          ? terminalBoundaryRecoveryGuaranteedCodeBearingDepth()
+          : 0u;
+  const unsigned max_helper_closure_depth =
+      terminal_boundary_recovery_mode ? 1u : kMaxClosedSliceHelperClosureDepth;
+  const unsigned max_code_bearing_depth =
+      terminal_boundary_recovery_mode
+          ? std::max(1u, recovery_guaranteed_code_bearing_depth)
+          : std::numeric_limits<unsigned>::max();
+  auto is_guaranteed_recovery_seed = [&](unsigned helper_depth,
+                                         unsigned code_bearing_depth) {
+    if (!terminal_boundary_recovery_mode)
+      return false;
+    if (code_bearing_depth > recovery_guaranteed_code_bearing_depth)
+      return false;
+    return helper_depth <= max_helper_closure_depth;
+  };
+  auto enqueue_interesting = [&](llvm::StringRef name, unsigned helper_depth,
+                                 unsigned code_bearing_depth) {
     std::string key = name.str();
-    auto [it, inserted_depth] = helper_chain_depths.emplace(key, helper_depth);
+    auto [it, inserted_depth] =
+        worklist_depths.emplace(key,
+                                std::make_pair(helper_depth, code_bearing_depth));
     if (!inserted_depth) {
-      if (helper_depth >= it->second)
+      auto &existing = it->second;
+      if (helper_depth >= existing.first &&
+          code_bearing_depth >= existing.second) {
         return;
-      it->second = helper_depth;
+      }
+      existing.first = std::min(existing.first, helper_depth);
+      existing.second = std::min(existing.second, code_bearing_depth);
+    }
+    if (terminal_boundary_recovery_mode &&
+        !is_guaranteed_recovery_seed(helper_depth, code_bearing_depth) &&
+        !interesting_handlers.count(key) &&
+        interesting_handlers.size() >= recovery_max_seed_handlers) {
+      vmModelStageDebugLog(
+          (llvm::Twine("run: recovery-seed-cap-reached skip=") + key).str());
+      return;
     }
     bool inserted_handler = interesting_handlers.insert(key).second;
     if (!inserted_handler && !inserted_depth)
-      worklist.emplace_back(std::move(key), helper_depth);
+      worklist.push_back(
+          InterestingWorkItem{std::move(key), helper_depth, code_bearing_depth});
     else if (inserted_handler)
-      worklist.emplace_back(std::move(key), helper_depth);
+      worklist.push_back(
+          InterestingWorkItem{std::move(key), helper_depth, code_bearing_depth});
   };
   const bool closed_slice_scope = isClosedRootSliceScopedModule(M);
+  if (recovery_root_va) {
+    std::string root_name = liftedFunctionName(*recovery_root_va);
+    if (auto *root = M.getFunction(root_name);
+        root && !root->isDeclaration()) {
+      enqueue_interesting(root->getName(), /*helper_depth=*/0,
+                          /*code_bearing_depth=*/0);
+      vmModelStageDebugLog(
+          (llvm::Twine("run: recovery-root-seed ") + root->getName()).str());
+    } else {
+      std::string block_name =
+          (llvm::Twine("blk_") + llvm::Twine::utohexstr(*recovery_root_va))
+              .str();
+      if (auto *root = M.getFunction(block_name);
+          root && !root->isDeclaration()) {
+        enqueue_interesting(root->getName(), /*helper_depth=*/0,
+                            /*code_bearing_depth=*/0);
+        vmModelStageDebugLog(
+            (llvm::Twine("run: recovery-root-seed ") + root->getName()).str());
+      }
+    }
+    for (auto &F : M) {
+      if (F.isDeclaration() ||
+          !F.hasFnAttribute("omill.terminal_boundary_recovery_seed")) {
+        continue;
+      }
+      enqueue_interesting(F.getName(), /*helper_depth=*/0,
+                          /*code_bearing_depth=*/0);
+      vmModelStageDebugLog(
+          (llvm::Twine("run: recovery-extra-seed ") + F.getName()).str());
+    }
+  }
   if (closed_slice_scope) {
     for (auto &F : M) {
       if (F.isDeclaration() || !isClosedRootSliceFunction(F) ||
           !isVirtualModelCodeBearingFunction(F)) {
         continue;
       }
-      enqueue_interesting(F.getName(), /*helper_depth=*/0);
+      enqueue_interesting(F.getName(), /*helper_depth=*/0,
+                          /*code_bearing_depth=*/0);
     }
   }
   if (interesting_handlers.empty()) {
     for (auto &F : M) {
       if (!isVirtualModelInitialSeedFunction(F))
         continue;
-      enqueue_interesting(F.getName(), /*helper_depth=*/0);
+      enqueue_interesting(F.getName(), /*helper_depth=*/0,
+                          /*code_bearing_depth=*/0);
     }
   }
 
   while (!worklist.empty()) {
-    auto [current, helper_depth] = worklist.back();
+    auto [current, helper_depth, code_bearing_depth] = worklist.back();
     worklist.pop_back();
     auto *current_fn = M.getFunction(current);
     if (!current_fn || current_fn->isDeclaration())
@@ -206,11 +321,18 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
           callee && isVirtualModelCodeBearingFunction(*callee);
       unsigned next_helper_depth =
           callee_code_bearing ? 0u : helper_depth + 1u;
-      if (closed_slice_scope && !callee_code_bearing &&
-          next_helper_depth > kMaxClosedSliceHelperClosureDepth) {
+      unsigned next_code_bearing_depth =
+          callee_code_bearing ? code_bearing_depth + 1u : code_bearing_depth;
+      if ((closed_slice_scope || terminal_boundary_recovery_mode) &&
+          !callee_code_bearing && next_helper_depth > max_helper_closure_depth) {
         continue;
       }
-      enqueue_interesting(callee_name, next_helper_depth);
+      if (terminal_boundary_recovery_mode &&
+          next_code_bearing_depth > max_code_bearing_depth) {
+        continue;
+      }
+      enqueue_interesting(callee_name, next_helper_depth,
+                          next_code_bearing_depth);
     }
   }
 

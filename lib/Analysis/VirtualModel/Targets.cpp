@@ -102,6 +102,13 @@ bool isTargetExecutable(const BinaryMemoryMap &binary_memory,
   return binary_memory.isExecutable(target_pc, 1);
 }
 
+const BinaryMemoryMap::ImportEntry *lookupImportTarget(
+    const BinaryMemoryMap &binary_memory, uint64_t target_pc) {
+  if (!target_pc)
+    return nullptr;
+  return binary_memory.lookupImport(target_pc);
+}
+
 TargetArch targetArchForModule(llvm::Module &M) {
   TargetArch arch = TargetArch::kX86_64;
 

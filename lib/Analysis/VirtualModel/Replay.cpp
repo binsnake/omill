@@ -56,6 +56,13 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
     const std::map<StackCellKey, VirtualValueExpr>
         *fallback_caller_structural_stack_facts,
     LocalizedReplayCacheState *localized_replay_cache) {
+  const auto replay_begin = std::chrono::steady_clock::now();
+  auto replay_timer = llvm::make_scope_exit([&]() {
+    if (localized_replay_cache) {
+      localized_replay_cache->localized_single_block_compute_ms +=
+          elapsedMilliseconds(replay_begin, std::chrono::steady_clock::now());
+    }
+  });
   (void) summary;
   (void) localized_replay_cache;
   auto replay_blocks = collectLocalizedReplayBlocks(F, summary);
@@ -64,8 +71,27 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
 
   const auto &dl = F.getParent()->getDataLayout();
   const auto native_sp_offset = lookupNativeStackPointerOffset(*F.getParent());
-  const auto slot_info = buildSlotInfoMap(model);
-  const auto stack_cell_info = buildStackCellInfoMap(model);
+  std::map<unsigned, const VirtualStateSlotInfo *> owned_slot_info;
+  std::map<unsigned, const VirtualStackCellInfo *> owned_stack_cell_info;
+  std::map<EquivalentStackCellGroupKey, llvm::SmallVector<unsigned, 4>>
+      owned_equivalent_stack_cell_groups;
+  const auto *slot_info_ptr =
+      localized_replay_cache && localized_replay_cache->slot_info
+          ? localized_replay_cache->slot_info
+          : &(owned_slot_info = buildSlotInfoMap(model));
+  const auto *stack_cell_info_ptr =
+      localized_replay_cache && localized_replay_cache->stack_cell_info
+          ? localized_replay_cache->stack_cell_info
+          : &(owned_stack_cell_info = buildStackCellInfoMap(model));
+  const auto *equivalent_stack_cell_groups_ptr =
+      localized_replay_cache &&
+              localized_replay_cache->equivalent_stack_cell_groups
+          ? localized_replay_cache->equivalent_stack_cell_groups
+          : &(owned_equivalent_stack_cell_groups =
+                  buildEquivalentStackCellGroupMap(model));
+  const auto &slot_info = *slot_info_ptr;
+  const auto &stack_cell_info = *stack_cell_info_ptr;
+  const auto &equivalent_stack_cell_groups = *equivalent_stack_cell_groups_ptr;
   struct LocalLeafReplayState {
     std::map<unsigned, VirtualValueExpr> slot_facts;
     std::map<unsigned, VirtualValueExpr> stack_facts;
@@ -212,12 +238,10 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
     else
       os << "none";
     if (direct_id) {
-      auto it = llvm::find_if(model.stackCells(), [&](const auto &info) {
-        return info.id == *direct_id;
-      });
-      if (it != model.stackCells().end())
-        os << "(" << it->base_name << "+" << it->base_offset << ","
-           << it->cell_offset << ")";
+      auto it = stack_cell_info.find(*direct_id);
+      if (it != stack_cell_info.end())
+        os << "(" << it->second->base_name << "+" << it->second->base_offset
+           << "," << it->second->cell_offset << ")";
     }
     os << " rebased=";
     if (rebased_id)
@@ -225,12 +249,10 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
     else
       os << "none";
     if (rebased_id) {
-      auto it = llvm::find_if(model.stackCells(), [&](const auto &info) {
-        return info.id == *rebased_id;
-      });
-      if (it != model.stackCells().end())
-        os << "(" << it->base_name << "+" << it->base_offset << ","
-           << it->cell_offset << ")";
+      auto it = stack_cell_info.find(*rebased_id);
+      if (it != stack_cell_info.end())
+        os << "(" << it->second->base_name << "+" << it->second->base_offset
+           << "," << it->second->cell_offset << ")";
     }
     os << " local_hit=" << local_hit << " rebased_hit=" << rebased_hit
        << " caller_hit=" << caller_hit;
@@ -250,18 +272,12 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
       if (!stack_facts)
         return std::nullopt;
       std::optional<VirtualValueExpr> found;
-      for (const auto &candidate : model.stackCells()) {
-        if (candidate.base_offset != query.base_offset ||
-            candidate.base_width != query.base_width ||
-            candidate.cell_offset != query.offset ||
-            candidate.width != query.width ||
-            candidate.base_from_argument != query.base_from_argument ||
-            candidate.base_from_alloca != query.base_from_alloca) {
-          continue;
-        }
-        if (!query.base_from_argument && candidate.base_name != query.base_name)
-          continue;
-        auto it = stack_facts->find(candidate.id);
+      auto group_it = equivalent_stack_cell_groups.find(
+          equivalentStackCellGroupKeyForSummary(query));
+      if (group_it == equivalent_stack_cell_groups.end())
+        return std::nullopt;
+      for (unsigned candidate_id : group_it->second) {
+        auto it = stack_facts->find(candidate_id);
         if (it == stack_facts->end())
           continue;
         if (!found) {
@@ -286,19 +302,17 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
     };
     auto stack_cell_summary_for_id =
         [&](unsigned cell_id) -> std::optional<VirtualStackCellSummary> {
-      auto it = llvm::find_if(model.stackCells(), [&](const auto &info) {
-        return info.id == cell_id;
-      });
-      if (it == model.stackCells().end())
+      auto it = stack_cell_info.find(cell_id);
+      if (it == stack_cell_info.end())
         return std::nullopt;
       VirtualStackCellSummary summary;
-      summary.base_name = it->base_name;
-      summary.base_offset = it->base_offset;
-      summary.base_width = it->base_width;
-      summary.base_from_argument = it->base_from_argument;
-      summary.base_from_alloca = it->base_from_alloca;
-      summary.offset = it->cell_offset;
-      summary.width = it->width;
+      summary.base_name = it->second->base_name;
+      summary.base_offset = it->second->base_offset;
+      summary.base_width = it->second->base_width;
+      summary.base_from_argument = it->second->base_from_argument;
+      summary.base_from_alloca = it->second->base_from_alloca;
+      summary.offset = it->second->cell_offset;
+      summary.width = it->second->width;
       summary.canonical_id = cell_id;
       return summary;
     };
@@ -1048,7 +1062,8 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
               state.stack_facts, state.structural_stack_facts, slot_ids,
               slot_info, stack_cell_ids, stack_cell_info, dl, binary_memory,
               depth + 1, visiting, fallback_caller_structural_stack_facts,
-              fallback_caller_stack_facts, fallback_caller_slot_facts)) {
+              fallback_caller_stack_facts, fallback_caller_slot_facts,
+              localized_replay_cache)) {
         vmModelStageDebugLog("leaf-replay: helper=" + F.getName().str() +
                              " callee=" + callee->getName().str() +
                              " step=post-direct-call-begin");

@@ -15,11 +15,14 @@
 #include <llvm/Transforms/Utils/Cloning.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <limits>
 #include <map>
 #include <set>
 
 #include "omill/Analysis/VirtualModel/Analysis.h"
+#include "omill/Arch/ArchABI.h"
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/IterativeLiftingSession.h"
 #include "omill/BC/BlockLifterAnalysis.h"
@@ -60,6 +63,25 @@ static bool isDispatchIntrinsicName(llvm::StringRef name) {
 static bool genericDebugEnabled() {
   const char *v = std::getenv("OMILL_DEBUG_GENERIC_STATIC_DEVIRT");
   return v && v[0] != '\0';
+}
+
+static bool envFlagEnabled(const char *name) {
+  const char *v = std::getenv(name);
+  if (!v || v[0] == '\0')
+    return false;
+  auto sv = llvm::StringRef(v).lower();
+  return !(sv == "0" || sv == "false" || sv == "off" || sv == "no");
+}
+
+static std::optional<unsigned> parseUnsignedEnv(const char *name) {
+  const char *v = std::getenv(name);
+  if (!v || v[0] == '\0')
+    return std::nullopt;
+  unsigned long parsed = 0;
+  llvm::StringRef(v).getAsInteger(10, parsed);
+  if (parsed == 0)
+    return std::nullopt;
+  return static_cast<unsigned>(parsed);
 }
 
 static void genericDebugLog(llvm::StringRef message) {
@@ -130,7 +152,8 @@ static bool isSemanticallyLocalizedCallsite(
   if (!has_lifted_direct_callee && !has_same_handler_localized_continuation)
     return false;
 
-  return callsite.unresolved_reason == "call_target_not_executable" ||
+  return callsite.unresolved_reason == "call_target_import_pointer" ||
+         callsite.unresolved_reason == "call_target_not_executable_in_image" ||
          callsite.unresolved_reason == "call_target_undecodable" ||
          callsite.unresolved_reason == "call_target_mid_instruction";
 }
@@ -155,6 +178,78 @@ static llvm::Function *lookupLiftedTargetByPC(llvm::Module &M, uint64_t pc) {
   auto trace_block_name =
       (llvm::Twine("block_") + llvm::Twine::utohexstr(pc)).str();
   return M.getFunction(trace_block_name);
+}
+
+static TargetArch targetArchForMaterializationModule(llvm::Module &M) {
+  TargetArch arch = TargetArch::kX86_64;
+  if (auto *md = M.getModuleFlag("omill.target_arch")) {
+    if (auto *ci = llvm::mdconst::dyn_extract<llvm::ConstantInt>(md))
+      arch = static_cast<TargetArch>(ci->getZExtValue());
+  }
+  return arch;
+}
+
+static uint64_t nearbyEntrySearchWindow(TargetArch arch) {
+  switch (arch) {
+    case TargetArch::kAArch64:
+      return 4;
+    case TargetArch::kX86_64:
+    default:
+      return 64;
+  }
+}
+
+static std::optional<uint64_t> extractLiftedOrBlockEntryPC(
+    const llvm::Function &F) {
+  if (uint64_t pc = extractEntryVA(F.getName()); pc != 0)
+    return pc;
+  auto name = F.getName();
+  if (name.starts_with("blk_"))
+    name = name.drop_front(4);
+  else if (name.starts_with("block_"))
+    name = name.drop_front(6);
+  else
+    return std::nullopt;
+
+  uint64_t pc = 0;
+  if (name.getAsInteger(16, pc))
+    return std::nullopt;
+  if (pc != 0)
+    return pc;
+  return std::nullopt;
+}
+
+static llvm::Function *lookupNearbyLiftedTargetByPC(llvm::Module &M,
+                                                    uint64_t target_pc,
+                                                    uint64_t &resolved_pc) {
+  if (!target_pc)
+    return nullptr;
+
+  const uint64_t window =
+      nearbyEntrySearchWindow(targetArchForMaterializationModule(M));
+  llvm::Function *best = nullptr;
+  uint64_t best_pc = 0;
+
+  for (auto &F : M) {
+    if (F.isDeclaration() || !hasLiftedSignature(F))
+      continue;
+
+    auto entry_pc = extractLiftedOrBlockEntryPC(F);
+    if (!entry_pc || *entry_pc >= target_pc)
+      continue;
+    if ((target_pc - *entry_pc) > window)
+      continue;
+    if (!best || *entry_pc > best_pc) {
+      best = &F;
+      best_pc = *entry_pc;
+    }
+  }
+
+  if (!best)
+    return nullptr;
+
+  resolved_pc = best_pc;
+  return best;
 }
 
 static bool isTerminalMissingBlockStub(const llvm::Function &F) {
@@ -514,6 +609,21 @@ static ResolvedTarget resolveTarget(llvm::Module &M,
                              : std::string("<non-function>")));
     }
     return resolved;
+  }
+
+  if (isExecutableTargetAddress(binary_memory, pc)) {
+    uint64_t nearby_pc = 0;
+    if (auto *nearby_target = lookupNearbyLiftedTargetByPC(M, pc, nearby_pc)) {
+      resolved.function = nearby_target;
+      resolved.pc = nearby_pc;
+      if (diagnostics) {
+        diagnostics->push_back(
+            "nearby-lifted target=0x" + llvm::utohexstr(pc) + " -> " +
+            nearby_target->getName().str() + " recovered_pc=0x" +
+            llvm::utohexstr(nearby_pc));
+      }
+      return resolved;
+    }
   }
 
   if (auto boundary = classifyProtectedBoundary(binary_memory, pc)) {
@@ -1423,6 +1533,48 @@ static bool tryLiftTarget(
   return true;
 }
 
+static bool tryAttachExistingLiftedTargetForRecovery(
+    llvm::Module &M, uint64_t target_pc,
+    const std::set<std::string> &reachable_handlers,
+    llvm::SmallVectorImpl<std::string> *diagnostics) {
+  if (target_pc == 0)
+    return false;
+
+  auto *target = lookupLiftedTargetByPC(M, target_pc);
+  if (!target || target->isDeclaration())
+    return false;
+  if (reachable_handlers.find(target->getName().str()) !=
+      reachable_handlers.end()) {
+    return false;
+  }
+  if (target->hasFnAttribute("omill.terminal_boundary_recovery_seed"))
+    return false;
+
+  target->addFnAttr("omill.terminal_boundary_recovery_seed", "1");
+  if (diagnostics) {
+    diagnostics->push_back("recovery-seed target=0x" +
+                           llvm::utohexstr(target_pc) + " -> " +
+                           target->getName().str());
+  }
+  return true;
+}
+
+static void markLiftedTargetForRecoverySeed(
+    llvm::Module &M, uint64_t target_pc,
+    llvm::SmallVectorImpl<std::string> *diagnostics) {
+  auto *target = lookupLiftedTargetByPC(M, target_pc);
+  if (!target || target->isDeclaration() ||
+      target->hasFnAttribute("omill.terminal_boundary_recovery_seed")) {
+    return;
+  }
+  target->addFnAttr("omill.terminal_boundary_recovery_seed", "1");
+  if (diagnostics) {
+    diagnostics->push_back("recovery-seed target=0x" +
+                           llvm::utohexstr(target_pc) + " -> " +
+                           target->getName().str());
+  }
+}
+
 static bool shouldAttemptLiftFrontier(
     const VirtualRootSliceSummary::FrontierEdge &frontier) {
   switch (frontier.kind) {
@@ -1442,6 +1594,7 @@ static bool liftConstantDispatchTargetsInReachableHandlers(
     llvm::Module &M, llvm::ModuleAnalysisManager &AM,
     const BinaryMemoryMap &binary_memory,
     const std::set<std::string> &reachable_functions, bool has_root_slices,
+    bool terminal_boundary_recovery_mode,
     llvm::SmallDenseSet<uint64_t, 16> &failed_targets,
     llvm::SmallVectorImpl<std::string> *diagnostics) {
   bool changed = false;
@@ -1481,6 +1634,8 @@ static bool liftConstantDispatchTargetsInReachableHandlers(
 
         if (!tryLiftTarget(M, AM, pc, failed_targets, diagnostics))
           continue;
+        if (terminal_boundary_recovery_mode)
+          markLiftedTargetForRecoverySeed(M, pc, diagnostics);
 
         changed = true;
         if (diagnostics) {
@@ -1601,6 +1756,8 @@ static bool synthesizeLocalizedContinuationShims(
     llvm::Module &M, const VirtualMachineModel &model,
     llvm::SmallVectorImpl<std::string> *diagnostics,
     llvm::SmallPtrSetImpl<llvm::Function *> &changed_functions) {
+  const bool terminal_boundary_recovery_mode =
+      envFlagEnabled("OMILL_TERMINAL_BOUNDARY_RECOVERY");
   std::map<std::string, const VirtualHandlerSummary *> handler_by_name;
   for (const auto &handler : model.handlers())
     handler_by_name.emplace(handler.function_name, &handler);
@@ -1619,6 +1776,12 @@ static bool synthesizeLocalizedContinuationShims(
 
   auto materialize_shim_body = [&](llvm::Function &continuation,
                                    llvm::StringRef reason) {
+    if (continuation.hasFnAttribute("omill.localized_continuation_shim"))
+      return;
+
+    if (!continuation.isDeclaration())
+      continuation.deleteBody();
+
     continuation.setLinkage(llvm::GlobalValue::InternalLinkage);
     continuation.addFnAttr(llvm::Attribute::AlwaysInline);
     continuation.addFnAttr("omill.localized_continuation_shim", "1");
@@ -1662,7 +1825,7 @@ static bool synthesizeLocalizedContinuationShims(
 
       auto *continuation =
           lookupLiftedTargetByPC(M, *callsite.continuation_pc);
-      if (!continuation || !continuation->isDeclaration())
+      if (!continuation)
         continue;
 
       bool should_synthesize =
@@ -1677,6 +1840,38 @@ static bool synthesizeLocalizedContinuationShims(
         continue;
 
       materialize_shim_body(*continuation, "callsite");
+    }
+  }
+
+  if (terminal_boundary_recovery_mode) {
+    for (auto &caller : M) {
+      if (caller.isDeclaration())
+        continue;
+      if (closed_handlers.find(caller.getName().str()) == closed_handlers.end())
+        continue;
+
+      for (auto &BB : caller) {
+        for (auto &I : BB) {
+          auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+          if (!call)
+            continue;
+
+          auto *callee = call->getCalledFunction();
+          if (!callee || callee->isDeclaration())
+            continue;
+          if (closed_handlers.find(callee->getName().str()) !=
+              closed_handlers.end()) {
+            continue;
+          }
+          if (!isSyntheticBlockLikeFunctionName(callee->getName()))
+            continue;
+          if (!hasLiftedSignature(*callee))
+            continue;
+
+          materialize_shim_body(*callee,
+                                "closed-slice-defined-continuation-call");
+        }
+      }
     }
   }
 
@@ -1729,11 +1924,205 @@ static bool synthesizeLocalizedContinuationShims(
   return changed;
 }
 
+static bool pruneTerminalBoundaryRecoveryToClosedSlices(
+    llvm::Module &M, const VirtualMachineModel &model,
+    llvm::SmallVectorImpl<std::string> *diagnostics,
+    llvm::SmallPtrSetImpl<llvm::Function *> &changed_functions) {
+  if (!envFlagEnabled("OMILL_TERMINAL_BOUNDARY_RECOVERY"))
+    return false;
+
+  llvm::SmallVector<llvm::Function *, 16> worklist;
+  llvm::SmallPtrSet<llvm::Function *, 32> live_functions;
+  bool has_closed_slice = false;
+
+  auto enqueue_live = [&](llvm::Function *F) {
+    if (!F || F->isDeclaration() || !live_functions.insert(F).second)
+      return;
+    worklist.push_back(F);
+  };
+
+  for (const auto &slice : model.rootSlices()) {
+    if (!slice.is_closed)
+      continue;
+    has_closed_slice = true;
+    for (const auto &handler_name : slice.reachable_handler_names)
+      enqueue_live(M.getFunction(handler_name));
+  }
+
+  if (!has_closed_slice)
+    return false;
+
+  while (!worklist.empty()) {
+    llvm::Function *F = worklist.pop_back_val();
+    for (auto &BB : *F) {
+      for (auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+        if (!call)
+          continue;
+        enqueue_live(call->getCalledFunction());
+      }
+    }
+  }
+
+  auto should_prune = [&](llvm::Function &F) {
+    if (F.isDeclaration())
+      return false;
+    if (live_functions.contains(&F))
+      return false;
+    if (F.hasFnAttribute("omill.output_root"))
+      return false;
+    if (isSyntheticBlockLikeFunctionName(F.getName()) ||
+        hasLiftedSignature(F) || F.getName().starts_with("sub_")) {
+      return true;
+    }
+    return false;
+  };
+
+  llvm::SmallVector<llvm::Function *, 32> erase_list;
+  for (auto &F : M) {
+    if (should_prune(F))
+      erase_list.push_back(&F);
+  }
+  if (erase_list.empty())
+    return false;
+
+  for (auto *F : erase_list)
+    F->eraseFromParent();
+
+  if (diagnostics) {
+    diagnostics->push_back("terminal-boundary-recovery-pruned=" +
+                           llvm::Twine(erase_list.size()).str());
+  }
+  return true;
+}
+
+static void annotateClosedRootSlices(llvm::Module &M,
+                                     const VirtualMachineModel &model);
+
+static bool rewriteClosedSliceTerminalContinuationCalls(
+    llvm::Module &M, const VirtualMachineModel &model,
+    llvm::SmallVectorImpl<std::string> *diagnostics,
+    llvm::SmallPtrSetImpl<llvm::Function *> &changed_functions) {
+  if (!envFlagEnabled("OMILL_TERMINAL_BOUNDARY_RECOVERY"))
+    return false;
+
+  std::set<std::string> closed_handlers;
+  for (const auto &slice : model.rootSlices()) {
+    if (!slice.is_closed)
+      continue;
+    closed_handlers.insert(slice.reachable_handler_names.begin(),
+                           slice.reachable_handler_names.end());
+  }
+  if (closed_handlers.empty())
+    return false;
+
+  bool changed = false;
+  for (auto &caller : M) {
+    if (caller.isDeclaration())
+      continue;
+    if (closed_handlers.find(caller.getName().str()) == closed_handlers.end())
+      continue;
+
+    for (auto &BB : caller) {
+      auto *ret = llvm::dyn_cast<llvm::ReturnInst>(BB.getTerminator());
+      if (!ret)
+        continue;
+
+      auto *call =
+          llvm::dyn_cast_or_null<llvm::CallInst>(ret->getPrevNonDebugInstruction());
+      if (!call || call->getParent() != &BB)
+        continue;
+      if (call->arg_size() < 3)
+        continue;
+
+      auto *callee = call->getCalledFunction();
+      if (!callee)
+        continue;
+      if (closed_handlers.find(callee->getName().str()) !=
+          closed_handlers.end()) {
+        continue;
+      }
+      if (!isSyntheticBlockLikeFunctionName(callee->getName()) ||
+          !hasLiftedSignature(*callee)) {
+        continue;
+      }
+      if (!ret->getReturnValue() || ret->getReturnValue() != call)
+        continue;
+
+      llvm::Value *replacement = call->getArgOperand(2);
+      if (replacement->getType() != ret->getReturnValue()->getType())
+        continue;
+      if (replacement->getType()->isFirstClassType()) {
+        llvm::IRBuilder<> B(ret);
+        replacement = B.CreateFreeze(replacement);
+      }
+
+      ret->setOperand(0, replacement);
+      call->eraseFromParent();
+      changed_functions.insert(&caller);
+      changed = true;
+      if (diagnostics) {
+        diagnostics->push_back("localized-continuation-call-edge caller=" +
+                               caller.getName().str() + " callee=" +
+                               callee->getName().str());
+      }
+    }
+  }
+
+  return changed;
+}
+
+static bool runLateTerminalBoundaryRecoveryCleanup(
+    llvm::Module &M, llvm::ModuleAnalysisManager &AM,
+    VirtualMachineModel &model,
+    llvm::SmallVectorImpl<std::string> *diagnostics,
+    llvm::SmallPtrSetImpl<llvm::Function *> &changed_functions) {
+  if (!envFlagEnabled("OMILL_TERMINAL_BOUNDARY_RECOVERY"))
+    return false;
+
+  bool changed = false;
+  for (unsigned round = 0; round < 4; ++round) {
+    bool round_changed = false;
+
+    if (rewriteClosedSliceTerminalContinuationCalls(
+            M, model, diagnostics, changed_functions)) {
+      round_changed = true;
+    }
+
+    if (synthesizeLocalizedContinuationShims(
+            M, model, diagnostics, changed_functions)) {
+      round_changed = true;
+    }
+
+    if (pruneTerminalBoundaryRecoveryToClosedSlices(
+            M, model, diagnostics, changed_functions)) {
+      round_changed = true;
+    }
+
+    if (!round_changed)
+      break;
+
+    model = VirtualMachineModelAnalysis().run(M, AM);
+    annotateClosedRootSlices(M, model);
+    changed = true;
+  }
+
+  return changed;
+}
+
 static void annotateClosedRootSlices(llvm::Module &M,
                                      const VirtualMachineModel &model) {
+  const bool terminal_boundary_recovery_mode =
+      envFlagEnabled("OMILL_TERMINAL_BOUNDARY_RECOVERY");
   for (auto &F : M) {
     F.removeFnAttr("omill.closed_root_slice");
     F.removeFnAttr("omill.closed_root_slice_root");
+  }
+
+  if (terminal_boundary_recovery_mode) {
+    M.setModuleFlag(llvm::Module::Override, "omill.closed_root_slice_scope",
+                    static_cast<uint32_t>(0));
+    return;
   }
 
   bool has_closed_slice = false;
@@ -1768,9 +2157,29 @@ static MaterializationResult runMaterialization(llvm::Module &M,
   std::map<std::pair<uint64_t, std::string>, unsigned> variants_per_source;
   unsigned total_specialized_functions = 0;
   bool final_model_current = false;
+  const bool terminal_boundary_recovery_mode =
+      envFlagEnabled("OMILL_TERMINAL_BOUNDARY_RECOVERY");
+  const unsigned max_iterations =
+      terminal_boundary_recovery_mode
+          ? parseUnsignedEnv("OMILL_TERMINAL_BOUNDARY_RECOVERY_MAX_ITERATIONS")
+                .value_or(4u)
+          : 32u;
+  const unsigned max_reachable_handlers =
+      terminal_boundary_recovery_mode
+          ? parseUnsignedEnv("OMILL_TERMINAL_BOUNDARY_RECOVERY_MAX_REACHABLE")
+                .value_or(128u)
+          : std::numeric_limits<unsigned>::max();
+  const unsigned max_new_target_rounds =
+      terminal_boundary_recovery_mode
+          ? parseUnsignedEnv(
+                "OMILL_TERMINAL_BOUNDARY_RECOVERY_MAX_NEW_TARGET_ROUNDS")
+                .value_or(2u)
+          : std::numeric_limits<unsigned>::max();
+  unsigned new_target_rounds = 0;
+  std::optional<std::string> preferred_recovery_frontier_anchor;
+  auto materialization_start = std::chrono::steady_clock::now();
 
-  constexpr unsigned kMaxIterations = 32;
-  for (unsigned iteration = 0; iteration < kMaxIterations; ++iteration) {
+  for (unsigned iteration = 0; iteration < max_iterations; ++iteration) {
     genericDebugLog("iteration " + llvm::Twine(iteration).str() +
                     " model-start");
     final_model = VirtualMachineModelAnalysis().run(M, AM);
@@ -1785,6 +2194,15 @@ static MaterializationResult runMaterialization(llvm::Module &M,
         collectReachableHandlerNames(final_model, has_root_slices);
     auto reachable_rewrite_functions = collectReachableRewriteFunctionNames(
         M, final_model, reachable_handlers, has_root_slices);
+    if (terminal_boundary_recovery_mode &&
+        reachable_handlers.size() > max_reachable_handlers) {
+      result.diagnostics.push_back(
+          ("terminal-boundary-recovery reachable handler budget exceeded: " +
+           llvm::Twine(reachable_handlers.size()) + " > " +
+           llvm::Twine(max_reachable_handlers))
+              .str());
+      break;
+    }
     genericDebugLog("iteration " + llvm::Twine(iteration).str() +
                     " reachable-handlers=" +
                     llvm::Twine(reachable_handlers.size()).str());
@@ -1792,37 +2210,101 @@ static MaterializationResult runMaterialization(llvm::Module &M,
                     " reachable-rewrite-functions=" +
                     llvm::Twine(reachable_rewrite_functions.size()).str());
 
-    bool lifted_new_target = false;
-    for (const auto &slice : final_model.rootSlices()) {
-      if (slice.is_closed)
-        continue;
-      for (const auto &frontier : slice.frontier_edges) {
-        if (!shouldAttemptLiftFrontier(frontier))
+    llvm::SmallDenseSet<llvm::StringRef, 8> preferred_frontier_handlers;
+    if (terminal_boundary_recovery_mode &&
+        preferred_recovery_frontier_anchor.has_value()) {
+      for (const auto &region : final_model.regions()) {
+        if (!llvm::is_contained(region.handler_names,
+                                *preferred_recovery_frontier_anchor)) {
           continue;
-        uint64_t target_pc =
-            frontier.canonical_target_va.value_or(frontier.target_pc.value_or(0));
-        if (target_pc == 0)
-          continue;
-        if (tryLiftTarget(M, AM, target_pc, failed_lift_targets,
-                          &result.diagnostics)) {
-          lifted_new_target = true;
-          result.changed = true;
-          final_model_current = false;
         }
+        for (const auto &handler_name : region.handler_names)
+          preferred_frontier_handlers.insert(handler_name);
+        genericDebugLog("iteration " + llvm::Twine(iteration).str() +
+                        " preferred-recovery-region anchor=" +
+                        *preferred_recovery_frontier_anchor + " handlers=" +
+                        llvm::Twine(preferred_frontier_handlers.size()).str());
+        break;
       }
     }
-    if (liftConstantDispatchTargetsInReachableHandlers(
+
+    bool changed_frontier_target = false;
+    bool lifted_fresh_target = false;
+    auto try_process_frontiers =
+        [&](bool prefer_region_only) -> bool {
+      for (const auto &slice : final_model.rootSlices()) {
+        if (slice.is_closed)
+          continue;
+        for (const auto &frontier : slice.frontier_edges) {
+          if (!shouldAttemptLiftFrontier(frontier))
+            continue;
+          if (prefer_region_only &&
+              !preferred_frontier_handlers.contains(frontier.source_handler_name)) {
+            continue;
+          }
+          uint64_t target_pc = frontier.canonical_target_va.value_or(
+              frontier.target_pc.value_or(0));
+          if (target_pc == 0)
+            continue;
+          if (terminal_boundary_recovery_mode &&
+              tryAttachExistingLiftedTargetForRecovery(
+                  M, target_pc, reachable_handlers, &result.diagnostics)) {
+            if (auto *target = lookupLiftedTargetByPC(M, target_pc))
+              preferred_recovery_frontier_anchor = target->getName().str();
+            changed_frontier_target = true;
+            result.changed = true;
+            final_model_current = false;
+            return true;
+          }
+          if (tryLiftTarget(M, AM, target_pc, failed_lift_targets,
+                            &result.diagnostics)) {
+            if (terminal_boundary_recovery_mode) {
+              markLiftedTargetForRecoverySeed(M, target_pc, &result.diagnostics);
+              if (auto *target = lookupLiftedTargetByPC(M, target_pc))
+                preferred_recovery_frontier_anchor = target->getName().str();
+            }
+            changed_frontier_target = true;
+            lifted_fresh_target = true;
+            result.changed = true;
+            final_model_current = false;
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+
+    if (terminal_boundary_recovery_mode && !preferred_frontier_handlers.empty())
+      try_process_frontiers(/*prefer_region_only=*/true);
+    if (!changed_frontier_target)
+      try_process_frontiers(/*prefer_region_only=*/false);
+    if (!terminal_boundary_recovery_mode &&
+        liftConstantDispatchTargetsInReachableHandlers(
             M, AM, binary_memory, reachable_rewrite_functions, has_root_slices,
+            terminal_boundary_recovery_mode,
             failed_lift_targets, &result.diagnostics)) {
-      lifted_new_target = true;
+      changed_frontier_target = true;
+      lifted_fresh_target = true;
       result.changed = true;
       final_model_current = false;
     }
     genericDebugLog("iteration " + llvm::Twine(iteration).str() +
                     " frontier-lift-done changed=" +
-                    llvm::Twine(lifted_new_target ? 1 : 0).str());
-    if (lifted_new_target)
+                    llvm::Twine(changed_frontier_target ? 1 : 0).str());
+    if (changed_frontier_target) {
+      if (terminal_boundary_recovery_mode && lifted_fresh_target) {
+        ++new_target_rounds;
+        if (new_target_rounds > max_new_target_rounds) {
+          result.diagnostics.push_back(
+              ("terminal-boundary-recovery target-round budget exceeded: " +
+               llvm::Twine(new_target_rounds) + " > " +
+               llvm::Twine(max_new_target_rounds))
+                  .str());
+          break;
+        }
+      }
       continue;
+    }
 
     genericDebugLog("iteration " + llvm::Twine(iteration).str() +
                     " specialize-start");
@@ -1849,52 +2331,54 @@ static MaterializationResult runMaterialization(llvm::Module &M,
                     " scan-start");
 
     bool lifted_terminal_target = false;
-    for (auto &F : M) {
-      if (F.isDeclaration())
-        continue;
-      if (has_root_slices &&
-          reachable_rewrite_functions.find(F.getName().str()) ==
-              reachable_rewrite_functions.end()) {
-        continue;
-      }
-
-      const auto *summary = final_model.lookupHandler(F.getName());
-      if (!summary)
-        continue;
-
-      bool has_missing_block = false;
-      for (auto &BB : F) {
-        for (auto &I : BB) {
-          auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
-          if (!call)
-            continue;
-          auto *callee = call->getCalledFunction();
-          if (callee && callee->getName() == "__remill_missing_block") {
-            has_missing_block = true;
-            break;
-          }
+    if (!terminal_boundary_recovery_mode) {
+      for (auto &F : M) {
+        if (F.isDeclaration())
+          continue;
+        if (has_root_slices &&
+            reachable_rewrite_functions.find(F.getName().str()) ==
+                reachable_rewrite_functions.end()) {
+          continue;
         }
-        if (has_missing_block)
-          break;
-      }
-      if (!has_missing_block)
-        continue;
 
-      auto target_pc = resolveTerminalNextPcFromFacts(*summary, binary_memory,
-                                                      &result.diagnostics);
-      if (!target_pc || lookupLiftedTargetByPC(M, *target_pc))
-        continue;
-      if (tryLiftTarget(M, AM, *target_pc, failed_lift_targets,
-                        &result.diagnostics)) {
-        lifted_terminal_target = true;
-        result.changed = true;
-        final_model_current = false;
+        const auto *summary = final_model.lookupHandler(F.getName());
+        if (!summary)
+          continue;
+
+        bool has_missing_block = false;
+        for (auto &BB : F) {
+          for (auto &I : BB) {
+            auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+            if (!call)
+              continue;
+            auto *callee = call->getCalledFunction();
+            if (callee && callee->getName() == "__remill_missing_block") {
+              has_missing_block = true;
+              break;
+            }
+          }
+          if (has_missing_block)
+            break;
+        }
+        if (!has_missing_block)
+          continue;
+
+        auto target_pc = resolveTerminalNextPcFromFacts(*summary, binary_memory,
+                                                        &result.diagnostics);
+        if (!target_pc || lookupLiftedTargetByPC(M, *target_pc))
+          continue;
+        if (tryLiftTarget(M, AM, *target_pc, failed_lift_targets,
+                          &result.diagnostics)) {
+          lifted_terminal_target = true;
+          result.changed = true;
+          final_model_current = false;
+        }
       }
-    }
-    if (lifted_terminal_target) {
-      genericDebugLog("iteration " + llvm::Twine(iteration).str() +
-                      " terminal-lift-changed");
-      continue;
+      if (lifted_terminal_target) {
+        genericDebugLog("iteration " + llvm::Twine(iteration).str() +
+                        " terminal-lift-changed");
+        continue;
+      }
     }
 
     struct Candidate {
@@ -2056,7 +2540,11 @@ static MaterializationResult runMaterialization(llvm::Module &M,
                   resolveTarget(M, binary_memory, final_model,
                                 call->getFunctionType(), successor.target_pc,
                                 &result.diagnostics);
-              if (!resolved.function || resolved.function == &F) {
+              const bool self_jump_target =
+                  resolved.function == &F &&
+                  name == "__omill_dispatch_jump";
+              if (!resolved.function ||
+                  (resolved.function == &F && !self_jump_target)) {
                 all_resolved = false;
                 break;
               }
@@ -2093,7 +2581,10 @@ static MaterializationResult runMaterialization(llvm::Module &M,
           auto resolved = resolveTarget(M, binary_memory, final_model,
                                         call->getFunctionType(), resolved_pc,
                                         &result.diagnostics);
-          if (!resolved.function || resolved.function == &F)
+          const bool self_jump_target =
+              resolved.function == &F && name == "__omill_dispatch_jump";
+          if (!resolved.function ||
+              (resolved.function == &F && !self_jump_target))
             continue;
 
           candidates.push_back(Candidate{call, &F, resolved.function,
@@ -2164,6 +2655,15 @@ static MaterializationResult runMaterialization(llvm::Module &M,
       break;
     genericDebugLog("iteration " + llvm::Twine(iteration).str() +
                     " rewrite-changed");
+    if (terminal_boundary_recovery_mode) {
+      auto elapsed = std::chrono::duration_cast<std::chrono::minutes>(
+          std::chrono::steady_clock::now() - materialization_start);
+      if (elapsed.count() >= 5) {
+        result.diagnostics.push_back(
+            "terminal-boundary-recovery wall-time budget exceeded");
+        break;
+      }
+    }
   }
 
   genericDebugLog("final-model-start");
@@ -2171,6 +2671,20 @@ static MaterializationResult runMaterialization(llvm::Module &M,
     final_model = VirtualMachineModelAnalysis().run(M, AM);
   genericDebugLog("final-model-done");
   annotateClosedRootSlices(M, final_model);
+
+  if (pruneTerminalBoundaryRecoveryToClosedSlices(
+          M, final_model, &result.diagnostics, result.changed_functions)) {
+    result.changed = true;
+    final_model = VirtualMachineModelAnalysis().run(M, AM);
+    final_model_current = true;
+    annotateClosedRootSlices(M, final_model);
+  }
+
+  if (runLateTerminalBoundaryRecoveryCleanup(
+          M, AM, final_model, &result.diagnostics, result.changed_functions)) {
+    result.changed = true;
+    final_model_current = true;
+  }
 
   llvm::SmallVector<llvm::Function *, 8> dead_missing_stubs;
   for (auto &F : M) {

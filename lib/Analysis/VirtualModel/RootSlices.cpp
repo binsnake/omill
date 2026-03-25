@@ -3,6 +3,7 @@
 #include <llvm/ADT/STLExtras.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <optional>
 #include <set>
@@ -13,8 +14,26 @@ namespace omill::virtual_model::detail {
 
 namespace {
 
+static bool terminalBoundaryRecoveryModeEnabled() {
+  const char *mode = std::getenv("OMILL_TERMINAL_BOUNDARY_RECOVERY");
+  if (mode && mode[0] != '\0')
+    return true;
+  const char *root = std::getenv("OMILL_TERMINAL_BOUNDARY_RECOVERY_ROOT_VA");
+  return root && root[0] != '\0';
+}
+
 static std::string normalizeBoundaryNameForRootSlice(llvm::StringRef name) {
   return name.lower();
+}
+
+static std::optional<std::string> importBoundaryName(
+    const BinaryMemoryMap &binary_memory, std::optional<uint64_t> target_pc) {
+  if (!target_pc.has_value())
+    return std::nullopt;
+  auto *entry = lookupImportTarget(binary_memory, *target_pc);
+  if (!entry)
+    return std::nullopt;
+  return entry->module + "!" + entry->function;
 }
 
 static uint64_t nearbyEntrySearchWindow(TargetArch arch) {
@@ -77,11 +96,68 @@ static DispatchFrontierClassification classifyUnknownDispatchFrontier(
   return classification;
 }
 
+static std::optional<unsigned> lookupSummaryNamedSlotId(
+    const VirtualHandlerSummary &summary, llvm::StringRef base_name) {
+  for (const auto &slot : summary.state_slots) {
+    if (slot.base_name != base_name || slot.offset != 0 ||
+        !slot.canonical_id.has_value()) {
+      continue;
+    }
+    return slot.canonical_id;
+  }
+  return std::nullopt;
+}
+
+static const VirtualSlotFact *lookupSlotFactById(
+    llvm::ArrayRef<VirtualSlotFact> facts, unsigned slot_id) {
+  auto it = llvm::find_if(facts, [&](const VirtualSlotFact &fact) {
+    return fact.slot_id == slot_id;
+  });
+  return it == facts.end() ? nullptr : &*it;
+}
+
+static std::optional<uint64_t> resolveTerminalNextPcFromFacts(
+    const VirtualHandlerSummary &summary) {
+  auto next_pc_slot_id = lookupSummaryNamedSlotId(summary, "NEXT_PC");
+  if (!next_pc_slot_id)
+    return std::nullopt;
+
+  const auto *next_pc_fact =
+      lookupSlotFactById(summary.outgoing_facts, *next_pc_slot_id);
+  if (!next_pc_fact)
+    return std::nullopt;
+
+  struct FactStateRef {
+    llvm::ArrayRef<VirtualSlotFact> slots;
+    llvm::ArrayRef<VirtualStackFact> stack;
+  };
+
+  const FactStateRef states[] = {
+      {summary.outgoing_facts, summary.outgoing_stack_facts},
+      {summary.outgoing_facts, summary.incoming_stack_facts},
+      {summary.incoming_facts, summary.outgoing_stack_facts},
+      {summary.incoming_facts, summary.incoming_stack_facts},
+  };
+
+  std::optional<uint64_t> first_resolved;
+  for (const auto &state : states) {
+    if (auto resolved =
+            evaluateVirtualExpr(next_pc_fact->value, state.slots, state.stack)) {
+      if (!first_resolved)
+        first_resolved = resolved;
+    }
+  }
+
+  return first_resolved;
+}
+
 }  // namespace
 
 void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
                          const BinaryMemoryMap &binary_memory) {
   auto target_arch = targetArchForModule(M);
+  const bool terminal_boundary_recovery_mode =
+      terminalBoundaryRecoveryModeEnabled();
   auto &root_slices = model.mutableRootSlices();
   root_slices.clear();
 
@@ -206,7 +282,10 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
             !has_same_handler_localized_continuation(handler, callsite)) {
           return false;
         }
-        return callsite.unresolved_reason == "call_target_not_executable" ||
+        return callsite.unresolved_reason ==
+                   "call_target_import_pointer" ||
+               callsite.unresolved_reason ==
+                   "call_target_not_executable_in_image" ||
                callsite.unresolved_reason == "call_target_undecodable" ||
                callsite.unresolved_reason == "call_target_mid_instruction" ||
                (callsite.unresolved_reason == "call_target_unresolved" &&
@@ -241,7 +320,9 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
       [&](const VirtualRootSliceSummary::FrontierEdge &frontier) {
         switch (frontier.kind) {
           case VirtualRootFrontierKind::kCall:
-            return frontier.reason == "call_target_not_executable" ||
+            return frontier.reason == "call_target_import_pointer" ||
+                   frontier.reason == "call_target_not_executable_in_image" ||
+                   frontier.reason == "call_target_out_of_image" ||
                    frontier.reason == "call_target_undecodable";
 
           case VirtualRootFrontierKind::kDispatch:
@@ -305,43 +386,44 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
           if (target) {
             enqueue_handler(target, worklist, queued_names, reachable_names);
           } else {
-            auto reason = std::string("call_target_not_executable");
+            auto reason = std::string("call_target_out_of_image");
             std::optional<uint64_t> recovered_entry_pc;
             const VirtualHandlerSummary *recovered_target = nullptr;
             if (isTargetExecutable(binary_memory, prelude->target_pc)) {
               auto decodable = isTargetDecodableEntry(
                   binary_memory, prelude->target_pc, target_arch);
-              if (decodable.has_value() && !*decodable) {
-                recovered_target = findNearbyLiftedHandlerEntry(
-                    handler_by_pc, prelude->target_pc, target_arch);
-                if (recovered_target && recovered_target->entry_va.has_value()) {
-                  recovered_entry_pc = recovered_target->entry_va;
-                  reason = std::string("call_target_mid_instruction");
-                } else {
-                  recovered_entry_pc = findNearbyExecutableEntry(
-                      binary_memory, prelude->target_pc, target_arch);
-                  if (recovered_entry_pc) {
-                    auto recovered_it = handler_by_pc.find(*recovered_entry_pc);
-                    if (recovered_it != handler_by_pc.end()) {
-                      recovered_target = recovered_it->second;
-                      reason = std::string("call_target_mid_instruction");
-                    } else {
-                      reason = std::string("call_target_nearby_unlifted");
-                    }
+              recovered_target = findNearbyLiftedHandlerEntry(
+                  handler_by_pc, prelude->target_pc, target_arch);
+              if (recovered_target && recovered_target->entry_va.has_value()) {
+                recovered_entry_pc = recovered_target->entry_va;
+                reason = std::string("call_target_mid_instruction");
+              } else if (decodable.has_value() && !*decodable) {
+                recovered_entry_pc = findNearbyExecutableEntry(
+                    binary_memory, prelude->target_pc, target_arch);
+                if (recovered_entry_pc) {
+                  auto recovered_it = handler_by_pc.find(*recovered_entry_pc);
+                  if (recovered_it != handler_by_pc.end()) {
+                    recovered_target = recovered_it->second;
+                    reason = std::string("call_target_mid_instruction");
                   } else {
-                    reason = std::string("call_target_undecodable");
+                    reason = std::string("call_target_nearby_unlifted");
                   }
+                } else {
+                  reason = std::string("call_target_undecodable");
                 }
               } else {
                 reason = std::string("call_target_unlifted");
               }
+            } else if (lookupImportTarget(binary_memory, prelude->target_pc)) {
+              reason = std::string("call_target_import_pointer");
             } else if (isTargetMapped(binary_memory, prelude->target_pc)) {
-              reason = std::string("call_target_not_executable");
+              reason = std::string("call_target_not_executable_in_image");
             }
 
             auto prelude_target_decodable = isTargetDecodableEntry(
                 binary_memory, prelude->target_pc, target_arch);
             bool semantically_localized_unlifted_prelude_target =
+                !terminal_boundary_recovery_mode &&
                 reason == "call_target_unlifted" &&
                 handler->dispatches.empty() &&
                 isTargetExecutable(binary_memory, prelude->target_pc) &&
@@ -372,7 +454,7 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
                 std::move(reason),
                 prelude->target_pc,
                 recovered_entry_pc,
-                std::nullopt});
+                importBoundaryName(binary_memory, prelude->target_pc)});
           }
         }
       }
@@ -502,6 +584,7 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
           enqueue_handler(target, worklist, queued_names, reachable_names);
 
         bool semantically_localized_unlifted_target =
+            !terminal_boundary_recovery_mode &&
             !target &&
             callsite.unresolved_reason == "call_target_unlifted" &&
             callsite.resolved_target_pc.has_value() &&
@@ -523,8 +606,38 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
               static_cast<unsigned>(callsite_index),
               callsite.unresolved_reason.empty() ? "call_target_unlifted"
                                                  : callsite.unresolved_reason,
-              callsite.resolved_target_pc, callsite.recovered_entry_pc,
-              std::nullopt});
+              callsite.resolved_target_pc,
+              callsite.recovered_entry_pc,
+              importBoundaryName(binary_memory, callsite.resolved_target_pc)});
+        }
+      }
+
+      if (handler->dispatches.empty()) {
+        if (auto terminal_next_pc = resolveTerminalNextPcFromFacts(*handler)) {
+          const VirtualHandlerSummary *target = nullptr;
+          auto it = handler_by_pc.find(*terminal_next_pc);
+          if (it != handler_by_pc.end())
+            target = it->second;
+          if (!target) {
+            target = findNearbyLiftedHandlerEntry(handler_by_pc, *terminal_next_pc,
+                                                  target_arch);
+          }
+          if (target) {
+            enqueue_handler(target, worklist, queued_names, reachable_names);
+          } else {
+            auto classification = classifyUnknownDispatchFrontier(
+                binary_memory, *terminal_next_pc, target_arch);
+            slice.frontier_edges.push_back(
+                VirtualRootSliceSummary::FrontierEdge{
+                    VirtualRootFrontierKind::kDispatch,
+                    handler->function_name,
+                    static_cast<unsigned>(handler->dispatches.size()),
+                    0,
+                    std::move(classification.reason),
+                    *terminal_next_pc,
+                    classification.canonical_target_va,
+                    std::nullopt});
+          }
         }
       }
 

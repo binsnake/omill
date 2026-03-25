@@ -331,6 +331,20 @@ bool envEnabled(const char *name) {
          (v[0] == 'Y' && v[1] == '\0');
 }
 
+bool alwaysInlinerEnabled() {
+  return !envDisabled("OMILL_SKIP_ALWAYS_INLINE");
+}
+
+bool abiAlwaysInlinerEnabled() {
+  return alwaysInlinerEnabled() &&
+         !envDisabled("OMILL_SKIP_ABI_ALWAYS_INLINE");
+}
+
+bool moduleInlinerEnabled() {
+  return alwaysInlinerEnabled() &&
+         !envDisabled("OMILL_SKIP_MODULE_INLINE");
+}
+
 bool enableClosedSliceContinuationDiscovery() {
   return envEnabled("OMILL_ENABLE_CLOSED_SLICE_CONTINUATION_DISCOVERY") &&
          !envDisabled("OMILL_SKIP_CLOSED_SLICE_CONTINUATION_DISCOVERY");
@@ -357,12 +371,86 @@ bool envBoolEnabled(const char *name) {
   return !(sv == "0" || sv == "false" || sv == "off" || sv == "no");
 }
 
+static bool isGenericStaticDevirtSignalFunction(const llvm::Function &F) {
+  auto name = F.getName();
+  if (name.starts_with("vm_entry_"))
+    return true;
+
+  return F.hasFnAttribute("omill.vm_handler") ||
+         F.hasFnAttribute("omill.vm_wrapper") ||
+         F.hasFnAttribute("omill.protection_boundary") ||
+         F.hasFnAttribute("omill.trace_native_target") ||
+         F.hasFnAttribute("omill.vm_newly_lifted") ||
+         F.hasFnAttribute("omill.newly_lifted") ||
+         F.hasFnAttribute("omill.virtual_specialized") ||
+         F.getFnAttribute("omill.vm_demerged_clone").isValid() ||
+         F.getFnAttribute("omill.vm_outlined_virtual_call").isValid() ||
+         F.getFnAttribute("omill.boundary_kind").isValid();
+}
+
+static bool moduleHasGenericStaticDevirtualizationCandidatesImpl(
+    const llvm::Module &M) {
+  for (const auto &F : M) {
+    if (isGenericStaticDevirtSignalFunction(F))
+      return true;
+  }
+
+  return false;
+}
+
 static constexpr llvm::StringLiteral kLoopifiedTerminalPcMetadata =
     "omill.loopified_terminal_pc";
 static constexpr llvm::StringLiteral kLoopifiedTerminalPcAttr =
     "omill.loopified_terminal_pc";
 static constexpr llvm::StringLiteral kTerminalBoundaryCandidatePcAttr =
     "omill.terminal_boundary_candidate_pc";
+
+std::optional<uint64_t> getTerminalBoundaryCandidatePc(
+    const llvm::Function &F) {
+  auto attr = F.getFnAttribute(kTerminalBoundaryCandidatePcAttr);
+  if (!attr.isValid())
+    return std::nullopt;
+  uint64_t parsed_pc = 0;
+  if (attr.getValueAsString().getAsInteger(16, parsed_pc))
+    return std::nullopt;
+  return parsed_pc;
+}
+
+llvm::Function *getOrCreateMissingBlockHandler(llvm::Module &M,
+                                               llvm::Function *&handler) {
+  if (handler)
+    return handler;
+  auto &ctx = M.getContext();
+  auto *handler_ty = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx),
+                                             {llvm::Type::getInt64Ty(ctx)},
+                                             false);
+  handler = llvm::cast<llvm::Function>(
+      M.getOrInsertFunction("__omill_missing_block_handler", handler_ty)
+          .getCallee());
+  return handler;
+}
+
+bool rewriteTerminalBoundaryOutputRoot(llvm::Module &M, llvm::Function &F,
+                                       uint64_t target_pc,
+                                       llvm::Function *&handler) {
+  F.addFnAttr(kTerminalBoundaryCandidatePcAttr, llvm::utohexstr(target_pc));
+  for (auto &BB : llvm::make_early_inc_range(F))
+    BB.dropAllReferences();
+  while (!F.empty())
+    F.begin()->eraseFromParent();
+
+  auto *entry = llvm::BasicBlock::Create(M.getContext(), "entry", &F);
+  llvm::IRBuilder<> B(entry);
+  B.CreateCall(getOrCreateMissingBlockHandler(M, handler),
+               {llvm::ConstantInt::get(llvm::Type::getInt64Ty(M.getContext()),
+                                       target_pc)});
+  if (F.getReturnType()->isVoidTy()) {
+    B.CreateRetVoid();
+  } else {
+    B.CreateRet(llvm::Constant::getNullValue(F.getReturnType()));
+  }
+  return true;
+}
 
 TargetArch targetArchForModule(llvm::Module &M) {
   TargetArch arch = TargetArch::kX86_64;
@@ -521,6 +609,23 @@ std::optional<uint64_t> getLoopifiedTerminalBranchPc(const llvm::BranchInst &br)
     return ci->getZExtValue();
   }
   return std::nullopt;
+}
+
+std::optional<uint64_t> getConstantIndirectCallTargetPc(
+    const llvm::CallBase &call) {
+  if (call.getCalledFunction())
+    return std::nullopt;
+
+  auto *called = call.getCalledOperand()->stripPointerCasts();
+  auto *expr = llvm::dyn_cast<llvm::ConstantExpr>(called);
+  if (!expr || expr->getOpcode() != llvm::Instruction::IntToPtr)
+    return std::nullopt;
+
+  auto *target = llvm::dyn_cast<llvm::ConstantInt>(expr->getOperand(0));
+  if (!target)
+    return std::nullopt;
+
+  return target->getZExtValue();
 }
 
 bool emitInlineDiagMarkers() {
@@ -2771,11 +2876,15 @@ struct LoopifyClosedSliceSelfRecursiveBlockHelpersPass
 
         auto *term = call->getParent()->getTerminator();
         auto *br = llvm::dyn_cast<llvm::BranchInst>(term);
-        if (!br || !br->isUnconditional()) {
+        auto *ret = llvm::dyn_cast<llvm::ReturnInst>(term);
+        const bool is_uncond_branch_tail = br && br->isUnconditional();
+        const bool is_direct_return_tail =
+            ret && (!ret->getReturnValue() || ret->getReturnValue() == call);
+        if (!is_uncond_branch_tail && !is_direct_return_tail) {
           rejected = true;
           if (debug)
             llvm::errs() << "[selfrec-loopify] skip " << F.getName()
-                         << " reason=non-uncond-tail\n";
+                         << " reason=non-tail-branch-or-return\n";
           break;
         }
 
@@ -2816,8 +2925,10 @@ struct LoopifyClosedSliceSelfRecursiveBlockHelpersPass
       for (auto *call : loopifiable_calls) {
         auto *BB = call->getParent();
         auto *old_term = BB->getTerminator();
-        auto *succ = llvm::cast<llvm::BranchInst>(old_term)->getSuccessor(0);
-        succ->removePredecessor(BB);
+        if (auto *old_br = llvm::dyn_cast<llvm::BranchInst>(old_term)) {
+          auto *succ = old_br->getSuccessor(0);
+          succ->removePredecessor(BB);
+        }
 
         llvm::SmallVector<llvm::Instruction *, 16> erase_list;
         for (auto it = llvm::BasicBlock::iterator(call), end = BB->end();
@@ -3643,6 +3754,42 @@ struct EraseIsolatedSyntheticBlockWrapperCallsPass
 
 struct SeedTerminalSyntheticBoundaryCandidatesPass
     : llvm::PassInfoMixin<SeedTerminalSyntheticBoundaryCandidatesPass> {
+  static std::optional<uint64_t> inferCandidatePc(const llvm::Function &F) {
+    std::optional<uint64_t> candidate_pc;
+    bool conflict = false;
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+        if (!CB || CB->arg_size() < 3)
+          continue;
+        auto *callee = CB->getCalledFunction();
+        if (!callee || !callee->isDeclaration())
+          continue;
+        auto continuation_pc = parseSyntheticBlockLikePC(callee->getName());
+        if (!continuation_pc)
+          continue;
+        auto *pc_arg = llvm::dyn_cast<llvm::ConstantInt>(CB->getArgOperand(1));
+        if (!pc_arg || pc_arg->getZExtValue() != *continuation_pc)
+          continue;
+        if (!isTerminalSyntheticMemoryArgValue(CB->getArgOperand(2)))
+          continue;
+
+        if (!candidate_pc.has_value()) {
+          candidate_pc = *continuation_pc;
+        } else if (*candidate_pc != *continuation_pc) {
+          conflict = true;
+          break;
+        }
+      }
+      if (conflict)
+        break;
+    }
+
+    if (conflict)
+      return std::nullopt;
+    return candidate_pc;
+  }
+
   llvm::PreservedAnalyses run(llvm::Module &M,
                               llvm::ModuleAnalysisManager &) {
     bool changed = false;
@@ -3653,38 +3800,8 @@ struct SeedTerminalSyntheticBoundaryCandidatesPass
       if (F.hasFnAttribute(kTerminalBoundaryCandidatePcAttr))
         continue;
 
-      std::optional<uint64_t> candidate_pc;
-      bool conflict = false;
-      for (auto &BB : F) {
-        for (auto &I : BB) {
-          auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
-          if (!CB || CB->arg_size() < 3)
-            continue;
-          auto *callee = CB->getCalledFunction();
-          if (!callee || !callee->isDeclaration())
-            continue;
-          auto continuation_pc = parseSyntheticBlockLikePC(callee->getName());
-          if (!continuation_pc)
-            continue;
-          auto *pc_arg =
-              llvm::dyn_cast<llvm::ConstantInt>(CB->getArgOperand(1));
-          if (!pc_arg || pc_arg->getZExtValue() != *continuation_pc)
-            continue;
-          if (!isTerminalSyntheticMemoryArgValue(CB->getArgOperand(2)))
-            continue;
-
-          if (!candidate_pc.has_value()) {
-            candidate_pc = *continuation_pc;
-          } else if (*candidate_pc != *continuation_pc) {
-            conflict = true;
-            break;
-          }
-        }
-        if (conflict)
-          break;
-      }
-
-      if (!conflict && candidate_pc.has_value()) {
+      auto candidate_pc = inferCandidatePc(F);
+      if (candidate_pc.has_value()) {
         F.addFnAttr(kTerminalBoundaryCandidatePcAttr,
                     llvm::utohexstr(*candidate_pc));
         changed = true;
@@ -3710,11 +3827,10 @@ struct PropagateLoopifiedTerminalBoundaryAttrsPass
       for (auto &F : M) {
         if (F.isDeclaration())
           continue;
-        if (F.hasFnAttribute(kLoopifiedTerminalPcAttr))
-          continue;
-
         std::optional<std::string> loopified_pc;
-        bool conflict = false;
+        std::optional<std::string> candidate_pc;
+        bool loopified_conflict = false;
+        bool candidate_conflict = false;
         for (auto &BB : F) {
           for (auto &I : BB) {
             auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
@@ -3723,23 +3839,49 @@ struct PropagateLoopifiedTerminalBoundaryAttrsPass
             auto *callee = CB->getCalledFunction();
             if (!callee || callee->isDeclaration())
               continue;
-            auto attr = callee->getFnAttribute(kLoopifiedTerminalPcAttr);
-            if (!attr.isValid())
-              continue;
-            auto pc = attr.getValueAsString().str();
-            if (!loopified_pc.has_value()) {
-              loopified_pc = pc;
-            } else if (*loopified_pc != pc) {
-              conflict = true;
-              break;
+
+            auto loopified_attr = callee->getFnAttribute(kLoopifiedTerminalPcAttr);
+            if (loopified_attr.isValid()) {
+              auto pc = loopified_attr.getValueAsString().str();
+              if (!loopified_pc.has_value()) {
+                loopified_pc = pc;
+              } else if (*loopified_pc != pc) {
+                loopified_conflict = true;
+              }
+            }
+
+            auto candidate_attr =
+                callee->getFnAttribute(kTerminalBoundaryCandidatePcAttr);
+            if (!candidate_attr.isValid())
+              candidate_attr = callee->getFnAttribute(kLoopifiedTerminalPcAttr);
+            auto inferred_candidate_pc =
+                SeedTerminalSyntheticBoundaryCandidatesPass::inferCandidatePc(
+                    *callee);
+            if (candidate_attr.isValid() || inferred_candidate_pc.has_value()) {
+              auto pc = candidate_attr.isValid()
+                            ? candidate_attr.getValueAsString().str()
+                            : llvm::utohexstr(*inferred_candidate_pc);
+              if (!candidate_pc.has_value()) {
+                candidate_pc = pc;
+              } else if (*candidate_pc != pc) {
+                candidate_conflict = true;
+              }
             }
           }
-          if (conflict)
+          if (loopified_conflict && candidate_conflict)
             break;
         }
 
-        if (!conflict && loopified_pc.has_value()) {
+        if (!F.hasFnAttribute(kLoopifiedTerminalPcAttr) &&
+            !loopified_conflict && loopified_pc.has_value()) {
           F.addFnAttr(kLoopifiedTerminalPcAttr, *loopified_pc);
+          local_change = true;
+          changed = true;
+        }
+
+        if (!F.hasFnAttribute(kTerminalBoundaryCandidatePcAttr) &&
+            !candidate_conflict && candidate_pc.has_value()) {
+          F.addFnAttr(kTerminalBoundaryCandidatePcAttr, *candidate_pc);
           local_change = true;
           changed = true;
         }
@@ -3799,23 +3941,13 @@ struct RewriteLoopifiedTerminalBoundaryOutputRootsPass
     : llvm::PassInfoMixin<RewriteLoopifiedTerminalBoundaryOutputRootsPass> {
   llvm::PreservedAnalyses run(llvm::Module &M,
                               llvm::ModuleAnalysisManager &) {
+    static const bool debug_terminal_rewrite =
+        (std::getenv("OMILL_DEBUG_TERMINAL_REWRITE") != nullptr);
     llvm::Function *missing_block_handler = nullptr;
     bool changed = false;
 
-    auto getOrCreateMissingBlockHandler = [&]() -> llvm::Function * {
-      if (missing_block_handler)
-        return missing_block_handler;
-      auto &ctx = M.getContext();
-      auto *handler_ty = llvm::FunctionType::get(
-          llvm::Type::getVoidTy(ctx), {llvm::Type::getInt64Ty(ctx)}, false);
-      missing_block_handler = llvm::cast<llvm::Function>(
-          M.getOrInsertFunction("__omill_missing_block_handler", handler_ty)
-              .getCallee());
-      return missing_block_handler;
-    };
-
     auto isTrivialLoopifyBlock =
-        [&](llvm::BasicBlock &BB,
+        [&](llvm::Function &F, llvm::BasicBlock &BB,
             std::optional<uint64_t> &target_pc) -> bool {
       auto *br = llvm::dyn_cast<llvm::BranchInst>(BB.getTerminator());
       if (!br || !br->isUnconditional() || br->getSuccessor(0) != &BB)
@@ -3832,6 +3964,10 @@ struct RewriteLoopifiedTerminalBoundaryOutputRootsPass
           }
           continue;
         }
+        if (isLoopifiableRecursiveTailSuffixInst(I, F))
+          continue;
+        if (!I.mayHaveSideEffects() && !I.isTerminator())
+          continue;
         return false;
       }
       return true;
@@ -3841,15 +3977,22 @@ struct RewriteLoopifiedTerminalBoundaryOutputRootsPass
       if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
         continue;
 
+      if (debug_terminal_rewrite)
+        llvm::errs() << "[terminal-rewrite] inspect " << F.getName() << "\n";
+
       uint64_t target_pc = 0;
       llvm::BasicBlock *loop_block = nullptr;
       bool skip_function = false;
       for (auto &BB : F) {
         std::optional<uint64_t> block_pc;
-        if (!isTrivialLoopifyBlock(BB, block_pc))
+        if (!isTrivialLoopifyBlock(F, BB, block_pc))
           continue;
         if (loop_block) {
           skip_function = true;
+          if (debug_terminal_rewrite) {
+            llvm::errs() << "[terminal-rewrite] skip " << F.getName()
+                         << " multiple-loop-blocks\n";
+          }
           break;
         }
         loop_block = &BB;
@@ -3857,15 +4000,18 @@ struct RewriteLoopifiedTerminalBoundaryOutputRootsPass
           target_pc = *block_pc;
       }
 
-      if (skip_function || !loop_block)
+      if (skip_function || !loop_block) {
+        if (debug_terminal_rewrite && !loop_block && !skip_function) {
+          llvm::errs() << "[terminal-rewrite] skip " << F.getName()
+                       << " no-trivial-loop-block\n";
+        }
         continue;
+      }
 
       if (!target_pc) {
-        auto attr = F.getFnAttribute(kTerminalBoundaryCandidatePcAttr);
-        if (attr.isValid()) {
-          uint64_t parsed_pc = 0;
-          if (!attr.getValueAsString().getAsInteger(16, parsed_pc))
-            target_pc = parsed_pc;
+        if (auto candidate_pc = getTerminalBoundaryCandidatePc(F);
+            candidate_pc.has_value()) {
+          target_pc = *candidate_pc;
         }
       }
 
@@ -3878,8 +4024,13 @@ struct RewriteLoopifiedTerminalBoundaryOutputRootsPass
         }
       }
 
-      if (!target_pc)
+      if (!target_pc) {
+        if (debug_terminal_rewrite) {
+          llvm::errs() << "[terminal-rewrite] skip " << F.getName()
+                       << " no-target-pc\n";
+        }
         continue;
+      }
 
       for (auto &BB : F) {
         if (&BB == loop_block)
@@ -3887,10 +4038,22 @@ struct RewriteLoopifiedTerminalBoundaryOutputRootsPass
         for (auto &I : BB) {
           if (llvm::isa<llvm::DbgInfoIntrinsic>(&I))
             continue;
+          if (auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
+            if (&BB == &F.getEntryBlock() && AI->getParent() == &F.getEntryBlock())
+              continue;
+          }
+          if (isLoopifiableRecursiveTailSuffixInst(I, F))
+            continue;
+          if (!I.mayHaveSideEffects() && !I.isTerminator())
+            continue;
           auto *br = llvm::dyn_cast<llvm::BranchInst>(&I);
           if (br && br->isUnconditional() && br->getSuccessor(0) == loop_block)
             continue;
           skip_function = true;
+          if (debug_terminal_rewrite) {
+            llvm::errs() << "[terminal-rewrite] skip " << F.getName()
+                         << " extra-body " << BB.getName() << "\n";
+          }
           break;
         }
         if (skip_function)
@@ -3900,21 +4063,242 @@ struct RewriteLoopifiedTerminalBoundaryOutputRootsPass
       if (skip_function)
         continue;
 
-      for (auto &BB : llvm::make_early_inc_range(F))
-        BB.dropAllReferences();
-      while (!F.empty())
-        F.begin()->eraseFromParent();
-
-      auto *entry = llvm::BasicBlock::Create(M.getContext(), "entry", &F);
-      llvm::IRBuilder<> B(entry);
-      B.CreateCall(getOrCreateMissingBlockHandler(),
-                   {llvm::ConstantInt::get(
-                       llvm::Type::getInt64Ty(M.getContext()), target_pc)});
-      if (F.getReturnType()->isVoidTy()) {
-        B.CreateRetVoid();
-      } else {
-        B.CreateRet(llvm::Constant::getNullValue(F.getReturnType()));
+      if (debug_terminal_rewrite) {
+        llvm::errs() << "[terminal-rewrite] rewrite " << F.getName()
+                     << " target=0x" << llvm::utohexstr(target_pc) << "\n";
       }
+      changed |= rewriteTerminalBoundaryOutputRoot(
+          M, F, target_pc, missing_block_handler);
+    }
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+
+  static bool isRequired() { return true; }
+};
+
+struct RewriteIndirectCallTerminalBoundaryOutputRootsPass
+    : llvm::PassInfoMixin<RewriteIndirectCallTerminalBoundaryOutputRootsPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &) {
+    llvm::Function *missing_block_handler = nullptr;
+    bool changed = false;
+
+    for (auto &F : M) {
+      if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
+        continue;
+
+      bool saw_self_loop = false;
+      bool saw_missing_block_handler = false;
+      bool conflict = false;
+      std::optional<uint64_t> target_pc;
+
+      for (auto &BB : F) {
+        if (auto *br = llvm::dyn_cast<llvm::BranchInst>(BB.getTerminator())) {
+          if (br->isUnconditional() && br->getSuccessor(0) == &BB)
+            saw_self_loop = true;
+        }
+
+        for (auto &I : BB) {
+          auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+          if (!CB)
+            continue;
+
+          if (auto *callee = CB->getCalledFunction()) {
+            if (callee->isIntrinsic())
+              continue;
+            if (callee->getName() == "__omill_missing_block_handler") {
+              saw_missing_block_handler = true;
+              continue;
+            }
+            conflict = true;
+            break;
+          }
+
+          auto pc = getConstantIndirectCallTargetPc(*CB);
+          if (!pc.has_value()) {
+            conflict = true;
+            break;
+          }
+
+          if (!target_pc.has_value()) {
+            target_pc = *pc;
+          } else if (*target_pc != *pc) {
+            conflict = true;
+            break;
+          }
+        }
+
+        if (conflict)
+          break;
+      }
+
+      if (conflict || saw_missing_block_handler || !saw_self_loop ||
+          !target_pc.has_value()) {
+        continue;
+      }
+      changed |= rewriteTerminalBoundaryOutputRoot(
+          M, F, *target_pc, missing_block_handler);
+    }
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+
+  static bool isRequired() { return true; }
+};
+
+struct RewriteStateWrapperTerminalBoundaryOutputRootsPass
+    : llvm::PassInfoMixin<RewriteStateWrapperTerminalBoundaryOutputRootsPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &) {
+    llvm::Function *missing_block_handler = nullptr;
+    bool changed = false;
+
+    for (auto &F : M) {
+      if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
+        continue;
+      if (!F.hasFnAttribute(kTerminalBoundaryCandidatePcAttr))
+        continue;
+      if (F.hasFnAttribute("omill.terminal_boundary_kind"))
+        continue;
+
+      auto target_pc = getTerminalBoundaryCandidatePc(F);
+      if (!target_pc.has_value())
+        continue;
+
+      bool saw_missing_block_handler = false;
+      llvm::CallBase *terminal_call = nullptr;
+      bool conflict = false;
+
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+          if (!CB)
+            continue;
+          auto *callee = CB->getCalledFunction();
+          if (!callee) {
+            conflict = true;
+            break;
+          }
+          if (callee->isIntrinsic())
+            continue;
+          if (callee->getName() == "__omill_missing_block_handler") {
+            saw_missing_block_handler = true;
+            break;
+          }
+          if (terminal_call) {
+            conflict = true;
+            break;
+          }
+          terminal_call = CB;
+        }
+
+        if (saw_missing_block_handler || conflict)
+          break;
+      }
+
+      if (saw_missing_block_handler || conflict || !terminal_call)
+        continue;
+
+      auto *callee = terminal_call->getCalledFunction();
+      if (!callee || callee->isDeclaration())
+        continue;
+      if (!F.getName().ends_with("_native"))
+        continue;
+      auto expected_lifted_name = F.getName().drop_back(strlen("_native"));
+      if (callee->getName() != expected_lifted_name)
+        continue;
+
+      changed |= rewriteTerminalBoundaryOutputRoot(M, F, *target_pc,
+                                                   missing_block_handler);
+    }
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+
+  static bool isRequired() { return true; }
+};
+
+struct CanonicalizeTerminalBoundaryOutputRootsToProbeCyclePass
+    : llvm::PassInfoMixin<
+          CanonicalizeTerminalBoundaryOutputRootsToProbeCyclePass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &) {
+    static constexpr llvm::StringLiteral kProbeCycleCanonicalAttr =
+        "omill.terminal_boundary_probe_cycle_canonical_target_va";
+    static constexpr llvm::StringLiteral kOriginalTargetAttr =
+        "omill.terminal_boundary_original_target_va";
+
+    bool changed = false;
+
+    for (auto &F : M) {
+      if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
+        continue;
+
+      auto canonical_attr = F.getFnAttribute(kProbeCycleCanonicalAttr);
+      if (!canonical_attr.isValid())
+        continue;
+
+      uint64_t canonical_pc = 0;
+      if (canonical_attr.getValueAsString().getAsInteger(16, canonical_pc) ||
+          canonical_pc == 0) {
+        continue;
+      }
+
+      uint64_t current_pc = 0;
+      bool has_current_pc = false;
+      if (auto target_attr = F.getFnAttribute("omill.terminal_boundary_target_va");
+          target_attr.isValid() &&
+          !target_attr.getValueAsString().getAsInteger(16, current_pc) &&
+          current_pc != 0) {
+        has_current_pc = true;
+      } else if (auto candidate_pc = getTerminalBoundaryCandidatePc(F);
+                 candidate_pc.has_value()) {
+        current_pc = *candidate_pc;
+        has_current_pc = true;
+      }
+
+      if (has_current_pc && current_pc == canonical_pc)
+        continue;
+
+      llvm::CallInst *handler_call = nullptr;
+      bool conflict = false;
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+          if (!CI)
+            continue;
+          auto *callee = CI->getCalledFunction();
+          if (!callee || callee->getName() != "__omill_missing_block_handler")
+            continue;
+          if (handler_call) {
+            conflict = true;
+            break;
+          }
+          handler_call = CI;
+        }
+        if (conflict)
+          break;
+      }
+
+      if (conflict || !handler_call)
+        continue;
+
+      if (handler_call->arg_size() != 1)
+        continue;
+
+      auto *old_pc = llvm::dyn_cast<llvm::ConstantInt>(handler_call->getArgOperand(0));
+      if (!old_pc)
+        continue;
+
+      if (!F.hasFnAttribute(kOriginalTargetAttr))
+        F.addFnAttr(kOriginalTargetAttr, llvm::utohexstr(old_pc->getZExtValue()));
+
+      handler_call->setArgOperand(
+          0, llvm::ConstantInt::get(old_pc->getType(), canonical_pc));
       changed = true;
     }
 
@@ -4062,6 +4446,161 @@ struct AnnotateTerminalBoundaryHandlersPass
         if (info.nearby_entry_pc.has_value())
           F->addFnAttr(kNearbyAttr, llvm::utohexstr(*info.nearby_entry_pc));
       }
+    }
+
+    return llvm::PreservedAnalyses::none();
+  }
+
+  static bool isRequired() { return true; }
+};
+
+static std::optional<uint64_t> parseTerminalBoundaryTargetAttr(
+    const llvm::Function &F) {
+  auto attr = F.getFnAttribute("omill.terminal_boundary_target_va");
+  if (!attr.isValid())
+    return std::nullopt;
+  uint64_t target_pc = 0;
+  if (attr.getValueAsString().getAsInteger(16, target_pc))
+    return std::nullopt;
+  return target_pc;
+}
+
+static std::optional<uint64_t> parseTerminalBoundaryFunctionPC(
+    const llvm::Function &F) {
+  if (uint64_t va = extractEntryVA(F.getName()))
+    return va;
+  if (auto pc = parseSyntheticBlockLikePC(F.getName()))
+    return *pc;
+  return std::nullopt;
+}
+
+static std::string joinTerminalBoundaryCyclePCs(
+    llvm::ArrayRef<uint64_t> cycle_pcs) {
+  llvm::SmallVector<std::string, 8> parts;
+  parts.reserve(cycle_pcs.size());
+  for (uint64_t pc : cycle_pcs)
+    parts.push_back(llvm::utohexstr(pc));
+  return llvm::join(parts, ",");
+}
+
+struct AnnotateTerminalBoundaryCyclesPass
+    : llvm::PassInfoMixin<AnnotateTerminalBoundaryCyclesPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &) {
+    static constexpr llvm::StringLiteral kNamedMetadata =
+        "omill.terminal_boundary_cycles";
+    static constexpr llvm::StringLiteral kCycleAttr =
+        "omill.terminal_boundary_cycle";
+    static constexpr llvm::StringLiteral kCycleLenAttr =
+        "omill.terminal_boundary_cycle_len";
+    static constexpr llvm::StringLiteral kCycleCanonicalAttr =
+        "omill.terminal_boundary_cycle_canonical_target_va";
+
+    if (auto *old_md = M.getNamedMetadata(kNamedMetadata))
+      M.eraseNamedMetadata(old_md);
+
+    for (auto &F : M) {
+      F.removeFnAttr(kCycleAttr);
+      F.removeFnAttr(kCycleLenAttr);
+      F.removeFnAttr(kCycleCanonicalAttr);
+    }
+
+    struct NodeInfo {
+      std::optional<uint64_t> target_pc;
+      bool ambiguous = false;
+      llvm::SmallVector<llvm::Function *, 4> funcs;
+    };
+
+    llvm::DenseMap<uint64_t, NodeInfo> nodes;
+    for (auto &F : M) {
+      if (F.isDeclaration())
+        continue;
+      auto entry_pc = parseTerminalBoundaryFunctionPC(F);
+      auto target_pc = parseTerminalBoundaryTargetAttr(F);
+      if (!entry_pc || !target_pc)
+        continue;
+
+      auto &node = nodes[*entry_pc];
+      node.funcs.push_back(&F);
+      if (!node.target_pc.has_value()) {
+        node.target_pc = *target_pc;
+      } else if (*node.target_pc != *target_pc) {
+        node.ambiguous = true;
+      }
+    }
+
+    llvm::DenseSet<uint64_t> annotated_cycle_nodes;
+    auto *named_md = M.getOrInsertNamedMetadata(kNamedMetadata);
+    auto &ctx = M.getContext();
+    auto *i64_ty = llvm::Type::getInt64Ty(ctx);
+    bool changed = false;
+
+    for (const auto &[start_pc, node] : nodes) {
+      if (annotated_cycle_nodes.contains(start_pc) || node.ambiguous ||
+          !node.target_pc.has_value())
+        continue;
+
+      llvm::SmallVector<uint64_t, 8> path;
+      llvm::DenseMap<uint64_t, unsigned> path_index;
+      uint64_t current_pc = start_pc;
+
+      while (true) {
+        if (annotated_cycle_nodes.contains(current_pc))
+          break;
+
+        auto it = nodes.find(current_pc);
+        if (it == nodes.end() || it->second.ambiguous ||
+            !it->second.target_pc.has_value()) {
+          break;
+        }
+
+        auto [pos_it, inserted] = path_index.try_emplace(current_pc, path.size());
+        if (!inserted) {
+          llvm::SmallVector<uint64_t, 8> cycle_pcs;
+          for (unsigned i = pos_it->second; i < path.size(); ++i)
+            cycle_pcs.push_back(path[i]);
+          if (cycle_pcs.empty())
+            break;
+
+          auto min_it = llvm::min_element(cycle_pcs);
+          std::rotate(cycle_pcs.begin(), min_it, cycle_pcs.end());
+          const std::string cycle_attr = joinTerminalBoundaryCyclePCs(cycle_pcs);
+          const uint64_t canonical_pc = cycle_pcs.front();
+
+          llvm::SmallVector<llvm::Metadata *, 12> md_fields;
+          md_fields.push_back(
+              llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i64_ty,
+                                                                   canonical_pc)));
+          md_fields.push_back(
+              llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i64_ty,
+                                                                   cycle_pcs.size())));
+          for (uint64_t pc : cycle_pcs) {
+            annotated_cycle_nodes.insert(pc);
+            md_fields.push_back(llvm::ConstantAsMetadata::get(
+                llvm::ConstantInt::get(i64_ty, pc)));
+            auto cycle_node_it = nodes.find(pc);
+            if (cycle_node_it == nodes.end())
+              continue;
+            for (auto *F : cycle_node_it->second.funcs) {
+              F->addFnAttr(kCycleAttr, cycle_attr);
+              F->addFnAttr(kCycleLenAttr, std::to_string(cycle_pcs.size()));
+              F->addFnAttr(kCycleCanonicalAttr, llvm::utohexstr(canonical_pc));
+            }
+          }
+
+          named_md->addOperand(llvm::MDTuple::get(ctx, md_fields));
+          changed = true;
+          break;
+        }
+
+        path.push_back(current_pc);
+        current_pc = *it->second.target_pc;
+      }
+    }
+
+    if (!changed) {
+      M.eraseNamedMetadata(named_md);
+      return llvm::PreservedAnalyses::all();
     }
 
     return llvm::PreservedAnalyses::none();
@@ -4555,7 +5094,8 @@ bool runClosedRootSliceContinuationCollapse(llvm::Module &M,
   CollapseMPM.addPass(MarkReachableClosedRootSliceFunctionsPass{});
   CollapseMPM.addPass(MarkClosedRootSliceHelpersForInliningPass());
   CollapseMPM.addPass(RepairBeforeInlinePass{});
-  CollapseMPM.addPass(llvm::AlwaysInlinerPass());
+  if (alwaysInlinerEnabled())
+    CollapseMPM.addPass(llvm::AlwaysInlinerPass());
   CollapseMPM.addPass(llvm::GlobalDCEPass());
   {
     llvm::FunctionPassManager FPM;
@@ -4685,6 +5225,145 @@ struct LateClosedRootSliceContinuationClosurePass
 
 }  // namespace
 
+bool moduleHasGenericStaticDevirtualizationCandidates(const llvm::Module &M) {
+  return moduleHasGenericStaticDevirtualizationCandidatesImpl(M);
+}
+
+bool shouldAutoSkipGenericStaticDevirtualizationForRoot(
+    const llvm::Module &M, bool vm_mode, bool requested_root_is_export,
+    bool force_generic_static_devirtualize,
+    bool root_local_generic_static_devirtualization_shape) {
+  if (vm_mode || force_generic_static_devirtualize ||
+      root_local_generic_static_devirtualization_shape) {
+    return false;
+  }
+  if (requested_root_is_export)
+    return true;
+  return !moduleHasGenericStaticDevirtualizationCandidatesImpl(M);
+}
+
+bool shouldUseStableNoGsdExportRootFallback(
+    bool vm_mode, bool requested_root_is_export, bool use_block_lifting,
+    bool generic_static_devirtualize_requested,
+    bool force_generic_static_devirtualize,
+    uint64_t largest_executable_section_size) {
+  constexpr uint64_t kLargeExecutableSectionBytes = 1ull << 20;
+  return !vm_mode && requested_root_is_export && use_block_lifting &&
+         generic_static_devirtualize_requested &&
+         !force_generic_static_devirtualize &&
+         largest_executable_section_size >= kLargeExecutableSectionBytes;
+}
+
+bool shouldAutoSkipAlwaysInlineForRoot(
+    bool vm_mode, bool requested_root_is_export,
+    bool generic_static_devirtualize_requested,
+    bool generic_static_devirtualize_enabled,
+    bool root_local_generic_static_devirtualization_shape) {
+  return !vm_mode &&
+         !requested_root_is_export &&
+         !root_local_generic_static_devirtualization_shape &&
+         generic_static_devirtualize_requested &&
+         !generic_static_devirtualize_enabled;
+}
+
+llvm::StringRef terminalBoundaryRecoveryStatusName(
+    TerminalBoundaryRecoveryStatus status) {
+  switch (status) {
+    case TerminalBoundaryRecoveryStatus::kClosedCandidate:
+      return "closed_candidate";
+    case TerminalBoundaryRecoveryStatus::kVmLikeOpen:
+      return "vm_like_open";
+    case TerminalBoundaryRecoveryStatus::kLargeOpen:
+      return "large_open";
+    case TerminalBoundaryRecoveryStatus::kTimeout:
+      return "timeout";
+    case TerminalBoundaryRecoveryStatus::kImported:
+      return "imported";
+  }
+  return "unknown";
+}
+
+TerminalBoundaryRecoveryStatus classifyTerminalBoundaryRecoveryMetrics(
+    const TerminalBoundaryRecoveryMetrics &metrics) {
+  const uint32_t dispatch_total =
+      metrics.dispatch_jump + metrics.dispatch_call;
+  if (metrics.declare_blk == 0 && dispatch_total == 0 &&
+      metrics.missing_block_handler == 0) {
+    return TerminalBoundaryRecoveryStatus::kClosedCandidate;
+  }
+
+  if (metrics.define_blk > 2048 || metrics.declare_blk > 512 ||
+      metrics.call_blk > 8192 || dispatch_total > 128) {
+    return TerminalBoundaryRecoveryStatus::kLargeOpen;
+  }
+
+  return TerminalBoundaryRecoveryStatus::kVmLikeOpen;
+}
+
+std::string summarizeTerminalBoundaryRecoveryMetrics(
+    const TerminalBoundaryRecoveryMetrics &metrics) {
+  return ("define_blk=" + llvm::Twine(metrics.define_blk) +
+          ",declare_blk=" + llvm::Twine(metrics.declare_blk) +
+          ",call_blk=" + llvm::Twine(metrics.call_blk) +
+          ",dispatch_jump=" + llvm::Twine(metrics.dispatch_jump) +
+          ",dispatch_call=" + llvm::Twine(metrics.dispatch_call) +
+          ",missing_block_handler=" +
+          llvm::Twine(metrics.missing_block_handler))
+      .str();
+}
+
+void refreshTerminalBoundaryRecoveryMetadata(llvm::Module &M) {
+  static constexpr llvm::StringLiteral kNamedMetadata =
+      "omill.terminal_boundary_recoveries";
+  static constexpr llvm::StringLiteral kStatusAttr =
+      "omill.terminal_boundary_recovery_status";
+  static constexpr llvm::StringLiteral kTargetAttr =
+      "omill.terminal_boundary_recovery_target_va";
+  static constexpr llvm::StringLiteral kSummaryAttr =
+      "omill.terminal_boundary_recovery_summary";
+
+  if (auto *old_md = M.getNamedMetadata(kNamedMetadata))
+    M.eraseNamedMetadata(old_md);
+
+  auto *named_md = M.getOrInsertNamedMetadata(kNamedMetadata);
+  auto &ctx = M.getContext();
+  auto *i64_ty = llvm::Type::getInt64Ty(ctx);
+
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+
+    auto status_attr = F.getFnAttribute(kStatusAttr);
+    if (!status_attr.isValid())
+      continue;
+
+    llvm::SmallVector<llvm::Metadata *, 4> fields;
+    fields.push_back(llvm::MDString::get(ctx, F.getName()));
+    fields.push_back(
+        llvm::MDString::get(ctx, status_attr.getValueAsString()));
+
+    uint64_t target_pc = 0;
+    auto target_attr = F.getFnAttribute(kTargetAttr);
+    if (target_attr.isValid() &&
+        !target_attr.getValueAsString().getAsInteger(16, target_pc) &&
+        target_pc != 0) {
+      fields.push_back(llvm::ConstantAsMetadata::get(
+          llvm::ConstantInt::get(i64_ty, target_pc)));
+    } else {
+      fields.push_back(llvm::ConstantAsMetadata::get(
+          llvm::ConstantInt::get(i64_ty, 0)));
+    }
+
+    auto summary_attr = F.getFnAttribute(kSummaryAttr);
+    fields.push_back(llvm::MDString::get(
+        ctx, summary_attr.isValid() ? summary_attr.getValueAsString() : ""));
+    named_md->addOperand(llvm::MDTuple::get(ctx, fields));
+  }
+
+  if (named_md->getNumOperands() == 0)
+    M.eraseNamedMetadata(named_md);
+}
+
 void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
                               const PipelineOptions &opts) {
   addPhaseMarker(MPM, "ABI: start (target-cpu)");
@@ -4745,8 +5424,11 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
   addClosedSliceShapeProbe(MPM, "abi-post-signatures");
 
   addPhaseMarker(MPM, "ABI: repair+inline lifted → native");
+  MPM.addPass(SeedTerminalSyntheticBoundaryCandidatesPass{});
+  MPM.addPass(PropagateTerminalBoundaryAttrsToNativeRootsPass{});
   MPM.addPass(RepairBeforeInlinePass{});
-  if (!envDisabled("OMILL_SKIP_ABI_ALWAYS_INLINE")) {
+  MPM.addPass(PropagateLoopifiedTerminalBoundaryAttrsPass{});
+  if (abiAlwaysInlinerEnabled()) {
     MPM.addPass(llvm::AlwaysInlinerPass());
   }
   addPhaseMarker(MPM, "ABI: rewrite lifted calls (post-inline)");
@@ -4939,7 +5621,8 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
         // Inline the marked functions.
         {
           llvm::ModulePassManager InlineMPM;
-          InlineMPM.addPass(llvm::AlwaysInlinerPass());
+          if (alwaysInlinerEnabled())
+            InlineMPM.addPass(llvm::AlwaysInlinerPass());
           InlineMPM.run(M, MAM);
         }
 
@@ -5217,10 +5900,12 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
       MPM.addPass(MarkClosedRootSliceNativeHelpersForInliningPass());
       MPM.addPass(MarkClosedRootSliceSemanticHelpersForInliningPass());
       MPM.addPass(RepairBeforeInlinePass{});
-      if (!envDisabled("OMILL_SKIP_ABI_ALWAYS_INLINE"))
+      if (abiAlwaysInlinerEnabled())
         MPM.addPass(llvm::AlwaysInlinerPass());
-      llvm::InlineParams params = llvm::getInlineParams(50);
-      MPM.addPass(llvm::ModuleInlinerWrapperPass(params));
+      if (moduleInlinerEnabled()) {
+        llvm::InlineParams params = llvm::getInlineParams(50);
+        MPM.addPass(llvm::ModuleInlinerWrapperPass(params));
+      }
       MPM.addPass(NeutralizeInlinedFunctionReturnsPass{});
       {
         llvm::FunctionPassManager FPM;
@@ -5272,10 +5957,12 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
       MPM.addPass(MarkOutputRootNativeHelpersForInliningPass());
       MPM.addPass(MarkOutputRootSemanticHelpersForInliningPass());
       MPM.addPass(RepairBeforeInlinePass{});
-      if (!envDisabled("OMILL_SKIP_ABI_ALWAYS_INLINE"))
+      if (abiAlwaysInlinerEnabled())
         MPM.addPass(llvm::AlwaysInlinerPass());
-      llvm::InlineParams second_params = llvm::getInlineParams(50);
-      MPM.addPass(llvm::ModuleInlinerWrapperPass(second_params));
+      if (moduleInlinerEnabled()) {
+        llvm::InlineParams second_params = llvm::getInlineParams(50);
+        MPM.addPass(llvm::ModuleInlinerWrapperPass(second_params));
+      }
       MPM.addPass(NeutralizeInlinedFunctionReturnsPass{});
       {
         llvm::FunctionPassManager FPM;
@@ -5321,10 +6008,12 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
     MPM.addPass(MarkOutputRootNativeHelpersForInliningPass());
     MPM.addPass(MarkOutputRootSemanticHelpersForInliningPass());
     MPM.addPass(RepairBeforeInlinePass{});
-    if (!envDisabled("OMILL_SKIP_ABI_ALWAYS_INLINE"))
+    if (abiAlwaysInlinerEnabled())
       MPM.addPass(llvm::AlwaysInlinerPass());
-    llvm::InlineParams late_output_root_params = llvm::getInlineParams(50);
-    MPM.addPass(llvm::ModuleInlinerWrapperPass(late_output_root_params));
+    if (moduleInlinerEnabled()) {
+      llvm::InlineParams late_output_root_params = llvm::getInlineParams(50);
+      MPM.addPass(llvm::ModuleInlinerWrapperPass(late_output_root_params));
+    }
     MPM.addPass(NeutralizeInlinedFunctionReturnsPass{});
     {
       llvm::FunctionPassManager FPM;
@@ -5351,10 +6040,12 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
     MPM.addPass(MarkOutputRootNativeHelpersForInliningPass());
     MPM.addPass(MarkOutputRootSemanticHelpersForInliningPass());
     MPM.addPass(RepairBeforeInlinePass{});
-    if (!envDisabled("OMILL_SKIP_ABI_ALWAYS_INLINE"))
+    if (abiAlwaysInlinerEnabled())
       MPM.addPass(llvm::AlwaysInlinerPass());
-    llvm::InlineParams final_native_cleanup_params = llvm::getInlineParams(50);
-    MPM.addPass(llvm::ModuleInlinerWrapperPass(final_native_cleanup_params));
+    if (moduleInlinerEnabled()) {
+      llvm::InlineParams final_native_cleanup_params = llvm::getInlineParams(50);
+      MPM.addPass(llvm::ModuleInlinerWrapperPass(final_native_cleanup_params));
+    }
     MPM.addPass(NeutralizeInlinedFunctionReturnsPass{});
     {
       llvm::FunctionPassManager FPM;
@@ -5391,6 +6082,8 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
     MPM.addPass(llvm::GlobalDCEPass());
     MPM.addPass(PropagateTerminalBoundaryAttrsToNativeRootsPass{});
     MPM.addPass(RewriteLoopifiedTerminalBoundaryOutputRootsPass{});
+    MPM.addPass(RewriteIndirectCallTerminalBoundaryOutputRootsPass{});
+    MPM.addPass(RewriteStateWrapperTerminalBoundaryOutputRootsPass{});
     MPM.addPass(AnnotateTerminalBoundaryHandlersPass{});
     addClosedSliceShapeProbe(MPM, "abi-final");
   }
@@ -6019,7 +6712,8 @@ static void buildPreResolutionPipeline(llvm::ModulePassManager &MPM,
   // Phase 0: Inline remill's alwaysinline semantic functions so that
   // subsequent passes can see through them.
   MPM.addPass(RepairBeforeInlinePass{});
-  MPM.addPass(llvm::AlwaysInlinerPass());
+  if (alwaysInlinerEnabled())
+    MPM.addPass(llvm::AlwaysInlinerPass());
 
   // Protect semantic function bodies from Phase 2 function-pass optimizations.
   // Phase 3.6 Step 2b restores alwaysinline before inlining into VM handlers.
@@ -6047,8 +6741,10 @@ static void buildPreResolutionPipeline(llvm::ModulePassManager &MPM,
   // Phase 2: State Optimization
   if (opts.optimize_state) {
     if (opts.deobfuscate && !envDisabled("OMILL_SKIP_STATE_MODULE_INLINER")) {
-       llvm::InlineParams Params = llvm::getInlineParams(2000); // Aggressive threshold
-       MPM.addPass(llvm::ModuleInlinerWrapperPass(Params));
+       if (moduleInlinerEnabled()) {
+         llvm::InlineParams Params = llvm::getInlineParams(2000); // Aggressive threshold
+         MPM.addPass(llvm::ModuleInlinerWrapperPass(Params));
+       }
     }
 
     llvm::FunctionPassManager FPM;
@@ -6110,7 +6806,8 @@ static void buildPreResolutionPipeline(llvm::ModulePassManager &MPM,
     // preserving the full State across the call chain.
     if (!envDisabled("OMILL_SKIP_CF_HANDLER_INLINE")) {
       MPM.addPass(RepairBeforeInlinePass{});
-      MPM.addPass(llvm::AlwaysInlinerPass());
+      if (alwaysInlinerEnabled())
+        MPM.addPass(llvm::AlwaysInlinerPass());
     }
     // Remove inlined handler functions so they don't appear as callers in
     // the call graph, which would prevent InterProceduralConstProp from
@@ -6300,7 +6997,8 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
       MPM.addPass(MarkReachableClosedRootSliceFunctionsPass{});
       MPM.addPass(MarkClosedRootSliceHelpersForInliningPass());
       MPM.addPass(RepairBeforeInlinePass{});
-      MPM.addPass(llvm::AlwaysInlinerPass());
+      if (alwaysInlinerEnabled())
+        MPM.addPass(llvm::AlwaysInlinerPass());
       MPM.addPass(llvm::GlobalDCEPass());
       MPM.addPass(MarkReachableClosedRootSliceFunctionsPass{});
       llvm::FunctionPassManager FPM;
@@ -6392,7 +7090,8 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
       MPM.addPass(LoopifyClosedSliceSelfRecursiveBlockHelpersPass{});
       MPM.addPass(MarkClosedRootSliceHelpersForInliningPass());
       MPM.addPass(RepairBeforeInlinePass{});
-      MPM.addPass(llvm::AlwaysInlinerPass());
+      if (alwaysInlinerEnabled())
+        MPM.addPass(llvm::AlwaysInlinerPass());
       MPM.addPass(llvm::GlobalDCEPass());
       MPM.addPass(MarkReachableClosedRootSliceFunctionsPass{});
       MPM.addPass(CollapseSyntheticBlockContinuationCallsPass(
@@ -7643,12 +8342,21 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
   }
 
   MPM.addPass(llvm::GlobalDCEPass());
+  MPM.addPass(PropagateTerminalBoundaryAttrsToNativeRootsPass{});
+  MPM.addPass(RewriteLoopifiedTerminalBoundaryOutputRootsPass{});
+  MPM.addPass(RewriteIndirectCallTerminalBoundaryOutputRootsPass{});
+  MPM.addPass(RewriteStateWrapperTerminalBoundaryOutputRootsPass{});
+  MPM.addPass(CanonicalizeTerminalBoundaryOutputRootsToProbeCyclePass{});
+  MPM.addPass(AnnotateTerminalBoundaryHandlersPass{});
+  MPM.addPass(AnnotateTerminalBoundaryCyclesPass{});
 }
 
 void buildPostPatchCleanupPipeline(llvm::ModulePassManager &MPM,
                                    unsigned inline_threshold) {
-  llvm::InlineParams params = llvm::getInlineParams(inline_threshold);
-  MPM.addPass(llvm::ModuleInlinerWrapperPass(params));
+  if (moduleInlinerEnabled()) {
+    llvm::InlineParams params = llvm::getInlineParams(inline_threshold);
+    MPM.addPass(llvm::ModuleInlinerWrapperPass(params));
+  }
   buildCleanupPipeline(MPM, CleanupProfile::kBoundary);
   MPM.addPass(llvm::GlobalDCEPass());
 }

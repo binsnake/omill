@@ -121,14 +121,35 @@ std::map<unsigned, VirtualValueExpr> buildSpecializedCallArgumentMap(
     const std::map<StackCellKey, unsigned> &stack_cell_ids,
     const std::map<unsigned, VirtualValueExpr> &caller_outgoing,
     const std::map<unsigned, VirtualValueExpr> &caller_outgoing_stack,
-    const std::map<unsigned, VirtualValueExpr> &caller_argument_map) {
+    const std::map<unsigned, VirtualValueExpr> &caller_argument_map,
+    llvm::ArrayRef<unsigned> requested_arg_indices) {
   std::map<unsigned, VirtualValueExpr> specialized_args;
   auto caller_name = call.getFunction() ? call.getFunction()->getName().str()
                                         : std::string("<null>");
   auto callee_name = call.getCalledFunction()
                          ? call.getCalledFunction()->getName().str()
                          : std::string("<indirect>");
-  for (unsigned arg_index = 0; arg_index < call.arg_size(); ++arg_index) {
+  if (requested_arg_indices.empty()) {
+    for (unsigned arg_index = 0; arg_index < call.arg_size(); ++arg_index) {
+      vmModelStageDebugLog("call-arg-specialize: caller=" + caller_name +
+                           " callee=" + callee_name + " arg=" +
+                           llvm::Twine(arg_index).str() + " step=begin");
+      specialized_args.emplace(
+          arg_index,
+          summarizeSpecializedCallArg(call, arg_index, dl, slot_ids,
+                                      stack_cell_ids, caller_outgoing,
+                                      caller_outgoing_stack,
+                                      caller_argument_map));
+      vmModelStageDebugLog("call-arg-specialize: caller=" + caller_name +
+                           " callee=" + callee_name + " arg=" +
+                           llvm::Twine(arg_index).str() + " step=done");
+    }
+    return specialized_args;
+  }
+
+  for (unsigned arg_index : requested_arg_indices) {
+    if (arg_index >= call.arg_size())
+      continue;
     vmModelStageDebugLog("call-arg-specialize: caller=" + caller_name +
                          " callee=" + callee_name + " arg=" +
                          llvm::Twine(arg_index).str() + " step=begin");

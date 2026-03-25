@@ -181,6 +181,54 @@ TEST_F(VirtualCFGMaterializationTest, MaterializesMustTailJumpFromVirtualFacts) 
 }
 
 TEST_F(VirtualCFGMaterializationTest,
+       MaterializesSelfMustTailJumpFromVirtualFacts) {
+  auto M = createModule();
+  auto *i8_ty = llvm::Type::getInt8Ty(Ctx);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+
+  auto *dispatch = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "__omill_dispatch_jump", *M);
+
+  auto *caller = llvm::Function::Create(lifted_ty,
+                                        llvm::Function::ExternalLinkage,
+                                        "sub_180004900", *M);
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", caller);
+  llvm::IRBuilder<> B(entry);
+  auto *slot = B.CreateGEP(i8_ty, caller->getArg(0), B.getInt64(0x108));
+  B.CreateStore(B.getInt64(0x180004900ULL), slot);
+  auto *loaded = B.CreateLoad(i64_ty, slot);
+  auto *dispatch_call =
+      B.CreateCall(dispatch, {caller->getArg(0), loaded, caller->getArg(2)});
+  B.CreateRet(dispatch_call);
+
+  runPass(*M);
+
+  unsigned dispatch_calls = 0;
+  llvm::CallInst *self_tail = nullptr;
+  for (auto &BB : *caller) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *callee = CI->getCalledFunction();
+      if (!callee)
+        continue;
+      if (callee->getName() == "__omill_dispatch_jump")
+        ++dispatch_calls;
+      if (callee == caller)
+        self_tail = CI;
+    }
+  }
+
+  EXPECT_EQ(dispatch_calls, 0u);
+  ASSERT_NE(self_tail, nullptr);
+  EXPECT_EQ(self_tail->getTailCallKind(), llvm::CallInst::TCK_MustTail);
+}
+
+TEST_F(VirtualCFGMaterializationTest,
        CollapsesTerminalMissingBlockStubToDirectMissingBlockCall) {
   auto M = createModule();
   auto *i8_ty = llvm::Type::getInt8Ty(Ctx);
@@ -318,6 +366,81 @@ TEST_F(VirtualCFGMaterializationTest,
   auto *pc_arg = llvm::dyn_cast<llvm::ConstantInt>(direct_call->getArgOperand(1));
   ASSERT_NE(pc_arg, nullptr);
   EXPECT_EQ(pc_arg->getZExtValue(), 0x180011140ULL);
+}
+
+TEST_F(VirtualCFGMaterializationTest,
+       MaterializesTerminalMissingBlockFromNearbyNextPcFacts) {
+  auto M = createModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+
+  auto *jmpi = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage,
+      "_ZN12_GLOBAL__N_13JMPI2RnImLb1EEEEP6MemoryS4_R5StateT_3RnWImE", *M);
+  auto *missing = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "__remill_missing_block", *M);
+
+  auto *target = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "blk_180021140", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target->getArg(0));
+  }
+
+  auto *caller = llvm::Function::Create(lifted_ty,
+                                        llvm::Function::ExternalLinkage,
+                                        "blk_1800210ce", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", caller);
+    llvm::IRBuilder<> B(entry);
+    auto *next_pc = B.CreateAlloca(i64_ty, nullptr, "NEXT_PC");
+    B.CreateStore(B.getInt64(0x180021145ULL), next_pc);
+    auto *target_pc = B.CreateLoad(i64_ty, next_pc);
+    B.CreateCall(jmpi, {caller->getArg(2), caller->getArg(0), target_pc, next_pc});
+    auto *call = B.CreateCall(
+        missing, {caller->getArg(0), B.getInt64(0xFFFFFFFFAC9B1737ULL),
+                  caller->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  std::vector<uint8_t> image(0x4000, 0x90);
+  omill::BinaryMemoryMap map;
+  map.setImageBase(0x180020000ULL);
+  map.setImageSize(image.size());
+  map.addRegion(0x180020000ULL, image.data(), image.size(), false,
+                /*executable=*/true);
+
+  runPass(*M, std::move(map));
+
+  unsigned missing_calls = 0;
+  unsigned direct_calls = 0;
+  llvm::CallInst *direct_call = nullptr;
+  for (auto &BB : *caller) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *callee = CI->getCalledFunction();
+      if (!callee)
+        continue;
+      if (callee->getName() == "__remill_missing_block")
+        ++missing_calls;
+      if (callee == target) {
+        ++direct_calls;
+        direct_call = CI;
+      }
+    }
+  }
+
+  EXPECT_EQ(missing_calls, 0u);
+  EXPECT_EQ(direct_calls, 1u);
+  ASSERT_NE(direct_call, nullptr);
+  auto *pc_arg = llvm::dyn_cast<llvm::ConstantInt>(direct_call->getArgOperand(1));
+  ASSERT_NE(pc_arg, nullptr);
+  EXPECT_EQ(pc_arg->getZExtValue(), 0x180021140ULL);
 }
 
 TEST_F(VirtualCFGMaterializationTest,

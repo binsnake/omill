@@ -80,7 +80,8 @@ std::map<unsigned, VirtualValueExpr> buildSpecializedCallArgumentMap(
     const std::map<StackCellKey, unsigned> &stack_cell_ids,
     const std::map<unsigned, VirtualValueExpr> &caller_outgoing,
     const std::map<unsigned, VirtualValueExpr> &caller_outgoing_stack,
-    const std::map<unsigned, VirtualValueExpr> &caller_argument_map);
+    const std::map<unsigned, VirtualValueExpr> &caller_argument_map,
+    llvm::ArrayRef<unsigned> requested_arg_indices = {});
 std::optional<uint64_t> resolveSpecializedExprToConstant(
     const VirtualValueExpr &expr,
     const std::map<unsigned, VirtualValueExpr> &caller_outgoing,
@@ -117,7 +118,10 @@ computeCallsiteLocalizedOutgoingFacts(
     const std::map<unsigned, VirtualValueExpr> *fallback_caller_slot_facts =
         nullptr,
     const std::map<StackCellKey, VirtualValueExpr>
-        *fallback_caller_structural_stack_facts = nullptr);
+        *fallback_caller_structural_stack_facts = nullptr,
+    LocalizedReplayCacheState *localized_replay_cache = nullptr,
+    const LocalCallSiteState *precomputed_local_call_state = nullptr,
+    llvm::StringRef specialized_arg_cache_key_hint = "");
 std::optional<CallsiteLocalizedOutgoingFacts>
 computeResolvedCallTargetOutgoingFacts(
     llvm::CallBase &call, const VirtualMachineModel &model,
@@ -221,7 +225,10 @@ bool applySingleDirectCalleeEffects(
     const std::map<unsigned, VirtualValueExpr> *fallback_caller_stack_facts =
         nullptr,
     const std::map<unsigned, VirtualValueExpr> *fallback_caller_slot_facts =
-        nullptr);
+        nullptr,
+    LocalizedReplayCacheState *localized_replay_cache = nullptr,
+    llvm::ArrayRef<unsigned> relevant_caller_slot_ids = {},
+    llvm::ArrayRef<unsigned> relevant_caller_stack_cell_ids = {});
 void applyDirectCalleeEffectsImpl(
     llvm::Function &caller_fn, const VirtualMachineModel &model,
     const std::map<std::string, size_t> &handler_index,
@@ -238,7 +245,10 @@ void applyDirectCalleeEffectsImpl(
     const std::map<unsigned, const VirtualStackCellInfo *> &stack_cell_info,
     const llvm::DataLayout &dl, const BinaryMemoryMap &binary_memory,
     unsigned depth,
-    llvm::SmallPtrSetImpl<const llvm::Function *> &visiting);
+    llvm::SmallPtrSetImpl<const llvm::Function *> &visiting,
+    LocalizedReplayCacheState *localized_replay_cache = nullptr,
+    llvm::ArrayRef<unsigned> relevant_caller_slot_ids = {},
+    llvm::ArrayRef<unsigned> relevant_caller_stack_cell_ids = {});
 void applyDirectCalleeEffects(
     llvm::Function &caller_fn, const VirtualMachineModel &model,
     const std::map<std::string, size_t> &handler_index,
@@ -248,7 +258,10 @@ void applyDirectCalleeEffects(
     const std::map<unsigned, VirtualValueExpr> &caller_argument_map,
     std::map<unsigned, VirtualValueExpr> &caller_outgoing,
     std::map<unsigned, VirtualValueExpr> &caller_outgoing_stack,
-    const BinaryMemoryMap &binary_memory);
+    const BinaryMemoryMap &binary_memory,
+    LocalizedReplayCacheState *localized_replay_cache = nullptr,
+    llvm::ArrayRef<unsigned> relevant_caller_slot_ids = {},
+    llvm::ArrayRef<unsigned> relevant_caller_stack_cell_ids = {});
 bool canRecursivelyLocalizeCallsiteSummary(
     const VirtualHandlerSummary &summary, unsigned depth);
 bool isCallerStateArgumentExpr(const VirtualValueExpr &expr);
@@ -275,6 +288,8 @@ std::optional<std::string> resolveBoundaryNameForTarget(
     uint64_t pc);
 bool isTargetMapped(const BinaryMemoryMap &binary_memory, uint64_t target_pc);
 bool isTargetExecutable(const BinaryMemoryMap &binary_memory, uint64_t target_pc);
+const BinaryMemoryMap::ImportEntry *lookupImportTarget(
+    const BinaryMemoryMap &binary_memory, uint64_t target_pc);
 TargetArch targetArchForModule(llvm::Module &M);
 std::optional<bool> isTargetDecodableEntry(
     const BinaryMemoryMap &binary_memory, uint64_t target_pc, TargetArch arch);

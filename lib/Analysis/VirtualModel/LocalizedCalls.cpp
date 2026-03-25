@@ -6,6 +6,194 @@
 
 namespace omill::virtual_model::detail {
 
+namespace {
+
+static void appendExprMapCacheKey(
+    llvm::raw_ostream &os, const std::map<unsigned, VirtualValueExpr> &facts,
+    llvm::StringRef label) {
+  os << label << "{";
+  for (const auto &[id, value] : facts)
+    os << id << "=" << renderVirtualValueExpr(value) << ";";
+  os << "}";
+}
+
+static void appendRelevantSlotFactMapCacheKey(
+    llvm::raw_ostream &os, const std::map<unsigned, VirtualValueExpr> &facts,
+    llvm::StringRef label, const VirtualHandlerSummary &callee_summary,
+    const std::map<unsigned, const VirtualStateSlotInfo *> &slot_info) {
+  llvm::SmallDenseSet<unsigned, 16> relevant_ids(
+      callee_summary.live_in_slot_ids.begin(),
+      callee_summary.live_in_slot_ids.end());
+  os << label << "{";
+  for (const auto &[id, value] : facts) {
+    bool include = relevant_ids.count(id) != 0;
+    if (!include) {
+      auto info_it = slot_info.find(id);
+      include = info_it != slot_info.end() && info_it->second->from_argument;
+    }
+    if (!include)
+      continue;
+    os << id << "=" << renderVirtualValueExpr(value) << ";";
+  }
+  os << "}";
+}
+
+static void appendRelevantStackFactMapCacheKey(
+    llvm::raw_ostream &os, const std::map<unsigned, VirtualValueExpr> &facts,
+    llvm::StringRef label, const VirtualHandlerSummary &callee_summary,
+    const std::map<unsigned, const VirtualStackCellInfo *> &stack_cell_info) {
+  llvm::SmallDenseSet<unsigned, 16> relevant_ids(
+      callee_summary.live_in_stack_cell_ids.begin(),
+      callee_summary.live_in_stack_cell_ids.end());
+  os << label << "{";
+  for (const auto &[id, value] : facts) {
+    bool include = relevant_ids.count(id) != 0;
+    if (!include) {
+      auto info_it = stack_cell_info.find(id);
+      include =
+          info_it != stack_cell_info.end() && info_it->second->base_from_argument;
+    }
+    if (!include)
+      continue;
+    os << id << "=" << renderVirtualValueExpr(value) << ";";
+  }
+  os << "}";
+}
+
+static void appendRelevantArgumentFactMapCacheKey(
+    llvm::raw_ostream &os, const std::map<unsigned, VirtualValueExpr> &facts,
+    llvm::StringRef label, llvm::ArrayRef<unsigned> relevant_arg_indices) {
+  os << label << "{";
+  for (const auto &[id, value] : facts) {
+    if (!std::binary_search(relevant_arg_indices.begin(),
+                            relevant_arg_indices.end(), id)) {
+      continue;
+    }
+    os << id << "=" << renderVirtualValueExpr(value) << ";";
+  }
+  os << "}";
+}
+
+static void appendStructuralStackMapCacheKey(
+    llvm::raw_ostream &os,
+    const std::map<StackCellKey, VirtualValueExpr> &facts,
+    llvm::StringRef label) {
+  os << label << "{";
+  for (const auto &[key, value] : facts) {
+    os << key.base_slot.base_name << ":" << key.base_slot.offset << ":"
+       << key.base_slot.width << ":" << key.base_slot.from_argument << ":"
+       << key.base_slot.from_alloca << ":" << key.cell_offset << ":"
+       << key.width << "=" << renderVirtualValueExpr(value) << ";";
+  }
+  os << "}";
+}
+
+static std::string buildCallsiteLocalizedReplayCacheKey(
+    const llvm::Function &callee_fn, const VirtualHandlerSummary &callee_summary,
+    const std::map<unsigned, const VirtualStateSlotInfo *> &slot_info,
+    const std::map<unsigned, const VirtualStackCellInfo *> &stack_cell_info,
+    const std::map<unsigned, VirtualValueExpr> &callee_incoming,
+    const std::map<unsigned, VirtualValueExpr> &callee_incoming_stack,
+    const std::map<unsigned, VirtualValueExpr> &callee_localized_args,
+    const std::map<unsigned, VirtualValueExpr> &caller_outgoing,
+    const std::map<unsigned, VirtualValueExpr> &caller_outgoing_stack,
+    const std::map<unsigned, VirtualValueExpr> &caller_argument_map,
+    llvm::ArrayRef<unsigned> relevant_arg_indices,
+    const std::map<StackCellKey, VirtualValueExpr>
+        *caller_structural_stack_facts,
+    const std::map<unsigned, VirtualValueExpr> *fallback_caller_stack_facts,
+    const std::map<unsigned, VirtualValueExpr> *fallback_caller_slot_facts,
+    const std::map<StackCellKey, VirtualValueExpr>
+        *fallback_caller_structural_stack_facts,
+    unsigned depth) {
+  std::string key_storage;
+  llvm::raw_string_ostream os(key_storage);
+  os << callee_fn.getName() << "|fp="
+     << summaryRelevantFunctionFingerprint(callee_fn) << "|depth=" << depth
+     << "|";
+  appendExprMapCacheKey(os, callee_incoming, "in");
+  appendExprMapCacheKey(os, callee_incoming_stack, "stack");
+  appendExprMapCacheKey(os, callee_localized_args, "args");
+  appendRelevantSlotFactMapCacheKey(os, caller_outgoing, "caller_out",
+                                    callee_summary, slot_info);
+  appendRelevantStackFactMapCacheKey(os, caller_outgoing_stack, "caller_stack",
+                                     callee_summary, stack_cell_info);
+  appendRelevantArgumentFactMapCacheKey(os, caller_argument_map, "caller_args",
+                                        relevant_arg_indices);
+  if (caller_structural_stack_facts)
+    appendStructuralStackMapCacheKey(os, *caller_structural_stack_facts,
+                                     "caller_struct");
+  if (fallback_caller_stack_facts)
+    appendRelevantStackFactMapCacheKey(os, *fallback_caller_stack_facts,
+                                       "fallback_stack", callee_summary,
+                                       stack_cell_info);
+  if (fallback_caller_slot_facts)
+    appendRelevantSlotFactMapCacheKey(os, *fallback_caller_slot_facts,
+                                      "fallback_slot", callee_summary,
+                                      slot_info);
+  if (fallback_caller_structural_stack_facts) {
+    appendStructuralStackMapCacheKey(os, *fallback_caller_structural_stack_facts,
+                                     "fallback_struct");
+  }
+  os.flush();
+  return key_storage;
+}
+
+static void collectReferencedArgumentIds(const VirtualValueExpr &expr,
+                                        llvm::SmallDenseSet<unsigned, 8> &ids) {
+  if (expr.kind == VirtualExprKind::kArgument && expr.argument_index.has_value())
+    ids.insert(*expr.argument_index);
+  for (const auto &operand : expr.operands)
+    collectReferencedArgumentIds(operand, ids);
+}
+
+static llvm::SmallVector<unsigned, 4> collectLocalizedCallArgumentIndices(
+    const VirtualHandlerSummary &callee_summary,
+    const std::map<unsigned, const VirtualStateSlotInfo *> &slot_info,
+    const std::map<unsigned, const VirtualStackCellInfo *> &stack_cell_info) {
+  llvm::SmallDenseSet<unsigned, 8> arg_indices;
+  for (const auto &fact : callee_summary.incoming_argument_facts)
+    arg_indices.insert(fact.argument_index);
+  for (unsigned slot_id : callee_summary.live_in_slot_ids) {
+    auto info_it = slot_info.find(slot_id);
+    if (info_it == slot_info.end())
+      continue;
+    if (auto arg_index = parseArgumentBaseName(info_it->second->base_name))
+      arg_indices.insert(*arg_index);
+  }
+  for (unsigned cell_id : callee_summary.live_in_stack_cell_ids) {
+    auto info_it = stack_cell_info.find(cell_id);
+    if (info_it == stack_cell_info.end())
+      continue;
+    if (auto arg_index = parseArgumentBaseName(info_it->second->base_name))
+      arg_indices.insert(*arg_index);
+  }
+  for (const auto &dispatch : callee_summary.dispatches)
+    collectReferencedArgumentIds(dispatch.target, arg_indices);
+  for (const auto &callsite : callee_summary.callsites)
+    collectReferencedArgumentIds(callsite.target, arg_indices);
+  for (const auto &transfer : callee_summary.state_transfers)
+    collectReferencedArgumentIds(transfer.value, arg_indices);
+  for (const auto &transfer : callee_summary.stack_transfers)
+    collectReferencedArgumentIds(transfer.value, arg_indices);
+
+  llvm::SmallVector<unsigned, 4> requested_arg_indices(arg_indices.begin(),
+                                                       arg_indices.end());
+  llvm::sort(requested_arg_indices);
+  return requested_arg_indices;
+}
+
+static void appendRequestedArgIndexCacheKey(llvm::raw_ostream &os,
+                                            llvm::ArrayRef<unsigned> arg_indices) {
+  if (arg_indices.empty())
+    return;
+  os << "|requested_args=";
+  for (unsigned arg_index : arg_indices)
+    os << arg_index << ',';
+}
+
+}  // namespace
+
 static void applyLocalizedCallsiteReturnEffects(
     llvm::Function &caller_fn, const VirtualMachineModel &model,
     const VirtualHandlerSummary &caller_summary,
@@ -22,7 +210,8 @@ static void applyLocalizedCallsiteReturnEffects(
     std::map<unsigned, VirtualValueExpr> &caller_outgoing,
     std::map<unsigned, VirtualValueExpr> &caller_outgoing_stack,
     const BinaryMemoryMap &binary_memory, unsigned depth,
-    llvm::SmallPtrSetImpl<const llvm::Function *> &visiting);
+    llvm::SmallPtrSetImpl<const llvm::Function *> &visiting,
+    LocalizedReplayCacheState *localized_replay_cache);
 
 std::optional<CallsiteLocalizedOutgoingFacts> computeCallsiteLocalizedOutgoingFacts(
     llvm::CallBase &call, const VirtualMachineModel &model,
@@ -45,7 +234,10 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeCallsiteLocalizedOutgoingFa
     const std::map<unsigned, VirtualValueExpr> *fallback_caller_stack_facts,
     const std::map<unsigned, VirtualValueExpr> *fallback_caller_slot_facts,
     const std::map<StackCellKey, VirtualValueExpr>
-        *fallback_caller_structural_stack_facts) {
+        *fallback_caller_structural_stack_facts,
+    LocalizedReplayCacheState *localized_replay_cache,
+    const LocalCallSiteState *precomputed_local_call_state,
+    llvm::StringRef specialized_arg_cache_key_hint) {
   auto *callee_fn = call.getCalledFunction();
   if (!callee_fn)
     return std::nullopt;
@@ -65,19 +257,121 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeCallsiteLocalizedOutgoingFa
   std::map<unsigned, VirtualValueExpr> callee_incoming_args;
   std::map<unsigned, VirtualValueExpr> callee_localized_args;
   const auto native_sp_offset = nativeStackPointerOffsetForValue(&call);
-  const auto specialized_call_args = [&]() {
-    if (native_sp_offset.has_value()) {
-      auto local_call_state = computeLocalFactsBeforeCall(
-          call, dl, slot_ids, stack_cell_ids, caller_outgoing,
-          caller_outgoing_stack, caller_argument_map);
-      return buildSpecializedCallArgumentMap(
-          call, dl, slot_ids, stack_cell_ids, local_call_state.slot_facts,
-          local_call_state.stack_facts, caller_argument_map);
+  auto requested_arg_indices = collectLocalizedCallArgumentIndices(
+      callee_summary, slot_info, stack_cell_info);
+  std::optional<LocalCallSiteState> cached_local_call_state;
+  std::string precall_state_cache_key;
+  if (!precomputed_local_call_state && localized_replay_cache &&
+      native_sp_offset.has_value() && !specialized_arg_cache_key_hint.empty()) {
+    precall_state_cache_key =
+        std::string("precall|") + specialized_arg_cache_key_hint.str();
+    auto cache_it =
+        localized_replay_cache->precall_state_entries.find(precall_state_cache_key);
+    if (cache_it != localized_replay_cache->precall_state_entries.end()) {
+      ++localized_replay_cache->precall_state_hits;
+      cached_local_call_state = cache_it->second;
+      precomputed_local_call_state = &*cached_local_call_state;
+    } else if (localized_replay_cache->persistent_precall_state_entries) {
+      auto persistent_it =
+          localized_replay_cache->persistent_precall_state_entries->find(
+              precall_state_cache_key);
+      if (persistent_it !=
+          localized_replay_cache->persistent_precall_state_entries->end()) {
+        ++localized_replay_cache->precall_state_hits;
+        cached_local_call_state = persistent_it->second;
+        localized_replay_cache->precall_state_entries.emplace(
+            precall_state_cache_key, *cached_local_call_state);
+        precomputed_local_call_state = &*cached_local_call_state;
+      }
     }
-    return buildSpecializedCallArgumentMap(
-        call, dl, slot_ids, stack_cell_ids, caller_outgoing,
-        caller_outgoing_stack, caller_argument_map);
-  }();
+  }
+  std::map<unsigned, VirtualValueExpr> specialized_call_args;
+  bool have_cached_specialized_call_args = false;
+  std::string specialized_call_args_cache_key;
+  if (localized_replay_cache && !specialized_arg_cache_key_hint.empty()) {
+    specialized_call_args_cache_key =
+        std::string("callsite-full-args|") +
+        specialized_arg_cache_key_hint.str();
+    llvm::raw_string_ostream os(specialized_call_args_cache_key);
+    appendRequestedArgIndexCacheKey(os, requested_arg_indices);
+    os.flush();
+    auto cache_it = localized_replay_cache->specialized_call_arg_entries.find(
+        specialized_call_args_cache_key);
+    if (cache_it != localized_replay_cache->specialized_call_arg_entries.end()) {
+      ++localized_replay_cache->specialized_call_arg_hits;
+      specialized_call_args = cache_it->second;
+      have_cached_specialized_call_args = true;
+    } else if (localized_replay_cache->persistent_specialized_call_arg_entries) {
+      auto persistent_it =
+          localized_replay_cache->persistent_specialized_call_arg_entries->find(
+              specialized_call_args_cache_key);
+      if (persistent_it !=
+          localized_replay_cache->persistent_specialized_call_arg_entries
+              ->end()) {
+        ++localized_replay_cache->specialized_call_arg_hits;
+        specialized_call_args = persistent_it->second;
+        localized_replay_cache->specialized_call_arg_entries.emplace(
+            specialized_call_args_cache_key, specialized_call_args);
+        have_cached_specialized_call_args = true;
+      }
+    }
+  }
+  if (!have_cached_specialized_call_args) {
+    if (localized_replay_cache)
+      ++localized_replay_cache->specialized_call_arg_misses;
+    const auto specialized_args_begin = std::chrono::steady_clock::now();
+    if (native_sp_offset.has_value()) {
+      if (precomputed_local_call_state) {
+        specialized_call_args = buildSpecializedCallArgumentMap(
+            call, dl, slot_ids, stack_cell_ids,
+            precomputed_local_call_state->slot_facts,
+            precomputed_local_call_state->stack_facts, caller_argument_map,
+            requested_arg_indices);
+      } else {
+        if (localized_replay_cache)
+          ++localized_replay_cache->precall_state_misses;
+        const auto precall_begin = std::chrono::steady_clock::now();
+        auto local_call_state = computeLocalFactsBeforeCall(
+            call, dl, slot_ids, stack_cell_ids, caller_outgoing,
+            caller_outgoing_stack, caller_argument_map);
+        if (localized_replay_cache) {
+          localized_replay_cache->precall_state_build_ms +=
+              elapsedMilliseconds(precall_begin,
+                                  std::chrono::steady_clock::now());
+          if (!precall_state_cache_key.empty()) {
+            localized_replay_cache->precall_state_entries.emplace(
+                precall_state_cache_key, local_call_state);
+            if (localized_replay_cache->persistent_precall_state_entries) {
+              localized_replay_cache->persistent_precall_state_entries
+                  ->insert_or_assign(precall_state_cache_key, local_call_state);
+            }
+          }
+        }
+        specialized_call_args = buildSpecializedCallArgumentMap(
+            call, dl, slot_ids, stack_cell_ids, local_call_state.slot_facts,
+            local_call_state.stack_facts, caller_argument_map,
+            requested_arg_indices);
+      }
+    } else {
+      specialized_call_args = buildSpecializedCallArgumentMap(
+          call, dl, slot_ids, stack_cell_ids, caller_outgoing,
+          caller_outgoing_stack, caller_argument_map, requested_arg_indices);
+    }
+    if (localized_replay_cache) {
+      localized_replay_cache->specialized_call_arg_build_ms +=
+          elapsedMilliseconds(specialized_args_begin,
+                              std::chrono::steady_clock::now());
+      if (!specialized_call_args_cache_key.empty()) {
+        localized_replay_cache->specialized_call_arg_entries.emplace(
+            specialized_call_args_cache_key, specialized_call_args);
+        if (localized_replay_cache->persistent_specialized_call_arg_entries) {
+          localized_replay_cache->persistent_specialized_call_arg_entries
+              ->insert_or_assign(specialized_call_args_cache_key,
+                                 specialized_call_args);
+        }
+      }
+    }
+  }
   log_localization_step("specialized-args-done");
 
   for (const auto &fact : callee_summary.specialization_facts)
@@ -217,14 +511,65 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeCallsiteLocalizedOutgoingFa
   CallsiteLocalizedOutgoingFacts localized;
   if (canComputeLocalizedSingleBlockOutgoingFacts(*callee_fn, callee_summary)) {
     log_localization_step("leaf-replay-begin");
-    if (auto leaf_localized = computeLocalizedSingleBlockOutgoingFacts(
-            *callee_fn, model, callee_summary, slot_ids, stack_cell_ids,
-            callee_incoming, callee_incoming_stack, callee_localized_args,
-            handler_index, outgoing_maps, outgoing_stack_maps, binary_memory,
-            depth + 1, visiting, &call, &caller_outgoing_stack,
-            &caller_outgoing, caller_structural_stack_facts,
-            fallback_caller_stack_facts, fallback_caller_slot_facts,
-            fallback_caller_structural_stack_facts)) {
+    const bool cacheable_leaf =
+        localized_replay_cache && callee_summary.direct_callees.empty() &&
+        callee_summary.callsites.empty();
+    std::optional<CallsiteLocalizedOutgoingFacts> leaf_localized;
+    bool have_cached_leaf = false;
+    std::string cache_key;
+    if (cacheable_leaf) {
+      const auto key_begin = std::chrono::steady_clock::now();
+      cache_key = buildCallsiteLocalizedReplayCacheKey(
+          *callee_fn, callee_summary, slot_info, stack_cell_info,
+          callee_incoming, callee_incoming_stack,
+          callee_localized_args, caller_outgoing, caller_outgoing_stack,
+          caller_argument_map, requested_arg_indices,
+          caller_structural_stack_facts,
+          fallback_caller_stack_facts, fallback_caller_slot_facts,
+          fallback_caller_structural_stack_facts, depth);
+      if (localized_replay_cache) {
+        localized_replay_cache->callsite_key_build_ms +=
+            elapsedMilliseconds(key_begin, std::chrono::steady_clock::now());
+      }
+      auto cache_it = localized_replay_cache->callsite_entries.find(cache_key);
+      if (cache_it != localized_replay_cache->callsite_entries.end()) {
+        ++localized_replay_cache->callsite_hits;
+        have_cached_leaf = true;
+        leaf_localized = cache_it->second;
+      } else if (localized_replay_cache->persistent_callsite_entries) {
+        auto persistent_it =
+            localized_replay_cache->persistent_callsite_entries->find(cache_key);
+        if (persistent_it !=
+            localized_replay_cache->persistent_callsite_entries->end()) {
+          ++localized_replay_cache->callsite_hits;
+          have_cached_leaf = true;
+          leaf_localized = persistent_it->second;
+          localized_replay_cache->callsite_entries.emplace(cache_key,
+                                                           leaf_localized);
+        }
+      }
+    }
+    if (!cacheable_leaf || !have_cached_leaf) {
+      if (cacheable_leaf)
+        ++localized_replay_cache->callsite_misses;
+      leaf_localized = computeLocalizedSingleBlockOutgoingFacts(
+          *callee_fn, model, callee_summary, slot_ids, stack_cell_ids,
+          callee_incoming, callee_incoming_stack, callee_localized_args,
+          handler_index, outgoing_maps, outgoing_stack_maps, binary_memory,
+          depth + 1, visiting, &call, &caller_outgoing_stack, &caller_outgoing,
+          caller_structural_stack_facts, fallback_caller_stack_facts,
+          fallback_caller_slot_facts, fallback_caller_structural_stack_facts,
+          localized_replay_cache);
+      if (cacheable_leaf) {
+        localized_replay_cache->callsite_entries.emplace(cache_key,
+                                                         leaf_localized);
+        if (localized_replay_cache->persistent_callsite_entries) {
+          localized_replay_cache->persistent_callsite_entries->insert_or_assign(
+              cache_key, leaf_localized);
+        }
+      }
+    }
+    if (leaf_localized) {
       log_localization_step("leaf-replay-done");
       visiting.erase(callee_fn);
       return leaf_localized;
@@ -233,16 +578,9 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeCallsiteLocalizedOutgoingFa
   }
 
   log_localization_step("summary-outgoing-begin");
-  for (const auto &fact : computeOutgoingFacts(callee_summary, callee_incoming,
-                                               callee_incoming_stack,
-                                               callee_incoming_args)) {
-    localized.outgoing_slots.emplace(fact.slot_id, fact.value);
-  }
-  for (const auto &fact :
-       computeOutgoingStackFacts(callee_summary, callee_incoming,
-                                 callee_incoming_stack, callee_incoming_args)) {
-    localized.outgoing_stack.emplace(fact.cell_id, fact.value);
-  }
+  computeOutgoingFactMaps(callee_summary, callee_incoming, callee_incoming_stack,
+                          callee_incoming_args, localized.outgoing_slots,
+                          localized.outgoing_stack);
   log_localization_step("summary-outgoing-done");
   if (!callee_summary.direct_callees.empty()) {
     log_localization_step("direct-callees-begin");
@@ -250,7 +588,8 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeCallsiteLocalizedOutgoingFa
         *callee_fn, model, handler_index, outgoing_maps, outgoing_stack_maps,
         callee_incoming_args, localized.outgoing_slots, localized.outgoing_stack,
         localized.structural_outgoing_stack, slot_ids, slot_info, stack_cell_ids,
-        stack_cell_info, dl, binary_memory, depth + 1, visiting);
+        stack_cell_info, dl, binary_memory, depth + 1, visiting,
+        localized_replay_cache);
     log_localization_step("direct-callees-done");
   }
   if (!callee_summary.callsites.empty()) {
@@ -260,7 +599,7 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeCallsiteLocalizedOutgoingFa
         stack_cell_ids, handler_index, outgoing_maps, outgoing_stack_maps,
         callee_incoming, callee_incoming_stack, callee_incoming_args,
         localized.outgoing_slots, localized.outgoing_stack, binary_memory,
-        depth + 1, visiting);
+        depth + 1, visiting, localized_replay_cache);
     log_localization_step("callsites-done");
   }
   if (!callee_summary.direct_callees.empty()) {
@@ -387,23 +726,16 @@ computeResolvedCallTargetOutgoingFacts(
     }
   }
 
-  for (const auto &fact : computeOutgoingFacts(target_summary, callee_incoming,
-                                               callee_incoming_stack,
-                                               callee_incoming_args)) {
-    localized.outgoing_slots.emplace(fact.slot_id, fact.value);
-  }
-  for (const auto &fact :
-       computeOutgoingStackFacts(target_summary, callee_incoming,
-                                 callee_incoming_stack, callee_incoming_args)) {
-    localized.outgoing_stack.emplace(fact.cell_id, fact.value);
-  }
+  computeOutgoingFactMaps(target_summary, callee_incoming,
+                          callee_incoming_stack, callee_incoming_args,
+                          localized.outgoing_slots, localized.outgoing_stack);
 
   if (!target_summary.direct_callees.empty()) {
     applyDirectCalleeEffectsImpl(
         *target_fn, model, handler_index, outgoing_maps, outgoing_stack_maps,
         callee_incoming_args, localized.outgoing_slots, localized.outgoing_stack,
         localized.structural_outgoing_stack, slot_ids, slot_info, stack_cell_ids,
-        stack_cell_info, dl, binary_memory, depth + 1, visiting);
+        stack_cell_info, dl, binary_memory, depth + 1, visiting, nullptr);
   }
   if (!target_summary.callsites.empty()) {
     applyLocalizedCallsiteReturnEffects(
@@ -411,7 +743,7 @@ computeResolvedCallTargetOutgoingFacts(
         stack_cell_ids, handler_index, outgoing_maps, outgoing_stack_maps,
         callee_incoming, callee_incoming_stack, callee_incoming_args,
         localized.outgoing_slots, localized.outgoing_stack, binary_memory,
-        depth + 1, visiting);
+        depth + 1, visiting, nullptr);
   }
   if (!target_summary.direct_callees.empty() || !target_summary.callsites.empty()) {
     const auto snapshot_slots = localized.outgoing_slots;
@@ -456,7 +788,9 @@ static void applyLocalizedCallsiteReturnEffects(
     std::map<unsigned, VirtualValueExpr> &caller_outgoing,
     std::map<unsigned, VirtualValueExpr> &caller_outgoing_stack,
     const BinaryMemoryMap &binary_memory, unsigned depth,
-    llvm::SmallPtrSetImpl<const llvm::Function *> &visiting) {
+    llvm::SmallPtrSetImpl<const llvm::Function *> &visiting,
+    LocalizedReplayCacheState *localized_replay_cache) {
+  (void) localized_replay_cache;
   const auto &dl = caller_fn.getParent()->getDataLayout();
 
   size_t callsite_index = 0;
@@ -631,16 +965,9 @@ computeEntryPreludeCallOutgoingFacts(
     }
   }
 
-  for (const auto &fact : computeOutgoingFacts(target_summary, callee_incoming,
-                                               callee_incoming_stack,
-                                               callee_incoming_args)) {
-    localized.outgoing_slots.emplace(fact.slot_id, fact.value);
-  }
-  for (const auto &fact :
-       computeOutgoingStackFacts(target_summary, callee_incoming,
-                                 callee_incoming_stack, callee_incoming_args)) {
-    localized.outgoing_stack.emplace(fact.cell_id, fact.value);
-  }
+  computeOutgoingFactMaps(target_summary, callee_incoming,
+                          callee_incoming_stack, callee_incoming_args,
+                          localized.outgoing_slots, localized.outgoing_stack);
 
   if (!target_summary.direct_callees.empty()) {
     applyDirectCalleeEffectsImpl(
@@ -648,7 +975,7 @@ computeEntryPreludeCallOutgoingFacts(
         callee_incoming_args, localized.outgoing_slots, localized.outgoing_stack,
         localized.structural_outgoing_stack, slot_ids, slot_info, stack_cell_ids,
         stack_cell_info, M.getDataLayout(), binary_memory, depth + 1,
-        visiting);
+        visiting, nullptr);
   }
   if (!target_summary.callsites.empty()) {
     applyLocalizedCallsiteReturnEffects(
@@ -656,7 +983,7 @@ computeEntryPreludeCallOutgoingFacts(
         stack_cell_ids, handler_index, outgoing_maps, outgoing_stack_maps,
         callee_incoming, callee_incoming_stack, callee_incoming_args,
         localized.outgoing_slots, localized.outgoing_stack, binary_memory,
-        depth + 1, visiting);
+        depth + 1, visiting, nullptr);
   }
   if (!target_summary.direct_callees.empty() || !target_summary.callsites.empty()) {
     const auto snapshot_slots = localized.outgoing_slots;
