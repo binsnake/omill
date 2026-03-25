@@ -4566,3 +4566,20 @@ Practical conclusion:
     - stays on the normal GSD path
   - `build-remill/test_obf/corpus/lifted/default_export_refresh_current_20260324_actual8/summary.json`
     - final clean default export report
+
+2026-03-25 late output cleanup:
+- Added a guarded final output cleanup in `tools/omill-lift/main.cpp`:
+  - only runs after the last output-root rewrite/import step
+  - only runs when the module is already structurally clean
+    (`dispatch_call=0`, `dispatch_jump=0`, no live `blk_*`,
+    no `__omill_missing_block_handler`)
+  - uses LLVM's late module `O2` pipeline instead of the lighter custom
+    cleanup bundle
+- Measured on the real default artifact:
+  - `TvmpInterprocPipeline` line count dropped from `26896` to `21264`
+  - metrics stayed clean: `dispatch=0`, `blk=0`, `alloca_state=0`,
+    `missing_block=0`
+  - artifact: `build-remill/test_obf/corpus/lifted/default_cleanup_probe3/TvmpInterprocPipeline.va180001d80.ll`
+- Stability spot-check:
+  - `TvmpGroundTruthDigest` remained tiny and clean
+  - artifact: `build-remill/test_obf/corpus/lifted/default_cleanup_probe3/TvmpGroundTruthDigest.va180002400.ll`

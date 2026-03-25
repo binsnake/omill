@@ -3827,6 +3827,39 @@ int main(int argc, char **argv) {
     }
   };
 
+  auto moduleHasStructuralOutputFrontierArtifacts = [&]() {
+    auto has_live_uses = [&](llvm::StringRef name) {
+      if (auto *F = module->getFunction(name))
+        return !F->use_empty();
+      return false;
+    };
+
+    if (has_live_uses("__omill_dispatch_call") ||
+        has_live_uses("__omill_dispatch_jump") ||
+        has_live_uses("__omill_missing_block_handler")) {
+      return true;
+    }
+
+    for (auto &F : *module) {
+      if (F.getName().starts_with("blk_") || F.getName().starts_with("block_")) {
+        return true;
+      }
+    }
+
+    return false;
+  };
+
+  auto runFinalOutputCleanup = [&]() {
+    if (parseBoolEnv("OMILL_SKIP_OUTPUT_FINAL_CLEANUP").value_or(false))
+      return;
+    if (moduleHasStructuralOutputFrontierArtifacts())
+      return;
+    llvm::PassBuilder PB;
+    llvm::ModulePassManager MPM =
+        PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
+    MPM.run(*module, MAM);
+  };
+
   auto liftedNameFor = [&](uint64_t pc, bool native) {
     std::string name = "sub_" + llvm::Twine::utohexstr(pc).str();
     if (native)
@@ -8089,6 +8122,8 @@ int main(int argc, char **argv) {
   maybeRerunLateCleanupForCanonicalTerminalBoundaryCycle();
   annotateOutputRootTerminalBoundaryProbeChains();
   recoverOutputRootTerminalBoundaries();
+  annotateOutputRootTerminalBoundaryProbeChains();
+  runFinalOutputCleanup();
   annotateOutputRootTerminalBoundaryProbeChains();
   omill::refreshTerminalBoundaryRecoveryMetadata(*module);
 
