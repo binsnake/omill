@@ -25,6 +25,32 @@ bool shouldPreserveLiftedOutputRootBoundary(const llvm::Function &F) {
   if (isClosedRootSliceRoot(F))
     return false;
 
+  auto has_open_control_flow = [&]() {
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+        if (!call)
+          continue;
+        auto *callee = call->getCalledFunction();
+        if (!callee)
+          return true;
+
+        auto name = callee->getName();
+        if (name == "__omill_dispatch_call" || name == "__omill_dispatch_jump")
+          return true;
+        if (name.starts_with("blk_") && callee->isDeclaration())
+          return true;
+        if (name.starts_with("sub_") && !name.ends_with("_native") &&
+            callee->isDeclaration())
+          return true;
+      }
+    }
+    return false;
+  };
+
+  if (has_open_control_flow())
+    return true;
+
   return F.hasFnAttribute("omill.vm_wrapper") ||
          F.hasFnAttribute("omill.vm_handler") ||
          F.getFnAttribute("omill.vm_demerged_clone").isValid() ||

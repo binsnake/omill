@@ -3443,6 +3443,51 @@ TEST_F(PipelineTest, LateCleanupAnnotatesTerminalBoundaryCycle) {
 }
 
 TEST_F(PipelineTest,
+       LateCleanupAnnotatesTerminalBoundaryTargetForRepeatedSameTarget) {
+  auto M = createModule();
+
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *handler_ty = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(Ctx), {i64_ty}, false);
+  auto *handler = llvm::Function::Create(handler_ty,
+                                         llvm::GlobalValue::ExternalLinkage,
+                                         "__omill_missing_block_handler", *M);
+
+  auto *root = llvm::Function::Create(
+      llvm::FunctionType::get(i64_ty, {ptr_ty}, false),
+      llvm::GlobalValue::ExternalLinkage, "sub_401000_native", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    auto *left = llvm::BasicBlock::Create(Ctx, "left", root);
+    auto *right = llvm::BasicBlock::Create(Ctx, "right", root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateCondBr(B.getTrue(), left, right);
+
+    B.SetInsertPoint(left);
+    B.CreateCall(handler, {B.getInt64(0x401234ULL)});
+    B.CreateRet(B.getInt64(1));
+
+    B.SetInsertPoint(right);
+    B.CreateCall(handler, {B.getInt64(0x401234ULL)});
+    B.CreateRet(B.getInt64(2));
+  }
+
+  llvm::ModulePassManager MPM;
+  omill::buildLateCleanupPipeline(MPM);
+  runMPM(MPM, *M);
+
+  auto *root_after = M->getFunction("sub_401000_native");
+  ASSERT_NE(root_after, nullptr);
+  ASSERT_TRUE(root_after->hasFnAttribute("omill.terminal_boundary_count"));
+  auto target_attr =
+      root_after->getFnAttribute("omill.terminal_boundary_target_va");
+  ASSERT_TRUE(target_attr.isValid());
+  EXPECT_EQ(target_attr.getValueAsString(), "401234");
+}
+
+TEST_F(PipelineTest,
        LateCleanupCanonicalizesTerminalBoundaryOutputRootToProbeCycleTarget) {
   auto M = createModule();
 
@@ -3504,6 +3549,70 @@ TEST_F(PipelineTest,
   EXPECT_TRUE(saw_handler);
 }
 
+TEST_F(PipelineTest,
+       LateCleanupPreservesExecutableInImageDeclaredLiftedHelperCall) {
+  auto M = createModule();
+
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *lifted_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+
+  auto *callee = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage, "sub_402000", *M);
+  auto *root = llvm::Function::Create(
+      llvm::FunctionType::get(i64_ty, {ptr_ty}, false),
+      llvm::GlobalValue::ExternalLinkage, "sub_401000_native", *M);
+  root->addFnAttr("omill.output_root");
+
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *state =
+        B.CreateAlloca(llvm::ArrayType::get(B.getInt8Ty(), 64), nullptr,
+                       "state_storage");
+    auto *stack =
+        B.CreateAlloca(llvm::ArrayType::get(B.getInt8Ty(), 64), nullptr,
+                       "stack_storage");
+    auto *state_ptr = B.CreateConstGEP1_64(B.getInt8Ty(), state, 0);
+    auto *stack_ptr = B.CreateConstGEP1_64(B.getInt8Ty(), stack, 0);
+    auto *rv = B.CreateCall(callee, {state_ptr, B.getInt64(0x402000), stack_ptr});
+    B.CreateRet(B.CreatePtrToInt(rv, i64_ty));
+  }
+
+  omill::BinaryMemoryMap map;
+  static const uint8_t exec_bytes[16] = {0x55, 0x48, 0x89, 0xE5};
+  map.setImageBase(0x400000);
+  map.setImageSize(0x4000);
+  map.addRegion(0x402000, exec_bytes, sizeof(exec_bytes), /*read_only=*/false,
+                /*executable=*/true);
+
+  llvm::ModulePassManager MPM;
+  omill::buildLateCleanupPipeline(MPM);
+  runMPM(MPM, *M, std::move(map));
+
+  auto *root_after = M->getFunction("sub_401000_native");
+  ASSERT_NE(root_after, nullptr);
+
+  bool found_helper_call = false;
+  bool found_unreachable = false;
+  for (auto &BB : *root_after) {
+    if (llvm::isa<llvm::UnreachableInst>(BB.getTerminator()))
+      found_unreachable = true;
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *called = CI->getCalledFunction();
+      if (called && called->getName() == "sub_402000")
+        found_helper_call = true;
+    }
+  }
+
+  EXPECT_TRUE(found_helper_call);
+  EXPECT_FALSE(found_unreachable);
+}
+
 TEST_F(PipelineTest, GlobalAlwaysInlineSkipSuppressesAlwaysInlinerPasses) {
   auto M = createModule();
   createDefinedFunction(*M, "sub_401000");
@@ -3561,6 +3670,46 @@ TEST_F(PipelineTest,
       *M, /*vm_mode=*/false, /*requested_root_is_export=*/true,
       /*force_generic_static_devirtualize=*/false,
       /*root_local_generic_static_devirtualization_shape=*/true));
+}
+
+TEST_F(PipelineTest,
+       GenericStaticDevirtualizationCandidateDetectionSkipsVmModuleExportWithoutRootLocalShape) {
+  auto M = createModule();
+  auto *root = createDefinedFunction(*M, "sub_401000");
+  root->addFnAttr("omill.vm_handler");
+
+  EXPECT_TRUE(omill::shouldAutoSkipGenericStaticDevirtualizationForRoot(
+      *M, /*vm_mode=*/true, /*requested_root_is_export=*/true,
+      /*force_generic_static_devirtualize=*/false,
+      /*root_local_generic_static_devirtualization_shape=*/false));
+  EXPECT_FALSE(omill::shouldAutoSkipGenericStaticDevirtualizationForRoot(
+      *M, /*vm_mode=*/true, /*requested_root_is_export=*/true,
+      /*force_generic_static_devirtualize=*/false,
+      /*root_local_generic_static_devirtualization_shape=*/true));
+}
+
+TEST_F(PipelineTest, FastPlainExportRootFallbackMatchesDriverPolicy) {
+  EXPECT_TRUE(omill::shouldUseFastPlainExportRootFallback(
+      /*vm_mode=*/false, /*requested_root_is_export=*/true,
+      /*use_block_lifting=*/true,
+      /*generic_static_devirtualize_requested=*/true,
+      /*force_generic_static_devirtualize=*/false,
+      /*largest_executable_section_size=*/64ull << 10,
+      /*executable_section_count=*/1));
+  EXPECT_FALSE(omill::shouldUseFastPlainExportRootFallback(
+      /*vm_mode=*/false, /*requested_root_is_export=*/true,
+      /*use_block_lifting=*/true,
+      /*generic_static_devirtualize_requested=*/true,
+      /*force_generic_static_devirtualize=*/false,
+      /*largest_executable_section_size=*/2ull << 20,
+      /*executable_section_count=*/2));
+  EXPECT_FALSE(omill::shouldUseFastPlainExportRootFallback(
+      /*vm_mode=*/true, /*requested_root_is_export=*/true,
+      /*use_block_lifting=*/true,
+      /*generic_static_devirtualize_requested=*/true,
+      /*force_generic_static_devirtualize=*/false,
+      /*largest_executable_section_size=*/64ull << 10,
+      /*executable_section_count=*/1));
 }
 
 TEST_F(PipelineTest, StableNoGsdExportRootFallbackMatchesDriverPolicy) {

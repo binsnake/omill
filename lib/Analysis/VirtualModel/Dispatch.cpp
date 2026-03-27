@@ -11,6 +11,7 @@
 
 #include "omill/Utils/LiftedNames.h"
 #include "omill/Utils/ProtectedBoundaryUtils.h"
+#include "omill/Support/JumpTableDiscovery.h"
 
 namespace omill::virtual_model::detail {
 
@@ -38,6 +39,71 @@ struct BoundaryTargetSummary {
   std::string name;
   std::optional<uint64_t> canonical_target_va;
 };
+
+static bool slotSummaryMatchesInfo(const VirtualStateSlotSummary &summary,
+                                   const VirtualStateSlotInfo &info) {
+  return summary.base_name == info.base_name &&
+         summary.offset == info.offset &&
+         summary.width == info.width &&
+         summary.from_argument == info.from_argument &&
+         summary.from_alloca == info.from_alloca;
+}
+
+static bool stackCellSummaryMatchesInfo(const VirtualStackCellSummary &summary,
+                                        const VirtualStackCellInfo &info) {
+  return summary.base_name == info.base_name &&
+         summary.base_offset == info.base_offset &&
+         summary.base_width == info.base_width &&
+         summary.base_from_argument == info.base_from_argument &&
+         summary.base_from_alloca == info.base_from_alloca &&
+         summary.offset == info.cell_offset && summary.width == info.width;
+}
+
+static std::optional<VirtualValueExpr> structurallySpecializeDispatchExpr(
+    const VirtualValueExpr &expr, llvm::ArrayRef<VirtualSlotFact> slot_facts,
+    llvm::ArrayRef<VirtualStackFact> stack_facts,
+    const std::map<unsigned, const VirtualStateSlotInfo *> &slot_info,
+    const std::map<unsigned, const VirtualStackCellInfo *> &stack_cell_info) {
+  if (expr.kind == VirtualExprKind::kStateSlot) {
+    if (auto summary = extractStateSlotSummaryFromExpr(expr, slot_info)) {
+      for (const auto &fact : slot_facts) {
+        auto it = slot_info.find(fact.slot_id);
+        if (it == slot_info.end() ||
+            !slotSummaryMatchesInfo(*summary, *it->second)) {
+          continue;
+        }
+        return castExprToBitWidth(fact.value, expr.bit_width);
+      }
+    }
+  } else if (expr.kind == VirtualExprKind::kStackCell) {
+    if (auto summary = extractStackCellSummaryFromExpr(expr, exprByteWidth(expr))) {
+      for (const auto &fact : stack_facts) {
+        auto it = stack_cell_info.find(fact.cell_id);
+        if (it == stack_cell_info.end() ||
+            !stackCellSummaryMatchesInfo(*summary, *it->second)) {
+          continue;
+        }
+        return castExprToBitWidth(fact.value, expr.bit_width);
+      }
+    }
+  }
+
+  bool changed = false;
+  VirtualValueExpr specialized = expr;
+  specialized.operands.clear();
+  for (const auto &operand : expr.operands) {
+    if (auto rewritten = structurallySpecializeDispatchExpr(
+            operand, slot_facts, stack_facts, slot_info, stack_cell_info)) {
+      specialized.operands.push_back(*rewritten);
+      changed = true;
+    } else {
+      specialized.operands.push_back(operand);
+    }
+  }
+  if (!changed)
+    return std::nullopt;
+  return specialized;
+}
 
 static std::optional<BoundaryTargetSummary> lookupBoundaryTargetSummary(
     const VirtualMachineModel &model, const BinaryMemoryMap &binary_memory,
@@ -288,31 +354,43 @@ void summarizeDispatchSuccessors(llvm::Module &M, VirtualMachineModel &model,
               const std::vector<VirtualSlotFact> &slot_facts,
               const std::vector<VirtualStackFact> &stack_facts,
               VirtualDispatchResolutionSource source) {
-            annotateExprSlots(expr, slot_ids);
-            annotateExprStackCells(expr, stack_cell_ids, slot_ids);
-            note_target_expr(expr, source);
-            if (auto pc =
-                    evaluateVirtualExpr(expr, slot_facts, stack_facts,
-                                        &binary_memory)) {
-              append_pc(*pc, source);
+            auto try_collect_expr = [&](VirtualValueExpr candidate) {
+              annotateExprSlots(candidate, slot_ids);
+              annotateExprStackCells(candidate, stack_cell_ids, slot_ids);
+              note_target_expr(candidate, source);
+              if (auto pc =
+                      evaluateVirtualExpr(candidate, slot_facts, stack_facts,
+                                          &binary_memory)) {
+                append_pc(*pc, source);
+                return true;
+              }
+              llvm::SmallVector<uint64_t, 4> choices;
+              if (collectEvaluatedTargetChoices(candidate, slot_facts,
+                                                stack_facts, &boolean_slot_ids,
+                                                &boolean_slot_expr_keys,
+                                                choices, &binary_memory)) {
+                for (uint64_t pc : choices)
+                  append_pc(pc, source);
+                return true;
+              }
+              if (collectEvaluatedValueChoices(candidate, slot_facts,
+                                               stack_facts, choices,
+                                               &binary_memory) &&
+                  !choices.empty()) {
+                for (uint64_t pc : choices)
+                  append_pc(pc, source);
+                return true;
+              }
+              return false;
+            };
+
+            if (try_collect_expr(expr))
               return;
-            }
-            llvm::SmallVector<uint64_t, 4> choices;
-            if (collectEvaluatedTargetChoices(expr, slot_facts,
-                                              stack_facts,
-                                              &boolean_slot_ids,
-                                              &boolean_slot_expr_keys, choices,
-                                              &binary_memory)) {
-              for (uint64_t pc : choices)
-                append_pc(pc, source);
-              return;
-            }
-            if (collectEvaluatedValueChoices(expr, slot_facts,
-                                             stack_facts, choices,
-                                             &binary_memory) &&
-                !choices.empty()) {
-              for (uint64_t pc : choices)
-                append_pc(pc, source);
+
+            if (auto structural = structurallySpecializeDispatchExpr(
+                    expr, slot_facts, stack_facts, slot_info,
+                    stack_cell_info)) {
+              try_collect_expr(*structural);
             }
           };
 
@@ -379,6 +457,16 @@ void summarizeDispatchSuccessors(llvm::Module &M, VirtualMachineModel &model,
               stackFactsForMap(localized->outgoing_stack),
               VirtualDispatchResolutionSource::kPreludeLocalization);
         }
+      }
+      if (resolved_pcs.empty() && summary.entry_va.has_value()) {
+        auto binary_targets = discoverImageBaseRelativeTargetsInRegion(
+            binary_memory, binary_memory.imageBase(), *summary.entry_va);
+        if (binary_targets.empty()) {
+          binary_targets =
+              discoverJumpTableTargets(binary_memory, *summary.entry_va);
+        }
+        for (uint64_t pc : binary_targets)
+          append_pc(pc, VirtualDispatchResolutionSource::kDirect);
       }
 
       for (const auto &resolved_pc : resolved_pcs) {

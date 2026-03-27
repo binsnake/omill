@@ -44,6 +44,8 @@ static constexpr const char *kWin64ParamRegs[] = {
     "RCX", "RDX", "R8", "R9",
 };
 static constexpr unsigned kWin64ParamCount = 4;
+static constexpr llvm::StringLiteral kExportCallsiteWin64ParamCountAttr =
+    "omill.export_callsite_win64_gpr_count";
 
 /// Win64 callee-saved (nonvolatile) registers.
 static constexpr const char *kWin64CalleeSaved[] = {
@@ -185,9 +187,72 @@ unsigned scoreWin64Params(const llvm::DenseSet<unsigned> &live_in,
   return matched;
 }
 
+bool hasStateReadBeforeWritePath(llvm::Function &F, unsigned state_offset,
+                                 const llvm::DataLayout &DL) {
+  if (F.empty())
+    return false;
+
+  using State = std::pair<llvm::BasicBlock *, bool>;
+  llvm::SmallVector<State, 16> worklist;
+  llvm::DenseSet<uintptr_t> seen;
+  worklist.push_back({&F.getEntryBlock(), false});
+
+  auto encodeState = [](const llvm::BasicBlock *BB, bool written) {
+    return (reinterpret_cast<uintptr_t>(BB) << 1) |
+           static_cast<uintptr_t>(written);
+  };
+
+  auto pushState = [&](llvm::BasicBlock *BB, bool written) {
+    if (seen.insert(encodeState(BB, written)).second)
+      worklist.push_back({BB, written});
+  };
+
+  while (!worklist.empty()) {
+    auto [BB, written] = worklist.pop_back_val();
+    bool local_written = written;
+
+    for (auto &I : *BB) {
+      if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I)) {
+        int64_t off = resolveStateOffset(LI->getPointerOperand(), DL);
+        if (off >= 0 && static_cast<unsigned>(off) == state_offset &&
+            !local_written)
+          return true;
+      }
+      if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+        int64_t off = resolveStateOffset(SI->getPointerOperand(), DL);
+        if (off >= 0 && static_cast<unsigned>(off) == state_offset)
+          local_written = true;
+      }
+    }
+
+    for (auto *succ : llvm::successors(BB))
+      pushState(succ, local_written);
+  }
+
+  return false;
+}
+
+unsigned scoreWin64ParamsFromReadBeforeWritePaths(llvm::Function &F,
+                                                  const llvm::DataLayout &DL,
+                                                  const StateFieldMap &field_map) {
+  unsigned matched = 0;
+  for (unsigned i = 0; i < kWin64ParamCount; ++i) {
+    auto field = field_map.fieldByName(kWin64ParamRegs[i]);
+    if (!field)
+      break;
+    if (!hasStateReadBeforeWritePath(F, field->offset, DL))
+      break;
+    ++matched;
+  }
+  return matched;
+}
+
 FunctionABI analyzeFunction(llvm::Function &F, const llvm::DataLayout &DL,
                             const StateFieldMap &field_map) {
   FunctionABI abi;
+  const bool is_public_output_root =
+      F.hasFnAttribute("omill.output_root") &&
+      !F.hasFnAttribute("omill.vm_wrapper");
 
   if (F.isDeclaration() || F.empty()) return abi;
   if (F.arg_size() == 0) return abi;
@@ -198,6 +263,23 @@ FunctionABI analyzeFunction(llvm::Function &F, const llvm::DataLayout &DL,
   // Win64 detection: use entry-block read-before-write signals only.
   // Non-entry reads are often transformed temporaries, not true ABI params.
   unsigned win64_score = scoreWin64Params(entry_live_in, field_map);
+
+  // Exported roots commonly branch into local lifted closures before touching
+  // the original parameter registers. For those, fall back to a path-sensitive
+  // read-before-first-write check instead of whole-function liveness.
+  if (win64_score == 0 && is_public_output_root) {
+    win64_score =
+        scoreWin64ParamsFromReadBeforeWritePaths(F, DL, field_map);
+  }
+
+  if (is_public_output_root) {
+    auto attr = F.getFnAttribute(kExportCallsiteWin64ParamCountAttr);
+    if (attr.isValid() && attr.isStringAttribute()) {
+      unsigned attr_count = 0;
+      if (!attr.getValueAsString().getAsInteger(10, attr_count))
+        win64_score = std::max(win64_score, attr_count);
+    }
+  }
 
   if (win64_score > 0) {
     abi.cc = DetectedCC::kWin64;
@@ -220,15 +302,17 @@ FunctionABI analyzeFunction(llvm::Function &F, const llvm::DataLayout &DL,
     // Default to Win64 with all 4 params — unused params become dead values
     // after inlining and are trivially eliminated by DCE.
     abi.cc = DetectedCC::kWin64;
-    for (unsigned i = 0; i < kWin64ParamCount; ++i) {
-      auto field = field_map.fieldByName(kWin64ParamRegs[i]);
-      if (!field) break;
-      RecoveredParam param;
-      param.reg_name = kWin64ParamRegs[i];
-      param.state_offset = field->offset;
-      param.size = field->size;
-      param.index = i;
-      abi.params.push_back(param);
+    if (!is_public_output_root) {
+      for (unsigned i = 0; i < kWin64ParamCount; ++i) {
+        auto field = field_map.fieldByName(kWin64ParamRegs[i]);
+        if (!field) break;
+        RecoveredParam param;
+        param.reg_name = kWin64ParamRegs[i];
+        param.state_offset = field->offset;
+        param.size = field->size;
+        param.index = i;
+        abi.params.push_back(param);
+      }
     }
   }
 

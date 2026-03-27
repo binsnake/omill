@@ -193,6 +193,542 @@ TEST_F(RecoverFunctionSignaturesTest, VoidReturnWrapper) {
 }
 
 TEST_F(RecoverFunctionSignaturesTest,
+       PublicOutputRootDropsForcedConstantLeadingGPRParam) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *state_ty = llvm::StructType::create(Ctx, "struct.State");
+  auto *arr_ty = llvm::ArrayType::get(llvm::Type::getInt8Ty(Ctx), 3504);
+  state_ty->setBody({arr_ty});
+
+  auto *bb_fn_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *bb_fn = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "__remill_basic_block", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", bb_fn);
+    llvm::IRBuilder<> B(entry);
+    auto *bb_state = bb_fn->getArg(0);
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 0, "RAX");
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 16, "RCX");
+    B.CreateRet(bb_fn->getArg(2));
+  }
+
+  auto *helper = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "sub_402000", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", helper);
+    llvm::IRBuilder<> B(entry);
+    auto *state = helper->getArg(0);
+    auto *rcx_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 16);
+    auto *rcx = B.CreateLoad(i64_ty, rcx_gep);
+    auto *rax_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 0);
+    B.CreateStore(rcx, rax_gep);
+    B.CreateRet(helper->getArg(2));
+  }
+
+  auto *root = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *state = root->getArg(0);
+    auto *rcx_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 16);
+    B.CreateStore(B.getInt64(0), rcx_gep);
+    auto *ret_mem = B.CreateCall(helper, {state, root->getArg(1), root->getArg(2)});
+    B.CreateRet(ret_mem);
+  }
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+
+  llvm::ModulePassManager MPM;
+  MPM.addPass(omill::RecoverFunctionSignaturesPass());
+  MPM.run(*M, MAM);
+
+  auto *native_fn = M->getFunction("sub_401000_native");
+  ASSERT_NE(native_fn, nullptr);
+  EXPECT_TRUE(native_fn->getReturnType()->isIntegerTy(64));
+  EXPECT_EQ(native_fn->getFunctionType()->getNumParams(), 0u);
+}
+
+TEST_F(RecoverFunctionSignaturesTest,
+       PublicOutputRootKeepsAllRecoveredWin64GprParams) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *state_ty = llvm::StructType::create(Ctx, "struct.State");
+  auto *arr_ty = llvm::ArrayType::get(llvm::Type::getInt8Ty(Ctx), 3504);
+  state_ty->setBody({arr_ty});
+
+  auto *bb_fn_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *bb_fn = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "__remill_basic_block", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", bb_fn);
+    llvm::IRBuilder<> B(entry);
+    auto *bb_state = bb_fn->getArg(0);
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 0, "RAX");
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 16, "RCX");
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 24, "RDX");
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 64, "R8");
+    B.CreateRet(bb_fn->getArg(2));
+  }
+
+  auto *root = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *state = root->getArg(0);
+    auto *rcx_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 16);
+    auto *rdx_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 24);
+    auto *r8_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 64);
+    auto *rax_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 0);
+    auto *rcx = B.CreateLoad(i64_ty, rcx_gep);
+    auto *rdx = B.CreateLoad(i64_ty, rdx_gep);
+    auto *r8 = B.CreateLoad(i64_ty, r8_gep);
+    auto *sum = B.CreateAdd(B.CreateAdd(rcx, rdx), r8);
+    B.CreateStore(sum, rax_gep);
+    B.CreateRet(root->getArg(2));
+  }
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+
+  llvm::ModulePassManager MPM;
+  MPM.addPass(omill::RecoverFunctionSignaturesPass());
+  MPM.run(*M, MAM);
+
+  auto *native_fn = M->getFunction("sub_401000_native");
+  ASSERT_NE(native_fn, nullptr);
+  EXPECT_TRUE(native_fn->getReturnType()->isIntegerTy(64));
+  EXPECT_EQ(native_fn->getFunctionType()->getNumParams(), 3u);
+  EXPECT_TRUE(native_fn->getFunctionType()->getParamType(0)->isIntegerTy(64));
+  EXPECT_TRUE(native_fn->getFunctionType()->getParamType(1)->isIntegerTy(64));
+  EXPECT_TRUE(native_fn->getFunctionType()->getParamType(2)->isIntegerTy(64));
+}
+
+TEST_F(RecoverFunctionSignaturesTest,
+       PublicOutputRootWithoutEntryParamReadsDefaultsToZeroParams) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *state_ty = llvm::StructType::create(Ctx, "struct.State");
+  auto *arr_ty = llvm::ArrayType::get(llvm::Type::getInt8Ty(Ctx), 3504);
+  state_ty->setBody({arr_ty});
+
+  auto *bb_fn_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *bb_fn = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "__remill_basic_block", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", bb_fn);
+    llvm::IRBuilder<> B(entry);
+    auto *bb_state = bb_fn->getArg(0);
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 0, "RAX");
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 16, "RCX");
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 24, "RDX");
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 64, "R8");
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 72, "R9");
+    B.CreateRet(bb_fn->getArg(2));
+  }
+
+  auto *root = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *state = root->getArg(0);
+    auto *rax_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 0);
+    B.CreateStore(B.getInt64(1), rax_gep);
+    B.CreateRet(root->getArg(2));
+  }
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+
+  llvm::ModulePassManager MPM;
+  MPM.addPass(omill::RecoverFunctionSignaturesPass());
+  MPM.run(*M, MAM);
+
+  auto *native_fn = M->getFunction("sub_401000_native");
+  ASSERT_NE(native_fn, nullptr);
+  EXPECT_EQ(native_fn->getFunctionType()->getNumParams(), 0u);
+  EXPECT_TRUE(native_fn->getReturnType()->isIntegerTy(64));
+}
+
+TEST_F(RecoverFunctionSignaturesTest,
+       PublicOutputRootWithoutEntryReadsUsesCallsiteEvidenceForParams) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *state_ty = llvm::StructType::create(Ctx, "struct.State");
+  auto *arr_ty = llvm::ArrayType::get(llvm::Type::getInt8Ty(Ctx), 3504);
+  state_ty->setBody({arr_ty});
+
+  auto *bb_fn_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *bb_fn = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "__remill_basic_block", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", bb_fn);
+    llvm::IRBuilder<> B(entry);
+    auto *bb_state = bb_fn->getArg(0);
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 0, "RAX");
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 16, "RCX");
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 24, "RDX");
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 64, "R8");
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 72, "R9");
+    B.CreateRet(bb_fn->getArg(2));
+  }
+
+  auto *root = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *state = root->getArg(0);
+    auto *rax_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 0);
+    B.CreateStore(B.getInt64(7), rax_gep);
+    B.CreateRet(root->getArg(2));
+  }
+
+  auto *caller = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "sub_402000", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", caller);
+    llvm::IRBuilder<> B(entry);
+    auto *state = caller->getArg(0);
+    auto *rcx_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 16);
+    auto *rdx_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 24);
+    auto *r8_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 64);
+    B.CreateStore(B.getInt64(11), rcx_gep);
+    B.CreateStore(B.getInt64(22), rdx_gep);
+    B.CreateStore(B.getInt64(33), r8_gep);
+    auto *ret_mem =
+        B.CreateCall(root, {state, caller->getArg(1), caller->getArg(2)});
+    B.CreateRet(ret_mem);
+  }
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+
+  llvm::ModulePassManager MPM;
+  MPM.addPass(omill::RecoverFunctionSignaturesPass());
+  MPM.run(*M, MAM);
+
+  auto *native_fn = M->getFunction("sub_401000_native");
+  ASSERT_NE(native_fn, nullptr);
+  EXPECT_EQ(native_fn->getFunctionType()->getNumParams(), 3u);
+  EXPECT_TRUE(native_fn->getFunctionType()->getParamType(0)->isIntegerTy(64));
+  EXPECT_TRUE(native_fn->getFunctionType()->getParamType(1)->isIntegerTy(64));
+  EXPECT_TRUE(native_fn->getFunctionType()->getParamType(2)->isIntegerTy(64));
+}
+
+TEST_F(RecoverFunctionSignaturesTest,
+       PublicOutputRootUsesDriverProvidedExportCallsiteParamOverride) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *state_ty = llvm::StructType::create(Ctx, "struct.State");
+  auto *arr_ty = llvm::ArrayType::get(llvm::Type::getInt8Ty(Ctx), 3504);
+  state_ty->setBody({arr_ty});
+
+  auto *bb_fn_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *bb_fn = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "__remill_basic_block", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", bb_fn);
+    llvm::IRBuilder<> B(entry);
+    auto *bb_state = bb_fn->getArg(0);
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 0, "RAX");
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 16, "RCX");
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 24, "RDX");
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 64, "R8");
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 72, "R9");
+    B.CreateRet(bb_fn->getArg(2));
+  }
+
+  auto *root = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  root->addFnAttr("omill.export_callsite_win64_gpr_count", "3");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *state = root->getArg(0);
+    auto *rax_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 0);
+    B.CreateStore(B.getInt64(7), rax_gep);
+    B.CreateRet(root->getArg(2));
+  }
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+
+  llvm::ModulePassManager MPM;
+  MPM.addPass(omill::RecoverFunctionSignaturesPass());
+  MPM.run(*M, MAM);
+
+  auto *native_fn = M->getFunction("sub_401000_native");
+  ASSERT_NE(native_fn, nullptr);
+  EXPECT_EQ(native_fn->getFunctionType()->getNumParams(), 3u);
+  EXPECT_TRUE(native_fn->getFunctionType()->getParamType(0)->isIntegerTy(64));
+  EXPECT_TRUE(native_fn->getFunctionType()->getParamType(1)->isIntegerTy(64));
+  EXPECT_TRUE(native_fn->getFunctionType()->getParamType(2)->isIntegerTy(64));
+}
+
+TEST_F(RecoverFunctionSignaturesTest,
+       PublicOutputRootPathSensitiveFallbackSkipsWrittenR9) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *state_ty = llvm::StructType::create(Ctx, "struct.State");
+  auto *arr_ty = llvm::ArrayType::get(llvm::Type::getInt8Ty(Ctx), 3504);
+  state_ty->setBody({arr_ty});
+
+  auto *bb_fn_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *bb_fn = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "__remill_basic_block", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", bb_fn);
+    llvm::IRBuilder<> B(entry);
+    auto *bb_state = bb_fn->getArg(0);
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 0, "RAX");
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 16, "RCX");
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 24, "RDX");
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 64, "R8");
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 72, "R9");
+    B.CreateRet(bb_fn->getArg(2));
+  }
+
+  auto *root = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    auto *body = llvm::BasicBlock::Create(Ctx, "body", root);
+    llvm::IRBuilder<> B(entry);
+    auto *state = root->getArg(0);
+    auto *r9_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 72);
+    B.CreateStore(B.getInt64(0), r9_gep);
+    B.CreateBr(body);
+
+    B.SetInsertPoint(body);
+    auto *rax_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 0);
+    auto *rcx_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 16);
+    auto *rdx_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 24);
+    auto *r8_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 64);
+    auto *r9_gep_body = B.CreateConstGEP1_64(B.getInt8Ty(), state, 72);
+    auto *rcx = B.CreateLoad(i64_ty, rcx_gep);
+    auto *rdx = B.CreateLoad(i64_ty, rdx_gep);
+    auto *r8 = B.CreateLoad(i64_ty, r8_gep);
+    auto *r9 = B.CreateLoad(i64_ty, r9_gep_body);
+    auto *sum = B.CreateAdd(B.CreateAdd(B.CreateAdd(rcx, rdx), r8), r9);
+    B.CreateStore(sum, rax_gep);
+    B.CreateRet(root->getArg(2));
+  }
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+
+  llvm::ModulePassManager MPM;
+  MPM.addPass(omill::RecoverFunctionSignaturesPass());
+  MPM.run(*M, MAM);
+
+  auto *native_fn = M->getFunction("sub_401000_native");
+  ASSERT_NE(native_fn, nullptr);
+  EXPECT_EQ(native_fn->getFunctionType()->getNumParams(), 3u);
+}
+
+TEST_F(RecoverFunctionSignaturesTest,
+       PublicOutputRootSeedsHiddenNonParamGPRConstants) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *state_ty = llvm::StructType::create(Ctx, "struct.State");
+  auto *arr_ty = llvm::ArrayType::get(llvm::Type::getInt8Ty(Ctx), 3504);
+  state_ty->setBody({arr_ty});
+
+  auto *bb_fn_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *bb_fn = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "__remill_basic_block", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", bb_fn);
+    llvm::IRBuilder<> B(entry);
+    auto *bb_state = bb_fn->getArg(0);
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 0, "RAX");
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 8, "RBX");
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 16, "RCX");
+    B.CreateConstGEP1_64(B.getInt8Ty(), bb_state, 32, "RBP");
+    B.CreateRet(bb_fn->getArg(2));
+  }
+
+  auto *root = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *state = root->getArg(0);
+    auto *pc = root->getArg(1);
+
+    auto *rbx_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 8);
+    auto *rbp_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 32);
+    auto *rcx_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 16);
+    auto *rax_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 0);
+
+    auto *pc_seed = B.CreateAdd(pc, B.getInt64(0x321));
+    B.CreateStore(pc_seed, rbx_gep);
+    B.CreateStore(B.getInt64(0x123456789abcdef0ULL), rbp_gep);
+
+    auto *rcx = B.CreateLoad(i64_ty, rcx_gep);
+    auto *rbx = B.CreateLoad(i64_ty, rbx_gep);
+    auto *rbp = B.CreateLoad(i64_ty, rbp_gep);
+    auto *sum = B.CreateAdd(B.CreateAdd(rcx, rbx), rbp);
+    B.CreateStore(sum, rax_gep);
+    B.CreateRet(root->getArg(2));
+  }
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+
+  llvm::ModulePassManager MPM;
+  MPM.addPass(omill::RecoverFunctionSignaturesPass());
+  MPM.run(*M, MAM);
+
+  auto *native_fn = M->getFunction("sub_401000_native");
+  ASSERT_NE(native_fn, nullptr);
+  EXPECT_EQ(native_fn->getFunctionType()->getNumParams(), 1u);
+
+  bool saw_pc_relative_seed = false;
+  bool saw_constant_seed = false;
+  for (auto &BB : *native_fn) {
+    for (auto &I : BB) {
+      auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I);
+      if (!SI)
+        continue;
+      auto *CI = llvm::dyn_cast<llvm::ConstantInt>(SI->getValueOperand());
+      if (!CI)
+        continue;
+      if (CI->getZExtValue() == 0x401321ULL)
+        saw_pc_relative_seed = true;
+      if (CI->getZExtValue() == 0x123456789abcdef0ULL)
+        saw_constant_seed = true;
+    }
+  }
+
+  EXPECT_TRUE(saw_pc_relative_seed);
+  EXPECT_TRUE(saw_constant_seed);
+}
+
+TEST_F(RecoverFunctionSignaturesTest,
        ClosedRootSliceScopeSkipsUnmarkedLiftedFunctions) {
   auto M = std::make_unique<llvm::Module>("test", Ctx);
   M->setDataLayout(

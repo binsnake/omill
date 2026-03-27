@@ -85,13 +85,92 @@ discoverJumpTableTargets(const BinaryMemoryMap &mem, uint64_t func_va,
   return targets;
 }
 
+/// Discover image-base-relative jump table targets by scanning a code region.
+///
+/// Unlike discoverImageBaseRelativeTargets(), this does not require the exact
+/// indirect jump PC. It scans forward from a candidate handler entry for the
+/// MOV-with-SIB pattern used by MSVC / OLLVM flattened dispatches and requires
+/// an indirect register jump to appear shortly afterward.
+inline std::vector<uint64_t> discoverImageBaseRelativeTargetsInRegion(
+    const BinaryMemoryMap &mem, uint64_t image_base, uint64_t func_va,
+    size_t max_scan = 2048) {
+  std::vector<uint64_t> targets;
+  if (image_base == 0)
+    return targets;
+
+  std::vector<uint8_t> bytes(max_scan);
+  if (!mem.read(func_va, bytes.data(), static_cast<unsigned>(max_scan)))
+    return targets;
+
+  for (size_t i = 0; i + 7 <= max_scan; ++i) {
+    size_t opcode_index = i;
+    if ((bytes[opcode_index] & 0xF0) == 0x40) {
+      if (opcode_index + 8 > max_scan)
+        continue;
+      ++opcode_index;
+    }
+    if (bytes[opcode_index] != 0x8B)
+      continue;
+
+    uint8_t modrm = bytes[opcode_index + 1];
+    if ((modrm >> 6) != 2 || (modrm & 7) != 4)
+      continue;
+
+    uint8_t sib = bytes[opcode_index + 2];
+    if ((sib >> 6) != 2)
+      continue;
+
+    size_t inst_len = (opcode_index - i) + 7;
+
+    bool has_indirect_jmp = false;
+    for (size_t j = i + inst_len; j + 1 < std::min(max_scan, i + 24); ++j) {
+      if (bytes[j] == 0xFF && (bytes[j + 1] & 0xF8) == 0xE0) {
+        has_indirect_jmp = true;
+        break;
+      }
+    }
+    if (!has_indirect_jmp)
+      continue;
+
+    uint32_t table_rva = 0;
+    std::memcpy(&table_rva, &bytes[opcode_index + 3], 4);
+    uint64_t table_va = image_base + table_rva;
+
+    std::vector<uint64_t> candidate;
+    for (unsigned j = 0; j < 256; ++j) {
+      auto entry_opt = mem.readInt(table_va + j * 4, 4);
+      if (!entry_opt)
+        break;
+
+      uint32_t entry = static_cast<uint32_t>(*entry_opt);
+      if (entry == 0)
+        break;
+
+      uint64_t target = image_base + entry;
+      if (target < func_va - 0x100000 || target > func_va + 0x100000)
+        break;
+
+      candidate.push_back(target);
+    }
+
+    if (candidate.size() >= 2) {
+      targets.insert(targets.end(), candidate.begin(), candidate.end());
+      break;
+    }
+  }
+
+  std::sort(targets.begin(), targets.end());
+  targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+  return targets;
+}
+
 /// Discover jump table targets from an image-base-relative dispatch pattern.
 ///
 /// Scans backward from the indirect jump instruction to find:
 ///   [REX] 8B [ModRM: mod=10 rm=SIB] [SIB: scale=4] [disp32]
 ///   [REX.W] 03 [ModRM: mod=11]
 ///
-/// The disp32 in the MOV is the table RVA.  Each 4-byte table entry is an
+/// The disp32 in the MOV is the table RVA. Each 4-byte table entry is an
 /// unsigned RVA; the absolute target is image_base + entry.
 ///
 /// \param mem          Binary memory map with section data.
@@ -105,7 +184,6 @@ discoverImageBaseRelativeTargets(const BinaryMemoryMap &mem,
   if (image_base == 0)
     return targets;
 
-  // Read up to 32 bytes before the indirect jump instruction.
   constexpr size_t kMaxBackScan = 32;
   uint64_t scan_start = jmp_pc > kMaxBackScan ? jmp_pc - kMaxBackScan : 0;
   size_t scan_len = static_cast<size_t>(jmp_pc - scan_start);
@@ -114,32 +192,31 @@ discoverImageBaseRelativeTargets(const BinaryMemoryMap &mem,
   if (!mem.read(scan_start, bytes.data(), static_cast<unsigned>(scan_len)))
     return targets;
 
-  // Look for MOV reg32, [base + idx*4 + disp32] instruction.
-  // Encoding: [REX] 8B [ModRM] [SIB] [disp32]  (8 bytes)
-  //   ModRM: mod=10 (disp32), rm=100 (SIB follows)
-  //   SIB:   scale=10 (×4)
-  // Use the last (closest to jmp) match.
   uint32_t table_rva = 0;
   bool found = false;
 
-  for (size_t i = 0; i + 8 <= scan_len; ++i) {
-    uint8_t rex = bytes[i];
-    if ((rex & 0xF0) != 0x40)
+  for (size_t i = 0; i + 7 <= scan_len; ++i) {
+    size_t opcode_index = i;
+    if ((bytes[opcode_index] & 0xF0) == 0x40) {
+      if (opcode_index + 8 > scan_len)
+        continue;
+      ++opcode_index;
+    }
+    if (bytes[opcode_index] != 0x8B)
       continue;
-    if (bytes[i + 1] != 0x8B)
-      continue;
-    uint8_t modrm = bytes[i + 2];
-    if ((modrm >> 6) != 2)
-      continue; // mod must be 10 (disp32)
-    if ((modrm & 7) != 4)
-      continue; // rm must be 100 (SIB)
-    uint8_t sib = bytes[i + 3];
-    if ((sib >> 6) != 2)
-      continue; // scale must be 10 (×4)
 
-    std::memcpy(&table_rva, &bytes[i + 4], 4);
+    uint8_t modrm = bytes[opcode_index + 1];
+    if ((modrm >> 6) != 2)
+      continue;
+    if ((modrm & 7) != 4)
+      continue;
+
+    uint8_t sib = bytes[opcode_index + 2];
+    if ((sib >> 6) != 2)
+      continue;
+
+    std::memcpy(&table_rva, &bytes[opcode_index + 3], 4);
     found = true;
-    // Continue scanning to prefer the match closest to the jmp.
   }
 
   if (!found)
@@ -147,7 +224,6 @@ discoverImageBaseRelativeTargets(const BinaryMemoryMap &mem,
 
   uint64_t table_va = image_base + table_rva;
 
-  // Read 32-bit unsigned RVA entries from the table.
   for (unsigned j = 0; j < 256; ++j) {
     auto entry_opt = mem.readInt(table_va + j * 4, 4);
     if (!entry_opt)
@@ -158,8 +234,6 @@ discoverImageBaseRelativeTargets(const BinaryMemoryMap &mem,
       break;
 
     uint64_t target = image_base + entry;
-
-    // Sanity: target should be within ~1 MB of the jump site.
     if (target < jmp_pc - 0x100000 || target > jmp_pc + 0x100000)
       break;
 
@@ -171,4 +245,4 @@ discoverImageBaseRelativeTargets(const BinaryMemoryMap &mem,
   return targets;
 }
 
-} // namespace omill
+}  // namespace omill

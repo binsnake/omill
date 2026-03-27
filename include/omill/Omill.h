@@ -215,6 +215,16 @@ bool shouldUseStableNoGsdExportRootFallback(
     bool force_generic_static_devirtualize,
     uint64_t largest_executable_section_size);
 
+/// Return true when driver-side policy should prefer a fast non-GSD path for
+/// small plain export roots. This is intended for non-virtualized binaries
+/// where forcing GSD onto dispatch-shaped lifted code is pure overhead.
+bool shouldUseFastPlainExportRootFallback(
+    bool vm_mode, bool requested_root_is_export, bool use_block_lifting,
+    bool generic_static_devirtualize_requested,
+    bool force_generic_static_devirtualize,
+    uint64_t largest_executable_section_size,
+    uint64_t executable_section_count);
+
 /// Return true when driver-side policy should auto-suppress the inliner for a
 /// root after generic static devirtualization was skipped based on root-local
 /// shape.

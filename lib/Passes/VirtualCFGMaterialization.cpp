@@ -229,19 +229,25 @@ static llvm::Function *lookupNearbyLiftedTargetByPC(llvm::Module &M,
       nearbyEntrySearchWindow(targetArchForMaterializationModule(M));
   llvm::Function *best = nullptr;
   uint64_t best_pc = 0;
+  uint64_t best_distance = std::numeric_limits<uint64_t>::max();
 
   for (auto &F : M) {
     if (F.isDeclaration() || !hasLiftedSignature(F))
       continue;
 
     auto entry_pc = extractLiftedOrBlockEntryPC(F);
-    if (!entry_pc || *entry_pc >= target_pc)
+    if (!entry_pc)
       continue;
-    if ((target_pc - *entry_pc) > window)
+    uint64_t distance =
+        (*entry_pc > target_pc) ? (*entry_pc - target_pc)
+                                : (target_pc - *entry_pc);
+    if (distance == 0 || distance > window)
       continue;
-    if (!best || *entry_pc > best_pc) {
+    if (!best || distance < best_distance ||
+        (distance == best_distance && *entry_pc < best_pc)) {
       best = &F;
       best_pc = *entry_pc;
+      best_distance = distance;
     }
   }
 
@@ -1517,7 +1523,7 @@ static bool tryLiftTarget(
   if (lifted && session_result.session)
     session_result.session->noteLiftedTarget(target_pc);
 
-  if (!lifted || !lookupLiftedTargetByPC(M, target_pc)) {
+  if (!lifted) {
     failed_targets.insert(target_pc);
     if (diagnostics) {
       diagnostics->push_back("lift-failed target=0x" +
@@ -1526,11 +1532,31 @@ static bool tryLiftTarget(
     return false;
   }
 
-  if (diagnostics) {
-    diagnostics->push_back("lifted target=0x" + llvm::utohexstr(target_pc) +
-                           " -> " + lookupLiftedTargetByPC(M, target_pc)->getName().str());
+  if (auto *lifted_target = lookupLiftedTargetByPC(M, target_pc)) {
+    if (diagnostics) {
+      diagnostics->push_back("lifted target=0x" + llvm::utohexstr(target_pc) +
+                             " -> " + lifted_target->getName().str());
+    }
+    return true;
   }
-  return true;
+
+  uint64_t nearby_pc = 0;
+  if (auto *nearby_target = lookupNearbyLiftedTargetByPC(M, target_pc, nearby_pc)) {
+    if (diagnostics) {
+      diagnostics->push_back("lifted-nearby target=0x" +
+                             llvm::utohexstr(target_pc) + " -> " +
+                             nearby_target->getName().str() +
+                             " recovered_pc=0x" + llvm::utohexstr(nearby_pc));
+    }
+    return true;
+  }
+
+  failed_targets.insert(target_pc);
+  if (diagnostics) {
+    diagnostics->push_back("lift-failed target=0x" +
+                           llvm::utohexstr(target_pc));
+  }
+  return false;
 }
 
 static bool tryAttachExistingLiftedTargetForRecovery(

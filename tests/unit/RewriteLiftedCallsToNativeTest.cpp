@@ -226,6 +226,142 @@ TEST_F(RewriteLiftedCallsToNativeTest,
   EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
 }
 
+TEST_F(RewriteLiftedCallsToNativeTest,
+       OpenOutputRootSkipsLiftedToNativeRewrite) {
+  auto M = createBaseModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+
+  auto *callee = llvm::Function::Create(
+      liftedFnTy(), llvm::Function::ExternalLinkage, "sub_402000", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", callee);
+    llvm::IRBuilder<> B(entry);
+    auto *dispatch = M->getOrInsertFunction(
+        "__omill_dispatch_call", liftedFnTy()).getCallee();
+    auto *result =
+        B.CreateCall(liftedFnTy(), dispatch,
+                     {callee->getArg(0), B.getInt64(0x999000), callee->getArg(2)});
+    B.CreateRet(result);
+  }
+
+  auto *native_fn_ty = llvm::FunctionType::get(i64_ty, {i64_ty}, false);
+  auto *native_fn = llvm::Function::Create(
+      native_fn_ty, llvm::Function::ExternalLinkage, "sub_402000_native", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", native_fn);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(native_fn->getArg(0));
+  }
+
+  auto *blk_helper = llvm::Function::Create(
+      liftedFnTy(), llvm::Function::ExternalLinkage, "blk_401010", *M);
+
+  auto *caller = llvm::Function::Create(
+      liftedFnTy(), llvm::Function::ExternalLinkage, "sub_401000", *M);
+  caller->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", caller);
+    llvm::IRBuilder<> B(entry);
+    auto *call1 = B.CreateCall(
+        callee, {caller->getArg(0), caller->getArg(1), caller->getArg(2)});
+    auto *call2 = B.CreateCall(
+        blk_helper, {caller->getArg(0), caller->getArg(1), call1});
+    B.CreateRet(call2);
+  }
+
+  runPass(*M);
+
+  bool calls_lifted = false;
+  bool calls_native = false;
+  for (auto &BB : *caller) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      if (CI->getCalledFunction() == callee)
+        calls_lifted = true;
+      if (CI->getCalledFunction() == native_fn)
+        calls_native = true;
+    }
+  }
+
+  EXPECT_TRUE(calls_lifted);
+  EXPECT_FALSE(calls_native);
+  EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+}
+
+TEST_F(RewriteLiftedCallsToNativeTest,
+       OpenOutputRootModuleSkipsHelperLiftedToNativeRewrite) {
+  auto M = createBaseModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+
+  auto *callee = llvm::Function::Create(
+      liftedFnTy(), llvm::Function::ExternalLinkage, "sub_402000", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", callee);
+    llvm::IRBuilder<> B(entry);
+    auto *dispatch = M->getOrInsertFunction(
+        "__omill_dispatch_call", liftedFnTy()).getCallee();
+    auto *result =
+        B.CreateCall(liftedFnTy(), dispatch,
+                     {callee->getArg(0), B.getInt64(0x999000), callee->getArg(2)});
+    B.CreateRet(result);
+  }
+
+  auto *native_fn_ty = llvm::FunctionType::get(i64_ty, {i64_ty}, false);
+  auto *native_fn = llvm::Function::Create(
+      native_fn_ty, llvm::Function::ExternalLinkage, "sub_402000_native", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", native_fn);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(native_fn->getArg(0));
+  }
+
+  auto *blk_helper = llvm::Function::Create(
+      liftedFnTy(), llvm::Function::ExternalLinkage, "blk_401010", *M);
+
+  auto *root = llvm::Function::Create(
+      liftedFnTy(), llvm::Function::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *result = B.CreateCall(
+        blk_helper, {root->getArg(0), root->getArg(1), root->getArg(2)});
+    B.CreateRet(result);
+  }
+
+  auto *helper = llvm::Function::Create(
+      liftedFnTy(), llvm::Function::ExternalLinkage, "sub_401100", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", helper);
+    llvm::IRBuilder<> B(entry);
+    auto *result = B.CreateCall(
+        callee, {helper->getArg(0), helper->getArg(1), helper->getArg(2)});
+    B.CreateRet(result);
+  }
+
+  runPass(*M);
+
+  bool helper_calls_lifted = false;
+  bool helper_calls_native = false;
+  for (auto &BB : *helper) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      if (CI->getCalledFunction() == callee)
+        helper_calls_lifted = true;
+      if (CI->getCalledFunction() == native_fn)
+        helper_calls_native = true;
+    }
+  }
+
+  EXPECT_TRUE(helper_calls_lifted);
+  EXPECT_FALSE(helper_calls_native);
+  EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+}
+
 TEST_F(RewriteLiftedCallsToNativeTest, DynamicDispatchEmitsIndirectCall) {
   auto M = createBaseModule();
   auto *i64_ty = llvm::Type::getInt64Ty(Ctx);

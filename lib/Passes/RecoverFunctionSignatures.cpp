@@ -1,10 +1,18 @@
 #include "omill/Passes/RecoverFunctionSignatures.h"
 
+#include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/StringRef.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/DataLayout.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/Operator.h>
+
+#include <cctype>
+#include <functional>
+#include <memory>
 
 #include "omill/Analysis/CallingConventionAnalysis.h"
 #include "omill/Utils/LiftedNames.h"
@@ -14,7 +22,10 @@ namespace omill {
 
 namespace {
 
-static constexpr unsigned kWin64PublicRootParamCount = 2;
+bool debugPublicRootSeeds() {
+  static bool enabled = std::getenv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS") != nullptr;
+  return enabled;
+}
 
 std::string nativeWrapperName(const llvm::Function &F) {
   return F.getName().str() + "_native";
@@ -57,9 +68,469 @@ unsigned exportedRootGPRParamCount(const FunctionABI &abi,
                                    bool is_public_output_root) {
   if (!is_public_output_root)
     return abi.numParams();
-  if (abi.cc == DetectedCC::kWin64)
-    return std::min(kWin64PublicRootParamCount, abi.numParams());
   return abi.numParams();
+}
+
+std::optional<unsigned> getStateByteOffset(const llvm::Function &F,
+                                           const llvm::Value *ptr,
+                                           const llvm::DataLayout &DL) {
+  auto *state_arg = F.arg_empty() ? nullptr : F.getArg(0);
+  if (!state_arg)
+    return std::nullopt;
+
+  auto *gep =
+      llvm::dyn_cast<llvm::GEPOperator>(ptr->stripPointerCasts());
+  if (!gep || gep->getPointerOperand() != state_arg)
+    return std::nullopt;
+
+  llvm::APInt offset(DL.getIndexTypeSizeInBits(gep->getPointerOperandType()),
+                     0);
+  if (!gep->accumulateConstantOffset(DL, offset))
+    return std::nullopt;
+
+  return static_cast<unsigned>(offset.getZExtValue());
+}
+
+struct EntrySeedValue {
+  enum class Kind {
+    Constant,
+    ProgramCounterRelative,
+  };
+
+  Kind kind = Kind::Constant;
+  int64_t value = 0;
+};
+
+struct DriverSeedExpr {
+  enum class Kind {
+    Param,
+    Constant,
+    Add64,
+    Xor64,
+    Xor32,
+    And32,
+    ZExt32,
+  };
+
+  Kind kind = Kind::Constant;
+  uint64_t constant = 0;
+  unsigned param_index = 0;
+  std::unique_ptr<DriverSeedExpr> lhs;
+  std::unique_ptr<DriverSeedExpr> rhs;
+};
+
+class DriverSeedExprParser {
+ public:
+  explicit DriverSeedExprParser(llvm::StringRef text) : text_(text) {}
+
+  std::unique_ptr<DriverSeedExpr> parse() {
+    auto expr = parseExpr();
+    skipWS();
+    if (!expr || pos_ != text_.size())
+      return nullptr;
+    return expr;
+  }
+
+ private:
+  llvm::StringRef text_;
+  size_t pos_ = 0;
+
+  void skipWS() {
+    while (pos_ < text_.size() &&
+           std::isspace(static_cast<unsigned char>(text_[pos_])))
+      ++pos_;
+  }
+
+  bool consume(char c) {
+    skipWS();
+    if (pos_ >= text_.size() || text_[pos_] != c)
+      return false;
+    ++pos_;
+    return true;
+  }
+
+  std::optional<llvm::StringRef> parseIdentifier() {
+    skipWS();
+    size_t start = pos_;
+    while (pos_ < text_.size() &&
+           (std::isalnum(static_cast<unsigned char>(text_[pos_])) ||
+            text_[pos_] == '_'))
+      ++pos_;
+    if (start == pos_)
+      return std::nullopt;
+    return text_.slice(start, pos_);
+  }
+
+  std::optional<uint64_t> parseUInt() {
+    skipWS();
+    size_t start = pos_;
+    if (pos_ + 2 <= text_.size() && text_[pos_] == '0' &&
+        (text_[pos_ + 1] == 'x' || text_[pos_ + 1] == 'X')) {
+      pos_ += 2;
+      size_t hex_start = pos_;
+      while (pos_ < text_.size() &&
+             std::isxdigit(static_cast<unsigned char>(text_[pos_])))
+        ++pos_;
+      if (hex_start == pos_)
+        return std::nullopt;
+      uint64_t value = 0;
+      if (text_.slice(hex_start, pos_).getAsInteger(16, value))
+        return std::nullopt;
+      return value;
+    }
+    while (pos_ < text_.size() &&
+           std::isdigit(static_cast<unsigned char>(text_[pos_])))
+      ++pos_;
+    if (start == pos_)
+      return std::nullopt;
+    uint64_t value = 0;
+    if (text_.slice(start, pos_).getAsInteger(10, value))
+      return std::nullopt;
+    return value;
+  }
+
+  std::unique_ptr<DriverSeedExpr> parseUnaryCall(DriverSeedExpr::Kind kind) {
+    if (!consume('('))
+      return nullptr;
+    auto inner = parseExpr();
+    if (!inner || !consume(')'))
+      return nullptr;
+    auto expr = std::make_unique<DriverSeedExpr>();
+    expr->kind = kind;
+    expr->lhs = std::move(inner);
+    return expr;
+  }
+
+  std::unique_ptr<DriverSeedExpr> parseBinaryCall(DriverSeedExpr::Kind kind) {
+    if (!consume('('))
+      return nullptr;
+    auto lhs = parseExpr();
+    if (!lhs || !consume(','))
+      return nullptr;
+    auto rhs = parseExpr();
+    if (!rhs || !consume(')'))
+      return nullptr;
+    auto expr = std::make_unique<DriverSeedExpr>();
+    expr->kind = kind;
+    expr->lhs = std::move(lhs);
+    expr->rhs = std::move(rhs);
+    return expr;
+  }
+
+  std::unique_ptr<DriverSeedExpr> parseExpr() {
+    auto ident = parseIdentifier();
+    if (!ident)
+      return nullptr;
+
+    if (*ident == "param") {
+      if (!consume('('))
+        return nullptr;
+      auto index = parseUInt();
+      if (!index || !consume(')'))
+        return nullptr;
+      auto expr = std::make_unique<DriverSeedExpr>();
+      expr->kind = DriverSeedExpr::Kind::Param;
+      expr->param_index = static_cast<unsigned>(*index);
+      return expr;
+    }
+
+    if (*ident == "const") {
+      if (!consume('('))
+        return nullptr;
+      auto value = parseUInt();
+      if (!value || !consume(')'))
+        return nullptr;
+      auto expr = std::make_unique<DriverSeedExpr>();
+      expr->kind = DriverSeedExpr::Kind::Constant;
+      expr->constant = *value;
+      return expr;
+    }
+
+    if (*ident == "add64")
+      return parseBinaryCall(DriverSeedExpr::Kind::Add64);
+    if (*ident == "xor64")
+      return parseBinaryCall(DriverSeedExpr::Kind::Xor64);
+    if (*ident == "xor32")
+      return parseBinaryCall(DriverSeedExpr::Kind::Xor32);
+    if (*ident == "and32")
+      return parseBinaryCall(DriverSeedExpr::Kind::And32);
+    if (*ident == "zext32")
+      return parseUnaryCall(DriverSeedExpr::Kind::ZExt32);
+
+    return nullptr;
+  }
+};
+
+using DriverSeedExprMap =
+    llvm::SmallVector<std::pair<std::string, std::unique_ptr<DriverSeedExpr>>, 8>;
+
+llvm::SmallVector<std::optional<unsigned>, 8>
+collectParamStateOffsets(const llvm::Function &F) {
+  llvm::SmallVector<std::optional<unsigned>, 8> result;
+  auto attr = F.getFnAttribute("omill.param_state_offsets");
+  if (!attr.isValid() || !attr.isStringAttribute())
+    return result;
+
+  llvm::SmallVector<llvm::StringRef, 8> entries;
+  attr.getValueAsString().split(entries, ',', -1, false);
+  for (auto entry : entries) {
+    entry = entry.trim();
+    if (entry.empty())
+      continue;
+    if (entry == "stack") {
+      result.push_back(std::nullopt);
+      continue;
+    }
+    unsigned offset = 0;
+    if (entry.getAsInteger(10, offset))
+      result.push_back(std::nullopt);
+    else
+      result.push_back(offset);
+  }
+  return result;
+}
+
+DriverSeedExprMap collectDriverProvidedPublicRootSeedExprs(
+    const llvm::Function &F) {
+  DriverSeedExprMap result;
+  auto attr = F.getFnAttribute("omill.export_entry_seed_exprs");
+  if (!attr.isValid() || !attr.isStringAttribute())
+    return result;
+
+  llvm::SmallVector<llvm::StringRef, 8> entries;
+  attr.getValueAsString().split(entries, ';', -1, false);
+  for (auto entry : entries) {
+    entry = entry.trim();
+    if (entry.empty())
+      continue;
+    auto parts = entry.split('=');
+    if (parts.first.empty() || parts.second.empty())
+      continue;
+    DriverSeedExprParser parser(parts.second.trim());
+    auto expr = parser.parse();
+    if (!expr)
+      continue;
+    result.emplace_back(parts.first.trim().str(), std::move(expr));
+  }
+
+  return result;
+}
+
+llvm::Value *evaluateDriverSeedExpr(
+    const DriverSeedExpr &expr, llvm::IRBuilder<> &Builder,
+    const std::function<llvm::Value *(unsigned)> &get_param_value) {
+  auto *i64_ty = Builder.getInt64Ty();
+  auto i64 = [&](uint64_t value) { return llvm::ConstantInt::get(i64_ty, value); };
+  auto mask32 = [&]() { return i64(0xffffffffull); };
+  auto eval = [&](const DriverSeedExpr &node,
+                  const auto &self) -> llvm::Value * {
+    switch (node.kind) {
+      case DriverSeedExpr::Kind::Param:
+        return get_param_value(node.param_index);
+      case DriverSeedExpr::Kind::Constant:
+        return i64(node.constant);
+      case DriverSeedExpr::Kind::Add64:
+        return Builder.CreateAdd(self(*node.lhs, self), self(*node.rhs, self));
+      case DriverSeedExpr::Kind::Xor64:
+        return Builder.CreateXor(self(*node.lhs, self), self(*node.rhs, self));
+      case DriverSeedExpr::Kind::Xor32: {
+        auto *value =
+            Builder.CreateXor(self(*node.lhs, self), self(*node.rhs, self));
+        return Builder.CreateAnd(value, mask32());
+      }
+      case DriverSeedExpr::Kind::And32: {
+        auto *value =
+            Builder.CreateAnd(self(*node.lhs, self), self(*node.rhs, self));
+        return Builder.CreateAnd(value, mask32());
+      }
+      case DriverSeedExpr::Kind::ZExt32:
+        return Builder.CreateAnd(self(*node.lhs, self), mask32());
+    }
+    llvm_unreachable("unknown driver seed expr kind");
+  };
+
+  return eval(expr, eval);
+}
+
+std::optional<EntrySeedValue> analyzeEntrySeedValue(const llvm::Value *V,
+                                                    const llvm::Function &F) {
+  auto *program_counter_arg = F.arg_size() > 1 ? F.getArg(1) : nullptr;
+  V = V->stripPointerCasts();
+
+  if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(V)) {
+    return EntrySeedValue{
+        EntrySeedValue::Kind::Constant,
+        static_cast<int64_t>(CI->getValue().zextOrTrunc(64).getZExtValue()),
+    };
+  }
+
+  if (program_counter_arg && V == program_counter_arg) {
+    return EntrySeedValue{
+        EntrySeedValue::Kind::ProgramCounterRelative,
+        0,
+    };
+  }
+
+  auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(V);
+  if (!BO || !program_counter_arg)
+    return std::nullopt;
+
+  auto eval_pc_relative = [&](llvm::Value *lhs, llvm::Value *rhs,
+                              bool rhs_is_subtrahend)
+      -> std::optional<EntrySeedValue> {
+    if (lhs != program_counter_arg)
+      return std::nullopt;
+    auto *CI = llvm::dyn_cast<llvm::ConstantInt>(rhs);
+    if (!CI)
+      return std::nullopt;
+    int64_t delta = CI->getSExtValue();
+    if (rhs_is_subtrahend)
+      delta = -delta;
+    return EntrySeedValue{
+        EntrySeedValue::Kind::ProgramCounterRelative,
+        delta,
+    };
+  };
+
+  switch (BO->getOpcode()) {
+    case llvm::Instruction::Add:
+      if (auto seed =
+              eval_pc_relative(BO->getOperand(0), BO->getOperand(1), false)) {
+        return seed;
+      }
+      return eval_pc_relative(BO->getOperand(1), BO->getOperand(0), false);
+    case llvm::Instruction::Sub:
+      return eval_pc_relative(BO->getOperand(0), BO->getOperand(1), true);
+    default:
+      return std::nullopt;
+  }
+}
+
+std::optional<EntrySeedValue> findEntrySeedValueForStateOffset(
+    const llvm::Function &F,
+    unsigned state_offset,
+    const llvm::DataLayout &DL) {
+  if (F.empty())
+    return std::nullopt;
+
+  for (const auto &I : F.getEntryBlock()) {
+    if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I)) {
+      auto load_offset = getStateByteOffset(F, LI->getPointerOperand(), DL);
+      if (load_offset && *load_offset == state_offset)
+        return std::nullopt;
+      continue;
+    }
+
+    if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+      auto store_offset = getStateByteOffset(F, SI->getPointerOperand(), DL);
+      if (!store_offset || *store_offset != state_offset)
+        continue;
+      return analyzeEntrySeedValue(SI->getValueOperand(), F);
+    }
+
+    if (llvm::isa<llvm::CallBase>(I))
+      return std::nullopt;
+  }
+
+  return std::nullopt;
+}
+
+std::optional<uint64_t> findEntryConstantSeedForStateOffset(
+    const llvm::Function &F,
+    unsigned state_offset,
+    const llvm::DataLayout &DL) {
+  auto seed = findEntrySeedValueForStateOffset(F, state_offset, DL);
+  if (!seed || seed->kind != EntrySeedValue::Kind::Constant)
+    return std::nullopt;
+  return static_cast<uint64_t>(seed->value);
+}
+
+std::optional<EntrySeedValue> findEntryLateSeedValueForStateOffset(
+    const llvm::Function &F,
+    unsigned state_offset,
+    const llvm::DataLayout &DL) {
+  if (F.empty())
+    return std::nullopt;
+
+  for (const auto &I : F.getEntryBlock()) {
+    if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+      auto store_offset = getStateByteOffset(F, SI->getPointerOperand(), DL);
+      if (!store_offset || *store_offset != state_offset)
+        continue;
+      return analyzeEntrySeedValue(SI->getValueOperand(), F);
+    }
+
+    if (llvm::isa<llvm::CallBase>(I))
+      return std::nullopt;
+  }
+
+  return std::nullopt;
+}
+
+llvm::SmallVector<std::optional<uint64_t>, 2>
+detectPublicRootForcedGPRPrefixConstants(const llvm::Function &F,
+                                         const FunctionABI &abi,
+                                         unsigned gpr_param_count) {
+  llvm::SmallVector<std::optional<uint64_t>, 2> constants;
+  const auto &DL = F.getParent()->getDataLayout();
+  for (unsigned i = 0; i < gpr_param_count; ++i) {
+    auto constant =
+        findEntryConstantSeedForStateOffset(F, abi.params[i].state_offset, DL);
+    if (!constant.has_value())
+      break;
+    constants.push_back(constant);
+  }
+  return constants;
+}
+
+llvm::DenseMap<unsigned, EntrySeedValue>
+detectPublicRootExtraGPRSeeds(const llvm::Function &F, const FunctionABI &abi) {
+  llvm::DenseMap<unsigned, EntrySeedValue> seeds;
+  const auto &DL = F.getParent()->getDataLayout();
+  for (unsigned off : abi.extra_gpr_live_ins) {
+    auto seed = findEntryLateSeedValueForStateOffset(F, off, DL);
+    if (!seed)
+      continue;
+    seeds.insert({off, *seed});
+  }
+  return seeds;
+}
+
+llvm::DenseMap<unsigned, EntrySeedValue>
+detectPublicRootHiddenNonParamGPRSeeds(const llvm::Function &F,
+                                       const FunctionABI &abi,
+                                       const StateFieldMap &field_map) {
+  llvm::DenseMap<unsigned, EntrySeedValue> seeds;
+  const auto &DL = F.getParent()->getDataLayout();
+
+  llvm::DenseSet<unsigned> excluded_offsets;
+  for (const auto &param : abi.params)
+    excluded_offsets.insert(param.state_offset);
+  for (unsigned off : abi.extra_gpr_live_ins)
+    excluded_offsets.insert(off);
+  if (auto sp = field_map.fieldByName("RSP"); sp.has_value())
+    excluded_offsets.insert(sp->offset);
+  if (auto sp = field_map.fieldByName("SP"); sp.has_value())
+    excluded_offsets.insert(sp->offset);
+  if (auto sp = field_map.fieldByName("sp"); sp.has_value())
+    excluded_offsets.insert(sp->offset);
+
+  static constexpr const char *kCandidateRegs[] = {
+      "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP", "R8",
+      "R9",  "R10", "R11", "R12", "R13", "R14", "R15",
+  };
+
+  for (const char *name : kCandidateRegs) {
+    auto field = field_map.fieldByName(name);
+    if (!field.has_value() || excluded_offsets.contains(field->offset))
+      continue;
+    auto seed = findEntryLateSeedValueForStateOffset(F, field->offset, DL);
+    if (!seed)
+      continue;
+    seeds.insert({field->offset, *seed});
+  }
+
+  return seeds;
 }
 
 /// Build a native function type from recovered ABI info.
@@ -172,9 +643,89 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
   }
   unsigned gpr_param_count =
       exportedRootGPRParamCount(wrapper_abi, is_public_output_root);
+  auto public_root_forced_gpr_constants =
+      is_public_output_root
+          ? detectPublicRootForcedGPRPrefixConstants(*lifted_fn, wrapper_abi,
+                                                     gpr_param_count)
+          : llvm::SmallVector<std::optional<uint64_t>, 2>{};
+  auto public_root_extra_gpr_seeds =
+      is_public_output_root
+          ? detectPublicRootExtraGPRSeeds(*lifted_fn, wrapper_abi)
+          : llvm::DenseMap<unsigned, EntrySeedValue>{};
+  auto public_root_hidden_nonparam_gpr_seeds =
+      is_public_output_root
+          ? detectPublicRootHiddenNonParamGPRSeeds(*lifted_fn, wrapper_abi,
+                                                   field_map)
+          : llvm::DenseMap<unsigned, EntrySeedValue>{};
+  auto public_root_driver_seed_exprs =
+      is_public_output_root
+          ? collectDriverProvidedPublicRootSeedExprs(*lifted_fn)
+          : DriverSeedExprMap{};
+  if (is_public_output_root && debugPublicRootSeeds()) {
+    llvm::errs() << "[public-root-seeds] " << lifted_fn->getName()
+                 << " extra_gpr_live_ins=" << abi.extra_gpr_live_ins.size()
+                 << " extra_seeds=" << public_root_extra_gpr_seeds.size()
+                 << " hidden_nonparam_seeds="
+                 << public_root_hidden_nonparam_gpr_seeds.size()
+                 << " driver_seed_exprs="
+                 << public_root_driver_seed_exprs.size() << "\n";
+    for (unsigned off : abi.extra_gpr_live_ins) {
+      llvm::errs() << "  off=" << off;
+      auto it = public_root_extra_gpr_seeds.find(off);
+      if (it == public_root_extra_gpr_seeds.end()) {
+        llvm::errs() << " seed=<none>\n";
+        continue;
+      }
+      llvm::errs() << " seed="
+                   << (it->second.kind == EntrySeedValue::Kind::Constant
+                           ? "const"
+                           : "pc+")
+                   << it->second.value << "\n";
+    }
+    for (const auto &[off, seed] : public_root_hidden_nonparam_gpr_seeds) {
+      llvm::errs() << "  hidden_off=" << off << " seed="
+                   << (seed.kind == EntrySeedValue::Kind::Constant ? "const"
+                                                                   : "pc+")
+                   << seed.value << "\n";
+    }
+    for (const auto &[reg_name, expr] : public_root_driver_seed_exprs) {
+      llvm::errs() << "  driver_seed " << reg_name << "=";
+      if (!expr) {
+        llvm::errs() << "<null>\n";
+        continue;
+      }
+      switch (expr->kind) {
+        case DriverSeedExpr::Kind::Param:
+          llvm::errs() << "param";
+          break;
+        case DriverSeedExpr::Kind::Constant:
+          llvm::errs() << "const";
+          break;
+        case DriverSeedExpr::Kind::Add64:
+          llvm::errs() << "add64";
+          break;
+        case DriverSeedExpr::Kind::Xor64:
+          llvm::errs() << "xor64";
+          break;
+        case DriverSeedExpr::Kind::Xor32:
+          llvm::errs() << "xor32";
+          break;
+        case DriverSeedExpr::Kind::And32:
+          llvm::errs() << "and32";
+          break;
+        case DriverSeedExpr::Kind::ZExt32:
+          llvm::errs() << "zext32";
+          break;
+      }
+      llvm::errs() << "\n";
+    }
+  }
+  const unsigned exposed_gpr_param_count =
+      gpr_param_count - public_root_forced_gpr_constants.size();
   auto *native_ty = buildNativeType(wrapper_abi, Ctx, is_public_output_root,
-                                    gpr_param_count, is_public_output_root,
-                                    is_public_output_root);
+                                    exposed_gpr_param_count,
+                                    is_public_output_root,
+                                    false);
 
   // Name: lifted function name + "_native"
   std::string native_name = nativeWrapperName(*lifted_fn);
@@ -204,6 +755,8 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
   propagateStringAttr("omill.vm_handler_va");
   propagateStringAttr("omill.vm_trace_hash");
   propagateStringAttr("omill.trace_native_target");
+  propagateStringAttr("omill.export_entry_seed_exprs");
+  propagateStringAttr("omill.export_callsite_win64_gpr_count");
   if (native_fn->getFnAttribute("omill.vm_demerged_clone").isValid() ||
       native_fn->getFnAttribute("omill.vm_outlined_virtual_call").isValid() ||
       native_fn->getFnAttribute("omill.trace_native_target").isValid()) {
@@ -220,6 +773,7 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
 
   auto *entry = llvm::BasicBlock::Create(Ctx, "entry", native_fn);
   llvm::IRBuilder<> Builder(entry);
+  const uint64_t entry_va = extractEntryVA(lifted_fn->getName());
 
   // If we can't find the State type, create a raw byte allocation.
   llvm::Value *state_alloca;
@@ -281,20 +835,91 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
     // artifacts like inttoptr(400).
     for (unsigned off : abi.extra_gpr_live_ins) {
       auto *field_ptr = buildStateGEP(Builder, state_alloca, off);
-      Builder.CreateStore(stack_top_i64, field_ptr);
+      if (auto it = public_root_extra_gpr_seeds.find(off);
+          it != public_root_extra_gpr_seeds.end()) {
+        uint64_t seed_value = 0;
+        switch (it->second.kind) {
+          case EntrySeedValue::Kind::Constant:
+            seed_value = static_cast<uint64_t>(it->second.value);
+            break;
+          case EntrySeedValue::Kind::ProgramCounterRelative:
+            seed_value =
+                static_cast<uint64_t>(static_cast<int64_t>(entry_va) +
+                                      it->second.value);
+            break;
+        }
+        Builder.CreateStore(Builder.getInt64(seed_value), field_ptr);
+      } else {
+        Builder.CreateStore(stack_top_i64, field_ptr);
+      }
+    }
+
+    for (const auto &[off, seed] : public_root_hidden_nonparam_gpr_seeds) {
+      auto *field_ptr = buildStateGEP(Builder, state_alloca, off);
+      uint64_t seed_value = 0;
+      switch (seed.kind) {
+        case EntrySeedValue::Kind::Constant:
+          seed_value = static_cast<uint64_t>(seed.value);
+          break;
+        case EntrySeedValue::Kind::ProgramCounterRelative:
+          seed_value =
+              static_cast<uint64_t>(static_cast<int64_t>(entry_va) +
+                                    seed.value);
+          break;
+      }
+      Builder.CreateStore(Builder.getInt64(seed_value), field_ptr);
+    }
+
+    auto get_public_root_param_value = [&](unsigned param_index)
+        -> llvm::Value * {
+      if (param_index < public_root_forced_gpr_constants.size()) {
+        return Builder.getInt64(*public_root_forced_gpr_constants[param_index]);
+      }
+
+      unsigned arg_index = 0;
+      for (unsigned i = 0; i < param_index; ++i) {
+        if (i < public_root_forced_gpr_constants.size())
+          continue;
+        ++arg_index;
+      }
+      if (arg_index >= native_fn->arg_size())
+        return Builder.getInt64(0);
+      auto *arg = native_fn->getArg(arg_index);
+      if (arg->getType()->isPointerTy()) {
+        return Builder.CreatePtrToInt(arg, Builder.getInt64Ty(),
+                                      arg->getName() + ".i64");
+      }
+      return arg;
+    };
+
+    for (const auto &[reg_name, expr] : public_root_driver_seed_exprs) {
+      auto field = field_map.fieldByName(reg_name);
+      if (!field.has_value())
+        continue;
+      auto *field_ptr = buildStateGEP(Builder, state_alloca, field->offset);
+      auto *value =
+          evaluateDriverSeedExpr(*expr, Builder, get_public_root_param_value);
+      Builder.CreateStore(value, field_ptr);
     }
   }
 
   // Store GPR parameters into State fields.
+  unsigned native_gpr_arg_index = 0;
   for (unsigned i = 0; i < gpr_param_count; ++i) {
-    auto *param = native_fn->getArg(i);
+    auto *field_ptr = buildStateGEP(Builder, state_alloca,
+                                     wrapper_abi.params[i].state_offset);
+    if (i < public_root_forced_gpr_constants.size()) {
+      Builder.CreateStore(
+          Builder.getInt64(*public_root_forced_gpr_constants[i]), field_ptr);
+      continue;
+    }
+
+    auto *param = native_fn->getArg(native_gpr_arg_index++);
     llvm::Value *param_i64 = param;
     if (param->getType()->isPointerTy()) {
       param_i64 = Builder.CreatePtrToInt(param, Builder.getInt64Ty(),
                                          param->getName() + ".i64");
     }
-    auto *field_ptr = buildStateGEP(Builder, state_alloca,
-                                     wrapper_abi.params[i].state_offset);
     Builder.CreateStore(param_i64, field_ptr);
   }
 
@@ -346,6 +971,8 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
   {
     std::string offsets_str;
     for (unsigned i = 0; i < gpr_param_count; ++i)
+      if (!(is_public_output_root &&
+            i < public_root_forced_gpr_constants.size()))
       offsets_str += std::to_string(wrapper_abi.params[i].state_offset) + ",";
     for (unsigned i = 0; !is_public_output_root &&
                          i < wrapper_abi.numStackParams(); ++i)
@@ -371,7 +998,6 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
   // Arg 1: Entry PC from the lifted symbol name (e.g. sub_401000).
   // Passing 0 here can trap unresolved dispatchers in synthetic loops.
   if (lifted_ty->getNumParams() > 1) {
-    uint64_t entry_va = extractEntryVA(lifted_fn->getName());
     call_args.push_back(Builder.getInt64(entry_va));
   }
 
@@ -429,6 +1055,108 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
   return native_fn;
 }
 
+bool rewritePublicRootNativeHelperCallArgs(llvm::Function &F,
+                                           const StateFieldMap &field_map) {
+  if (!F.hasFnAttribute("omill.output_root"))
+    return false;
+
+  auto root_param_offsets = collectParamStateOffsets(F);
+  if (root_param_offsets.empty())
+    return false;
+
+  auto driver_seed_exprs = collectDriverProvidedPublicRootSeedExprs(F);
+  if (driver_seed_exprs.empty())
+    return false;
+
+  llvm::DenseMap<unsigned, unsigned> root_offset_to_arg_index;
+  unsigned arg_index = 0;
+  for (auto offset : root_param_offsets) {
+    if (!offset.has_value())
+      continue;
+    if (arg_index >= F.arg_size())
+      break;
+    root_offset_to_arg_index.insert({*offset, arg_index++});
+  }
+
+  bool changed = false;
+  for (auto &BB : F) {
+    for (auto &I : BB) {
+      auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+      if (!CB)
+        continue;
+      auto *callee = CB->getCalledFunction();
+      if (!callee || callee->isDeclaration() || callee == &F)
+        continue;
+
+      auto callee_param_offsets = collectParamStateOffsets(*callee);
+      if (callee_param_offsets.empty() ||
+          callee_param_offsets.size() != CB->arg_size())
+        continue;
+
+      llvm::IRBuilder<> Builder(CB);
+      auto getRootParamValue = [&](unsigned param_index) -> llvm::Value * {
+        if (param_index >= F.arg_size())
+          return Builder.getInt64(0);
+        auto *arg = F.getArg(param_index);
+        if (arg->getType()->isPointerTy()) {
+          return Builder.CreatePtrToInt(arg, Builder.getInt64Ty(),
+                                        arg->getName() + ".i64");
+        }
+        return arg;
+      };
+
+      auto expressionForOffset = [&](unsigned offset) -> llvm::Value * {
+        if (auto it = root_offset_to_arg_index.find(offset);
+            it != root_offset_to_arg_index.end()) {
+          return getRootParamValue(it->second);
+        }
+
+        for (const auto &[reg_name, expr] : driver_seed_exprs) {
+          auto field = field_map.fieldByName(reg_name);
+          if (!field.has_value() || field->offset != offset)
+            continue;
+          return evaluateDriverSeedExpr(*expr, Builder, getRootParamValue);
+        }
+        return nullptr;
+      };
+
+      for (unsigned i = 0; i < callee_param_offsets.size(); ++i) {
+        auto offset = callee_param_offsets[i];
+        if (!offset.has_value())
+          continue;
+        auto *replacement = expressionForOffset(*offset);
+        if (!replacement)
+          continue;
+        auto *current = CB->getArgOperand(i);
+        if (replacement->getType() != current->getType()) {
+          if (current->getType()->isPointerTy()) {
+            replacement = Builder.CreateIntToPtr(
+                replacement, current->getType(),
+                callee->getName() + ".arg.ptr");
+          } else if (replacement->getType()->isPointerTy() &&
+                     current->getType()->isIntegerTy()) {
+            replacement = Builder.CreatePtrToInt(
+                replacement, current->getType(),
+                callee->getName() + ".arg.int");
+          } else if (replacement->getType()->isIntegerTy() &&
+                     current->getType()->isIntegerTy()) {
+            replacement =
+                Builder.CreateIntCast(replacement, current->getType(), false);
+          } else {
+            continue;
+          }
+        }
+        if (replacement == current)
+          continue;
+        CB->setArgOperand(i, replacement);
+        changed = true;
+      }
+    }
+  }
+
+  return changed;
+}
+
 }  // namespace
 
 llvm::PreservedAnalyses RecoverFunctionSignaturesPass::run(
@@ -471,6 +1199,14 @@ llvm::PreservedAnalyses RecoverFunctionSignaturesPass::run(
                     << " ret=" << abi->ret.has_value() << "\n";
     createNativeWrapper(F, *abi, field_map, state_ty);
     changed = true;
+  }
+
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    if (!F.getName().ends_with("_native"))
+      continue;
+    changed |= rewritePublicRootNativeHelperCallArgs(F, field_map);
   }
 
   return changed ? llvm::PreservedAnalyses::none()

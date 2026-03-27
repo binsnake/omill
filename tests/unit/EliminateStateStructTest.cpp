@@ -210,6 +210,105 @@ TEST_F(EliminateStateStructTest, PlainOutputRootBecomesAlwaysInline) {
   EXPECT_FALSE(lifted_fn->hasFnAttribute(llvm::Attribute::OptimizeNone));
 }
 
+TEST_F(EliminateStateStructTest,
+       PlainOutputRootWithDefinedLiftedBlockCalleeBecomesAlwaysInline) {
+  auto M = createTestModule();
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_fn = M->getFunction("sub_401000");
+  ASSERT_NE(lifted_fn, nullptr);
+  lifted_fn->addFnAttr("omill.output_root");
+  lifted_fn->addFnAttr(llvm::Attribute::AlwaysInline);
+
+  auto *blk_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *blk = llvm::Function::Create(
+      blk_ty, llvm::GlobalValue::ExternalLinkage, "blk_401010", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", blk);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(blk->getArg(2));
+  }
+
+  for (auto &BB : *lifted_fn) {
+    for (auto &I : llvm::make_early_inc_range(BB)) {
+      I.eraseFromParent();
+    }
+    llvm::IRBuilder<> B(&BB);
+    B.CreateCall(blk, {lifted_fn->getArg(0), lifted_fn->getArg(1),
+                       lifted_fn->getArg(2)});
+    B.CreateRet(lifted_fn->getArg(2));
+    break;
+  }
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+  llvm::ModulePassManager MPM;
+  MPM.addPass(omill::EliminateStateStructPass());
+  MPM.run(*M, MAM);
+
+  EXPECT_EQ(lifted_fn->getLinkage(), llvm::GlobalValue::InternalLinkage);
+  EXPECT_TRUE(lifted_fn->hasFnAttribute(llvm::Attribute::AlwaysInline));
+  EXPECT_FALSE(lifted_fn->hasFnAttribute(llvm::Attribute::NoInline));
+}
+
+TEST_F(EliminateStateStructTest,
+       PlainOutputRootWithDeclaredLiftedBlockCalleeStaysNoInlineBoundary) {
+  auto M = createTestModule();
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_fn = M->getFunction("sub_401000");
+  ASSERT_NE(lifted_fn, nullptr);
+  lifted_fn->addFnAttr("omill.output_root");
+  lifted_fn->addFnAttr(llvm::Attribute::AlwaysInline);
+
+  auto *blk_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *blk = llvm::Function::Create(
+      blk_ty, llvm::GlobalValue::ExternalLinkage, "blk_401020", *M);
+
+  for (auto &BB : *lifted_fn) {
+    for (auto &I : llvm::make_early_inc_range(BB)) {
+      I.eraseFromParent();
+    }
+    llvm::IRBuilder<> B(&BB);
+    B.CreateCall(blk, {lifted_fn->getArg(0), lifted_fn->getArg(1),
+                       lifted_fn->getArg(2)});
+    B.CreateRet(lifted_fn->getArg(2));
+    break;
+  }
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+  llvm::ModulePassManager MPM;
+  MPM.addPass(omill::EliminateStateStructPass());
+  MPM.run(*M, MAM);
+
+  EXPECT_EQ(lifted_fn->getLinkage(), llvm::GlobalValue::InternalLinkage);
+  EXPECT_FALSE(lifted_fn->hasFnAttribute(llvm::Attribute::AlwaysInline));
+  EXPECT_TRUE(lifted_fn->hasFnAttribute(llvm::Attribute::NoInline));
+}
+
 TEST_F(EliminateStateStructTest, VmOutputRootStaysNoInlineBoundary) {
   auto M = createTestModule();
 

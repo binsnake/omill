@@ -6,6 +6,7 @@
 #include <llvm/IR/Metadata.h>
 #include <llvm/IR/Module.h>
 
+#include <limits>
 #include <optional>
 
 #include "omill/Analysis/VMTraceEmulator.h"
@@ -142,16 +143,24 @@ const VirtualHandlerSummary *findNearbyLiftedHandlerEntry(
     const VirtualMachineModel &model, uint64_t target_pc, TargetArch arch) {
   const auto window = nearbyEntrySearchWindow(arch);
   const VirtualHandlerSummary *best = nullptr;
+  uint64_t best_distance = std::numeric_limits<uint64_t>::max();
   for (const auto &handler : model.handlers()) {
     if (!handler.entry_va.has_value())
       continue;
     const auto entry_va = *handler.entry_va;
-    if (entry_va >= target_pc)
+    uint64_t distance = 0;
+    if (entry_va > target_pc) {
+      distance = entry_va - target_pc;
+    } else {
+      distance = target_pc - entry_va;
+    }
+    if (distance == 0 || distance > window)
       continue;
-    if ((target_pc - entry_va) > window)
-      continue;
-    if (!best || *best->entry_va < entry_va)
+    if (!best || distance < best_distance ||
+        (distance == best_distance && *best->entry_va > entry_va)) {
       best = &handler;
+      best_distance = distance;
+    }
   }
   return best;
 }

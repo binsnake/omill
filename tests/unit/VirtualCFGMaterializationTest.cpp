@@ -4210,6 +4210,62 @@ TEST_F(VirtualCFGMaterializationTest,
 }
 
 TEST_F(VirtualCFGMaterializationTest,
+       MaterializesDispatchToForwardNearbyRecoveredLiftedEntry) {
+  auto M = createModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+
+  auto *dispatch = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "__omill_dispatch_jump", *M);
+
+  auto *target = llvm::Function::Create(lifted_ty,
+                                        llvm::Function::ExternalLinkage,
+                                        "blk_18000e348", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target->getArg(0));
+  }
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::Function::ExternalLinkage,
+                                      "sub_18000e300", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *call =
+        B.CreateCall(dispatch, {root->getArg(0), B.getInt64(0x18000E345ULL),
+                                root->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  runPass(*M);
+
+  unsigned dispatch_calls = 0;
+  unsigned direct_calls = 0;
+  for (auto &BB : *root) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *callee = CI->getCalledFunction();
+      if (!callee)
+        continue;
+      if (callee->getName() == "__omill_dispatch_jump")
+        ++dispatch_calls;
+      if (callee == target)
+        ++direct_calls;
+    }
+  }
+
+  EXPECT_EQ(dispatch_calls, 0u);
+  EXPECT_EQ(direct_calls, 1u);
+}
+
+TEST_F(VirtualCFGMaterializationTest,
        MaterializesDispatchToExtendedNearbyRecoveredLiftedEntry) {
   auto M = createModule();
   auto *i64_ty = llvm::Type::getInt64Ty(Ctx);

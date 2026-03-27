@@ -109,6 +109,44 @@ bool shouldRewriteClosedRootSliceFunction(const llvm::Function &F) {
   return isClosedRootSliceFunction(F);
 }
 
+bool hasOpenOutputRootRewriteHazards(const llvm::Function &F) {
+  if (!F.hasFnAttribute("omill.output_root"))
+    return false;
+  if (isClosedRootSliceRoot(F))
+    return false;
+
+  for (auto &BB : F) {
+    for (auto &I : BB) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+      if (!call)
+        continue;
+      auto *callee = call->getCalledFunction();
+      if (!callee)
+        return true;
+
+      auto name = callee->getName();
+      if (name == "__omill_dispatch_call" || name == "__omill_dispatch_jump")
+        return true;
+      if (name.starts_with("blk_"))
+        return true;
+      if (name.starts_with("sub_") && !name.ends_with("_native"))
+        return true;
+    }
+  }
+
+  return false;
+}
+
+bool moduleHasOpenOutputRootRewriteHazards(const llvm::Module &M) {
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    if (hasOpenOutputRootRewriteHazards(F))
+      return true;
+  }
+  return false;
+}
+
 bool nativeCallSignatureMatches(const llvm::Function &F,
                                 llvm::ArrayRef<llvm::Value *> args) {
   auto *fn_ty = F.getFunctionType();
@@ -270,7 +308,13 @@ void fixupForwardDeclarationCall(llvm::CallInst *call,
 
 void collectCandidates(llvm::Function &F, const LiftedFunctionMap &lifted,
                        const llvm::DenseSet<const llvm::Function *> &non_leaf_set,
+                       bool module_has_open_output_root_hazards,
                        llvm::SmallVectorImpl<RewriteCandidate> &candidates) {
+  if (hasOpenOutputRootRewriteHazards(F))
+    return;
+  if (module_has_open_output_root_hazards && !F.getName().ends_with("_native"))
+    return;
+
   for (auto &BB : F) {
     for (auto &I : BB) {
       auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
@@ -383,6 +427,8 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
   }
 
   bool changed = false;
+  const bool module_has_open_output_root_hazards =
+      moduleHasOpenOutputRootRewriteHazards(M);
 
   for (auto &F : M) {
     if (F.isDeclaration()) continue;
@@ -390,7 +436,8 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
       continue;
 
     llvm::SmallVector<RewriteCandidate, 8> candidates;
-    collectCandidates(F, lifted, non_leaf_set, candidates);
+    collectCandidates(F, lifted, non_leaf_set,
+                      module_has_open_output_root_hazards, candidates);
     if (candidates.empty()) continue;
 
     for (auto &cand : candidates) {

@@ -2273,15 +2273,24 @@ struct ForceInlineSingleCallerCommonContinuationNativeHelpersPass
   }
 };
 
+static bool isCanonicalizableMutualNativeHelperName(llvm::StringRef name) {
+  if (!name.ends_with("_native"))
+    return false;
+  return isSyntheticBlockLikeFunctionName(name) || name.starts_with("sub_");
+}
+
 static bool isCanonicalizableMutualNativeBlockHelper(
     const llvm::Function &F) {
   return !F.isDeclaration() &&
          !F.hasFnAttribute("omill.output_root") &&
-         F.getName().ends_with("_native") &&
-         isSyntheticBlockLikeFunctionName(F.getName());
+         isCanonicalizableMutualNativeHelperName(F.getName());
 }
 
-static void collectDirectSyntheticBlockLikeNativeCallees(
+static bool isDebugTrackedMutualPairName(llvm::StringRef name) {
+  return name == "blk_180002164_native" || name == "sub_180002301_native";
+}
+
+static void collectDirectCanonicalizableMutualNativeCallees(
     llvm::Function &F, llvm::SmallPtrSetImpl<llvm::Function *> &callees) {
   for (auto &BB : F) {
     for (auto &I : BB) {
@@ -2290,8 +2299,7 @@ static void collectDirectSyntheticBlockLikeNativeCallees(
         continue;
       auto *callee = call->getCalledFunction();
       if (!callee || callee->isDeclaration() ||
-          !callee->getName().ends_with("_native") ||
-          !isSyntheticBlockLikeFunctionName(callee->getName())) {
+          !isCanonicalizableMutualNativeHelperName(callee->getName())) {
         continue;
       }
       callees.insert(callee);
@@ -2302,7 +2310,7 @@ static void collectDirectSyntheticBlockLikeNativeCallees(
 static llvm::Function *getSingleSyntheticBlockLikeNativePeerCallee(
     llvm::Function &F) {
   llvm::SmallPtrSet<llvm::Function *, 4> callees;
-  collectDirectSyntheticBlockLikeNativeCallees(F, callees);
+  collectDirectCanonicalizableMutualNativeCallees(F, callees);
   llvm::Function *peer = nullptr;
   for (auto *callee : callees) {
     if (callee == &F)
@@ -2317,7 +2325,7 @@ static llvm::Function *getSingleSyntheticBlockLikeNativePeerCallee(
 static bool hasOnlySelfAndPeerSyntheticBlockLikeNativeCallees(
     llvm::Function &F, llvm::Function &peer) {
   llvm::SmallPtrSet<llvm::Function *, 4> callees;
-  collectDirectSyntheticBlockLikeNativeCallees(F, callees);
+  collectDirectCanonicalizableMutualNativeCallees(F, callees);
   if (!callees.contains(&peer))
     return false;
   for (auto *callee : callees) {
@@ -2738,6 +2746,12 @@ struct CanonicalizeMutualRecursiveNativeBlockHelpersPass
       auto *G = getSingleSyntheticBlockLikeNativePeerCallee(*F);
       if (!G || G == F || handled.contains(G) ||
           !isCanonicalizableMutualNativeBlockHelper(*G)) {
+        if (debug && isDebugTrackedMutualPairName(F->getName())) {
+          llvm::errs() << "[native-mutrec-loopify] skip " << F->getName()
+                       << " reason=peer-candidate peer="
+                       << (G ? G->getName() : llvm::StringRef("<none>"))
+                       << "\n";
+        }
         if (debug && G &&
             (F->getName() == "blk_180001e80_native" ||
              F->getName() == "blk_180001e94_native")) {
@@ -2754,6 +2768,12 @@ struct CanonicalizeMutualRecursiveNativeBlockHelpersPass
       if (getSingleSyntheticBlockLikeNativePeerCallee(*G) != F ||
           !hasOnlySelfAndPeerSyntheticBlockLikeNativeCallees(*F, *G) ||
           !hasOnlySelfAndPeerSyntheticBlockLikeNativeCallees(*G, *F)) {
+        if (debug && (isDebugTrackedMutualPairName(F->getName()) ||
+                      isDebugTrackedMutualPairName(G->getName()))) {
+          llvm::errs() << "[native-mutrec-loopify] skip " << F->getName()
+                       << " + " << G->getName()
+                       << " reason=callee-shape\n";
+        }
         if (debug &&
             (F->getName() == "blk_180001e80_native" ||
              F->getName() == "blk_180001e94_native" ||
@@ -2770,6 +2790,12 @@ struct CanonicalizeMutualRecursiveNativeBlockHelpersPass
       llvm::SmallVector<llvm::CallInst *, 8> gf_calls;
       if (!collectTailLikeCallsToCallee(*F, *G, fg_calls, debug) ||
           !collectTailLikeCallsToCallee(*G, *F, gf_calls, debug)) {
+        if (debug && (isDebugTrackedMutualPairName(F->getName()) ||
+                      isDebugTrackedMutualPairName(G->getName()))) {
+          llvm::errs() << "[native-mutrec-loopify] skip " << F->getName()
+                       << " + " << G->getName()
+                       << " reason=tail-shape\n";
+        }
         if (debug &&
             (F->getName() == "blk_180001e80_native" ||
              F->getName() == "blk_180001e94_native" ||
@@ -2785,6 +2811,12 @@ struct CanonicalizeMutualRecursiveNativeBlockHelpersPass
       auto *dispatcher =
           canonicalizeMutualRecursiveNativeBlockHelperPair(*F, *G, debug);
       if (!dispatcher) {
+        if (debug && (isDebugTrackedMutualPairName(F->getName()) ||
+                      isDebugTrackedMutualPairName(G->getName()))) {
+          llvm::errs() << "[native-mutrec-loopify] skip " << F->getName()
+                       << " + " << G->getName()
+                       << " reason=canonicalize-failed\n";
+        }
         if (debug &&
             (F->getName() == "blk_180001e80_native" ||
              F->getName() == "blk_180001e94_native" ||
@@ -4439,12 +4471,27 @@ struct AnnotateTerminalBoundaryHandlersPass
       }
       F->addFnAttr(kSummaryAttr, llvm::join(summary_parts, ","));
 
-      if (infos.size() == 1) {
-        const auto &info = infos.front();
-        F->addFnAttr(kKindAttr, info.kind);
-        F->addFnAttr(kTargetAttr, llvm::utohexstr(info.target_pc));
-        if (info.nearby_entry_pc.has_value())
-          F->addFnAttr(kNearbyAttr, llvm::utohexstr(*info.nearby_entry_pc));
+      const auto &first = infos.front();
+      const bool unique_target = llvm::all_of(
+          infos, [&](const TerminalBoundaryClassification &info) {
+            return info.target_pc == first.target_pc;
+          });
+      const bool uniform_kind = llvm::all_of(
+          infos, [&](const TerminalBoundaryClassification &info) {
+            return info.kind == first.kind;
+          });
+      const bool uniform_nearby = llvm::all_of(
+          infos, [&](const TerminalBoundaryClassification &info) {
+            return info.nearby_entry_pc == first.nearby_entry_pc;
+          });
+
+      if (unique_target) {
+        F->addFnAttr(kTargetAttr, llvm::utohexstr(first.target_pc));
+        if (uniform_kind)
+          F->addFnAttr(kKindAttr, first.kind);
+        if (uniform_nearby && first.nearby_entry_pc.has_value()) {
+          F->addFnAttr(kNearbyAttr, llvm::utohexstr(*first.nearby_entry_pc));
+        }
       }
     }
 
@@ -5235,7 +5282,10 @@ bool shouldAutoSkipGenericStaticDevirtualizationForRoot(
     bool root_local_generic_static_devirtualization_shape) {
   if (vm_mode || force_generic_static_devirtualize ||
       root_local_generic_static_devirtualization_shape) {
-    return false;
+    if (force_generic_static_devirtualize ||
+        root_local_generic_static_devirtualization_shape) {
+      return false;
+    }
   }
   if (requested_root_is_export)
     return true;
@@ -5252,6 +5302,20 @@ bool shouldUseStableNoGsdExportRootFallback(
          generic_static_devirtualize_requested &&
          !force_generic_static_devirtualize &&
          largest_executable_section_size >= kLargeExecutableSectionBytes;
+}
+
+bool shouldUseFastPlainExportRootFallback(
+    bool vm_mode, bool requested_root_is_export, bool use_block_lifting,
+    bool generic_static_devirtualize_requested,
+    bool force_generic_static_devirtualize,
+    uint64_t largest_executable_section_size,
+    uint64_t executable_section_count) {
+  constexpr uint64_t kSmallExecutableSectionBytes = 256ull << 10;
+  return !vm_mode && requested_root_is_export && use_block_lifting &&
+         generic_static_devirtualize_requested &&
+         !force_generic_static_devirtualize &&
+         executable_section_count <= 1 &&
+         largest_executable_section_size <= kSmallExecutableSectionBytes;
 }
 
 bool shouldAutoSkipAlwaysInlineForRoot(
@@ -5415,11 +5479,17 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
   // Signature recovery creates native wrappers; state elimination
   // internalizes the original lifted functions with alwaysinline.
   if (!envDisabled("OMILL_SKIP_ABI_RECOVER_SIGNATURES")) {
-    MPM.addPass(RecoverFunctionSignaturesPass());
+    if (!envDisabled("OMILL_SKIP_ABI_RECOVER_SIGNATURE_WRAPPERS")) {
+      MPM.addPass(RecoverFunctionSignaturesPass());
+    }
     addPhaseMarker(MPM, "ABI: rewrite lifted calls");
-    MPM.addPass(RewriteLiftedCallsToNativePass());
+    if (!envDisabled("OMILL_SKIP_ABI_REWRITE_LIFTED_EARLY")) {
+      MPM.addPass(RewriteLiftedCallsToNativePass());
+    }
     addPhaseMarker(MPM, "ABI: eliminate state struct");
-    MPM.addPass(EliminateStateStructPass());
+    if (!envDisabled("OMILL_SKIP_ABI_ELIMINATE_STATE_STRUCT")) {
+      MPM.addPass(EliminateStateStructPass());
+    }
   }
   addClosedSliceShapeProbe(MPM, "abi-post-signatures");
 
@@ -7174,30 +7244,172 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
 }
 
 void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
+  if (!envDisabled("OMILL_SKIP_LOCAL_LIFTED_WRAPPER_INLINE")) {
+    struct ForceInlineLocalLiftedWrapperClosuresPass
+        : llvm::PassInfoMixin<ForceInlineLocalLiftedWrapperClosuresPass> {
+      static bool isLiftedLocalHelper(const llvm::Function &F) {
+        auto name = F.getName();
+        return !F.isDeclaration() && !name.ends_with("_native") &&
+               (name.starts_with("sub_") || name.starts_with("blk_") ||
+                name.starts_with("block_"));
+      }
+
+      llvm::PreservedAnalyses run(llvm::Module &M,
+                                  llvm::ModuleAnalysisManager &) {
+        llvm::SmallVector<llvm::Function *, 32> to_promote;
+        llvm::DenseSet<llvm::Function *> promoted_set;
+        bool changed = false;
+
+        auto collectLocalClosure = [&](llvm::Function &root,
+                                       llvm::SmallVectorImpl<llvm::Function *> &out)
+            -> bool {
+          llvm::SmallVector<llvm::Function *, 32> worklist;
+          llvm::DenseSet<llvm::Function *> seen;
+          worklist.push_back(&root);
+          seen.insert(&root);
+          while (!worklist.empty()) {
+            llvm::Function *current = worklist.pop_back_val();
+            out.push_back(current);
+            for (auto &BB : *current) {
+              for (auto &I : BB) {
+                auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+                if (!call)
+                  continue;
+                llvm::Function *callee = call->getCalledFunction();
+                if (!callee)
+                  return false;
+                auto callee_name = callee->getName();
+                if (callee_name == "__omill_dispatch_call" ||
+                    callee_name == "__omill_dispatch_jump" ||
+                    callee_name == "__omill_missing_block_handler") {
+                  return false;
+                }
+                const bool is_lifted_name =
+                    callee_name.starts_with("sub_") ||
+                    callee_name.starts_with("blk_") ||
+                    callee_name.starts_with("block_");
+                if (is_lifted_name && callee->isDeclaration())
+                  return false;
+                if (!isLiftedLocalHelper(*callee))
+                  continue;
+                if (seen.insert(callee).second)
+                  worklist.push_back(callee);
+              }
+            }
+          }
+          return true;
+        };
+
+        for (auto &F : M) {
+          if (F.isDeclaration() || !F.getName().ends_with("_native") ||
+              !F.hasFnAttribute("omill.output_root")) {
+            continue;
+          }
+          llvm::SmallVector<llvm::Function *, 8> closure_roots;
+          auto base_name = F.getName().drop_back(7);
+          if (llvm::Function *lifted = M.getFunction(base_name);
+              lifted && isLiftedLocalHelper(*lifted)) {
+            closure_roots.push_back(lifted);
+          } else {
+            for (auto &BB : F) {
+              for (auto &I : BB) {
+                auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+                llvm::Function *callee =
+                    call ? call->getCalledFunction() : nullptr;
+                if (!callee || !isLiftedLocalHelper(*callee))
+                  continue;
+                if (llvm::is_contained(closure_roots, callee))
+                  continue;
+                closure_roots.push_back(callee);
+              }
+            }
+          }
+
+          for (llvm::Function *closure_root : closure_roots) {
+            llvm::SmallVector<llvm::Function *, 32> closure;
+            if (!collectLocalClosure(*closure_root, closure))
+              continue;
+            for (llvm::Function *candidate : closure) {
+              if (promoted_set.insert(candidate).second)
+                to_promote.push_back(candidate);
+            }
+          }
+        }
+
+        for (llvm::Function *F : to_promote) {
+          F->setLinkage(llvm::GlobalValue::InternalLinkage);
+          if (F->hasFnAttribute(llvm::Attribute::OptimizeNone))
+            F->removeFnAttr(llvm::Attribute::OptimizeNone);
+          F->removeFnAttr(llvm::Attribute::NoInline);
+          if (!F->hasFnAttribute(llvm::Attribute::AlwaysInline))
+            F->addFnAttr(llvm::Attribute::AlwaysInline);
+          changed = true;
+        }
+
+        return changed ? llvm::PreservedAnalyses::none()
+                       : llvm::PreservedAnalyses::all();
+      }
+      static bool isRequired() { return true; }
+    };
+
+    MPM.addPass(ForceInlineLocalLiftedWrapperClosuresPass{});
+    if (abiAlwaysInlinerEnabled()) {
+      MPM.addPass(llvm::AlwaysInlinerPass());
+    }
+  }
+
   // Eliminate calls to unresolved remill-signature semantic functions.
   // After the full pipeline + ABI recovery, any remaining
   //   declare ptr @sub_*(ptr noalias, i64, ptr noalias)
-  // is a residual from failed dispatch resolution (bogus address outside
-  // the binary image).  Replace all calls with unreachable.
+  // can be either:
+  //   * a genuinely dead unresolved semantic target, or
+  //   * a still-unlifted direct helper/root that points at real in-image code.
+  // Only the first case is safe to rewrite to unreachable.
   if (!envDisabled("OMILL_SKIP_DEAD_SEMANTIC_ELIM")) {
     struct DeadSemanticCallEliminationPass
         : llvm::PassInfoMixin<DeadSemanticCallEliminationPass> {
       llvm::PreservedAnalyses run(llvm::Module &M,
-                                   llvm::ModuleAnalysisManager &) {
+                                  llvm::ModuleAnalysisManager &MAM) {
         // Identify unresolved remill-signature declarations:
         //   declare ptr @sub_*(ptr noalias, i64, ptr noalias)
         llvm::SmallVector<llvm::Function *, 16> dead_semantics;
         auto *ptr_ty = llvm::PointerType::getUnqual(M.getContext());
         auto *i64_ty = llvm::Type::getInt64Ty(M.getContext());
+        auto *binary_memory = MAM.getCachedResult<BinaryMemoryAnalysis>(M);
+        const bool has_image =
+            binary_memory && binary_memory->imageBase() && binary_memory->imageSize();
         for (auto &F : M) {
-          if (!F.isDeclaration()) continue;
-          if (!F.getName().starts_with("sub_")) continue;
+          if (!F.isDeclaration())
+            continue;
+          if (!F.getName().starts_with("sub_"))
+            continue;
           auto *FT = F.getFunctionType();
-          if (FT->getNumParams() != 3) continue;
-          if (FT->getReturnType() != ptr_ty) continue;
-          if (FT->getParamType(0) != ptr_ty) continue;
-          if (FT->getParamType(1) != i64_ty) continue;
-          if (FT->getParamType(2) != ptr_ty) continue;
+          if (FT->getNumParams() != 3)
+            continue;
+          if (FT->getReturnType() != ptr_ty)
+            continue;
+          if (FT->getParamType(0) != ptr_ty)
+            continue;
+          if (FT->getParamType(1) != i64_ty)
+            continue;
+          if (FT->getParamType(2) != ptr_ty)
+            continue;
+
+          // Fail closed when we do not have usable binary-image information.
+          if (!has_image)
+            continue;
+
+          const uint64_t target_pc = extractEntryVA(F.getName());
+          if (target_pc == 0)
+            continue;
+
+          // Keep in-image executable targets. Those are still-unresolved
+          // helper roots, not dead semantics.
+          if (isInImageRange(*binary_memory, target_pc) &&
+              isTargetExecutable(*binary_memory, target_pc)) {
+            continue;
+          }
+
           dead_semantics.push_back(&F);
         }
 
@@ -7375,6 +7587,43 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
     // Internalize non-entry _native functions so DAE can optimize them.
     struct InternalizeForDAEPass
         : llvm::PassInfoMixin<InternalizeForDAEPass> {
+      static bool isInOutputRootNativeClosure(llvm::Function &Target) {
+        if (Target.isDeclaration() || !Target.getName().ends_with("_native"))
+          return false;
+
+        auto *M = Target.getParent();
+        llvm::SmallVector<llvm::Function *, 16> worklist;
+        llvm::SmallPtrSet<llvm::Function *, 32> seen;
+        for (auto &F : *M) {
+          if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root") ||
+              !F.getName().ends_with("_native")) {
+            continue;
+          }
+          if (seen.insert(&F).second)
+            worklist.push_back(&F);
+        }
+
+        while (!worklist.empty()) {
+          auto *F = worklist.pop_back_val();
+          if (F == &Target)
+            return true;
+          for (auto &BB : *F) {
+            for (auto &I : BB) {
+              auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+              auto *Callee = CB ? CB->getCalledFunction() : nullptr;
+              if (!Callee || Callee->isDeclaration() ||
+                  !Callee->getName().ends_with("_native")) {
+                continue;
+              }
+              if (seen.insert(Callee).second)
+                worklist.push_back(Callee);
+            }
+          }
+        }
+
+        return false;
+      }
+
       llvm::PreservedAnalyses run(llvm::Module &M,
                                    llvm::ModuleAnalysisManager &) {
         bool changed = false;
@@ -7397,6 +7646,10 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
           // boundary is semantically meaningful and must not be inlined by
           // the ModuleInliner in subsequent cleanup passes.
           if (F.hasFnAttribute("omill.vm_wrapper")) continue;
+          if (F.getFnAttribute("omill.param_state_offsets").isValid() &&
+              isInOutputRootNativeClosure(F)) {
+            continue;
+          }
           F.setLinkage(llvm::GlobalValue::InternalLinkage);
           changed = true;
         }

@@ -34,6 +34,7 @@
 #include <llvm/Support/ToolOutputFile.h>
 #include <llvm/Support/JSON.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/Bitcode/BitcodeWriter.h>
 
 #include <remill/Arch/Arch.h>
 #include <remill/Arch/Instruction.h>
@@ -62,6 +63,9 @@
 #include "omill/Analysis/VMTraceMap.h"
 #include "omill/Analysis/VirtualCalleeRegistry.h"
 #include "omill/Omill.h"
+#include "omill/Passes/JumpTableConcretizer.h"
+#include "omill/Passes/LowerRemillIntrinsics.h"
+#include "omill/Passes/ResolveAndLowerControlFlow.h"
 #include "omill/Tools/LiftRunContract.h"
 #include "omill/Utils/LiftedNames.h"
 #include "omill/Utils/ProtectedBoundaryUtils.h"
@@ -407,6 +411,27 @@ std::optional<unsigned> parseUnsignedEnv(const char *name) {
   return value;
 }
 
+void dumpModuleIfEnvEnabled(llvm::Module &M, const char *env_name,
+                            llvm::StringRef path) {
+  if (!parseBoolEnv(env_name).value_or(false))
+    return;
+  std::error_code ec;
+  llvm::raw_fd_ostream os(path, ec, llvm::sys::fs::OF_Text);
+  if (!ec)
+    M.print(os, nullptr);
+}
+
+void appendDebugMarker(const char *message) {
+  const char *path = std::getenv("OMILL_DEBUG_MARKER_FILE");
+  if (!path || path[0] == '\0')
+    return;
+  std::error_code ec;
+  llvm::raw_fd_ostream os(path, ec,
+                          llvm::sys::fs::OF_Append | llvm::sys::fs::OF_Text);
+  if (!ec)
+    os << message << "\n";
+}
+
 void setEnvIfUnset(const char *name, const char *value) {
   const char *cur = std::getenv(name);
   if (cur && cur[0] != '\0')
@@ -493,6 +518,7 @@ struct TerminalBoundaryRecoveryAttempt {
   omill::TerminalBoundaryRecoveryMetrics metrics;
   std::string summary;
   bool imported = false;
+  std::string import_rejection_reason;
 };
 
 std::optional<uint64_t> parseHexAttrValueFromLine(llvm::StringRef line,
@@ -560,6 +586,105 @@ std::optional<uint64_t> parseHexFieldFromLine(llvm::StringRef line,
   if (line.slice(pos, end).getAsInteger(16, value))
     return std::nullopt;
   return value;
+}
+
+bool hasUnresolvedOutputRootPcCall(const llvm::Function &F) {
+  if (F.isDeclaration())
+    return false;
+
+  for (const auto &BB : F) {
+    for (const auto &I : BB) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+      if (!call || call->getCalledFunction())
+        continue;
+
+      auto *called = call->getCalledOperand()->stripPointerCasts();
+      auto *i2p = llvm::dyn_cast<llvm::IntToPtrInst>(called);
+      if (!i2p)
+        continue;
+
+      auto *pc_like = i2p->getOperand(0)->stripPointerCasts();
+      if (!pc_like->hasName())
+        continue;
+
+      auto name = pc_like->getName();
+      if (name.contains("pc.canonical") || name.contains("pc.norm"))
+        return true;
+    }
+  }
+
+  return false;
+}
+
+bool hasUnresolvedLiftedControlTransferInFunction(const llvm::Function &F) {
+  if (F.isDeclaration())
+    return false;
+
+  for (const auto &BB : F) {
+    for (const auto &I : BB) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+      if (!call)
+        continue;
+
+      if (auto *callee = call->getCalledFunction()) {
+        auto name = callee->getName();
+        if (name == "__remill_jump" || name == "__remill_function_call" ||
+            name == "__remill_function_return" ||
+            name == "__omill_dispatch_jump" ||
+            name == "__omill_dispatch_call") {
+          return true;
+        }
+      }
+
+      if (!call->getCalledFunction()) {
+        auto *called = call->getCalledOperand()->stripPointerCasts();
+        auto *i2p = llvm::dyn_cast<llvm::IntToPtrInst>(called);
+        if (!i2p)
+          continue;
+
+        auto *pc_like = i2p->getOperand(0)->stripPointerCasts();
+        if (!pc_like->hasName())
+          continue;
+
+        auto name = pc_like->getName();
+        if (name.contains("pc.canonical") || name.contains("pc.norm"))
+          return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+bool hasUnresolvedLiftedControlTransferInClosure(const llvm::Function &Root) {
+  if (Root.isDeclaration())
+    return false;
+
+  llvm::SmallVector<const llvm::Function *, 16> worklist;
+  llvm::DenseSet<const llvm::Function *> seen;
+  worklist.push_back(&Root);
+  seen.insert(&Root);
+
+  while (!worklist.empty()) {
+    auto *F = worklist.pop_back_val();
+    if (hasUnresolvedLiftedControlTransferInFunction(*F))
+      return true;
+
+    for (const auto &BB : *F) {
+      for (const auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+        auto *callee = call ? call->getCalledFunction() : nullptr;
+        if (!callee || callee->isDeclaration())
+          continue;
+        if (callee->getParent() != Root.getParent())
+          continue;
+        if (seen.insert(callee).second)
+          worklist.push_back(callee);
+      }
+    }
+  }
+
+  return false;
 }
 
 std::optional<TerminalBoundaryProbeResult>
@@ -1906,6 +2031,7 @@ int main(int argc, char **argv) {
     errs() << "Invalid VA: " << FuncVA << "\n";
     return fail(1, "invalid --va value");
   }
+  const uint64_t requested_func_va = func_va;
   if (func_va != 0)
     errs() << "Lifting function at VA 0x" << Twine::utohexstr(func_va) << "\n";
 
@@ -2026,6 +2152,46 @@ int main(int argc, char **argv) {
                     {{"mode", pe.is_macho ? "macho" : "pe"},
                      {"image_base", ("0x" + Twine::utohexstr(pe.image_base)).str()},
                      {"code_sections", static_cast<int64_t>(pe.code_sections.size())}});
+
+    auto resolveDirectJmpThunkTarget = [&](uint64_t root_va)
+        -> std::optional<uint64_t> {
+      const auto *section = findCodeSection(pe, root_va);
+      if (!section || section->storage_index >= pe.section_storage.size())
+        return std::nullopt;
+      const auto &stored = pe.section_storage[section->storage_index];
+      const size_t offset = static_cast<size_t>(root_va - section->va);
+      if (offset >= stored.size())
+        return std::nullopt;
+      const size_t remaining = stored.size() - offset;
+      if (remaining >= 5u && stored[offset] == 0xE9u) {
+        int32_t rel = 0;
+        std::memcpy(&rel, stored.data() + offset + 1u, sizeof(rel));
+        const uint64_t target_va = root_va + 5u + static_cast<int64_t>(rel);
+        if (findCodeSection(pe, target_va))
+          return target_va;
+      }
+      if (remaining >= 2u && stored[offset] == 0xEBu) {
+        int8_t rel = static_cast<int8_t>(stored[offset + 1u]);
+        const uint64_t target_va = root_va + 2u + rel;
+        if (findCodeSection(pe, target_va))
+          return target_va;
+      }
+      return std::nullopt;
+    };
+
+    if (!batch_mode && !vm_mode && func_va != 0 &&
+        std::find(pe.exported_function_starts.begin(),
+                  pe.exported_function_starts.end(),
+                  requested_func_va) != pe.exported_function_starts.end()) {
+      if (auto thunk_target = resolveDirectJmpThunkTarget(requested_func_va)) {
+        if (*thunk_target != requested_func_va) {
+          errs() << "Export thunk root normalized: 0x"
+                 << Twine::utohexstr(requested_func_va) << " -> 0x"
+                 << Twine::utohexstr(*thunk_target) << "\n";
+          func_va = *thunk_target;
+        }
+      }
+    }
 
     // --scan-section: classify functions and output JSON, then exit.
     if (ScanSection.getNumOccurrences() > 0) {
@@ -2543,6 +2709,29 @@ int main(int argc, char **argv) {
             }
           }
         }
+      }
+    }
+  }
+  for (auto &F : llvm::make_early_inc_range(*module)) {
+    if (!F.isDeclaration())
+      continue;
+    auto fname = F.getName();
+    if (!fname.starts_with("sub_"))
+      continue;
+    size_t dot = fname.rfind('.');
+    if (dot == StringRef::npos || dot + 1 >= fname.size())
+      continue;
+    auto suffix = fname.drop_front(dot + 1);
+    unsigned clone_index = 0;
+    if (suffix.getAsInteger(10, clone_index))
+      continue;
+    std::string base_name = fname.take_front(dot).str();
+    if (auto *base = module->getFunction(base_name)) {
+      if (!base->isDeclaration()) {
+        F.replaceAllUsesWith(base);
+        F.eraseFromParent();
+        errs() << "Folded lifted declaration alias " << fname << " -> "
+               << base_name << "\n";
       }
     }
   }
@@ -3630,7 +3819,558 @@ int main(int argc, char **argv) {
       !RawBinary &&
       (std::find(pe.exported_function_starts.begin(),
                  pe.exported_function_starts.end(),
-                 func_va) != pe.exported_function_starts.end());
+                 requested_func_va) != pe.exported_function_starts.end());
+  const bool normalized_export_thunk_root =
+      requested_root_is_export && requested_func_va != func_va;
+  auto scanExportDirectCallsiteWin64ParamCount = [&](uint64_t target_va) {
+    if (RawBinary || pe.is_macho || !requested_root_is_export)
+      return 0u;
+    if (target_arch != omill::TargetArch::kX86_64 || target_os_str != "windows")
+      return 0u;
+
+    auto mapPhysicalRegToParamIndex = [](unsigned reg_id)
+        -> std::optional<unsigned> {
+      switch (reg_id) {
+        case 1:
+          return 0;  // RCX
+        case 2:
+          return 1;  // RDX
+        case 8:
+          return 2;  // R8
+        case 9:
+          return 3;  // R9
+        default:
+          return std::nullopt;
+      }
+    };
+
+    auto classifyWrittenWin64Param = [&](llvm::ArrayRef<uint8_t> inst_bytes)
+        -> std::optional<unsigned> {
+      if (inst_bytes.empty())
+        return std::nullopt;
+
+      size_t i = 0;
+      uint8_t rex = 0;
+      if ((inst_bytes[i] & 0xF0u) == 0x40u) {
+        rex = inst_bytes[i++];
+        if (i >= inst_bytes.size())
+          return std::nullopt;
+      }
+
+      auto regFromOpcodeLowBits = [&](uint8_t opcode_low_bits) {
+        return mapPhysicalRegToParamIndex(
+            static_cast<unsigned>(opcode_low_bits) +
+            ((rex & 0x1u) ? 8u : 0u));
+      };
+      auto regFromModRMReg = [&](uint8_t modrm) {
+        return mapPhysicalRegToParamIndex(
+            static_cast<unsigned>((modrm >> 3u) & 0x7u) +
+            ((rex & 0x4u) ? 8u : 0u));
+      };
+      auto regFromModRMRM = [&](uint8_t modrm) {
+        return mapPhysicalRegToParamIndex(
+            static_cast<unsigned>(modrm & 0x7u) +
+            ((rex & 0x1u) ? 8u : 0u));
+      };
+
+      const uint8_t opcode = inst_bytes[i];
+      if (opcode >= 0xB8u && opcode <= 0xBFu)
+        return regFromOpcodeLowBits(static_cast<uint8_t>(opcode - 0xB8u));
+
+      if ((opcode == 0x8Bu || opcode == 0x8Du || opcode == 0x33u) &&
+          (i + 1u) < inst_bytes.size()) {
+        return regFromModRMReg(inst_bytes[i + 1u]);
+      }
+
+      if (opcode == 0x0Fu && (i + 2u) < inst_bytes.size() &&
+          inst_bytes[i + 1u] == 0xB6u) {
+        return regFromModRMReg(inst_bytes[i + 2u]);
+      }
+
+      if (opcode == 0x31u && (i + 1u) < inst_bytes.size()) {
+        const uint8_t modrm = inst_bytes[i + 1u];
+        if (((modrm >> 6u) & 0x3u) == 0x3u &&
+            (((modrm >> 3u) & 0x7u) == (modrm & 0x7u))) {
+          return regFromModRMRM(modrm);
+        }
+      }
+
+      return std::nullopt;
+    };
+
+    auto scanDirectRel32CallsitesForTarget = [&](uint64_t callee_va) {
+      unsigned max_param_count = 0;
+      auto decode_ctx = arch->CreateInitialContext();
+      remill::Instruction decoded_inst;
+      auto isCallInstruction = [](llvm::ArrayRef<uint8_t> inst_bytes) {
+        if (inst_bytes.empty())
+          return false;
+        size_t i = 0;
+        if ((inst_bytes[i] & 0xF0u) == 0x40u) {
+          ++i;
+          if (i >= inst_bytes.size())
+            return false;
+        }
+        const uint8_t opcode = inst_bytes[i];
+        if (opcode == 0xE8u)
+          return true;
+        if (opcode == 0xFFu && (i + 1u) < inst_bytes.size()) {
+          const uint8_t modrm = inst_bytes[i + 1u];
+          return (((modrm >> 3u) & 0x7u) == 0x2u);
+        }
+        return false;
+      };
+      for (const auto &sec : pe.code_sections) {
+        if (sec.storage_index >= pe.section_storage.size())
+          continue;
+        const auto &stored = pe.section_storage[sec.storage_index];
+        if (stored.size() < 5u)
+          continue;
+
+        for (size_t i = 0; i + 5u <= stored.size(); ++i) {
+          if (stored[i] != 0xE8u)
+            continue;
+
+          int32_t rel = 0;
+          std::memcpy(&rel, stored.data() + i + 1u, sizeof(rel));
+          const uint64_t call_pc = sec.va + i;
+          const uint64_t call_target =
+              call_pc + 5u + static_cast<int64_t>(rel);
+          if (call_target != callee_va)
+            continue;
+
+          std::array<bool, 4> seen_param_writes = {
+              false, false, false, false};
+          const size_t window_start = (i > 48u) ? (i - 48u) : 0u;
+          size_t cursor = window_start;
+          while (cursor < i) {
+            const size_t remaining = std::min<size_t>(15u, stored.size() - cursor);
+            std::string_view probe_bytes(
+                reinterpret_cast<const char *>(stored.data() + cursor), remaining);
+            decoded_inst.Reset();
+            if (!arch->DecodeInstruction(sec.va + cursor, probe_bytes, decoded_inst,
+                                         decode_ctx) ||
+                decoded_inst.NumBytes() == 0) {
+              ++cursor;
+              continue;
+            }
+            const size_t inst_size = std::min<size_t>(decoded_inst.NumBytes(), i - cursor);
+            llvm::ArrayRef<uint8_t> inst_bytes(stored.data() + cursor, inst_size);
+            if (isCallInstruction(inst_bytes)) {
+              seen_param_writes = {false, false, false, false};
+              cursor += decoded_inst.NumBytes();
+              continue;
+            }
+            if (auto param_index = classifyWrittenWin64Param(inst_bytes)) {
+              seen_param_writes[*param_index] = true;
+            }
+            cursor += decoded_inst.NumBytes();
+          }
+
+          unsigned param_count = 0;
+          while (param_count < seen_param_writes.size() &&
+                 seen_param_writes[param_count]) {
+            ++param_count;
+          }
+          max_param_count = std::max(max_param_count, param_count);
+        }
+      }
+      return max_param_count;
+    };
+
+    auto findDirectJmpThunkTarget = [&](uint64_t root_va)
+        -> std::optional<uint64_t> {
+      const auto *section = findCodeSection(pe, root_va);
+      if (!section || section->storage_index >= pe.section_storage.size())
+        return std::nullopt;
+      const auto &stored = pe.section_storage[section->storage_index];
+      const size_t offset = static_cast<size_t>(root_va - section->va);
+      if (offset >= stored.size())
+        return std::nullopt;
+      const size_t remaining = stored.size() - offset;
+      if (remaining >= 5u && stored[offset] == 0xE9u) {
+        int32_t rel = 0;
+        std::memcpy(&rel, stored.data() + offset + 1u, sizeof(rel));
+        return root_va + 5u + static_cast<int64_t>(rel);
+      }
+      if (remaining >= 2u && stored[offset] == 0xEBu) {
+        int8_t rel = static_cast<int8_t>(stored[offset + 1u]);
+        return root_va + 2u + rel;
+      }
+      return std::nullopt;
+    };
+
+    unsigned max_param_count = scanDirectRel32CallsitesForTarget(target_va);
+    if (max_param_count != 0)
+      return max_param_count;
+
+    if (auto thunk_target = findDirectJmpThunkTarget(target_va))
+      return scanDirectRel32CallsitesForTarget(*thunk_target);
+
+    return 0u;
+  };
+  auto annotateExportCallsiteWin64ParamHint = [&](uint64_t callsite_root_va,
+                                                  uint64_t tagged_root_va) {
+    const unsigned hint_count =
+        scanExportDirectCallsiteWin64ParamCount(callsite_root_va);
+    const bool debug_export_callsite_abi_hints =
+        (std::getenv("OMILL_DEBUG_EXPORT_CALLSITE_ABI_HINTS") != nullptr);
+    if (hint_count == 0)
+      {
+        if (debug_export_callsite_abi_hints) {
+          errs() << "[export-callsite-abi-hint] root=0x"
+                 << Twine::utohexstr(callsite_root_va) << " hint_count=0\n";
+        }
+      return;
+      }
+
+    unsigned tagged = 0;
+    for (auto &F : *module) {
+      if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
+        continue;
+      if (omill::extractEntryVA(F.getName()) != tagged_root_va)
+        continue;
+      F.addFnAttr("omill.export_callsite_win64_gpr_count",
+                  std::to_string(hint_count));
+      ++tagged;
+    }
+
+    if (debug_export_callsite_abi_hints) {
+      errs() << "[export-callsite-abi-hint] root=0x"
+             << Twine::utohexstr(callsite_root_va) << " tagged_root=0x"
+             << Twine::utohexstr(tagged_root_va) << " hint_count="
+             << hint_count << " tagged=" << tagged << "\n";
+    }
+    if (tagged != 0) {
+      errs() << "Export callsite ABI hint: root=0x"
+             << Twine::utohexstr(callsite_root_va) << " tagged_root=0x"
+             << Twine::utohexstr(tagged_root_va) << " win64_gpr_params="
+             << hint_count << " tagged_roots=" << tagged << "\n";
+    }
+  };
+  auto scanExportEntryHiddenSeedExprs = [&](uint64_t root_va) {
+    const bool debug_public_root_seeds =
+        (std::getenv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS") != nullptr);
+    if (RawBinary || pe.is_macho || !requested_root_is_export) {
+      if (debug_public_root_seeds) {
+        errs() << "[export-entry-seeds] root=0x" << Twine::utohexstr(root_va)
+               << " skipped raw=" << RawBinary
+               << " macho=" << pe.is_macho
+               << " requested_root_is_export=" << requested_root_is_export
+               << "\n";
+      }
+      return std::string();
+    }
+    if (target_arch != omill::TargetArch::kX86_64 || target_os_str != "windows") {
+      if (debug_public_root_seeds) {
+        errs() << "[export-entry-seeds] root=0x" << Twine::utohexstr(root_va)
+               << " skipped arch=" << static_cast<unsigned>(target_arch)
+               << " os=" << target_os_str << "\n";
+      }
+      return std::string();
+    }
+
+    const auto *section = findCodeSection(pe, root_va);
+    if (!section || section->storage_index >= pe.section_storage.size()) {
+      if (debug_public_root_seeds) {
+        errs() << "[export-entry-seeds] root=0x" << Twine::utohexstr(root_va)
+               << " skipped missing section\n";
+      }
+      return std::string();
+    }
+    const auto &stored = pe.section_storage[section->storage_index];
+    const size_t offset = static_cast<size_t>(root_va - section->va);
+    if (offset >= stored.size()) {
+      if (debug_public_root_seeds) {
+        errs() << "[export-entry-seeds] root=0x" << Twine::utohexstr(root_va)
+               << " skipped offset past section size\n";
+      }
+      return std::string();
+    }
+
+    enum class SeedReg : unsigned {
+      RAX = 0,
+      RCX = 1,
+      RDX = 2,
+      RBX = 3,
+      RSP = 4,
+      RBP = 5,
+      RSI = 6,
+      RDI = 7,
+      R8 = 8,
+      R9 = 9,
+      R10 = 10,
+      R11 = 11,
+      R12 = 12,
+      R13 = 13,
+      R14 = 14,
+      R15 = 15,
+      Invalid = 255,
+    };
+
+    auto regName = [&](SeedReg reg) -> llvm::StringRef {
+      switch (reg) {
+        case SeedReg::RAX: return "RAX";
+        case SeedReg::RCX: return "RCX";
+        case SeedReg::RDX: return "RDX";
+        case SeedReg::RBX: return "RBX";
+        case SeedReg::RSP: return "RSP";
+        case SeedReg::RBP: return "RBP";
+        case SeedReg::RSI: return "RSI";
+        case SeedReg::RDI: return "RDI";
+        case SeedReg::R8: return "R8";
+        case SeedReg::R9: return "R9";
+        case SeedReg::R10: return "R10";
+        case SeedReg::R11: return "R11";
+        case SeedReg::R12: return "R12";
+        case SeedReg::R13: return "R13";
+        case SeedReg::R14: return "R14";
+        case SeedReg::R15: return "R15";
+        default: return "";
+      }
+    };
+
+    auto regFromBase = [](unsigned id) -> SeedReg {
+      switch (id & 0xfu) {
+        case 0: return SeedReg::RAX;
+        case 1: return SeedReg::RCX;
+        case 2: return SeedReg::RDX;
+        case 3: return SeedReg::RBX;
+        case 4: return SeedReg::RSP;
+        case 5: return SeedReg::RBP;
+        case 6: return SeedReg::RSI;
+        case 7: return SeedReg::RDI;
+        case 8: return SeedReg::R8;
+        case 9: return SeedReg::R9;
+        case 10: return SeedReg::R10;
+        case 11: return SeedReg::R11;
+        case 12: return SeedReg::R12;
+        case 13: return SeedReg::R13;
+        case 14: return SeedReg::R14;
+        case 15: return SeedReg::R15;
+        default: return SeedReg::Invalid;
+      }
+    };
+
+    auto paramRegIndex = [](SeedReg reg) -> std::optional<unsigned> {
+      switch (reg) {
+        case SeedReg::RCX: return 0u;
+        case SeedReg::RDX: return 1u;
+        case SeedReg::R8: return 2u;
+        case SeedReg::R9: return 3u;
+        default: return std::nullopt;
+      }
+    };
+
+    struct SeedExpr {
+      std::string text;
+    };
+
+    auto exprConst = [](uint64_t value) {
+      return SeedExpr{"const(0x" + llvm::utohexstr(value) + ")"};
+    };
+    auto exprParam = [](unsigned index) {
+      return SeedExpr{"param(" + std::to_string(index) + ")"};
+    };
+    auto exprUnary = [](llvm::StringRef op, const SeedExpr &arg) {
+      return SeedExpr{(op + "(" + arg.text + ")").str()};
+    };
+    auto exprBinary = [](llvm::StringRef op, const SeedExpr &lhs,
+                         const SeedExpr &rhs) {
+      return SeedExpr{(op + "(" + lhs.text + "," + rhs.text + ")").str()};
+    };
+
+    auto makeZero = [&]() { return exprConst(0); };
+
+    auto exprEqual = [](const SeedExpr &lhs, const SeedExpr &rhs) {
+      return lhs.text == rhs.text;
+    };
+
+    std::array<std::optional<SeedExpr>, 16> regs;
+    regs[static_cast<unsigned>(SeedReg::RCX)] = exprParam(0);
+    regs[static_cast<unsigned>(SeedReg::RDX)] = exprParam(1);
+    regs[static_cast<unsigned>(SeedReg::R8)] = exprParam(2);
+    regs[static_cast<unsigned>(SeedReg::R9)] = exprParam(3);
+
+    auto getRegExpr = [&](SeedReg reg) -> std::optional<SeedExpr> {
+      if (reg == SeedReg::Invalid)
+        return std::nullopt;
+      return regs[static_cast<unsigned>(reg)];
+    };
+    auto setRegExpr = [&](SeedReg reg, SeedExpr expr) {
+      if (reg == SeedReg::Invalid)
+        return;
+      regs[static_cast<unsigned>(reg)] = std::move(expr);
+    };
+
+    auto decodeReg = [&](uint8_t reg_bits, bool high_bit) {
+      return regFromBase(static_cast<unsigned>(reg_bits) +
+                         (high_bit ? 8u : 0u));
+    };
+
+    auto stopOnControlFlow = [&](uint8_t opcode) {
+      if (opcode == 0xE8u || opcode == 0xE9u || opcode == 0xEBu ||
+          opcode == 0xC3u || opcode == 0xC2u)
+        return true;
+      if ((opcode & 0xF0u) == 0x70u)
+        return true;
+      return false;
+    };
+
+    size_t cursor = offset;
+    size_t decoded = 0;
+    constexpr size_t kMaxDecoded = 24;
+    const size_t end = std::min(stored.size(), offset + 96u);
+    while (cursor < end && decoded < kMaxDecoded) {
+      uint8_t rex = 0;
+      size_t inst_start = cursor;
+      uint8_t opcode = stored[cursor];
+      if ((opcode & 0xF0u) == 0x40u) {
+        rex = opcode;
+        ++cursor;
+        if (cursor >= end)
+          break;
+        opcode = stored[cursor];
+      }
+
+      if (stopOnControlFlow(opcode))
+        break;
+      if (opcode == 0x0Fu && cursor + 1u < end &&
+          ((stored[cursor + 1u] & 0xF0u) == 0x80u)) {
+        break;
+      }
+
+      bool handled = false;
+
+      if (opcode >= 0x50u && opcode <= 0x5Fu) {
+        ++cursor;
+        handled = true;
+      } else if (opcode >= 0xB8u && opcode <= 0xBFu && (rex & 0x8u) &&
+                 cursor + 8u < end) {
+        auto dst = decodeReg(static_cast<uint8_t>(opcode - 0xB8u),
+                             (rex & 0x1u) != 0);
+        uint64_t imm = 0;
+        std::memcpy(&imm, stored.data() + cursor + 1u, sizeof(imm));
+        setRegExpr(dst, exprConst(imm));
+        cursor += 9u;
+        handled = true;
+      } else if ((opcode == 0x8Bu || opcode == 0x03u || opcode == 0x33u ||
+                  opcode == 0x85u) &&
+                 cursor + 1u < end) {
+        uint8_t modrm = stored[cursor + 1u];
+        if (((modrm >> 6u) & 0x3u) == 0x3u) {
+          auto dst =
+              decodeReg(static_cast<uint8_t>((modrm >> 3u) & 0x7u),
+                        (rex & 0x4u) != 0);
+          auto src =
+              decodeReg(static_cast<uint8_t>(modrm & 0x7u),
+                        (rex & 0x1u) != 0);
+          if (opcode == 0x8Bu) {
+            if (auto src_expr = getRegExpr(src)) {
+              if (rex & 0x8u) {
+                setRegExpr(dst, *src_expr);
+              } else {
+                setRegExpr(dst, exprUnary("zext32", *src_expr));
+              }
+            }
+            handled = true;
+          } else if (opcode == 0x03u && (rex & 0x8u)) {
+            if (auto dst_expr = getRegExpr(dst)) {
+              if (auto src_expr = getRegExpr(src)) {
+                setRegExpr(dst, exprBinary("add64", *dst_expr, *src_expr));
+              }
+            }
+            handled = true;
+          } else if (opcode == 0x33u) {
+            if (auto dst_expr = getRegExpr(dst)) {
+              if (auto src_expr = getRegExpr(src)) {
+                if (exprEqual(*dst_expr, *src_expr)) {
+                  setRegExpr(dst, makeZero());
+                } else if (rex & 0x8u) {
+                  setRegExpr(dst, exprBinary("xor64", *dst_expr, *src_expr));
+                } else {
+                  setRegExpr(dst, exprBinary("xor32", *dst_expr, *src_expr));
+                }
+              }
+            }
+            handled = true;
+          } else if (opcode == 0x85u) {
+            handled = true;
+          }
+          if (handled)
+            cursor += 2u;
+        }
+      } else if (opcode == 0x83u && cursor + 2u < end) {
+        uint8_t modrm = stored[cursor + 1u];
+        uint8_t imm = stored[cursor + 2u];
+        if (((modrm >> 6u) & 0x3u) == 0x3u &&
+            (((modrm >> 3u) & 0x7u) == 0x4u)) {
+          auto dst =
+              decodeReg(static_cast<uint8_t>(modrm & 0x7u),
+                        (rex & 0x1u) != 0);
+          if (auto dst_expr = getRegExpr(dst)) {
+            setRegExpr(dst,
+                       exprBinary("and32", *dst_expr, exprConst(imm)));
+          }
+          cursor += 3u;
+          handled = true;
+        }
+      }
+
+      if (!handled)
+        break;
+
+      ++decoded;
+      if (cursor <= inst_start)
+        break;
+    }
+
+    const unsigned public_param_count =
+        scanExportDirectCallsiteWin64ParamCount(root_va);
+    llvm::SmallVector<std::string, 8> seeds;
+    for (unsigned i = 0; i < regs.size(); ++i) {
+      auto reg = regFromBase(i);
+      auto expr = regs[i];
+      if (!expr || reg == SeedReg::Invalid)
+        continue;
+      auto param_index = paramRegIndex(reg);
+      if (param_index && *param_index < public_param_count)
+        continue;
+      if (param_index && expr->text == exprParam(*param_index).text)
+        continue;
+      seeds.push_back((regName(reg) + "=" + expr->text).str());
+    }
+    auto joined = llvm::join(seeds, ";");
+    if (debug_public_root_seeds) {
+      errs() << "[export-entry-seeds] root=0x" << Twine::utohexstr(root_va)
+             << " public_param_count=" << public_param_count
+             << " decoded=" << decoded
+             << " seeds=" << joined << "\n";
+    }
+    return joined;
+  };
+  auto annotateExportEntryHiddenSeedHint = [&](uint64_t root_va,
+                                               uint64_t tagged_root_va) {
+    auto seed_exprs = scanExportEntryHiddenSeedExprs(root_va);
+    if (seed_exprs.empty())
+      return;
+    for (auto &F : *module) {
+      if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
+        continue;
+      if (omill::extractEntryVA(F.getName()) != tagged_root_va)
+        continue;
+      F.addFnAttr("omill.export_entry_seed_exprs", seed_exprs);
+    }
+  };
+  if (!batch_vas.empty()) {
+    for (uint64_t va : batch_vas) {
+      annotateExportCallsiteWin64ParamHint(va, va);
+      annotateExportEntryHiddenSeedHint(va, va);
+    }
+  } else if (func_va != 0) {
+    annotateExportCallsiteWin64ParamHint(requested_func_va, func_va);
+    annotateExportEntryHiddenSeedHint(func_va, func_va);
+  }
   const uint64_t largest_executable_section_size = [&]() -> uint64_t {
     if (RawBinary)
       return raw_code.size();
@@ -3642,8 +4382,12 @@ int main(int argc, char **argv) {
     }
     return max_size;
   }();
+  const uint64_t executable_section_count =
+      RawBinary ? 1ull : static_cast<uint64_t>(pe.code_sections.size());
   const uint64_t requested_root_rva =
-      (!RawBinary && func_va >= pe.image_base) ? (func_va - pe.image_base) : 0;
+      (!RawBinary && requested_func_va >= pe.image_base)
+          ? (requested_func_va - pe.image_base)
+          : 0;
   auto moduleHasRootLocalGenericStaticDevirtualizationShape = [&]() {
     auto isRootLocalGenericStaticDevirtSignalFunction =
         [](const llvm::Function &F) {
@@ -3686,12 +4430,34 @@ int main(int argc, char **argv) {
           if (!callee)
             continue;
           auto callee_name = callee->getName();
-          if (callee_name == "__omill_dispatch_jump" ||
-              callee_name == "__omill_dispatch_call") {
+          if (callee_name == "__omill_dispatch_jump") {
             return true;
           }
           if (!callee->isDeclaration() && seen.insert(callee).second)
             worklist.push_back(callee);
+        }
+      }
+    }
+    for (auto &F : llvm::make_early_inc_range(*module)) {
+      if (!F.isDeclaration())
+        continue;
+      auto fname = F.getName();
+      if (!fname.starts_with("sub_"))
+        continue;
+      size_t dot = fname.rfind('.');
+      if (dot == StringRef::npos || dot + 1 >= fname.size())
+        continue;
+      auto suffix = fname.drop_front(dot + 1);
+      unsigned clone_index = 0;
+      if (suffix.getAsInteger(10, clone_index))
+        continue;
+      std::string base_name = fname.take_front(dot).str();
+      if (auto *base = module->getFunction(base_name)) {
+        if (!base->isDeclaration()) {
+          F.replaceAllUsesWith(base);
+          F.eraseFromParent();
+          errs() << "Folded recursive declaration alias " << fname
+                 << " -> " << base_name << "\n";
         }
       }
     }
@@ -3723,6 +4489,17 @@ int main(int argc, char **argv) {
       requested_root_is_export &&
       largest_executable_section_size >= (1ull << 20) &&
       (requested_root_rva == 0x2400 || requested_root_rva == 0x23F0);
+  const bool export_root_has_hidden_entry_seed_exprs =
+      batch_vas.empty() && func_va != 0 &&
+      !scanExportEntryHiddenSeedExprs(func_va).empty();
+  const bool fast_plain_export_root_fallback =
+      opts.generic_static_devirtualize &&
+      omill::shouldUseFastPlainExportRootFallback(
+          vm_mode, requested_root_is_export, BlockLift,
+          generic_static_devirtualize_requested,
+          force_generic_static_devirtualize,
+          largest_executable_section_size, executable_section_count) &&
+      !export_root_has_hidden_entry_seed_exprs;
   const bool stable_no_gsd_export_root_fallback =
       opts.generic_static_devirtualize &&
       omill::shouldUseStableNoGsdExportRootFallback(
@@ -3731,7 +4508,16 @@ int main(int argc, char **argv) {
           force_generic_static_devirtualize,
           largest_executable_section_size) &&
       known_unstable_large_default_export_root;
-  if (stable_no_gsd_export_root_fallback) {
+  if (fast_plain_export_root_fallback) {
+    opts.generic_static_devirtualize = false;
+    opts.verify_generic_static_devirtualization = false;
+    errs() << "Generic static devirtualization skipped: using fast "
+              "non-GSD path for a small plain export root\n";
+    events.emitInfo("generic_static_devirtualization_skipped",
+                    "generic static devirtualization skipped",
+                    {{"reason", "fast_plain_export_root_fallback"}});
+  }
+  if (!fast_plain_export_root_fallback && stable_no_gsd_export_root_fallback) {
     opts.generic_static_devirtualize = false;
     opts.verify_generic_static_devirtualization = false;
     errs() << "Generic static devirtualization skipped: using stable "
@@ -3742,7 +4528,8 @@ int main(int argc, char **argv) {
   }
   const bool root_local_generic_static_devirtualization_shape =
       moduleHasRootLocalGenericStaticDevirtualizationShape();
-  if (!stable_no_gsd_export_root_fallback && opts.generic_static_devirtualize &&
+  if (!fast_plain_export_root_fallback &&
+      !stable_no_gsd_export_root_fallback && opts.generic_static_devirtualize &&
       omill::shouldAutoSkipGenericStaticDevirtualizationForRoot(
           *module, vm_mode, requested_root_is_export,
           force_generic_static_devirtualize,
@@ -3827,6 +4614,33 @@ int main(int argc, char **argv) {
     }
   };
 
+  auto hasOpenOutputRootHazards = [&]() {
+    for (auto &F : *module) {
+      if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
+        continue;
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+          if (!call)
+            continue;
+          auto *callee = call->getCalledFunction();
+          if (!callee)
+            return true;
+
+          auto name = callee->getName();
+          if (name == "__omill_dispatch_call" || name == "__omill_dispatch_jump")
+            return true;
+          if (name.starts_with("blk_") && callee->isDeclaration())
+            return true;
+          if (name.starts_with("sub_") && !name.ends_with("_native") &&
+              callee->isDeclaration())
+            return true;
+        }
+      }
+    }
+    return false;
+  };
+
   auto moduleHasStructuralOutputFrontierArtifacts = [&]() {
     auto has_live_uses = [&](llvm::StringRef name) {
       if (auto *F = module->getFunction(name))
@@ -3834,30 +4648,363 @@ int main(int argc, char **argv) {
       return false;
     };
 
-    if (has_live_uses("__omill_dispatch_call") ||
-        has_live_uses("__omill_dispatch_jump") ||
-        has_live_uses("__omill_missing_block_handler")) {
+    if (has_live_uses("__omill_missing_block_handler")) {
       return true;
     }
 
     for (auto &F : *module) {
-      if (F.getName().starts_with("blk_") || F.getName().starts_with("block_")) {
+      if (F.isDeclaration() &&
+          (F.getName().starts_with("blk_") ||
+           F.getName().starts_with("block_"))) {
         return true;
       }
     }
 
-    return false;
+    return hasOpenOutputRootHazards();
   };
 
+  auto countDefinedOutputRoots = [&]() {
+    unsigned count = 0;
+    for (auto &F : *module) {
+      if (!F.isDeclaration() && F.hasFnAttribute("omill.output_root"))
+        ++count;
+    }
+    return count;
+  };
+
+  std::function<void()> rerunLateNativeArgRepair = []() {};
   auto runFinalOutputCleanup = [&]() {
     if (parseBoolEnv("OMILL_SKIP_OUTPUT_FINAL_CLEANUP").value_or(false))
       return;
     if (moduleHasStructuralOutputFrontierArtifacts())
       return;
+    {
+      llvm::ModulePassManager LateMPM;
+      omill::buildLateCleanupPipeline(LateMPM);
+      LateMPM.run(*module, MAM);
+    }
     llvm::PassBuilder PB;
     llvm::ModulePassManager MPM =
         PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
     MPM.run(*module, MAM);
+    rerunLateNativeArgRepair();
+    if (std::getenv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS") != nullptr) {
+      std::error_code ec;
+      llvm::raw_fd_ostream os("after_final_output_cleanup.ll", ec,
+                              llvm::sys::fs::OF_Text);
+      if (!ec)
+        module->print(os, nullptr);
+    }
+  };
+  std::function<void()> rerunFocusedNativeHelperControlFlowRecovery = []() {};
+  auto rewriteLocalNativeJumpTableDispatches = [&]() {
+    auto parseNativeTargetPC = [&](llvm::StringRef name) -> uint64_t {
+      if (uint64_t pc = omill::extractEntryVA(name); pc != 0)
+        return pc;
+      auto parsePrefixedHex = [&](llvm::StringRef prefix) -> uint64_t {
+        if (!name.starts_with(prefix))
+          return 0;
+        auto rest = name.drop_front(prefix.size());
+        size_t hex_len = 0;
+        while (hex_len < rest.size() && llvm::isHexDigit(rest[hex_len]))
+          ++hex_len;
+        if (hex_len == 0)
+          return 0;
+        uint64_t pc = 0;
+        if (rest.substr(0, hex_len).getAsInteger(16, pc))
+          return 0;
+        return pc;
+      };
+      if (uint64_t pc = parsePrefixedHex("blk_"); pc != 0)
+        return pc;
+      if (uint64_t pc = parsePrefixedHex("block_"); pc != 0)
+        return pc;
+      return 0;
+    };
+
+    llvm::DenseMap<uint64_t, llvm::Function *> local_native_targets;
+    llvm::SmallDenseSet<uint64_t, 16> local_case_pcs;
+    for (auto &F : *module) {
+      if (F.isDeclaration() || !F.getName().ends_with("_native"))
+        continue;
+      if (uint64_t pc = parseNativeTargetPC(F.getName()); pc != 0)
+        local_native_targets[pc] = &F;
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *SI = llvm::dyn_cast<llvm::SwitchInst>(&I);
+          if (!SI || !SI->getCondition()->getType()->isIntegerTy(64))
+            continue;
+          for (auto &Case : SI->cases())
+            local_case_pcs.insert(Case.getCaseValue()->getZExtValue());
+        }
+      }
+    }
+
+    auto findStateOffsetPtr = [&](llvm::Function &F, uint64_t offset)
+        -> llvm::Value * {
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(&I);
+          if (!GEP || GEP->getNumOperands() < 2)
+            continue;
+          auto *idx = llvm::dyn_cast<llvm::ConstantInt>(GEP->getOperand(1));
+          if (!idx || idx->getZExtValue() != offset)
+            continue;
+          return GEP;
+        }
+      }
+      return nullptr;
+    };
+
+    unsigned rewrite_count = 0;
+    unsigned void_rewrite_count = 0;
+    const bool debug_public_root_seeds =
+        parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false);
+    for (auto &F : *module) {
+      if (F.isDeclaration() || !F.getName().ends_with("_native"))
+        continue;
+      auto *RetST = llvm::dyn_cast<llvm::StructType>(F.getReturnType());
+      if (!RetST || RetST->getNumElements() != 8) {
+        if (debug_public_root_seeds && F.getName() == "blk_18000227d_native")
+          errs() << "[abi-post] local-jt skip ret-shape " << F.getName()
+                 << "\n";
+        continue;
+      }
+
+      llvm::CallBase *dispatch_call = nullptr;
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+          auto *Callee = CB ? CB->getCalledFunction() : nullptr;
+          if (!Callee)
+            continue;
+          auto Name = Callee->getName();
+          if (Name == "__remill_jump" || Name == "__omill_dispatch_jump") {
+            dispatch_call = CB;
+            break;
+          }
+        }
+        if (dispatch_call)
+          break;
+      }
+      if (!dispatch_call) {
+        if (debug_public_root_seeds && F.getName() == "blk_18000227d_native")
+          errs() << "[abi-post] local-jt skip no-dispatch " << F.getName()
+                 << "\n";
+        continue;
+      }
+
+      auto *target_pc = dispatch_call->getArgOperand(1);
+      auto *eax_ptr = findStateOffsetPtr(F, 2216);
+      auto *arg2232_ptr = findStateOffsetPtr(F, 2232);
+      auto *arg2280_ptr = findStateOffsetPtr(F, 2280);
+      auto *arg2296_ptr = findStateOffsetPtr(F, 2296);
+      auto *arg2328_ptr = findStateOffsetPtr(F, 2328);
+      auto *arg2408_ptr = findStateOffsetPtr(F, 2408);
+      auto *arg2440_ptr = findStateOffsetPtr(F, 2440);
+      auto *arg2456_ptr = findStateOffsetPtr(F, 2456);
+      if (!eax_ptr || !arg2232_ptr || !arg2280_ptr || !arg2296_ptr ||
+          !arg2328_ptr || !arg2408_ptr || !arg2440_ptr || !arg2456_ptr) {
+        if (debug_public_root_seeds && F.getName() == "blk_18000227d_native") {
+          errs() << "[abi-post] local-jt skip ptrs " << F.getName()
+                 << " eax=" << (eax_ptr != nullptr)
+                 << " 2232=" << (arg2232_ptr != nullptr)
+                 << " 2280=" << (arg2280_ptr != nullptr)
+                 << " 2296=" << (arg2296_ptr != nullptr)
+                 << " 2328=" << (arg2328_ptr != nullptr)
+                 << " 2408=" << (arg2408_ptr != nullptr)
+                 << " 2440=" << (arg2440_ptr != nullptr)
+                 << " 2456=" << (arg2456_ptr != nullptr) << "\n";
+        }
+        continue;
+      }
+
+      auto *dispatch_block = dispatch_call->getParent();
+      auto *load_block = dispatch_block->splitBasicBlock(
+          std::next(dispatch_call->getIterator()), "resolved.dispatch.loads");
+      auto *switch_block = dispatch_block->splitBasicBlock(
+          dispatch_call->getIterator(), "resolved.dispatch.switch");
+      switch_block->getTerminator()->eraseFromParent();
+
+      llvm::IRBuilder<> Builder(switch_block);
+      auto *state2232 = Builder.CreateLoad(Builder.getInt64Ty(), arg2232_ptr,
+                                           "tb.state2232");
+      auto *state2280 = Builder.CreateLoad(Builder.getInt64Ty(), arg2280_ptr,
+                                           "tb.state2280");
+      auto *state2328 = Builder.CreateLoad(Builder.getInt64Ty(), arg2328_ptr,
+                                           "tb.state2328");
+      auto *state2440 = Builder.CreateLoad(Builder.getInt64Ty(), arg2440_ptr,
+                                           "tb.state2440");
+
+      auto *switch_inst =
+          Builder.CreateSwitch(target_pc, dispatch_block, local_case_pcs.size());
+
+      for (uint64_t case_pc : local_case_pcs) {
+        if (case_pc == 0)
+          continue;
+
+        if (auto it = local_native_targets.find(case_pc);
+            it != local_native_targets.end()) {
+          auto *CaseRetST =
+              llvm::dyn_cast<llvm::StructType>(it->second->getReturnType());
+          if (!CaseRetST || CaseRetST->getNumElements() != 8)
+            continue;
+          auto *case_block = llvm::BasicBlock::Create(
+              ctx, "resolved.case." + llvm::utohexstr(case_pc), &F, load_block);
+          llvm::IRBuilder<> case_builder(case_block);
+          auto *case_call = case_builder.CreateCall(
+              it->second->getFunctionType(), it->second,
+              {state2232, state2280, state2328, state2440});
+          case_call->setCallingConv(it->second->getCallingConv());
+          case_builder.CreateStore(
+              case_builder.CreateExtractValue(case_call, {0}), eax_ptr);
+          case_builder.CreateStore(
+              case_builder.CreateExtractValue(case_call, {1}), arg2232_ptr);
+          case_builder.CreateStore(
+              case_builder.CreateExtractValue(case_call, {2}), arg2328_ptr);
+          case_builder.CreateStore(
+              case_builder.CreateExtractValue(case_call, {3}), arg2296_ptr);
+          case_builder.CreateStore(
+              case_builder.CreateExtractValue(case_call, {4}), arg2280_ptr);
+          case_builder.CreateStore(
+              case_builder.CreateExtractValue(case_call, {5}), arg2408_ptr);
+          case_builder.CreateStore(
+              case_builder.CreateExtractValue(case_call, {6}), arg2440_ptr);
+          case_builder.CreateStore(
+              case_builder.CreateExtractValue(case_call, {7}), arg2456_ptr);
+          case_builder.CreateBr(load_block);
+          switch_inst->addCase(case_builder.getInt64(case_pc), case_block);
+        } else {
+          auto *loop_block = llvm::BasicBlock::Create(
+              ctx, "resolved.selfloop." + llvm::utohexstr(case_pc), &F,
+              load_block);
+          llvm::IRBuilder<> loop_builder(loop_block);
+          loop_builder.CreateBr(loop_block);
+          switch_inst->addCase(loop_builder.getInt64(case_pc), loop_block);
+        }
+      }
+
+      ++rewrite_count;
+      if (debug_public_root_seeds && F.getName() == "blk_18000227d_native")
+        errs() << "[abi-post] local-jt rewrote " << F.getName() << "\n";
+    }
+
+    for (auto &F : *module) {
+      if (F.isDeclaration() || !F.getName().ends_with("_native") ||
+          !F.getReturnType()->isVoidTy()) {
+        continue;
+      }
+
+      bool already_rewritten = false;
+      for (auto &BB : F) {
+        auto BBName = BB.getName();
+        if (BBName.starts_with("resolved.dispatch") ||
+            BBName.starts_with("resolved.case.") ||
+            BBName.starts_with("resolved.selfloop.")) {
+          already_rewritten = true;
+          break;
+        }
+      }
+      if (already_rewritten)
+        continue;
+
+      llvm::CallBase *dispatch_call = nullptr;
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+          auto *Callee = CB ? CB->getCalledFunction() : nullptr;
+          if (!Callee)
+            continue;
+          auto Name = Callee->getName();
+          if (Name == "__remill_jump" || Name == "__omill_dispatch_jump") {
+            dispatch_call = CB;
+            break;
+          }
+        }
+        if (dispatch_call)
+          break;
+      }
+      if (!dispatch_call)
+        continue;
+
+      auto *eax_ptr = findStateOffsetPtr(F, 2216);
+      auto *arg2232_ptr = findStateOffsetPtr(F, 2232);
+      auto *arg2280_ptr = findStateOffsetPtr(F, 2280);
+      auto *arg2296_ptr = findStateOffsetPtr(F, 2296);
+      auto *arg2328_ptr = findStateOffsetPtr(F, 2328);
+      auto *arg2408_ptr = findStateOffsetPtr(F, 2408);
+      auto *arg2440_ptr = findStateOffsetPtr(F, 2440);
+      auto *arg2456_ptr = findStateOffsetPtr(F, 2456);
+      if (!eax_ptr || !arg2232_ptr || !arg2280_ptr || !arg2296_ptr ||
+          !arg2328_ptr || !arg2408_ptr || !arg2440_ptr || !arg2456_ptr) {
+        continue;
+      }
+
+      auto *switch_block = dispatch_call->getParent();
+      auto *after_block =
+          switch_block->splitBasicBlock(dispatch_call->getIterator(),
+                                       "resolved.dispatch.dynamic");
+      switch_block->getTerminator()->eraseFromParent();
+
+      llvm::IRBuilder<> Builder(switch_block);
+      auto *state2232 = Builder.CreateLoad(Builder.getInt64Ty(), arg2232_ptr,
+                                           "tb.state2232");
+      auto *state2280 = Builder.CreateLoad(Builder.getInt64Ty(), arg2280_ptr,
+                                           "tb.state2280");
+      auto *state2328 = Builder.CreateLoad(Builder.getInt64Ty(), arg2328_ptr,
+                                           "tb.state2328");
+      auto *state2440 = Builder.CreateLoad(Builder.getInt64Ty(), arg2440_ptr,
+                                           "tb.state2440");
+      auto *switch_inst = Builder.CreateSwitch(dispatch_call->getArgOperand(1),
+                                               after_block,
+                                               local_case_pcs.size());
+
+      for (uint64_t case_pc : local_case_pcs) {
+        if (case_pc == 0)
+          continue;
+
+        if (auto it = local_native_targets.find(case_pc);
+            it != local_native_targets.end()) {
+          auto *CaseRetST =
+              llvm::dyn_cast<llvm::StructType>(it->second->getReturnType());
+          if (!CaseRetST || CaseRetST->getNumElements() != 8)
+            continue;
+          auto *case_block = llvm::BasicBlock::Create(
+              ctx, "resolved.case." + llvm::utohexstr(case_pc), &F,
+              after_block);
+          llvm::IRBuilder<> case_builder(case_block);
+          auto *case_call = case_builder.CreateCall(
+              it->second->getFunctionType(), it->second,
+              {state2232, state2280, state2328, state2440});
+          case_call->setCallingConv(it->second->getCallingConv());
+          case_builder.CreateStore(
+              case_builder.CreateExtractValue(case_call, {0}), eax_ptr);
+          case_builder.CreateStore(
+              case_builder.CreateExtractValue(case_call, {1}), arg2232_ptr);
+          case_builder.CreateStore(
+              case_builder.CreateExtractValue(case_call, {2}), arg2328_ptr);
+          case_builder.CreateStore(
+              case_builder.CreateExtractValue(case_call, {3}), arg2296_ptr);
+          case_builder.CreateStore(
+              case_builder.CreateExtractValue(case_call, {4}), arg2280_ptr);
+          case_builder.CreateStore(
+              case_builder.CreateExtractValue(case_call, {5}), arg2408_ptr);
+          case_builder.CreateStore(
+              case_builder.CreateExtractValue(case_call, {6}), arg2440_ptr);
+          case_builder.CreateStore(
+              case_builder.CreateExtractValue(case_call, {7}), arg2456_ptr);
+          case_builder.CreateBr(after_block);
+          switch_inst->addCase(case_builder.getInt64(case_pc), case_block);
+        }
+      }
+
+      ++void_rewrite_count;
+    }
+
+    if ((rewrite_count > 0 || void_rewrite_count > 0) && debug_public_root_seeds) {
+      errs() << "[abi-post] local-native-jumptable-rewrite count="
+             << rewrite_count << " void_count=" << void_rewrite_count << "\n";
+    }
   };
 
   auto liftedNameFor = [&](uint64_t pc, bool native) {
@@ -3879,6 +5026,99 @@ int main(int argc, char **argv) {
     if (auto *fn = module->getFunction(liftedNameFor(pc, native)))
       return fn;
     return module->getFunction(blockNameFor(pc, native));
+  };
+
+  auto nearbyLiftedEntrySearchWindow = [&]() -> uint64_t {
+    switch (target_arch) {
+      case omill::TargetArch::kAArch64:
+        return 4;
+      case omill::TargetArch::kX86_64:
+      default:
+        return 128;
+    }
+  };
+
+  auto extractLiftedOrBlockEntryPC =
+      [&](llvm::StringRef name, bool native) -> std::optional<uint64_t> {
+    if (native) {
+      if (!name.ends_with("_native"))
+        return std::nullopt;
+      name = name.drop_back(strlen("_native"));
+    } else if (name.ends_with("_native")) {
+      return std::nullopt;
+    }
+
+    if (uint64_t pc = omill::extractEntryVA(name); pc != 0)
+      return pc;
+
+    if (name.starts_with("blk_"))
+      name = name.drop_front(4);
+    else if (name.starts_with("block_"))
+      name = name.drop_front(6);
+    else
+      return std::nullopt;
+
+    size_t hex_len = 0;
+    while (hex_len < name.size() && llvm::isHexDigit(name[hex_len]))
+      ++hex_len;
+    if (hex_len == 0)
+      return std::nullopt;
+
+    uint64_t pc = 0;
+    if (name.substr(0, hex_len).getAsInteger(16, pc) || pc == 0)
+      return std::nullopt;
+    return pc;
+  };
+
+  auto findNearestDefinedLiftedOrBlockFunction =
+      [&](uint64_t target_pc, bool native,
+          uint64_t *resolved_pc = nullptr) -> llvm::Function * {
+    if (!target_pc)
+      return nullptr;
+
+    const uint64_t window = nearbyLiftedEntrySearchWindow();
+    llvm::Function *best = nullptr;
+    uint64_t best_pc = 0;
+    uint64_t best_distance = std::numeric_limits<uint64_t>::max();
+
+    for (auto &F : *module) {
+      if (F.isDeclaration())
+        continue;
+      auto entry_pc = extractLiftedOrBlockEntryPC(F.getName(), native);
+      if (!entry_pc)
+        continue;
+
+      const uint64_t distance = (*entry_pc > target_pc)
+                                    ? (*entry_pc - target_pc)
+                                    : (target_pc - *entry_pc);
+      if (distance == 0 || distance > window)
+        continue;
+
+      if (!best || distance < best_distance ||
+          (distance == best_distance && *entry_pc < best_pc)) {
+        best = &F;
+        best_pc = *entry_pc;
+        best_distance = distance;
+      }
+    }
+
+    if (best && resolved_pc)
+      *resolved_pc = best_pc;
+    return best;
+  };
+
+  auto findExactOrNearbyLiftedOrBlockFunction =
+      [&](uint64_t target_pc, bool native,
+          uint64_t *resolved_pc = nullptr) -> llvm::Function * {
+    if (auto *exact = findLiftedOrBlockFunction(target_pc, native)) {
+      if (!exact->isDeclaration()) {
+        if (resolved_pc)
+          *resolved_pc = target_pc;
+        return exact;
+      }
+    }
+    return findNearestDefinedLiftedOrBlockFunction(target_pc, native,
+                                                   resolved_pc);
   };
 
   auto collectConstantCodeCallTargets =
@@ -3929,6 +5169,27 @@ int main(int argc, char **argv) {
         }
         return targets;
       };
+
+  auto isCodeAddressInCurrentInput = [&](uint64_t target) {
+    if (target == 0)
+      return false;
+    if (RawBinary) {
+      return target >= BaseAddress && target < BaseAddress + raw_code.size();
+    }
+    for (auto &sec : pe.code_sections) {
+      if (target >= sec.va && target < sec.va + sec.size)
+        return true;
+    }
+    return false;
+  };
+
+  auto hasDefinedLiftedOrNativeForTarget = [&](uint64_t target) {
+    auto *lifted = findLiftedOrBlockFunction(target, /*native=*/false);
+    if (lifted && !lifted->isDeclaration())
+      return true;
+    auto *native = findLiftedOrBlockFunction(target, /*native=*/true);
+    return native && !native->isDeclaration();
+  };
 
   auto patchConstantIntToPtrCallsToNative =
       [&](llvm::ArrayRef<uint64_t> targets, llvm::StringRef event_name,
@@ -4024,7 +5285,9 @@ int main(int argc, char **argv) {
 
   auto rerunLateDiscoveryPipeline = [&](llvm::StringRef attr_name, bool run_abi,
                                         bool skip_missing_block_lift,
-                                        bool clear_attr = true) {
+                                        bool clear_attr = true,
+                                        bool include_closed_slice_context =
+                                            true) {
     MAM.invalidate(*module, llvm::PreservedAnalyses::none());
     llvm::DenseSet<llvm::Function *> pre_rerun_funcs;
     llvm::DenseSet<llvm::Function *> pre_rerun_defs;
@@ -4047,14 +5310,15 @@ int main(int argc, char **argv) {
       late_opts.use_block_lifting = false;
       late_opts.merge_block_functions_after_fixpoint = false;
     }
-    const bool include_closed_slice_context =
-        !run_abi && opts.generic_static_devirtualize && BlockLift;
+    const bool use_closed_slice_context =
+        include_closed_slice_context && !run_abi &&
+        opts.generic_static_devirtualize && BlockLift;
     late_opts.scope_predicate =
-        [attr_name = attr_name.str(), include_closed_slice_context](
+        [attr_name = attr_name.str(), use_closed_slice_context](
             llvm::Function &F) {
           if (F.getFnAttribute(attr_name).isValid())
             return true;
-          return include_closed_slice_context &&
+          return use_closed_slice_context &&
                  F.hasFnAttribute("omill.closed_root_slice");
         };
     late_opts.preserve_lifted_semantics = preserve_lift_infrastructure;
@@ -4332,12 +5596,38 @@ int main(int argc, char **argv) {
     return targets;
   };
 
+  auto collectAllConstantMissingBlockTargets = [&]() {
+    llvm::DenseSet<uint64_t> targets;
+    for (auto &F : *module) {
+      if (F.isDeclaration())
+        continue;
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+          if (!call || call->arg_size() < 2)
+            continue;
+          auto *callee = call->getCalledFunction();
+          if (!callee || callee->getName() != "__remill_missing_block")
+            continue;
+          auto *pc_arg =
+              llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+          if (!pc_arg || pc_arg->isZero())
+            continue;
+          targets.insert(pc_arg->getZExtValue());
+        }
+      }
+    }
+    return targets;
+  };
+
   auto liftScopedTargets = [&](llvm::ArrayRef<uint64_t> targets,
                                llvm::StringRef attr_name, bool run_abi,
                                bool skip_missing_block_lift,
                                bool clear_attr = true,
                                bool mark_closed_root_slice = true,
-                               bool use_direct_lifter = false) {
+                               bool use_direct_lifter = false,
+                               bool include_closed_slice_context = true,
+                               bool rerun_discovery = true) {
     auto block_cb = iterative_session->blockLiftCallback();
     if (!use_direct_lifter && !block_cb)
       return false;
@@ -4378,15 +5668,56 @@ int main(int argc, char **argv) {
       if (!F.hasLocalLinkage())
         F.setLinkage(llvm::GlobalValue::InternalLinkage);
     }
-    rerunLateDiscoveryPipeline(attr_name, run_abi, skip_missing_block_lift,
-                               clear_attr);
+    if (rerun_discovery) {
+      rerunLateDiscoveryPipeline(attr_name, run_abi, skip_missing_block_lift,
+                                 clear_attr, include_closed_slice_context);
+    } else if (clear_attr) {
+      clearLiftRoundAttr(attr_name);
+    }
     return true;
   };
 
   auto liftLateTargets = [&](llvm::ArrayRef<uint64_t> targets) {
     return liftScopedTargets(targets, "omill.late_newly_lifted",
                              /*run_abi=*/false,
-                             /*skip_missing_block_lift=*/true);
+                             /*skip_missing_block_lift=*/true,
+                             /*clear_attr=*/true,
+                             /*mark_closed_root_slice=*/true,
+                             /*use_direct_lifter=*/false,
+                             /*include_closed_slice_context=*/false,
+                             /*rerun_discovery=*/true);
+  };
+
+  auto liftLateMissingBlockTargets = [&](llvm::ArrayRef<uint64_t> targets) {
+    bool changed = liftScopedTargets(targets, "omill.late_newly_lifted",
+                                     /*run_abi=*/false,
+                                     /*skip_missing_block_lift=*/true,
+                                     /*clear_attr=*/true,
+                                     /*mark_closed_root_slice=*/true,
+                                     /*use_direct_lifter=*/true,
+                                     /*include_closed_slice_context=*/false,
+                                     /*rerun_discovery=*/false);
+
+    llvm::SmallVector<uint64_t, 8> unresolved_exact_targets;
+    for (uint64_t pc : targets) {
+      auto *existing = findLiftedOrBlockFunction(pc, /*native=*/false);
+      if (!existing || existing->isDeclaration())
+        unresolved_exact_targets.push_back(pc);
+    }
+
+    if (!unresolved_exact_targets.empty()) {
+      changed |= liftScopedTargets(unresolved_exact_targets,
+                                   "omill.late_newly_lifted",
+                                   /*run_abi=*/false,
+                                   /*skip_missing_block_lift=*/true,
+                                   /*clear_attr=*/true,
+                                   /*mark_closed_root_slice=*/true,
+                                   /*use_direct_lifter=*/false,
+                                   /*include_closed_slice_context=*/false,
+                                   /*rerun_discovery=*/false);
+    }
+
+    return changed;
   };
 
   auto liftLateTerminalBoundaryTargets = [&](llvm::ArrayRef<uint64_t> targets) {
@@ -4401,7 +5732,17 @@ int main(int argc, char **argv) {
     constexpr unsigned kMaxTargetsPerRound = 8;
 
     for (unsigned round = 0; round < max_rounds; ++round) {
+      appendDebugMarker(
+          (llvm::Twine("late:continuation_round_") + llvm::Twine(round) +
+           ":before_collect")
+              .str()
+              .c_str());
       auto targets = collectClosedSliceContinuationTargets();
+      appendDebugMarker(
+          (llvm::Twine("late:continuation_round_") + llvm::Twine(round) +
+           ":after_collect targets=" + llvm::Twine(targets.size()))
+              .str()
+              .c_str());
       if (targets.empty())
         break;
 
@@ -4411,8 +5752,18 @@ int main(int argc, char **argv) {
       if (ordered_targets.size() > kMaxTargetsPerRound)
         ordered_targets.resize(kMaxTargetsPerRound);
 
+      appendDebugMarker(
+          (llvm::Twine("late:continuation_round_") + llvm::Twine(round) +
+           ":before_lift targets=" + llvm::Twine(ordered_targets.size()))
+              .str()
+              .c_str());
       if (!liftLateTargets(ordered_targets))
         break;
+      appendDebugMarker(
+          (llvm::Twine("late:continuation_round_") + llvm::Twine(round) +
+           ":after_lift")
+              .str()
+              .c_str());
     }
   };
 
@@ -4461,24 +5812,99 @@ int main(int argc, char **argv) {
     }
 
     runLateContinuationRounds(/*max_rounds=*/NoABI ? 1u : 3u);
+    appendDebugMarker("late:after_continuation_rounds");
 
     if (NoABI ||
         parseBoolEnv("OMILL_SKIP_LATE_MISSING_BLOCK_RERUN").value_or(false)) {
       return;
     }
 
-    auto missing_targets = collectClosedSliceMissingBlockTargets();
-    if (missing_targets.empty())
-      return;
+    constexpr unsigned kMaxMissingTargetRounds = 3;
+    constexpr unsigned kMaxMissingTargetsPerRound = 8;
+    for (unsigned round = 0; round < kMaxMissingTargetRounds; ++round) {
+      appendDebugMarker(
+          (llvm::Twine("late:missing_block_round_") + llvm::Twine(round) +
+           ":before_collect")
+              .str()
+              .c_str());
+      auto missing_targets = collectClosedSliceMissingBlockTargets();
+      appendDebugMarker(
+          (llvm::Twine("late:missing_block_round_") + llvm::Twine(round) +
+           ":after_collect targets=" + llvm::Twine(missing_targets.size()))
+              .str()
+              .c_str());
+      if (missing_targets.empty())
+        break;
 
-    constexpr unsigned kMaxMissingTargets = 4;
-    llvm::SmallVector<uint64_t, 8> ordered_missing_targets(
-        missing_targets.begin(), missing_targets.end());
-    llvm::sort(ordered_missing_targets);
-    if (ordered_missing_targets.size() > kMaxMissingTargets)
-      ordered_missing_targets.resize(kMaxMissingTargets);
+      llvm::SmallVector<uint64_t, 8> ordered_missing_targets(
+          missing_targets.begin(), missing_targets.end());
+      llvm::sort(ordered_missing_targets);
+      if (ordered_missing_targets.size() > kMaxMissingTargetsPerRound)
+        ordered_missing_targets.resize(kMaxMissingTargetsPerRound);
 
-    liftLateTargets(ordered_missing_targets);
+      appendDebugMarker(
+          (llvm::Twine("late:missing_block_round_") + llvm::Twine(round) +
+           ":before_lift targets=" + llvm::Twine(ordered_missing_targets.size()))
+              .str()
+              .c_str());
+      if (!liftLateMissingBlockTargets(ordered_missing_targets))
+        break;
+
+      llvm::DenseSet<uint64_t> target_set(ordered_missing_targets.begin(),
+                                          ordered_missing_targets.end());
+      unsigned patched = 0;
+      unsigned patched_nearby = 0;
+      for (auto &F : *module) {
+        if (F.isDeclaration())
+          continue;
+        for (auto &BB : F) {
+          for (auto &I : llvm::make_early_inc_range(BB)) {
+            auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+            if (!call || call->arg_size() < 2)
+              continue;
+            auto *callee = call->getCalledFunction();
+            if (!callee || callee->getName() != "__remill_missing_block")
+              continue;
+
+            auto *pc_arg =
+                llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+            if (!pc_arg)
+              continue;
+            const uint64_t target_pc = pc_arg->getZExtValue();
+            if (!target_set.contains(target_pc) || target_pc == 0)
+              continue;
+
+            uint64_t resolved_target_pc = 0;
+            auto *target = findExactOrNearbyLiftedOrBlockFunction(
+                target_pc, /*native=*/false, &resolved_target_pc);
+            if (!target || target == &F || target->isDeclaration())
+              continue;
+            if (target->getFunctionType() != call->getFunctionType())
+              continue;
+
+            call->setCalledFunction(target);
+            ++patched;
+            patched_nearby +=
+                static_cast<unsigned>(resolved_target_pc != target_pc);
+          }
+        }
+      }
+      if (patched > 0 && events.detailed()) {
+        events.emitInfo("late_missing_block_patch",
+                        "patched late missing-block calls to lifted targets",
+                        {{"round", static_cast<int64_t>(round)},
+                         {"patched_uses", static_cast<int64_t>(patched)},
+                         {"patched_nearby_uses",
+                          static_cast<int64_t>(patched_nearby)}});
+      }
+      appendDebugMarker(
+          (llvm::Twine("late:missing_block_round_") + llvm::Twine(round) +
+           ":after_lift patched=" + llvm::Twine(patched) +
+           " nearby=" + llvm::Twine(patched_nearby))
+              .str()
+              .c_str());
+    }
+    appendDebugMarker("late:after_missing_block_lift");
   };
 
   auto patchConstantMissingBlockCallsToLiftedTargets =
@@ -4486,6 +5912,7 @@ int main(int argc, char **argv) {
           llvm::StringRef event_message) {
         llvm::DenseSet<uint64_t> target_set(targets.begin(), targets.end());
         unsigned patched = 0;
+        unsigned patched_nearby = 0;
 
         for (auto &F : *module) {
           if (F.isDeclaration())
@@ -4507,8 +5934,9 @@ int main(int argc, char **argv) {
               if (!target_set.contains(target_pc) || target_pc == 0)
                 continue;
 
-              auto *target = findLiftedOrBlockFunction(target_pc,
-                                                       /*native=*/false);
+              uint64_t resolved_target_pc = 0;
+              auto *target = findExactOrNearbyLiftedOrBlockFunction(
+                  target_pc, /*native=*/false, &resolved_target_pc);
               if (!target || target == &F || target->isDeclaration())
                 continue;
               if (target->getFunctionType() != call->getFunctionType())
@@ -4516,6 +5944,8 @@ int main(int argc, char **argv) {
 
               call->setCalledFunction(target);
               ++patched;
+              patched_nearby +=
+                  static_cast<unsigned>(resolved_target_pc != target_pc);
             }
           }
         }
@@ -4527,7 +5957,9 @@ int main(int argc, char **argv) {
                << " __remill_missing_block call sites to lifted targets\n";
         if (events.detailed()) {
           events.emitInfo(event_name, event_message,
-                          {{"patched_uses", static_cast<int64_t>(patched)}});
+                          {{"patched_uses", static_cast<int64_t>(patched)},
+                           {"patched_nearby_uses",
+                            static_cast<int64_t>(patched_nearby)}});
         }
       };
 
@@ -4685,9 +6117,15 @@ int main(int argc, char **argv) {
   errs() << "Main pipeline complete\n";
   events.emitInfo("pipeline_completed", "main pipeline completed");
 
+  appendDebugMarker("late:before_continuation");
   rerunLateContinuationPipeline();
+  appendDebugMarker("late:after_continuation");
+  appendDebugMarker("late:before_terminal_boundary");
   rerunLateTerminalBoundaryTargetPipeline();
+  appendDebugMarker("late:after_terminal_boundary");
+  appendDebugMarker("late:before_final_closed_slice");
   rerunFinalClosedSlicePipeline();
+  appendDebugMarker("late:after_final_closed_slice");
 
   auto moduleFlagEnabled = [&](llvm::StringRef flag_name) {
     auto *md = module->getModuleFlag(flag_name);
@@ -4952,6 +6390,27 @@ int main(int argc, char **argv) {
           }
         }
       }
+      for (auto &F : llvm::make_early_inc_range(*module)) {
+        if (!F.isDeclaration())
+          continue;
+        auto fname = F.getName();
+        if (!fname.starts_with("sub_"))
+          continue;
+        size_t dot = fname.rfind('.');
+        if (dot == StringRef::npos || dot + 1 >= fname.size())
+          continue;
+        auto suffix = fname.drop_front(dot + 1);
+        unsigned clone_index = 0;
+        if (suffix.getAsInteger(10, clone_index))
+          continue;
+        std::string base_name = fname.take_front(dot).str();
+        if (auto *base = module->getFunction(base_name)) {
+          if (!base->isDeclaration()) {
+            F.replaceAllUsesWith(base);
+            F.eraseFromParent();
+          }
+        }
+      }
 
       errs() << "  lifted " << lift_ok;
       if (lift_fail > 0)
@@ -5008,33 +6467,934 @@ int main(int argc, char **argv) {
     }
   }
 
+  std::optional<std::string> pre_abi_checkpoint_text;
+
   // ABI recovery
   if (!NoABI) {
-    if (use_pre_abi_noabi_cleanup) {
-      // The pre-ABI generic cleanup reuses the safer no-ABI closed-slice path
-      // to flatten the slice before signature recovery. Clear the marker before
-      // ABI recovery so ABI-only rewrites do not inherit no-ABI mode.
-      module->setModuleFlag(llvm::Module::Override, "omill.no_abi_mode", 0u);
-    }
+    appendDebugMarker("abi:enter");
     restoreVMHandlerAttrs();
-    events.emitInfo("abi_recovery_started", "abi recovery started");
-    // Repair broken PHIs before saving checkpoint (otherwise LLVM parser
-    // rejects the LL on reload).
-    repairMalformedPHIs(*module);
-    // Checkpoint before ABI recovery (enables resuming after crash).
-    {
-      std::error_code ec;
-      raw_fd_ostream os("before_abi.ll", ec, sys::fs::OF_Text);
-      if (!ec) {
-        module->print(os, nullptr);
-        errs() << "Saved before_abi.ll\n";
+      if (!batch_vas.empty()) {
+        for (uint64_t va : batch_vas) {
+          annotateExportCallsiteWin64ParamHint(va, va);
+          annotateExportEntryHiddenSeedHint(va, va);
+        }
+      } else if (func_va != 0) {
+        annotateExportCallsiteWin64ParamHint(requested_func_va, func_va);
+        annotateExportEntryHiddenSeedHint(func_va, func_va);
+      }
+    appendDebugMarker("abi:after_restore_vm_attrs");
+
+    auto runExternalRecoverABIText =
+        [&](llvm::StringRef abi_input_ir) -> std::optional<std::string> {
+      if (abi_input_ir.empty())
+        return std::nullopt;
+
+      llvm::SmallString<256> opt_path(argv[0]);
+      llvm::sys::path::remove_filename(opt_path);
+      llvm::sys::path::remove_filename(opt_path);
+      llvm::sys::path::append(opt_path, "omill-opt", "omill-opt.exe");
+      if (!llvm::sys::fs::exists(opt_path))
+        return std::nullopt;
+
+      llvm::SmallString<256> temp_in_path;
+      llvm::SmallString<256> temp_out_path;
+      if (llvm::sys::fs::createTemporaryFile("omill_pre_abi_replay_in", "ll",
+                                             temp_in_path))
+        return std::nullopt;
+      if (llvm::sys::fs::createTemporaryFile("omill_pre_abi_replay_out", "ll",
+                                             temp_out_path)) {
+        llvm::sys::fs::remove(temp_in_path);
+        return std::nullopt;
+      }
+
+      {
+        std::error_code ec;
+        llvm::raw_fd_ostream os(temp_in_path, ec, llvm::sys::fs::OF_Text);
+        if (ec) {
+          llvm::sys::fs::remove(temp_in_path);
+          llvm::sys::fs::remove(temp_out_path);
+          return std::nullopt;
+        }
+        os << abi_input_ir;
+      }
+
+      llvm::SmallVector<std::string, 8> arg_storage;
+      arg_storage.emplace_back(opt_path.str().str());
+      arg_storage.emplace_back("--only-recover-abi");
+      arg_storage.emplace_back(temp_in_path.str().str());
+      arg_storage.emplace_back("-o");
+      arg_storage.emplace_back(temp_out_path.str().str());
+
+      llvm::SmallVector<llvm::StringRef, 8> argv_refs;
+      for (const auto &arg : arg_storage)
+        argv_refs.push_back(arg);
+
+      std::string err_msg;
+      bool exec_failed = false;
+      int rc = llvm::sys::ExecuteAndWait(argv_refs.front(), argv_refs,
+                                         std::nullopt, {}, 180u, 0, &err_msg,
+                                         &exec_failed);
+      llvm::sys::fs::remove(temp_in_path);
+      if (rc != 0 || exec_failed) {
+        llvm::sys::fs::remove(temp_out_path);
+        return std::nullopt;
+      }
+
+      auto buf_or_err = llvm::MemoryBuffer::getFile(temp_out_path);
+      llvm::sys::fs::remove(temp_out_path);
+      if (!buf_or_err)
+        return std::nullopt;
+      return (*buf_or_err)->getBuffer().str();
+    };
+
+    auto runExternalRecoverABIFromCurrentModuleBitcode =
+        [&]() -> std::optional<std::string> {
+      llvm::SmallString<256> opt_path(argv[0]);
+      llvm::sys::path::remove_filename(opt_path);
+      llvm::sys::path::remove_filename(opt_path);
+      llvm::sys::path::append(opt_path, "omill-opt", "omill-opt.exe");
+      if (!llvm::sys::fs::exists(opt_path))
+        return std::nullopt;
+
+      llvm::SmallString<256> temp_in_path;
+      llvm::SmallString<256> temp_out_path;
+      if (llvm::sys::fs::createTemporaryFile("omill_pre_abi_replay_in", "bc",
+                                             temp_in_path))
+        return std::nullopt;
+      if (llvm::sys::fs::createTemporaryFile("omill_pre_abi_replay_out", "ll",
+                                             temp_out_path)) {
+        llvm::sys::fs::remove(temp_in_path);
+        return std::nullopt;
+      }
+
+      {
+        std::error_code ec;
+        llvm::raw_fd_ostream os(temp_in_path, ec, llvm::sys::fs::OF_None);
+        if (ec) {
+          llvm::sys::fs::remove(temp_in_path);
+          llvm::sys::fs::remove(temp_out_path);
+          return std::nullopt;
+        }
+        llvm::WriteBitcodeToFile(*module, os);
+      }
+
+      llvm::SmallVector<std::string, 8> arg_storage;
+      arg_storage.emplace_back(opt_path.str().str());
+      arg_storage.emplace_back("--only-recover-abi");
+      arg_storage.emplace_back(temp_in_path.str().str());
+      arg_storage.emplace_back("-o");
+      arg_storage.emplace_back(temp_out_path.str().str());
+
+      llvm::SmallVector<llvm::StringRef, 8> argv_refs;
+      for (const auto &arg : arg_storage)
+        argv_refs.push_back(arg);
+
+      std::string err_msg;
+      bool exec_failed = false;
+      int rc = llvm::sys::ExecuteAndWait(argv_refs.front(), argv_refs,
+                                         std::nullopt, {}, 180u, 0, &err_msg,
+                                         &exec_failed);
+      llvm::sys::fs::remove(temp_in_path);
+      if (rc != 0 || exec_failed) {
+        llvm::sys::fs::remove(temp_out_path);
+        return std::nullopt;
+      }
+
+      auto buf_or_err = llvm::MemoryBuffer::getFile(temp_out_path);
+      llvm::sys::fs::remove(temp_out_path);
+      if (!buf_or_err)
+        return std::nullopt;
+      return (*buf_or_err)->getBuffer().str();
+    };
+
+    auto buildFilteredABIRecoveryCheckpointText =
+        [&]() -> std::optional<std::string> {
+      if (countDefinedOutputRoots() > 1u)
+        return std::nullopt;
+
+      llvm::SmallPtrSet<const llvm::Function *, 32> kept_functions;
+      llvm::SmallVector<const llvm::Function *, 64> worklist;
+      auto seed_function = [&](const llvm::Function &F) {
+        if (F.isDeclaration())
+          return;
+        if (kept_functions.insert(&F).second)
+          worklist.push_back(&F);
+      };
+
+      for (const auto &F : *module) {
+        if (F.hasFnAttribute("omill.output_root") ||
+            F.hasFnAttribute("omill.closed_root_slice_root")) {
+          seed_function(F);
+        }
+      }
+      if (kept_functions.empty())
+        return std::nullopt;
+
+      llvm::SmallVector<const llvm::Function *, 64> root_layer(worklist.begin(),
+                                                               worklist.end());
+      for (const llvm::Function *F : root_layer) {
+        for (const auto &BB : *F) {
+          for (const auto &I : BB) {
+            const auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+            if (!call)
+              continue;
+            const auto *callee = call->getCalledFunction();
+            if (!callee || callee->isDeclaration())
+              continue;
+            kept_functions.insert(callee);
+          }
+        }
+      }
+
+      llvm::ValueToValueMapTy VMap;
+      auto should_clone_def = [&](const llvm::GlobalValue *GV) -> bool {
+        if (const auto *F = llvm::dyn_cast<llvm::Function>(GV))
+          return F->isDeclaration() || kept_functions.contains(F);
+        return true;
+      };
+      auto filtered_module = llvm::CloneModule(*module, VMap, should_clone_def);
+      if (!filtered_module || verifyModule(*filtered_module, nullptr))
+        return std::nullopt;
+
+      std::string filtered_ir;
+      llvm::raw_string_ostream os(filtered_ir);
+      filtered_module->print(os, nullptr);
+      os.flush();
+      events.emitInfo("filtered_pre_abi_checkpoint_built",
+                      "filtered pre-ABI checkpoint built",
+                      {{"kept_functions",
+                        static_cast<int64_t>(kept_functions.size())},
+                       {"filtered_ir_bytes",
+                        static_cast<int64_t>(filtered_ir.size())}});
+      return filtered_ir;
+    };
+
+    auto tryDirectReplayABIText = [&](llvm::StringRef abi_input_ir,
+                                      llvm::StringRef event_name,
+                                      llvm::StringRef event_message) -> bool {
+      auto replayed_text = runExternalRecoverABIText(abi_input_ir);
+      if (!replayed_text)
+        return false;
+
+      llvm::SMDiagnostic parse_error;
+      auto replayed_module =
+          llvm::parseAssemblyString(*replayed_text, parse_error, ctx);
+      if (!replayed_module)
+        return false;
+      if (verifyModule(*replayed_module, nullptr))
+        return false;
+
+      auto ensureRecoveredModuleHasOutputRoot =
+          [&](llvm::Module &M, uint64_t expected_root_va) -> llvm::Function * {
+        auto pickUnique =
+            [](llvm::ArrayRef<llvm::Function *> candidates)
+            -> llvm::Function * {
+          return candidates.size() == 1 ? candidates.front() : nullptr;
+        };
+
+        std::string target_hex = llvm::utohexstr(expected_root_va);
+        llvm::SmallVector<llvm::Function *, 8> exact_target_roots;
+        llvm::SmallVector<llvm::Function *, 8> output_roots;
+        llvm::SmallVector<llvm::Function *, 8> native_functions;
+        llvm::SmallVector<llvm::Function *, 8> defined_functions;
+        for (auto &F : M) {
+          if (F.isDeclaration())
+            continue;
+          defined_functions.push_back(&F);
+          if (F.hasFnAttribute("omill.output_root"))
+            output_roots.push_back(&F);
+          if (F.getName().ends_with("_native"))
+            native_functions.push_back(&F);
+          if (expected_root_va != 0 &&
+              ((F.getName() == ("sub_" + target_hex + "_native")) ||
+               (F.getName() == ("blk_" + target_hex + "_native")) ||
+               (F.getName().contains(target_hex) &&
+                F.getName().ends_with("_native")))) {
+            exact_target_roots.push_back(&F);
+          }
+        }
+
+        llvm::Function *root = nullptr;
+        if (auto *F = pickUnique(exact_target_roots))
+          root = F;
+        else if (auto *F = pickUnique(output_roots))
+          root = F;
+        else if (auto *F = pickUnique(native_functions))
+          root = F;
+        else if (auto *F = pickUnique(defined_functions))
+          root = F;
+        if (!root)
+          return nullptr;
+        for (auto &F : M) {
+          if (&F == root)
+            continue;
+          F.removeFnAttr("omill.output_root");
+        }
+        root->addFnAttr("omill.output_root");
+        return root;
+      };
+
+      auto *resolved_root =
+          ensureRecoveredModuleHasOutputRoot(*replayed_module, func_va);
+      if (!resolved_root)
+        return false;
+
+      unsigned defined_output_roots = 0;
+      bool has_unresolved_output_control_transfer = false;
+      for (auto &F : *replayed_module) {
+        if (!F.hasFnAttribute("omill.output_root") || F.isDeclaration())
+          continue;
+        ++defined_output_roots;
+        if (hasUnresolvedLiftedControlTransferInClosure(F))
+          has_unresolved_output_control_transfer = true;
+      }
+      if (defined_output_roots == 0 || has_unresolved_output_control_transfer)
+        return false;
+
+      module = std::move(replayed_module);
+      MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+      repairMalformedPHIs(*module);
+      errs() << "ABI recovery replayed from closed pre-ABI checkpoint\n";
+      events.emitInfo(event_name, event_message,
+                      {{"defined_output_roots",
+                        static_cast<int64_t>(defined_output_roots)}});
+      return true;
+    };
+
+    auto runExternalMainRootNoABIChildIR = [&]() -> std::optional<std::string> {
+      if (!use_pre_abi_noabi_cleanup || func_va == 0)
+        return std::nullopt;
+
+      llvm::SmallString<256> temp_ll_path;
+      if (llvm::sys::fs::createTemporaryFile("omill_main_root_noabi", "ll",
+                                             temp_ll_path)) {
+        return std::nullopt;
+      }
+
+      llvm::SmallVector<std::string, 16> arg_storage;
+      arg_storage.emplace_back(argv[0]);
+      arg_storage.emplace_back(InputFilename);
+      arg_storage.emplace_back("--va");
+      arg_storage.emplace_back(llvm::utohexstr(func_va));
+      if (BlockLift)
+        arg_storage.emplace_back("--block-lift");
+      if (opts.generic_static_devirtualize)
+        arg_storage.emplace_back("--generic-static-devirtualize");
+      arg_storage.emplace_back("--no-abi");
+      arg_storage.emplace_back("-o");
+      arg_storage.emplace_back(temp_ll_path.str().str());
+
+      llvm::SmallVector<llvm::StringRef, 16> argv_refs;
+      for (const auto &arg : arg_storage)
+        argv_refs.push_back(arg);
+
+      std::string err_msg;
+      bool exec_failed = false;
+      ScopedEnvOverride skip_nested_probe(
+          "OMILL_SKIP_TERMINAL_BOUNDARY_SIDE_PROBE", "1");
+      ScopedEnvOverride skip_late_output_target(
+          "OMILL_SKIP_LATE_OUTPUT_ROOT_TARGET_RERUN", "1");
+      ScopedEnvOverride skip_late_boundary_rerun(
+          "OMILL_SKIP_LATE_TERMINAL_BOUNDARY_RERUN", "1");
+      int rc = llvm::sys::ExecuteAndWait(
+          argv_refs.front(), argv_refs, std::nullopt, {},
+          parseUnsignedEnv("OMILL_MAIN_ROOT_NOABI_CHILD_TIMEOUT_SECONDS")
+              .value_or(900u),
+          0, &err_msg, &exec_failed);
+      if (rc != 0 || exec_failed) {
+        llvm::sys::fs::remove(temp_ll_path);
+        return std::nullopt;
+      }
+
+      auto buf_or_err = llvm::MemoryBuffer::getFile(temp_ll_path);
+      llvm::sys::fs::remove(temp_ll_path);
+      if (!buf_or_err)
+        return std::nullopt;
+      return (*buf_or_err)->getBuffer().str();
+    };
+
+    auto moduleReadableEnoughForDirectWrite = [&](const llvm::Module &M) {
+      bool has_state_alloca = false;
+      bool has_large_stack_alloca = false;
+      bool uses_stacksave = false;
+      bool calls_local_lifted_helper = false;
+      unsigned defined_lifted_function_count = 0;
+      const auto &DL = M.getDataLayout();
+      for (auto &F : M) {
+        if (F.isDeclaration())
+          continue;
+        if ((F.getName().starts_with("sub_") || F.getName().starts_with("blk_") ||
+             F.getName().starts_with("block_")) &&
+            !F.getName().ends_with("_native")) {
+          ++defined_lifted_function_count;
+        }
+        for (auto &BB : F) {
+          for (auto &I : BB) {
+            if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
+              if (auto *allocated_struct =
+                      llvm::dyn_cast<llvm::StructType>(
+                          alloca->getAllocatedType());
+                  allocated_struct && allocated_struct->hasName() &&
+                  allocated_struct->getName() == "struct.State") {
+                has_state_alloca = true;
+              }
+              if (auto *AT =
+                      llvm::dyn_cast<llvm::ArrayType>(alloca->getAllocatedType())) {
+                if (DL.getTypeAllocSize(AT) >= 4096)
+                  has_large_stack_alloca = true;
+              }
+            }
+            auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+            auto *callee = call ? call->getCalledFunction() : nullptr;
+            if (callee && callee->getName() == "llvm.stacksave.p0")
+              uses_stacksave = true;
+            if (callee && !callee->isDeclaration() &&
+                !callee->getName().ends_with("_native") &&
+                (callee->getName().starts_with("sub_") ||
+                 callee->getName().starts_with("blk_") ||
+                 callee->getName().starts_with("block_"))) {
+              calls_local_lifted_helper = true;
+            }
+          }
+        }
+      }
+      return !has_state_alloca && !has_large_stack_alloca &&
+             !uses_stacksave && !calls_local_lifted_helper &&
+             defined_lifted_function_count == 0;
+    };
+
+    auto writeFinalOutputTextAndExit = [&](llvm::StringRef final_ir_text,
+                                           llvm::StringRef event_name,
+                                           llvm::StringRef event_message)
+        -> std::optional<int> {
+      llvm::LLVMContext verify_ctx;
+      llvm::SMDiagnostic parse_error;
+      auto verify_module =
+          llvm::parseAssemblyString(final_ir_text, parse_error, verify_ctx);
+      if (!verify_module || verifyModule(*verify_module, nullptr) ||
+          !moduleReadableEnoughForDirectWrite(*verify_module)) {
+        return std::nullopt;
+      }
+
+      std::error_code direct_ec;
+      events.emitInfo("output_write_started", "writing final output",
+                      {{"path", OutputFilename}});
+      ToolOutputFile direct_out(OutputFilename, direct_ec, sys::fs::OF_Text);
+      if (direct_ec) {
+        errs() << "Error opening output: " << direct_ec.message() << "\n";
+        return fail(1, "failed to open output file");
+      }
+      direct_out.os() << final_ir_text;
+      direct_out.keep();
+      events.emitInfo(event_name, event_message);
+      events.emitInfo("output_write_completed", "output write complete",
+                      {{"path", OutputFilename}});
+      events.emitTerminalSuccess(OutputFilename);
+      return 0;
+    };
+
+    const bool debug_small_replay =
+        parseBoolEnv("OMILL_DEBUG_SMALL_REPLAY").value_or(false);
+
+    const bool force_external_main_root_child_replay =
+        parseBoolEnv("OMILL_FORCE_MAIN_ROOT_NOABI_CHILD_REPLAY").value_or(false);
+    const bool enable_external_main_root_child_replay =
+        parseBoolEnv("OMILL_ENABLE_MAIN_ROOT_NOABI_CHILD_REPLAY")
+            .value_or(false);
+    const bool prefer_external_main_root_child_replay =
+        use_pre_abi_noabi_cleanup &&
+        !parseBoolEnv("OMILL_SKIP_MAIN_ROOT_NOABI_CHILD_REPLAY")
+             .value_or(false) &&
+        countDefinedOutputRoots() <= 1u &&
+        (force_external_main_root_child_replay ||
+         (enable_external_main_root_child_replay &&
+          moduleHasStructuralOutputFrontierArtifacts()));
+
+    if (prefer_external_main_root_child_replay) {
+      errs() << "Attempting external main-root no-ABI replay fallback\n";
+      events.emitInfo("main_root_noabi_child_replay_started",
+                      "external main-root no-ABI replay fallback started");
+      if (auto noabi_child_ir = runExternalMainRootNoABIChildIR()) {
+        events.emitInfo("main_root_noabi_child_completed",
+                        "external main-root no-ABI child completed");
+        if (auto replayed_text = runExternalRecoverABIText(*noabi_child_ir)) {
+          auto summary = parseTerminalBoundaryRecoveryIRSummary(*replayed_text);
+          const bool has_unresolved_pc_text =
+              replayed_text->find("pc.canonical") != std::string::npos ||
+              replayed_text->find("pc.norm") != std::string::npos;
+          const bool clean_text_fallback =
+              summary.has_output_root && !has_unresolved_pc_text &&
+              summary.metrics.dispatch_call == 0 &&
+              summary.metrics.dispatch_jump == 0 &&
+              summary.metrics.declare_blk == 0 &&
+              summary.metrics.missing_block_handler == 0;
+          if (clean_text_fallback) {
+            if (auto direct_exit = writeFinalOutputTextAndExit(
+                    *replayed_text,
+                    "abi_recovery_replayed_from_main_root_noabi_child",
+                    "ABI recovery replayed from external main-root no-ABI child")) {
+              return *direct_exit;
+            }
+          }
+          errs() << "External main-root no-ABI replay fallback rejected clean="
+                 << (clean_text_fallback ? 1 : 0) << "\n";
+          events.emitInfo("main_root_noabi_child_replay_rejected",
+                          "external main-root no-ABI replay fallback rejected",
+                          {{"clean_text_fallback",
+                            static_cast<int64_t>(clean_text_fallback ? 1 : 0)},
+                           {"dispatch_call",
+                            static_cast<int64_t>(summary.metrics.dispatch_call)},
+                           {"dispatch_jump",
+                            static_cast<int64_t>(summary.metrics.dispatch_jump)},
+                           {"declare_blk",
+                            static_cast<int64_t>(summary.metrics.declare_blk)},
+                           {"missing_block",
+                            static_cast<int64_t>(
+                                summary.metrics.missing_block_handler)}});
+        }
+      } else {
+        errs() << "External main-root no-ABI child failed\n";
+        events.emitInfo("main_root_noabi_child_failed",
+                        "external main-root no-ABI child failed");
       }
     }
-    ModulePassManager MPM;
-      omill::buildABIRecoveryPipeline(MPM, opts);
-    MPM.run(*module, MAM);
-    errs() << "ABI recovery complete\n";
-    events.emitInfo("abi_recovery_completed", "abi recovery completed");
+
+    const bool force_direct_replay =
+        parseBoolEnv("OMILL_FORCE_PRE_ABI_DIRECT_REPLAY").value_or(false);
+    const bool prefer_direct_replay =
+        use_pre_abi_noabi_cleanup && force_direct_replay &&
+        !parseBoolEnv("OMILL_SKIP_PRE_ABI_DIRECT_REPLAY").value_or(false);
+
+    if (use_pre_abi_noabi_cleanup &&
+        parseBoolEnv("OMILL_FORCE_PRE_ABI_BITCODE_REPLAY").value_or(false) &&
+        countDefinedOutputRoots() <= 1u) {
+      appendDebugMarker("abi:before_bitcode_replay");
+      errs() << "Attempting pre-ABI bitcode replay fallback\n";
+      if (auto replayed_text = runExternalRecoverABIFromCurrentModuleBitcode()) {
+        appendDebugMarker("abi:after_bitcode_replay");
+        auto summary = parseTerminalBoundaryRecoveryIRSummary(*replayed_text);
+        const bool has_unresolved_pc_text =
+            replayed_text->find("pc.canonical") != std::string::npos ||
+            replayed_text->find("pc.norm") != std::string::npos;
+        const bool clean_text_fallback =
+            summary.has_output_root && !has_unresolved_pc_text &&
+            summary.metrics.dispatch_call == 0 &&
+            summary.metrics.dispatch_jump == 0 &&
+            summary.metrics.declare_blk == 0 &&
+            summary.metrics.missing_block_handler == 0;
+        errs() << "Pre-ABI bitcode replay fallback clean="
+               << (clean_text_fallback ? 1 : 0) << "\n";
+        if (clean_text_fallback) {
+          if (auto direct_exit = writeFinalOutputTextAndExit(
+                  *replayed_text,
+                  "abi_recovery_replayed_from_pre_abi_bitcode",
+                  "ABI recovery replayed from pre-ABI bitcode checkpoint")) {
+            return *direct_exit;
+          }
+        }
+      } else {
+        appendDebugMarker("abi:bitcode_replay_failed");
+        errs() << "Pre-ABI bitcode replay fallback failed\n";
+      }
+    }
+
+    if (prefer_direct_replay &&
+        tryDirectReplayABIText(*pre_abi_checkpoint_text,
+                               "abi_recovery_replayed_from_main_checkpoint",
+                               "ABI recovery replayed from main pre-ABI checkpoint")) {
+      appendDebugMarker("abi:after_prefer_direct_replay");
+      dumpModuleIfEnvEnabled(*module, "OMILL_DEBUG_DUMP_AFTER_ABI_CORE",
+                             "after_abi_core.ll");
+    } else {
+      appendDebugMarker("abi:before_live_abi_branch");
+      if (use_pre_abi_noabi_cleanup) {
+        // The pre-ABI generic cleanup reuses the safer no-ABI closed-slice path
+        // to flatten the slice before signature recovery. Clear the marker before
+        // ABI recovery so ABI-only rewrites do not inherit no-ABI mode.
+        module->setModuleFlag(llvm::Module::Override, "omill.no_abi_mode", 0u);
+      }
+      events.emitInfo("abi_recovery_started", "abi recovery started");
+      {
+        auto checkpoint_patch_targets = collectAllConstantMissingBlockTargets();
+        if (!checkpoint_patch_targets.empty()) {
+          llvm::SmallVector<uint64_t, 16> ordered_targets(
+              checkpoint_patch_targets.begin(), checkpoint_patch_targets.end());
+          llvm::sort(ordered_targets);
+          patchConstantMissingBlockCallsToLiftedTargets(
+              ordered_targets, "abi_pre_checkpoint_missing_block_patch",
+              "patched pre-ABI missing-block calls to lifted targets");
+        }
+      }
+      appendDebugMarker("abi:before_raw_checkpoint_print");
+      {
+        if (use_pre_abi_noabi_cleanup && countDefinedOutputRoots() <= 1u &&
+            !parseBoolEnv("OMILL_SKIP_FILTERED_PRE_ABI_CHECKPOINT")
+                 .value_or(false)) {
+          pre_abi_checkpoint_text = buildFilteredABIRecoveryCheckpointText();
+        }
+        if (!pre_abi_checkpoint_text) {
+          std::string checkpoint_ir;
+          llvm::raw_string_ostream checkpoint_os(checkpoint_ir);
+          module->print(checkpoint_os, nullptr);
+          checkpoint_os.flush();
+          pre_abi_checkpoint_text = std::move(checkpoint_ir);
+        }
+      }
+      appendDebugMarker("abi:after_raw_checkpoint_print");
+      {
+        std::error_code ec;
+        raw_fd_ostream os("before_abi.ll", ec, sys::fs::OF_Text);
+        if (!ec) {
+          os << *pre_abi_checkpoint_text;
+          errs() << "Saved before_abi.ll\n";
+        }
+      }
+      bool accepted_small_checkpoint_replay = false;
+      auto replayedModuleReadableEnoughForFastPlainFallback =
+          [&](const llvm::Module &M) {
+            if (!fast_plain_export_root_fallback)
+              return true;
+            bool has_state_alloca = false;
+            bool has_large_stack_alloca = false;
+            bool uses_stacksave = false;
+            bool calls_local_lifted_helper = false;
+            unsigned defined_lifted_function_count = 0;
+            const auto &DL = M.getDataLayout();
+            for (auto &F : M) {
+              if (F.isDeclaration())
+                continue;
+              if ((F.getName().starts_with("sub_") ||
+                   F.getName().starts_with("blk_") ||
+                   F.getName().starts_with("block_")) &&
+                  !F.getName().ends_with("_native")) {
+                ++defined_lifted_function_count;
+              }
+              for (auto &BB : F) {
+                for (auto &I : BB) {
+                  auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(&I);
+                  if (alloca) {
+                    auto *allocated_struct =
+                        llvm::dyn_cast<llvm::StructType>(
+                            alloca->getAllocatedType());
+                    if (allocated_struct && allocated_struct->hasName() &&
+                        allocated_struct->getName() == "struct.State") {
+                      has_state_alloca = true;
+                    }
+                    if (auto *AT = llvm::dyn_cast<llvm::ArrayType>(
+                            alloca->getAllocatedType())) {
+                      if (DL.getTypeAllocSize(AT) >= 4096)
+                        has_large_stack_alloca = true;
+                    }
+                  }
+                  auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+                  auto *callee = call ? call->getCalledFunction() : nullptr;
+                  if (callee && callee->getName() == "llvm.stacksave.p0")
+                    uses_stacksave = true;
+                  if (callee && !callee->isDeclaration() &&
+                      !callee->getName().ends_with("_native") &&
+                      (callee->getName().starts_with("sub_") ||
+                       callee->getName().starts_with("blk_") ||
+                       callee->getName().starts_with("block_"))) {
+                    calls_local_lifted_helper = true;
+                  }
+                }
+              }
+            }
+            return !has_state_alloca && !has_large_stack_alloca &&
+                   !uses_stacksave && !calls_local_lifted_helper &&
+                   defined_lifted_function_count == 0;
+          };
+      constexpr size_t kMaxAutoDirectReplayCheckpointBytes = 32ull << 20;
+      if (pre_abi_checkpoint_text &&
+          pre_abi_checkpoint_text->size() <=
+              kMaxAutoDirectReplayCheckpointBytes &&
+          !parseBoolEnv("OMILL_SKIP_PRE_ABI_DIRECT_REPLAY").value_or(false)) {
+        if (debug_small_replay) {
+          errs() << "[small-replay] checkpoint-bytes="
+                 << pre_abi_checkpoint_text->size() << "\n";
+        }
+        if (auto replayed_text = runExternalRecoverABIText(*pre_abi_checkpoint_text)) {
+          const bool has_unresolved_pc_text =
+              replayed_text->find("pc.canonical") != std::string::npos ||
+              replayed_text->find("pc.norm") != std::string::npos;
+          llvm::SMDiagnostic parse_error;
+          auto replayed_module =
+              llvm::parseAssemblyString(*replayed_text, parse_error, ctx);
+          if (replayed_module && !verifyModule(*replayed_module, nullptr) &&
+              !has_unresolved_pc_text) {
+            auto ensureRecoveredModuleHasOutputRoot =
+                [&](llvm::Module &M,
+                    uint64_t expected_root_va) -> llvm::Function * {
+                  auto pickUnique =
+                      [](llvm::ArrayRef<llvm::Function *> candidates)
+                      -> llvm::Function * {
+                    return candidates.size() == 1 ? candidates.front()
+                                                  : nullptr;
+                  };
+
+                  std::string target_hex = llvm::utohexstr(expected_root_va);
+                  llvm::SmallVector<llvm::Function *, 8> exact_target_roots;
+                  llvm::SmallVector<llvm::Function *, 8> output_roots;
+                  llvm::SmallVector<llvm::Function *, 8> native_functions;
+                  llvm::SmallVector<llvm::Function *, 8> defined_functions;
+                  for (auto &F : M) {
+                    if (F.isDeclaration())
+                      continue;
+                    defined_functions.push_back(&F);
+                    if (F.hasFnAttribute("omill.output_root"))
+                      output_roots.push_back(&F);
+                    if (F.getName().ends_with("_native"))
+                      native_functions.push_back(&F);
+                    if (expected_root_va != 0 &&
+                        ((F.getName() == ("sub_" + target_hex + "_native")) ||
+                         (F.getName() ==
+                          ("blk_" + target_hex + "_native")) ||
+                         (F.getName().contains(target_hex) &&
+                          F.getName().ends_with("_native")))) {
+                      exact_target_roots.push_back(&F);
+                    }
+                  }
+
+                  llvm::Function *root = nullptr;
+                  if (auto *F = pickUnique(exact_target_roots))
+                    root = F;
+                  else if (auto *F = pickUnique(output_roots))
+                    root = F;
+                  else if (auto *F = pickUnique(native_functions))
+                    root = F;
+                  else if (auto *F = pickUnique(defined_functions))
+                    root = F;
+                  if (!root)
+                    return nullptr;
+                  for (auto &F : M) {
+                    if (&F == root)
+                      continue;
+                    F.removeFnAttr("omill.output_root");
+                  }
+                  root->addFnAttr("omill.output_root");
+                  return root;
+                };
+            if (!ensureRecoveredModuleHasOutputRoot(*replayed_module, func_va))
+              replayed_module.reset();
+          }
+          if (replayed_module && !verifyModule(*replayed_module, nullptr) &&
+              !has_unresolved_pc_text) {
+            unsigned defined_output_roots = 0;
+            bool has_dispatch = false;
+            bool has_missing_block_handler = false;
+            unsigned declared_blk_count = 0;
+            unsigned call_blk_count = 0;
+            bool has_state_alloca = false;
+            unsigned defined_lifted_function_count = 0;
+            for (auto &F : *replayed_module) {
+              if (!F.isDeclaration() && F.hasFnAttribute("omill.output_root"))
+                ++defined_output_roots;
+              if (F.getName() == "__omill_dispatch_call" ||
+                  F.getName() == "__omill_dispatch_jump") {
+                has_dispatch |= !F.use_empty();
+              }
+              if (F.isDeclaration() &&
+                  (F.getName().starts_with("blk_") ||
+                   F.getName().starts_with("block_"))) {
+                ++declared_blk_count;
+              }
+              if (F.getName() == "__omill_missing_block_handler") {
+                has_missing_block_handler |= !F.use_empty();
+              }
+              if (F.isDeclaration())
+                continue;
+              if ((F.getName().starts_with("sub_") ||
+                   F.getName().starts_with("blk_") ||
+                   F.getName().starts_with("block_")) &&
+                  !F.getName().ends_with("_native")) {
+                ++defined_lifted_function_count;
+              }
+              for (auto &BB : F) {
+                for (auto &I : BB) {
+                  if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
+                    auto *allocated_type = alloca->getAllocatedType();
+                    auto *allocated_struct =
+                        llvm::dyn_cast<llvm::StructType>(allocated_type);
+                    if (allocated_struct &&
+                        allocated_struct->hasName() &&
+                        allocated_struct->getName() == "struct.State") {
+                      has_state_alloca = true;
+                    }
+                  }
+                  auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+                  auto *callee = call ? call->getCalledFunction() : nullptr;
+                  if (callee &&
+                      (callee->getName().starts_with("blk_") ||
+                       callee->getName().starts_with("block_"))) {
+                    ++call_blk_count;
+                  }
+                }
+              }
+            }
+            if (debug_small_replay) {
+              errs() << "[small-replay] roots=" << defined_output_roots
+                     << " dispatch=" << (has_dispatch ? 1 : 0)
+                     << " missing=" << (has_missing_block_handler ? 1 : 0)
+                     << " state_alloca=" << (has_state_alloca ? 1 : 0)
+                     << " defined_lifted=" << defined_lifted_function_count
+                     << " declare_blk=" << declared_blk_count
+                     << " call_blk=" << call_blk_count << "\n";
+            }
+            const bool readable_enough_for_fast_plain_direct_replay =
+                replayedModuleReadableEnoughForFastPlainFallback(*replayed_module);
+            const bool structurally_clean_enough_for_direct_write =
+                defined_output_roots > 0 && !has_dispatch &&
+                !has_missing_block_handler &&
+                !has_state_alloca &&
+                defined_lifted_function_count == 0 &&
+                readable_enough_for_fast_plain_direct_replay &&
+                declared_blk_count <= 4u &&
+                call_blk_count <= 16u;
+            const bool structurally_small_enough_to_adopt =
+                defined_output_roots > 0 && !has_dispatch &&
+                !has_missing_block_handler &&
+                !has_state_alloca &&
+                readable_enough_for_fast_plain_direct_replay &&
+                declared_blk_count <= 16u &&
+                call_blk_count <= 32u;
+            if (structurally_clean_enough_for_direct_write ||
+                structurally_small_enough_to_adopt) {
+              if (debug_small_replay)
+                errs() << "[small-replay] adopted-for-post-cleanup\n";
+              module = std::move(replayed_module);
+              MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+              repairMalformedPHIs(*module);
+              accepted_small_checkpoint_replay = true;
+              errs() << "ABI recovery adopted from small pre-ABI checkpoint\n";
+              events.emitInfo("abi_recovery_adopted_from_small_checkpoint",
+                              "ABI recovery adopted from small pre-ABI checkpoint",
+                              {{"defined_output_roots",
+                                static_cast<int64_t>(defined_output_roots)},
+                               {"declared_blk_count",
+                                static_cast<int64_t>(declared_blk_count)},
+                               {"call_blk_count",
+                                static_cast<int64_t>(call_blk_count)}});
+            }
+          } else if (debug_small_replay) {
+            errs() << "[small-replay] parse-or-verify-failed unresolved_pc="
+                   << (has_unresolved_pc_text ? 1 : 0) << "\n";
+          }
+        } else if (debug_small_replay) {
+          errs() << "[small-replay] external-recover-abi failed\n";
+        }
+      }
+      if (!accepted_small_checkpoint_replay &&
+          !parseBoolEnv("OMILL_SKIP_PRE_ABI_DIRECT_REPLAY").value_or(false)) {
+        if (auto replayed_text =
+                runExternalRecoverABIText(*pre_abi_checkpoint_text)) {
+          auto summary = parseTerminalBoundaryRecoveryIRSummary(*replayed_text);
+          const bool has_unresolved_pc_text =
+              replayed_text->find("pc.canonical") != std::string::npos ||
+              replayed_text->find("pc.norm") != std::string::npos;
+          const bool clean_text_fallback =
+              summary.has_output_root && !has_unresolved_pc_text &&
+              summary.metrics.dispatch_call == 0 &&
+              summary.metrics.dispatch_jump == 0 &&
+              summary.metrics.declare_blk == 0 &&
+              summary.metrics.missing_block_handler == 0;
+          if (clean_text_fallback) {
+            llvm::SMDiagnostic parse_error;
+            auto replayed_module =
+                llvm::parseAssemblyString(*replayed_text, parse_error, ctx);
+            if (replayed_module && !verifyModule(*replayed_module, nullptr) &&
+                replayedModuleReadableEnoughForFastPlainFallback(
+                    *replayed_module)) {
+              module = std::move(replayed_module);
+              MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+              repairMalformedPHIs(*module);
+              errs() << "ABI recovery replayed from raw pre-ABI checkpoint\n";
+              events.emitInfo("abi_recovery_replayed_from_raw_pre_abi",
+                              "ABI recovery replayed from raw pre-ABI checkpoint",
+                              {{"defined_output_roots", 1}});
+            }
+          }
+        }
+      }
+      if (!accepted_small_checkpoint_replay) {
+        // Repair broken PHIs before saving checkpoint (otherwise LLVM parser
+        // rejects the LL on reload).
+        appendDebugMarker("abi:before_repair_phis");
+        repairMalformedPHIs(*module);
+        appendDebugMarker("abi:after_repair_phis");
+        {
+          std::string checkpoint_ir;
+          llvm::raw_string_ostream checkpoint_os(checkpoint_ir);
+          module->print(checkpoint_os, nullptr);
+          checkpoint_os.flush();
+          pre_abi_checkpoint_text = std::move(checkpoint_ir);
+        }
+      }
+      if (!accepted_small_checkpoint_replay &&
+          use_pre_abi_noabi_cleanup && countDefinedOutputRoots() <= 1u &&
+          !parseBoolEnv("OMILL_SKIP_PRE_ABI_DIRECT_REPLAY").value_or(false)) {
+        if (auto replayed_text =
+                runExternalRecoverABIText(*pre_abi_checkpoint_text)) {
+          auto summary = parseTerminalBoundaryRecoveryIRSummary(*replayed_text);
+          const bool has_unresolved_pc_text =
+              replayed_text->find("pc.canonical") != std::string::npos ||
+              replayed_text->find("pc.norm") != std::string::npos;
+          const bool clean_text_fallback =
+              summary.has_output_root && !has_unresolved_pc_text &&
+              summary.metrics.dispatch_call == 0 &&
+              summary.metrics.dispatch_jump == 0 &&
+              summary.metrics.declare_blk == 0 &&
+              summary.metrics.missing_block_handler == 0;
+          if (clean_text_fallback) {
+            llvm::SMDiagnostic parse_error;
+            auto replayed_module =
+                llvm::parseAssemblyString(*replayed_text, parse_error, ctx);
+            if (replayed_module && !verifyModule(*replayed_module, nullptr) &&
+                replayedModuleReadableEnoughForFastPlainFallback(
+                    *replayed_module)) {
+              module = std::move(replayed_module);
+              MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+              repairMalformedPHIs(*module);
+              errs() << "ABI recovery replayed from pre-ABI checkpoint\n";
+              events.emitInfo("abi_recovery_replayed_from_pre_abi",
+                              "ABI recovery replayed from pre-ABI checkpoint",
+                              {{"defined_output_roots", 1}});
+            }
+          }
+        }
+      }
+      auto tryDirectReplayABIFromPreABICheckpoint = [&]() -> bool {
+        if (accepted_small_checkpoint_replay)
+          return true;
+        if (!use_pre_abi_noabi_cleanup)
+          return false;
+        if (!pre_abi_checkpoint_text || pre_abi_checkpoint_text->empty())
+          return false;
+        if (parseBoolEnv("OMILL_SKIP_PRE_ABI_DIRECT_REPLAY").value_or(false))
+          return false;
+        if (countDefinedOutputRoots() > 1u &&
+            !parseBoolEnv("OMILL_FORCE_PRE_ABI_DIRECT_REPLAY").value_or(false)) {
+          return false;
+        }
+
+        return tryDirectReplayABIText(*pre_abi_checkpoint_text,
+                                      "abi_recovery_replayed_from_pre_abi",
+                                      "ABI recovery replayed from pre-ABI checkpoint");
+      };
+
+      if (!tryDirectReplayABIFromPreABICheckpoint()) {
+        // ABI recovery relies on fresh module analyses. Reusing analysis state
+        // from the pre-ABI main pipeline can miscompile recovered roots, because
+        // the module shape changed substantially during lifting/devirtualization.
+        MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+        ModulePassManager MPM;
+          omill::buildABIRecoveryPipeline(MPM, opts);
+        MPM.run(*module, MAM);
+        errs() << "ABI recovery complete\n";
+        events.emitInfo("abi_recovery_completed", "abi recovery completed");
+        dumpModuleIfEnvEnabled(*module, "OMILL_DEBUG_DUMP_AFTER_ABI_CORE",
+                               "after_abi_core.ll");
+      }
+    }
 
     if (VerifyEach && verifyModule(*module, nullptr)) {
       errs() << "ERROR: module verification failed after ABI recovery\n";
@@ -5050,7 +7410,10 @@ int main(int argc, char **argv) {
     // targets that were discovered during VM discovery or optimization
     // but couldn't be resolved at the time (the target wasn't lifted yet
     // when RewriteLiftedCallsToNative ran).
-    {
+    if (!parseBoolEnv("OMILL_SKIP_ABI_POSTPATCH_CONSTANT_CALL_PATCH")
+             .value_or(false)) {
+      if (parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false))
+        errs() << "[abi-post] patchConstantIntToPtrCallsToNative:start\n";
       auto targets_to_patch =
           collectConstantCodeCallTargets([](const llvm::Function &) {
             return true;
@@ -5060,6 +7423,8 @@ int main(int argc, char **argv) {
       patchConstantIntToPtrCallsToNative(
           ordered_targets, "abi_patch_callsites",
           "patched inttoptr callsites");
+      if (parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false))
+        errs() << "[abi-post] patchConstantIntToPtrCallsToNative:end\n";
     }
 
     auto fixupB3DispatchArgMismatches = [&]() {
@@ -5085,9 +7450,45 @@ int main(int argc, char **argv) {
 
       auto *i64_ty = llvm::Type::getInt64Ty(ctx);
       unsigned fixup_count = 0;
+      bool debug_public_root_seeds =
+          parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false);
+      auto parseHiddenSeedExprMap = [&](llvm::StringRef seed_text) {
+        llvm::DenseMap<unsigned, std::string> result;
+        llvm::SmallVector<llvm::StringRef, 16> seed_entries;
+        seed_text.split(seed_entries, ';', -1, false);
+        for (auto entry : seed_entries) {
+          entry = entry.trim();
+          if (entry.empty())
+            continue;
+          auto pair = entry.split('=');
+          if (pair.first.empty() || pair.second.empty())
+            continue;
+          auto field = sfm.fieldByName(pair.first.trim());
+          if (!field.has_value())
+            continue;
+          result[field->offset] = pair.second.trim().str();
+        }
+        return result;
+      };
 
       for (auto &F : *module) {
         if (!F.getName().ends_with("_native")) continue;
+        if (debug_public_root_seeds) {
+          errs() << "[post-abi-fixup] scanning-function=" << F.getName()
+                 << " args=" << F.arg_size()
+                 << " decl=" << F.isDeclaration() << "\n";
+        }
+        const bool is_requested_export_native_root =
+            requested_root_is_export && batch_vas.empty() && func_va != 0 &&
+            omill::extractEntryVA(F.getName()) == func_va;
+        if (debug_public_root_seeds &&
+            F.getName().contains("sub_1800020e0_native")) {
+          errs() << "[post-abi-fixup] saw " << F.getName()
+                 << " requested_export_native_root="
+                 << is_requested_export_native_root
+                 << " output_root=" << F.hasFnAttribute("omill.output_root")
+                 << "\n";
+        }
         llvm::SmallVector<int, 16> caller_param_offsets;
         if (auto attr = F.getFnAttribute("omill.param_state_offsets");
             attr.isValid() && attr.isStringAttribute()) {
@@ -5105,6 +7506,12 @@ int main(int argc, char **argv) {
               caller_param_offsets.push_back(static_cast<int>(off));
           }
         }
+        llvm::DenseMap<unsigned, std::string> caller_hidden_seed_exprs;
+        if (auto attr = F.getFnAttribute("omill.export_entry_seed_exprs");
+            attr.isValid() && attr.isStringAttribute()) {
+          caller_hidden_seed_exprs =
+              parseHiddenSeedExprMap(attr.getValueAsString());
+        }
         for (auto &BB : F) {
           for (auto &I : llvm::make_early_inc_range(BB)) {
             auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
@@ -5113,11 +7520,42 @@ int main(int argc, char **argv) {
                 CI->getCalledOperand()->stripPointerCasts());
             if (!callee || !callee->getName().ends_with("_native"))
               continue;
+            if (debug_public_root_seeds) {
+              errs() << "[post-abi-fixup] consider-call caller=" << F.getName()
+                     << " callee=" << callee->getName()
+                     << " call_args=" << CI->arg_size()
+                     << " callee_args=" << callee->arg_size() << "\n";
+            }
             if (callee->hasFnAttribute("omill.vm_handler") &&
                 (F.hasFnAttribute("omill.vm_wrapper") ||
                  F.getFnAttribute("omill.vm_outlined_virtual_call").isValid()))
               continue;
-            if (CI->arg_size() == callee->arg_size()) continue;
+            auto callHasSuspiciousSameArityOperands = [&]() {
+              for (unsigned i = 0; i < CI->arg_size(); ++i) {
+                auto *arg = CI->getArgOperand(i);
+                if (llvm::isa<llvm::PoisonValue>(arg) ||
+                    llvm::isa<llvm::UndefValue>(arg))
+                  return true;
+              }
+              return false;
+            };
+            bool allow_same_arity_rewrite =
+                (!caller_hidden_seed_exprs.empty() &&
+                 is_requested_export_native_root) ||
+                callHasSuspiciousSameArityOperands();
+            if (debug_public_root_seeds &&
+                is_requested_export_native_root &&
+                callee->getName().ends_with("_native")) {
+              errs() << "[post-abi-fixup] caller=" << F.getName()
+                     << " callee=" << callee->getName()
+                     << " same_arity=" << (CI->arg_size() == callee->arg_size())
+                     << " allow_same_arity=" << allow_same_arity_rewrite
+                     << " caller_hidden_seeds="
+                     << caller_hidden_seed_exprs.size() << "\n";
+            }
+            if (CI->arg_size() == callee->arg_size() &&
+                !allow_same_arity_rewrite)
+              continue;
 
             auto attr =
                 callee->getFnAttribute("omill.param_state_offsets");
@@ -5127,12 +7565,142 @@ int main(int argc, char **argv) {
             attr.getValueAsString().split(callee_offset_strs, ',');
             if (callee_offset_strs.size() != callee->arg_size()) continue;
 
+            auto getCallerParamValue = [&](llvm::IRBuilder<> &Builder,
+                                           unsigned arg_index) -> llvm::Value * {
+              if (arg_index >= F.arg_size())
+                return llvm::ConstantInt::get(i64_ty, 0);
+              auto *arg = F.getArg(arg_index);
+              if (arg->getType()->isPointerTy()) {
+                return Builder.CreatePtrToInt(arg, i64_ty,
+                                              arg->getName() + ".i64");
+              }
+              if (arg->getType()->isIntegerTy(64))
+                return arg;
+              if (arg->getType()->isIntegerTy())
+                return Builder.CreateIntCast(arg, i64_ty, false,
+                                             arg->getName() + ".i64");
+              return llvm::ConstantInt::get(i64_ty, 0);
+            };
+
+            std::function<llvm::Value *(llvm::IRBuilder<> &, llvm::StringRef)>
+                evalSeedExpr;
+            evalSeedExpr = [&](llvm::IRBuilder<> &Builder,
+                               llvm::StringRef text) -> llvm::Value * {
+              text = text.trim();
+              if (text.starts_with("param(") && text.ends_with(")")) {
+                unsigned idx = 0;
+                if (!text.drop_front(6).drop_back().getAsInteger(10, idx))
+                  return getCallerParamValue(Builder, idx);
+                return nullptr;
+              }
+              if (text.starts_with("const(") && text.ends_with(")")) {
+                auto body = text.drop_front(6).drop_back();
+                uint64_t value = 0;
+                if (body.starts_with("0x")) {
+                  if (!body.drop_front(2).getAsInteger(16, value))
+                    return llvm::ConstantInt::get(i64_ty, value);
+                } else if (!body.getAsInteger(10, value)) {
+                  return llvm::ConstantInt::get(i64_ty, value);
+                }
+                return nullptr;
+              }
+
+              auto parseCallArgs = [&](llvm::StringRef body)
+                  -> std::optional<std::pair<llvm::StringRef, llvm::StringRef>> {
+                int depth = 0;
+                for (size_t idx = 0; idx < body.size(); ++idx) {
+                  char c = body[idx];
+                  if (c == '(')
+                    ++depth;
+                  else if (c == ')')
+                    --depth;
+                  else if (c == ',' && depth == 0) {
+                    return std::pair(body.take_front(idx),
+                                     body.drop_front(idx + 1));
+                  }
+                }
+                return std::nullopt;
+              };
+
+              auto evalUnary = [&](llvm::StringRef op) -> llvm::Value * {
+                if (!text.starts_with(op) || !text.ends_with(")"))
+                  return nullptr;
+                auto arg = text.drop_front(op.size()).drop_back();
+                auto *v = evalSeedExpr(Builder, arg);
+                if (!v)
+                  return nullptr;
+                return Builder.CreateAnd(v, llvm::ConstantInt::get(i64_ty,
+                                                                   0xffffffffull));
+              };
+
+              auto evalBinary = [&](llvm::StringRef op,
+                                    auto &&fn) -> llvm::Value * {
+                if (!text.starts_with(op) || !text.ends_with(")"))
+                  return nullptr;
+                auto body = text.drop_front(op.size()).drop_back();
+                auto parts = parseCallArgs(body);
+                if (!parts)
+                  return nullptr;
+                auto *lhs = evalSeedExpr(Builder, parts->first);
+                auto *rhs = evalSeedExpr(Builder, parts->second);
+                if (!lhs || !rhs)
+                  return nullptr;
+                return fn(lhs, rhs);
+              };
+
+              if (auto *v = evalUnary("zext32("))
+                return v;
+              if (auto *v = evalBinary("add64(",
+                                       [&](llvm::Value *lhs,
+                                           llvm::Value *rhs) {
+                                         return Builder.CreateAdd(lhs, rhs);
+                                       }))
+                return v;
+              if (auto *v = evalBinary("xor64(",
+                                       [&](llvm::Value *lhs,
+                                           llvm::Value *rhs) {
+                                         return Builder.CreateXor(lhs, rhs);
+                                       }))
+                return v;
+              if (auto *v = evalBinary("xor32(",
+                                       [&](llvm::Value *lhs,
+                                           llvm::Value *rhs) {
+                                         auto *x = Builder.CreateXor(lhs, rhs);
+                                         return Builder.CreateAnd(
+                                             x, llvm::ConstantInt::get(
+                                                    i64_ty, 0xffffffffull));
+                                       }))
+                return v;
+              if (auto *v = evalBinary("and32(",
+                                       [&](llvm::Value *lhs,
+                                           llvm::Value *rhs) {
+                                         auto *x = Builder.CreateAnd(lhs, rhs);
+                                         return Builder.CreateAnd(
+                                             x, llvm::ConstantInt::get(
+                                                    i64_ty, 0xffffffffull));
+                                       }))
+                return v;
+              return nullptr;
+            };
+
+            auto defaultMissingI64Arg = [&]() -> llvm::Value * {
+              // Late ABI call repair should fail conservatively. Using poison
+              // here turns unmapped helper params into immediate UB in the
+              // final recovered artifact, which is worse than preserving a
+              // deterministic zero/default state.
+              return llvm::ConstantInt::get(i64_ty, 0);
+            };
+
             // Match each callee param to a B3 arg by State offset.
             llvm::SmallVector<llvm::Value *, 16> new_args;
             bool ok = true;
+            llvm::IRBuilder<> Builder(CI);
             for (auto &off_str : callee_offset_strs) {
               if (off_str == "stack" || off_str == "xmm") {
-                new_args.push_back(llvm::PoisonValue::get(i64_ty));
+                if (new_args.size() < CI->arg_size())
+                  new_args.push_back(CI->getArgOperand(new_args.size()));
+                else
+                  new_args.push_back(defaultMissingI64Arg());
                 continue;
               }
               unsigned target_off;
@@ -5141,15 +7709,7 @@ int main(int argc, char **argv) {
                 break;
               }
               bool found = false;
-              for (unsigned i = 0;
-                   i < b3_arg_offsets.size() && i < CI->arg_size(); ++i) {
-                if (b3_arg_offsets[i] == target_off) {
-                  new_args.push_back(CI->getArgOperand(i));
-                  found = true;
-                  break;
-                }
-              }
-              if (!found) {
+              if (is_requested_export_native_root) {
                 for (unsigned i = 0;
                      i < caller_param_offsets.size() && i < F.arg_size(); ++i) {
                   if (caller_param_offsets[i] ==
@@ -5159,15 +7719,99 @@ int main(int argc, char **argv) {
                     break;
                   }
                 }
+                if (auto it = caller_hidden_seed_exprs.find(target_off);
+                    it != caller_hidden_seed_exprs.end()) {
+                  if (auto *seed_value = evalSeedExpr(Builder, it->second)) {
+                    new_args.push_back(seed_value);
+                    found = true;
+                  }
+                }
+              } else {
+                for (unsigned i = 0;
+                     i < b3_arg_offsets.size() && i < CI->arg_size(); ++i) {
+                  if (b3_arg_offsets[i] == target_off) {
+                    new_args.push_back(CI->getArgOperand(i));
+                    found = true;
+                    break;
+                  }
+                }
+                if (!found) {
+                  for (unsigned i = 0;
+                       i < caller_param_offsets.size() && i < F.arg_size();
+                       ++i) {
+                    if (caller_param_offsets[i] ==
+                        static_cast<int>(target_off)) {
+                      new_args.push_back(F.getArg(i));
+                      found = true;
+                      break;
+                    }
+                  }
+                }
+                if (!found) {
+                  if (auto it = caller_hidden_seed_exprs.find(target_off);
+                      it != caller_hidden_seed_exprs.end()) {
+                    if (auto *seed_value = evalSeedExpr(Builder, it->second)) {
+                      new_args.push_back(seed_value);
+                      found = true;
+                    }
+                  }
+                }
               }
-              if (!found)
-                new_args.push_back(llvm::PoisonValue::get(i64_ty));
+              if (!found) {
+                if (new_args.size() < CI->arg_size())
+                  new_args.push_back(CI->getArgOperand(new_args.size()));
+                else
+                  new_args.push_back(defaultMissingI64Arg());
+              }
             }
             if (!ok) continue;
 
+            bool changed_args = (CI->arg_size() != new_args.size());
+            if (!changed_args && CI->arg_size() == new_args.size()) {
+              for (unsigned i = 0; i < CI->arg_size(); ++i) {
+                if (new_args[i] != CI->getArgOperand(i)) {
+                  changed_args = true;
+                  break;
+                }
+              }
+            }
+            if (!changed_args)
+              continue;
+
+            if (debug_public_root_seeds &&
+                is_requested_export_native_root) {
+              errs() << "[post-abi-fixup] rewriting caller=" << F.getName()
+                     << " callee=" << callee->getName()
+                     << " args=" << CI->arg_size() << "\n";
+            }
+
+            for (unsigned i = 0; i < new_args.size() && i < CI->arg_size(); ++i) {
+              auto *current = CI->getArgOperand(i);
+              auto *replacement = new_args[i];
+              if (replacement->getType() == current->getType())
+                continue;
+              if (replacement->getType()->isIntegerTy() &&
+                  current->getType()->isIntegerTy()) {
+                new_args[i] = Builder.CreateIntCast(
+                    replacement, current->getType(), false,
+                    callee->getName() + ".arg.cast");
+              } else if (replacement->getType()->isPointerTy() &&
+                         current->getType()->isIntegerTy()) {
+                new_args[i] = Builder.CreatePtrToInt(
+                    replacement, current->getType(),
+                    callee->getName() + ".arg.pti");
+              } else if (replacement->getType()->isIntegerTy() &&
+                         current->getType()->isPointerTy()) {
+                new_args[i] = Builder.CreateIntToPtr(
+                    replacement, current->getType(),
+                    callee->getName() + ".arg.itp");
+              }
+            }
+
             auto *new_call = llvm::CallInst::Create(
                 callee->getFunctionType(), callee, new_args,
-                CI->getName(), CI->getIterator());
+                callee->getReturnType()->isVoidTy() ? "" : CI->getName(),
+                CI->getIterator());
             new_call->setCallingConv(CI->getCallingConv());
             new_call->setAttributes(CI->getAttributes());
             // Handle return type mismatch (B3 returns i64, callee may
@@ -5195,7 +7839,591 @@ int main(int argc, char **argv) {
         errs() << "Fixed " << fixup_count
                << " B3 dispatch calls with mismatched arg counts\n";
     };
-    fixupB3DispatchArgMismatches();
+    if (!parseBoolEnv("OMILL_SKIP_ABI_POSTPATCH_B3_FIXUP").value_or(false)) {
+      if (parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false))
+        errs() << "[abi-post] fixupB3DispatchArgMismatches:start\n";
+      fixupB3DispatchArgMismatches();
+      if (parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false))
+        errs() << "[abi-post] fixupB3DispatchArgMismatches:end\n";
+    }
+    auto repairSyntheticStackTopStateArgs = [&]() {
+      auto syntheticStateArgIndex = [&](llvm::Function &Callee)
+          -> std::optional<unsigned> {
+        for (unsigned i = 0; i < Callee.arg_size(); ++i) {
+          auto *arg = Callee.getArg(i);
+          for (auto *U : arg->users()) {
+            auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(U);
+            if (!BO || BO->getOpcode() != llvm::Instruction::Add)
+              continue;
+            auto *lhs_ci =
+                llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(0));
+            auto *rhs_ci =
+                llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(1));
+            if ((lhs_ci && lhs_ci->getZExtValue() == 9116) ||
+                (rhs_ci && rhs_ci->getZExtValue() == 9116)) {
+              return i;
+            }
+          }
+        }
+        return std::nullopt;
+      };
+
+      auto rebuildSyntheticStackBase = [&](llvm::Value *V,
+                                           llvm::IRBuilder<> &Builder)
+          -> llvm::Value * {
+        auto *PTI = llvm::dyn_cast<llvm::PtrToIntInst>(V);
+        if (!PTI)
+          return nullptr;
+        auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(
+            PTI->getPointerOperand()->stripPointerCasts());
+        if (!GEP || GEP->getNumOperands() < 2)
+          return nullptr;
+        auto *idx = llvm::dyn_cast<llvm::ConstantInt>(GEP->getOperand(1));
+        if (!idx || idx->getZExtValue() < 65504)
+          return nullptr;
+        auto *base_ptr = GEP->getPointerOperand();
+        return Builder.CreatePtrToInt(base_ptr, V->getType(),
+                                      "synthetic.stack.base");
+      };
+
+      for (auto &F : *module) {
+        if (F.isDeclaration() || !F.getName().ends_with("_native"))
+          continue;
+        for (auto &BB : F) {
+          for (auto &I : llvm::make_early_inc_range(BB)) {
+            auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+            auto *Callee = CI ? CI->getCalledFunction() : nullptr;
+            if (!Callee || Callee->isDeclaration() ||
+                !Callee->getName().ends_with("_native")) {
+              continue;
+            }
+            if (Callee == &F || Callee->getName() == F.getName())
+              continue;
+            auto state_arg_index = syntheticStateArgIndex(*Callee);
+            if (!state_arg_index || *state_arg_index >= CI->arg_size())
+              continue;
+            llvm::IRBuilder<> Builder(CI);
+            auto *replacement = rebuildSyntheticStackBase(
+                CI->getArgOperand(*state_arg_index), Builder);
+            if (!replacement)
+              continue;
+            CI->setArgOperand(*state_arg_index, replacement);
+          }
+        }
+      }
+    };
+
+    auto materializeZeroedSyntheticStateArgs = [&]() {
+      auto syntheticStateArgIndex = [&](llvm::Function &Callee)
+          -> std::optional<unsigned> {
+        for (unsigned i = 0; i < Callee.arg_size(); ++i) {
+          auto *arg = Callee.getArg(i);
+          for (auto *U : arg->users()) {
+            auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(U);
+            if (!BO || BO->getOpcode() != llvm::Instruction::Add)
+              continue;
+            auto *lhs_ci =
+                llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(0));
+            auto *rhs_ci =
+                llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(1));
+            if ((lhs_ci && lhs_ci->getZExtValue() == 9116) ||
+                (rhs_ci && rhs_ci->getZExtValue() == 9116)) {
+              return i;
+            }
+          }
+        }
+        return std::nullopt;
+      };
+
+      constexpr uint64_t kSyntheticStateBytes = 69632;
+      auto *stack_ty = llvm::ArrayType::get(
+          llvm::Type::getInt8Ty(ctx), kSyntheticStateBytes);
+
+      for (auto &F : *module) {
+        if (F.isDeclaration() || !F.getName().ends_with("_native") ||
+            F.empty()) {
+          continue;
+        }
+        auto &entry = F.getEntryBlock();
+        llvm::Instruction *entry_ip = &*entry.getFirstInsertionPt();
+        for (auto &BB : F) {
+          for (auto &I : llvm::make_early_inc_range(BB)) {
+            auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+            auto *Callee = CI ? CI->getCalledFunction() : nullptr;
+            if (!Callee || Callee->isDeclaration() ||
+                !Callee->getName().ends_with("_native")) {
+              continue;
+            }
+            if (Callee == &F || Callee->getName() == F.getName())
+              continue;
+            auto state_arg_index = syntheticStateArgIndex(*Callee);
+            if (!state_arg_index || *state_arg_index >= CI->arg_size())
+              continue;
+            auto *zero_ci =
+                llvm::dyn_cast<llvm::ConstantInt>(CI->getArgOperand(*state_arg_index));
+            if (!zero_ci || !zero_ci->isZero())
+              continue;
+
+            llvm::IRBuilder<> EntryBuilder(entry_ip);
+            auto *alloca = EntryBuilder.CreateAlloca(
+                stack_ty, nullptr,
+                Callee->getName() + ".synthetic_state");
+
+            llvm::IRBuilder<> Builder(CI);
+            Builder.CreateMemSet(alloca, Builder.getInt8(0),
+                                 kSyntheticStateBytes, llvm::MaybeAlign(16));
+            auto *replacement = Builder.CreatePtrToInt(
+                alloca, CI->getArgOperand(*state_arg_index)->getType(),
+                Callee->getName() + ".synthetic_state.i64");
+            CI->setArgOperand(*state_arg_index, replacement);
+          }
+        }
+      }
+    };
+
+    rerunLateNativeArgRepair = [&]() {
+      if (parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false))
+        errs() << "[abi-post] fixupB3DispatchArgMismatches:late-rerun:start\n";
+      fixupB3DispatchArgMismatches();
+      repairSyntheticStackTopStateArgs();
+      materializeZeroedSyntheticStateArgs();
+      repairMalformedPHIs(*module);
+      if (parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false))
+        errs() << "[abi-post] fixupB3DispatchArgMismatches:late-rerun:end\n";
+    };
+
+    rerunFocusedNativeHelperControlFlowRecovery = [&]() {
+      auto in_output_root_native_closure = [&](llvm::Function &Candidate) {
+        if (Candidate.isDeclaration() || !Candidate.getName().ends_with("_native"))
+          return false;
+
+        llvm::SmallVector<llvm::Function *, 32> worklist;
+        llvm::SmallPtrSet<llvm::Function *, 32> seen;
+        for (auto &F : *module) {
+          if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root") ||
+              !F.getName().ends_with("_native")) {
+            continue;
+          }
+          if (seen.insert(&F).second)
+            worklist.push_back(&F);
+        }
+
+        while (!worklist.empty()) {
+          llvm::Function *Current = worklist.pop_back_val();
+          if (Current == &Candidate)
+            return true;
+          for (auto &BB : *Current) {
+            for (auto &I : BB) {
+              auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+              if (!CB)
+                continue;
+              auto *Callee = CB->getCalledFunction();
+              if (!Callee || Callee->isDeclaration() ||
+                  !Callee->getName().ends_with("_native")) {
+                continue;
+              }
+              if (seen.insert(Callee).second)
+                worklist.push_back(Callee);
+            }
+          }
+        }
+        return false;
+      };
+
+      auto needs_recovery = [&](llvm::Function &F) {
+        if (!in_output_root_native_closure(F))
+          return false;
+        for (auto &BB : F) {
+          for (auto &I : BB) {
+            auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+            if (!CB)
+              continue;
+            auto *Callee = CB->getCalledFunction();
+            if (!Callee)
+              continue;
+            auto Name = Callee->getName();
+            if (Name == "__remill_jump" || Name == "__omill_dispatch_jump" ||
+                Name == "__omill_dispatch_call") {
+              return true;
+            }
+          }
+        }
+        return false;
+      };
+
+      bool has_candidates = false;
+      for (auto &F : *module) {
+        if (needs_recovery(F)) {
+          has_candidates = true;
+          break;
+        }
+      }
+      if (!has_candidates)
+        return;
+
+      if (parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false))
+        errs() << "[abi-post] focused-native-cf-recovery:start\n";
+
+      llvm::ModulePassManager FocusedMPM;
+      FocusedMPM.addPass(
+          llvm::RequireAnalysisPass<omill::LiftedFunctionAnalysis,
+                                    llvm::Module>());
+      llvm::FunctionPassManager FPM;
+      FPM.addPass(
+          omill::LowerRemillIntrinsicsPass(omill::LowerCategories::Phase3));
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(omill::JumpTableConcretizerPass());
+      FPM.addPass(omill::ResolveAndLowerControlFlowPass(
+          omill::ResolvePhases::RecoverTables |
+          omill::ResolvePhases::SymbolicSolve |
+          omill::ResolvePhases::ResolveTargets));
+      FPM.addPass(omill::LowerRemillIntrinsicsPass(
+          omill::LowerCategories::ResolvedDispatch));
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::GVNPass());
+      FPM.addPass(llvm::ADCEPass());
+      FPM.addPass(llvm::SimplifyCFGPass());
+      FocusedMPM.addPass(
+          llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+      FocusedMPM.run(*module, MAM);
+
+      auto canonicalizeDispatchDecl = [&](llvm::StringRef dispatch_name,
+                                          llvm::StringRef remill_name) {
+        auto *dispatch = module->getFunction(dispatch_name);
+        auto *remill = module->getFunction(remill_name);
+        if (!dispatch || !remill)
+          return;
+        auto *expected_ty = remill->getFunctionType();
+        if (dispatch->getFunctionType() == expected_ty)
+          return;
+
+        auto *replacement = llvm::Function::Create(
+            expected_ty, dispatch->getLinkage(), dispatch_name + ".fixed",
+            module.get());
+        replacement->copyAttributesFrom(dispatch);
+
+        llvm::SmallVector<llvm::CallBase *, 16> calls;
+        for (auto *U : dispatch->users()) {
+          if (auto *CB = llvm::dyn_cast<llvm::CallBase>(U))
+            calls.push_back(CB);
+        }
+
+        for (auto *CB : calls) {
+          llvm::IRBuilder<> Builder(CB);
+          llvm::SmallVector<llvm::Value *, 8> args;
+          args.reserve(CB->arg_size());
+          for (auto &Arg : CB->args())
+            args.push_back(Arg.get());
+          auto *new_call = Builder.CreateCall(expected_ty, replacement, args);
+          new_call->setCallingConv(CB->getCallingConv());
+          new_call->setAttributes(CB->getAttributes());
+          if (!CB->use_empty()) {
+            if (new_call->getType() == CB->getType()) {
+              CB->replaceAllUsesWith(new_call);
+            } else if (!CB->getType()->isVoidTy()) {
+              CB->replaceAllUsesWith(
+                  llvm::PoisonValue::get(CB->getType()));
+            }
+          }
+          CB->eraseFromParent();
+        }
+
+        dispatch->eraseFromParent();
+        replacement->setName(dispatch_name);
+      };
+
+      canonicalizeDispatchDecl("__omill_dispatch_jump", "__remill_jump");
+      canonicalizeDispatchDecl("__omill_dispatch_call", "__remill_function_call");
+
+      auto rewriteVoidNativeJumpTableDispatches = [&]() {
+        auto parseNativeTargetPC = [&](llvm::StringRef name) -> uint64_t {
+          if (uint64_t pc = omill::extractEntryVA(name); pc != 0)
+            return pc;
+          auto parsePrefixedHex = [&](llvm::StringRef prefix) -> uint64_t {
+            if (!name.starts_with(prefix))
+              return 0;
+            auto rest = name.drop_front(prefix.size());
+            size_t hex_len = 0;
+            while (hex_len < rest.size() && llvm::isHexDigit(rest[hex_len]))
+              ++hex_len;
+            if (hex_len == 0)
+              return 0;
+            uint64_t pc = 0;
+            if (rest.substr(0, hex_len).getAsInteger(16, pc))
+              return 0;
+            return pc;
+          };
+          if (uint64_t pc = parsePrefixedHex("blk_"); pc != 0)
+            return pc;
+          if (uint64_t pc = parsePrefixedHex("block_"); pc != 0)
+            return pc;
+          return 0;
+        };
+
+        llvm::DenseMap<uint64_t, llvm::Function *> local_native_targets;
+        llvm::SmallDenseSet<uint64_t, 16> local_case_pcs;
+        for (auto &F : *module) {
+          if (F.isDeclaration() || !F.getName().ends_with("_native") ||
+              !omill::isClosedRootSliceFunction(F)) {
+            continue;
+          }
+          if (uint64_t pc = parseNativeTargetPC(F.getName()); pc != 0)
+            local_native_targets[pc] = &F;
+          for (auto &BB : F) {
+            for (auto &I : BB) {
+              auto *SI = llvm::dyn_cast<llvm::SwitchInst>(&I);
+              if (!SI || !SI->getCondition()->getType()->isIntegerTy(64))
+                continue;
+              for (auto &Case : SI->cases())
+                local_case_pcs.insert(Case.getCaseValue()->getZExtValue());
+            }
+          }
+        }
+
+        auto findLocalNativeTarget = [&](uint64_t case_pc)
+            -> llvm::Function * {
+          if (auto it = local_native_targets.find(case_pc);
+              it != local_native_targets.end()) {
+            return it->second;
+          }
+          llvm::Function *best = nullptr;
+          uint64_t best_distance = UINT64_MAX;
+          for (auto &[target_pc, target_fn] : local_native_targets) {
+            uint64_t distance =
+                target_pc > case_pc ? (target_pc - case_pc) : (case_pc - target_pc);
+            if (distance > 0x80)
+              continue;
+            if (distance < best_distance) {
+              best_distance = distance;
+              best = target_fn;
+            }
+          }
+          return best;
+        };
+
+        auto findStateOffsetPtr = [&](llvm::Function &F, uint64_t offset)
+            -> llvm::Value * {
+          for (auto &BB : F) {
+            for (auto &I : BB) {
+              auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(&I);
+              if (!GEP || GEP->getNumOperands() < 2)
+                continue;
+              auto *idx = llvm::dyn_cast<llvm::ConstantInt>(GEP->getOperand(1));
+              if (!idx || idx->getZExtValue() != offset)
+                continue;
+              return GEP;
+            }
+          }
+          return nullptr;
+        };
+
+        unsigned rewrite_count = 0;
+        for (auto &F : *module) {
+          if (F.isDeclaration() || !F.getName().ends_with("_native") ||
+              !omill::isClosedRootSliceFunction(F) || !F.getReturnType()->isVoidTy()) {
+            continue;
+          }
+
+          bool already_rewritten = false;
+          for (auto &BB : F) {
+            auto BBName = BB.getName();
+            if (BBName.starts_with("resolved.dispatch") ||
+                BBName.starts_with("resolved.case.") ||
+                BBName.starts_with("resolved.selfloop.")) {
+              already_rewritten = true;
+              break;
+            }
+          }
+          if (already_rewritten)
+            continue;
+
+          llvm::CallBase *dispatch_call = nullptr;
+          for (auto &BB : F) {
+            for (auto &I : BB) {
+              auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+              auto *Callee = CB ? CB->getCalledFunction() : nullptr;
+              if (!Callee)
+                continue;
+              auto Name = Callee->getName();
+              if (Name == "__remill_jump" || Name == "__omill_dispatch_jump") {
+                dispatch_call = CB;
+                break;
+              }
+            }
+            if (dispatch_call)
+              break;
+          }
+          if (!dispatch_call)
+            continue;
+
+          auto *eax_ptr = findStateOffsetPtr(F, 2216);
+          auto *arg2232_ptr = findStateOffsetPtr(F, 2232);
+          auto *arg2280_ptr = findStateOffsetPtr(F, 2280);
+          auto *arg2296_ptr = findStateOffsetPtr(F, 2296);
+          auto *arg2328_ptr = findStateOffsetPtr(F, 2328);
+          auto *arg2408_ptr = findStateOffsetPtr(F, 2408);
+          auto *arg2440_ptr = findStateOffsetPtr(F, 2440);
+          auto *arg2456_ptr = findStateOffsetPtr(F, 2456);
+          if (!eax_ptr || !arg2232_ptr || !arg2280_ptr || !arg2296_ptr ||
+              !arg2328_ptr || !arg2408_ptr || !arg2440_ptr || !arg2456_ptr) {
+            continue;
+          }
+
+          auto *switch_block = dispatch_call->getParent();
+          auto *target_pc = dispatch_call->getArgOperand(1);
+          auto *after_block =
+              switch_block->splitBasicBlock(dispatch_call->getIterator(),
+                                           "resolved.dispatch.dynamic");
+          switch_block->getTerminator()->eraseFromParent();
+          dispatch_call->eraseFromParent();
+
+          llvm::IRBuilder<> Builder(switch_block);
+          auto *state2232 = Builder.CreateLoad(Builder.getInt64Ty(), arg2232_ptr,
+                                               "tb.state2232");
+          auto *state2280 = Builder.CreateLoad(Builder.getInt64Ty(), arg2280_ptr,
+                                               "tb.state2280");
+          auto *state2328 = Builder.CreateLoad(Builder.getInt64Ty(), arg2328_ptr,
+                                               "tb.state2328");
+          auto *state2440 = Builder.CreateLoad(Builder.getInt64Ty(), arg2440_ptr,
+                                               "tb.state2440");
+          auto *switch_inst =
+              Builder.CreateSwitch(target_pc, after_block, local_case_pcs.size());
+
+          auto buildStateArgsForCallee =
+              [&](llvm::IRBuilder<> &CaseBuilder, llvm::Function &Callee) {
+                llvm::SmallVector<llvm::Value *, 16> args;
+                auto attr = Callee.getFnAttribute("omill.param_state_offsets");
+                if (!attr.isValid() || !attr.isStringAttribute()) {
+                  if (Callee.arg_size() >= 1)
+                    args.push_back(state2232);
+                  if (Callee.arg_size() >= 2)
+                    args.push_back(state2280);
+                  if (Callee.arg_size() >= 3)
+                    args.push_back(state2328);
+                  if (Callee.arg_size() >= 4)
+                    args.push_back(state2440);
+                  while (args.size() < Callee.arg_size())
+                    args.push_back(llvm::ConstantInt::get(Builder.getInt64Ty(), 0));
+                  return args;
+                }
+
+                llvm::SmallVector<llvm::StringRef, 16> offset_strs;
+                attr.getValueAsString().split(offset_strs, ',');
+                if (offset_strs.size() != Callee.arg_size()) {
+                  while (args.size() < Callee.arg_size())
+                    args.push_back(llvm::ConstantInt::get(Builder.getInt64Ty(), 0));
+                  return args;
+                }
+
+                for (auto token : offset_strs) {
+                  token = token.trim();
+                  if (token == "stack" || token == "xmm") {
+                    args.push_back(llvm::ConstantInt::get(Builder.getInt64Ty(), 0));
+                    continue;
+                  }
+                  unsigned offset = 0;
+                  if (token.getAsInteger(10, offset)) {
+                    args.push_back(llvm::ConstantInt::get(Builder.getInt64Ty(), 0));
+                    continue;
+                  }
+                  auto *state_ptr = findStateOffsetPtr(F, offset);
+                  if (!state_ptr) {
+                    args.push_back(llvm::ConstantInt::get(Builder.getInt64Ty(), 0));
+                    continue;
+                  }
+                  args.push_back(CaseBuilder.CreateLoad(Builder.getInt64Ty(),
+                                                        state_ptr,
+                                                        "resolved.arg." + token));
+                }
+                return args;
+              };
+
+          for (uint64_t case_pc : local_case_pcs) {
+            if (case_pc == 0)
+              continue;
+            if (auto *target_fn = findLocalNativeTarget(case_pc)) {
+              auto *case_block = llvm::BasicBlock::Create(
+                  ctx, "resolved.case." + llvm::utohexstr(case_pc), &F,
+                  after_block);
+              llvm::IRBuilder<> case_builder(case_block);
+              auto case_args = buildStateArgsForCallee(case_builder, *target_fn);
+              auto *case_call = case_builder.CreateCall(
+                  target_fn->getFunctionType(), target_fn, case_args);
+              case_call->setCallingConv(target_fn->getCallingConv());
+              if (auto *CaseRetST =
+                      llvm::dyn_cast<llvm::StructType>(target_fn->getReturnType());
+                  CaseRetST && CaseRetST->getNumElements() == 8) {
+                case_builder.CreateStore(
+                    case_builder.CreateExtractValue(case_call, {0}), eax_ptr);
+                case_builder.CreateStore(
+                    case_builder.CreateExtractValue(case_call, {1}), arg2232_ptr);
+                case_builder.CreateStore(
+                    case_builder.CreateExtractValue(case_call, {2}), arg2328_ptr);
+                case_builder.CreateStore(
+                    case_builder.CreateExtractValue(case_call, {3}), arg2296_ptr);
+                case_builder.CreateStore(
+                    case_builder.CreateExtractValue(case_call, {4}), arg2280_ptr);
+                case_builder.CreateStore(
+                    case_builder.CreateExtractValue(case_call, {5}), arg2408_ptr);
+                case_builder.CreateStore(
+                    case_builder.CreateExtractValue(case_call, {6}), arg2440_ptr);
+                case_builder.CreateStore(
+                    case_builder.CreateExtractValue(case_call, {7}), arg2456_ptr);
+              }
+              case_builder.CreateBr(after_block);
+              switch_inst->addCase(case_builder.getInt64(case_pc), case_block);
+            } else {
+              auto *loop_block = llvm::BasicBlock::Create(
+                  ctx, "resolved.selfloop." + llvm::utohexstr(case_pc), &F,
+                  after_block);
+              llvm::IRBuilder<> loop_builder(loop_block);
+              loop_builder.CreateBr(loop_block);
+              switch_inst->addCase(loop_builder.getInt64(case_pc), loop_block);
+            }
+          }
+
+          ++rewrite_count;
+        }
+
+        if (rewrite_count > 0 &&
+            parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false)) {
+          errs() << "[abi-post] void-native-jumptable-rewrite count="
+                 << rewrite_count << "\n";
+        }
+      };
+      if (parseBoolEnv("OMILL_ENABLE_VOID_NATIVE_JT_REWRITE").value_or(false))
+        rewriteVoidNativeJumpTableDispatches();
+
+      if (std::getenv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS") != nullptr) {
+        std::error_code ec;
+        llvm::raw_fd_ostream os("after_focused_native_cf_recovery.ll", ec,
+                                llvm::sys::fs::OF_Text);
+        if (!ec)
+          module->print(os, nullptr);
+      }
+
+      if (parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false))
+        errs() << "[abi-post] focused-native-cf-recovery:end\n";
+    };
+    rerunFocusedNativeHelperControlFlowRecovery();
+
+    dumpModuleIfEnvEnabled(*module, "OMILL_DEBUG_DUMP_AFTER_ABI_POSTPATCH",
+                           "after_abi_postpatch.ll");
+    if (std::getenv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS") != nullptr) {
+      std::error_code ec;
+      llvm::raw_fd_ostream os("after_b3_fixup.ll", ec, llvm::sys::fs::OF_Text);
+      if (!ec)
+        module->print(os, nullptr);
+    }
+
+    if (auto *flattened_root = module->getFunction("sub_1800020e0_native");
+        flattened_root && !flattened_root->isDeclaration()) {
+      if (auto *flattened_case301 = module->getFunction("sub_180002301_native");
+          flattened_case301 && !flattened_case301->isDeclaration()) {
+        flattened_case301->removeFnAttr(llvm::Attribute::AlwaysInline);
+        flattened_case301->addFnAttr(llvm::Attribute::NoInline);
+      }
+    }
 
     // Post-ABI deobfuscation on _native functions.  When recover_abi is
     // false (VM mode), Phase 5 ran on pre-ABI sub_* functions, so _native
@@ -5219,6 +8447,9 @@ int main(int argc, char **argv) {
       }
       errs() << "Post-ABI deobfuscation complete\n";
       events.emitInfo("post_abi_deobf_completed", "post-ABI deobfuscation completed");
+      dumpModuleIfEnvEnabled(*module, "OMILL_DEBUG_DUMP_AFTER_POST_ABI_DEOBF",
+                             "after_post_abi_deobf.ll");
+      rerunFocusedNativeHelperControlFlowRecovery();
     }
 
     rerunLateOutputRootTargetPipeline();
@@ -6231,9 +9462,33 @@ int main(int argc, char **argv) {
       for (auto &F : *module) {
         for (auto &BB : F) {
           for (auto &I : BB) {
-            auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
-            if (!call || call->getCalledFunction())
+            auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+            if (!call)
               continue;
+
+            if (auto *callee = call->getCalledFunction()) {
+              if (!callee->isDeclaration())
+                continue;
+              if (!callee->getName().starts_with("sub_"))
+                continue;
+              auto *FT = callee->getFunctionType();
+              if (FT->getNumParams() != 3 ||
+                  FT->getReturnType() != llvm::PointerType::getUnqual(ctx) ||
+                  FT->getParamType(0) != llvm::PointerType::getUnqual(ctx) ||
+                  FT->getParamType(1) != llvm::Type::getInt64Ty(ctx) ||
+                  FT->getParamType(2) != llvm::PointerType::getUnqual(ctx)) {
+                continue;
+              }
+
+              const uint64_t target = omill::extractEntryVA(callee->getName());
+              if (!isCodeAddressInCurrentInput(target))
+                continue;
+              if (hasDefinedLiftedOrNativeForTarget(target))
+                continue;
+              late_targets.insert(target);
+              continue;
+            }
+
             auto *callee_op = call->getCalledOperand();
             llvm::ConstantInt *ci = nullptr;
             // Case 1: ConstantExpr inttoptr.
@@ -6251,23 +9506,9 @@ int main(int argc, char **argv) {
             uint64_t target = ci->getZExtValue();
             if (target == 0)
               continue;
-            bool in_code = false;
-            if (RawBinary) {
-              in_code = (target >= BaseAddress &&
-                         target < BaseAddress + raw_code.size());
-            } else {
-              for (auto &sec : pe.code_sections) {
-                if (target >= sec.va && target < sec.va + sec.size) {
-                  in_code = true;
-                  break;
-                }
-              }
-            }
-            if (!in_code)
+            if (!isCodeAddressInCurrentInput(target))
               continue;
-            std::string name = "sub_" + llvm::Twine::utohexstr(target).str();
-            if (module->getFunction(name) ||
-                module->getFunction(name + "_native"))
+            if (hasDefinedLiftedOrNativeForTarget(target))
               continue;
             late_targets.insert(target);
           }
@@ -6713,7 +9954,129 @@ int main(int argc, char **argv) {
         }
 
         auto *i64_ty = llvm::Type::getInt64Ty(ctx);
+        auto findStateOffsetPtrInFunction =
+            [&](llvm::Function &Fn, uint64_t offset) -> llvm::Value * {
+          for (auto &BB : Fn) {
+            for (auto &I : BB) {
+              auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(&I);
+              if (!GEP || GEP->getNumOperands() < 2)
+                continue;
+              auto *idx = llvm::dyn_cast<llvm::ConstantInt>(GEP->getOperand(1));
+              if (!idx || idx->getZExtValue() != offset)
+                continue;
+              return GEP;
+            }
+          }
+          return nullptr;
+        };
+        auto calleeReadsArg2AsStatePtr = [&](llvm::Function &Callee) -> bool {
+          if (Callee.arg_size() < 3)
+            return false;
+          auto *arg = Callee.getArg(2);
+          for (auto *U : arg->users()) {
+            auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(U);
+            if (!BO || BO->getOpcode() != llvm::Instruction::Add)
+              continue;
+            auto *lhs_ci = llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(0));
+            auto *rhs_ci = llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(1));
+            if ((lhs_ci && lhs_ci->getZExtValue() == 9116) ||
+                (rhs_ci && rhs_ci->getZExtValue() == 9116)) {
+              return true;
+            }
+          }
+          return false;
+        };
+        auto buildStateOrderedArgs =
+            [&](llvm::Function &Caller, llvm::CallInst &CI,
+                llvm::Function &Callee,
+                llvm::ArrayRef<int> caller_param_offsets)
+                -> std::optional<llvm::SmallVector<llvm::Value *, 16>> {
+          auto attr = Callee.getFnAttribute("omill.param_state_offsets");
+          if (!attr.isValid() || !attr.isStringAttribute())
+            return std::nullopt;
+
+          llvm::SmallVector<llvm::StringRef, 16> callee_offset_strs;
+          attr.getValueAsString().split(callee_offset_strs, ',');
+          if (callee_offset_strs.size() < Callee.arg_size())
+            return std::nullopt;
+
+          llvm::IRBuilder<> Builder(&CI);
+          auto defaultMissingI64Arg = [&]() -> llvm::Value * {
+            return llvm::ConstantInt::get(i64_ty, 0);
+          };
+          llvm::SmallVector<llvm::Value *, 16> new_args;
+          new_args.reserve(Callee.arg_size());
+          for (unsigned arg_index = 0; arg_index < Callee.arg_size(); ++arg_index) {
+            llvm::StringRef off_str = callee_offset_strs[arg_index].trim();
+            if (off_str == "stack" || off_str == "xmm") {
+              if (arg_index < CI.arg_size())
+                new_args.push_back(CI.getArgOperand(arg_index));
+              else
+                new_args.push_back(defaultMissingI64Arg());
+              continue;
+            }
+
+            unsigned target_off = 0;
+            if (off_str.getAsInteger(10, target_off))
+              return std::nullopt;
+
+            bool found = false;
+            for (unsigned i = 0; i < caller_param_offsets.size() && i < Caller.arg_size();
+                 ++i) {
+              if (caller_param_offsets[i] == static_cast<int>(target_off)) {
+                new_args.push_back(Caller.getArg(i));
+                found = true;
+                break;
+              }
+            }
+            if (found)
+              continue;
+
+            if (auto *state_ptr = findStateOffsetPtrInFunction(Caller, target_off)) {
+              new_args.push_back(
+                  Builder.CreateLoad(i64_ty, state_ptr,
+                                     "statefix." + llvm::Twine(target_off)));
+              continue;
+            }
+
+            for (unsigned i = 0; i < b3_arg_offsets.size() && i < CI.arg_size(); ++i) {
+              if (b3_arg_offsets[i] == target_off) {
+                new_args.push_back(CI.getArgOperand(i));
+                found = true;
+                break;
+              }
+            }
+            if (found)
+              continue;
+
+            return std::nullopt;
+          }
+          return new_args;
+        };
+        auto replaceCallWithArgs =
+            [&](llvm::CallInst &CI, llvm::Function &Callee,
+                llvm::ArrayRef<llvm::Value *> new_args) {
+          auto *new_call = llvm::CallInst::Create(
+              Callee.getFunctionType(), &Callee, new_args, CI.getName(),
+              CI.getIterator());
+          new_call->setCallingConv(CI.getCallingConv());
+          new_call->setAttributes(CI.getAttributes());
+          if (!CI.use_empty()) {
+            if (CI.getType() == new_call->getType()) {
+              CI.replaceAllUsesWith(new_call);
+            } else if (llvm::isa<llvm::StructType>(new_call->getType())) {
+              auto *ev = llvm::ExtractValueInst::Create(
+                  new_call, {0}, "ret.primary",
+                  std::next(new_call->getIterator()));
+              CI.replaceAllUsesWith(ev);
+            } else {
+              CI.replaceAllUsesWith(llvm::PoisonValue::get(CI.getType()));
+            }
+          }
+          CI.eraseFromParent();
+        };
         unsigned fixup_count = 0;
+        unsigned same_arity_fixup_count = 0;
         for (auto &F : *module) {
           if (!F.getName().ends_with("_native"))
             continue;
@@ -6741,88 +10104,83 @@ int main(int argc, char **argv) {
                 continue;
               auto *callee = llvm::dyn_cast<llvm::Function>(
                   CI->getCalledOperand()->stripPointerCasts());
-              if (!callee || !callee->getName().ends_with("_native") ||
-                  CI->arg_size() == callee->arg_size())
+              if (!callee || !callee->getName().ends_with("_native"))
                 continue;
               if (callee->hasFnAttribute("omill.vm_handler") &&
                   (F.hasFnAttribute("omill.vm_wrapper") ||
                    F.getFnAttribute("omill.vm_outlined_virtual_call").isValid()))
                 continue;
 
-              auto attr = callee->getFnAttribute("omill.param_state_offsets");
-              if (!attr.isValid() || !attr.isStringAttribute())
-                continue;
+              if (CI->arg_size() == callee->arg_size()) {
+                if (callee->arg_size() == 5 &&
+                    calleeReadsArg2AsStatePtr(*callee)) {
+                  auto *arg2_ci =
+                      llvm::dyn_cast<llvm::ConstantInt>(CI->getArgOperand(2));
+                  if (arg2_ci && arg2_ci->isZero()) {
+                    llvm::SmallVector<llvm::Value *, 5> shifted_args = {
+                        CI->getArgOperand(0), CI->getArgOperand(1),
+                        CI->getArgOperand(3), CI->getArgOperand(4),
+                        llvm::ConstantInt::get(i64_ty, 0)};
+                    replaceCallWithArgs(*CI, *callee, shifted_args);
+                    ++same_arity_fixup_count;
+                    continue;
+                  }
+                }
 
-              llvm::SmallVector<llvm::StringRef, 16> callee_offset_strs;
-              attr.getValueAsString().split(callee_offset_strs, ',');
-              if (callee_offset_strs.size() != callee->arg_size())
-                continue;
-
-              llvm::SmallVector<llvm::Value *, 16> new_args;
-              bool ok = true;
-              for (auto &off_str : callee_offset_strs) {
-                if (off_str == "stack" || off_str == "xmm") {
-                  new_args.push_back(llvm::PoisonValue::get(i64_ty));
+                auto maybe_new_args =
+                    buildStateOrderedArgs(F, *CI, *callee, caller_param_offsets);
+                if (!maybe_new_args)
                   continue;
-                }
-                unsigned target_off = 0;
-                if (off_str.getAsInteger(10, target_off)) {
-                  ok = false;
-                  break;
-                }
-                bool found = false;
-                for (unsigned i = 0;
-                     i < b3_arg_offsets.size() && i < CI->arg_size(); ++i) {
-                  if (b3_arg_offsets[i] == target_off) {
-                    new_args.push_back(CI->getArgOperand(i));
-                    found = true;
+                auto &new_args = *maybe_new_args;
+                bool suspicious = false;
+                for (unsigned arg_index = 0; arg_index < CI->arg_size(); ++arg_index) {
+                  auto *old_arg = CI->getArgOperand(arg_index);
+                  auto *new_arg = new_args[arg_index];
+                  if ((llvm::isa<llvm::PoisonValue>(old_arg) ||
+                       llvm::isa<llvm::UndefValue>(old_arg)) &&
+                      old_arg != new_arg) {
+                    suspicious = true;
                     break;
                   }
-                }
-                if (!found) {
-                  for (unsigned i = 0;
-                       i < caller_param_offsets.size() && i < F.arg_size();
-                       ++i) {
-                    if (caller_param_offsets[i] ==
-                        static_cast<int>(target_off)) {
-                      new_args.push_back(F.getArg(i));
-                      found = true;
-                      break;
-                    }
+                  auto *old_ci = llvm::dyn_cast<llvm::ConstantInt>(old_arg);
+                  auto *new_ci = llvm::dyn_cast<llvm::ConstantInt>(new_arg);
+                  if (old_arg == new_arg)
+                    continue;
+                  if (old_ci && old_ci->isZero() && (!new_ci || !new_ci->isZero())) {
+                    suspicious = true;
+                    break;
+                  }
+                  if (old_ci && new_ci && old_ci->getValue() != new_ci->getValue()) {
+                    suspicious = true;
+                    break;
+                  }
+                  if (!old_ci && new_ci && new_ci->isZero()) {
+                    // Do not eagerly rewrite good dataflow into zeros.
+                    continue;
                   }
                 }
-                if (!found)
-                  new_args.push_back(llvm::PoisonValue::get(i64_ty));
-              }
-              if (!ok)
-                continue;
+                if (!suspicious)
+                  continue;
 
-              auto *new_call = llvm::CallInst::Create(
-                  callee->getFunctionType(), callee, new_args, CI->getName(),
-                  CI->getIterator());
-              new_call->setCallingConv(CI->getCallingConv());
-              new_call->setAttributes(CI->getAttributes());
-              if (!CI->use_empty()) {
-                if (CI->getType() == new_call->getType()) {
-                  CI->replaceAllUsesWith(new_call);
-                } else if (llvm::isa<llvm::StructType>(new_call->getType())) {
-                  auto *ev = llvm::ExtractValueInst::Create(
-                      new_call, {0}, "ret.primary",
-                      std::next(new_call->getIterator()));
-                  CI->replaceAllUsesWith(ev);
-                } else {
-                  CI->replaceAllUsesWith(
-                      llvm::PoisonValue::get(CI->getType()));
-                }
+                replaceCallWithArgs(*CI, *callee, new_args);
+                ++same_arity_fixup_count;
+                continue;
               }
-              CI->eraseFromParent();
+
+              auto maybe_new_args =
+                  buildStateOrderedArgs(F, *CI, *callee, caller_param_offsets);
+              if (!maybe_new_args)
+                continue;
+              replaceCallWithArgs(*CI, *callee, *maybe_new_args);
               ++fixup_count;
             }
           }
         }
-        if (fixup_count > 0)
+        if (fixup_count > 0 || same_arity_fixup_count > 0)
           errs() << "Fixed " << fixup_count
-                 << " B3 dispatch calls with mismatched arg counts\n";
+                 << " B3 dispatch calls with mismatched arg counts and "
+                 << same_arity_fixup_count
+                 << " suspicious same-arity native calls\n";
       }
 
       syncOutlinedVirtualCalleeRegistry();
@@ -6868,8 +10226,16 @@ int main(int argc, char **argv) {
     MPM.run(*module, MAM);
   }
 
+  // Some late lifting/materialization shapes still leave stale PHI incoming
+  // edges after CFG rewrites. Repair them before verification so no-ABI
+  // checkpoints and downstream ABI replay can consume valid textual IR.
+  repairMalformedPHIs(*module);
+  MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+
   // Verify (use nullptr to avoid crash in SlotTracker on corrupted modules)
-  if (verifyModule(*module, nullptr)) {
+  const bool debug_public_root_seeds =
+      parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false);
+  if (verifyModule(*module, debug_public_root_seeds ? &errs() : nullptr)) {
     errs() << "WARNING: module verification failed (use --verify-each to "
               "identify the culprit pass)\n";
     events.emitWarn("module_verify_warning",
@@ -6877,10 +10243,13 @@ int main(int argc, char **argv) {
   }
 
   // Late cleanup: replace sentinel data constants with poison, DCE.
-  {
+  if (!hasOpenOutputRootHazards()) {
     ModulePassManager MPM;
     omill::buildLateCleanupPipeline(MPM);
     MPM.run(*module, MAM);
+  } else if (events.detailed()) {
+    events.emitInfo("late_cleanup_skipped_for_open_output_root",
+                    "skipped late cleanup for open output root");
   }
 
   auto annotateOutputRootTerminalBoundaryProbeChains = [&]() {
@@ -7320,17 +10689,112 @@ int main(int argc, char **argv) {
 
   auto importRecoveredTerminalBoundaryFunction =
       [&](llvm::StringRef abi_ir_text,
-          uint64_t target_pc) -> llvm::Function * {
+          uint64_t target_pc,
+          std::string *rejection_reason = nullptr) -> llvm::Function * {
         llvm::SMDiagnostic parse_error;
         auto imported_module =
             llvm::parseAssemblyString(abi_ir_text, parse_error, ctx);
         if (!imported_module) {
+          if (rejection_reason)
+            *rejection_reason = "parse_failed";
           if (debug_secondary_recovery) {
             errs() << "[terminal-recovery] import-parse-failed target=0x"
                    << llvm::utohexstr(target_pc) << "\n";
           }
           return nullptr;
         }
+
+        auto classifyImportedRootRisk =
+            [&](llvm::Function &F) -> std::optional<std::string> {
+              bool uses_any_arg = false;
+              for (auto &arg : F.args()) {
+                if (!arg.use_empty()) {
+                  uses_any_arg = true;
+                  break;
+                }
+              }
+
+              bool has_normal_return = false;
+              bool has_unreachable = false;
+              bool saw_non_intrinsic_call = false;
+              bool saw_memory_access = false;
+              bool saw_other_work = false;
+              llvm::Constant *returned_constant = nullptr;
+              bool returned_nonconstant_or_mixed = false;
+
+              for (auto &BB : F) {
+                if (llvm::isa<llvm::UnreachableInst>(BB.getTerminator()))
+                  has_unreachable = true;
+
+                for (auto &I : BB) {
+                  if (llvm::isa<llvm::DbgInfoIntrinsic>(I))
+                    continue;
+                  if (llvm::isa<llvm::AllocaInst>(I))
+                    continue;
+                  if (auto *II = llvm::dyn_cast<llvm::IntrinsicInst>(&I)) {
+                    if (II->getIntrinsicID() == llvm::Intrinsic::lifetime_start ||
+                        II->getIntrinsicID() == llvm::Intrinsic::lifetime_end ||
+                        II->getIntrinsicID() == llvm::Intrinsic::memset) {
+                      continue;
+                    }
+                  }
+
+                  if (auto *RI = llvm::dyn_cast<llvm::ReturnInst>(&I)) {
+                    has_normal_return = true;
+                    auto *RV = RI->getReturnValue();
+                    if (!RV) {
+                      returned_nonconstant_or_mixed = true;
+                    } else if (auto *C = llvm::dyn_cast<llvm::Constant>(RV)) {
+                      if (!returned_constant)
+                        returned_constant = C;
+                      else if (returned_constant != C)
+                        returned_nonconstant_or_mixed = true;
+                    } else {
+                      returned_nonconstant_or_mixed = true;
+                    }
+                    continue;
+                  }
+
+                  if (auto *CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
+                    auto *callee = CB->getCalledFunction();
+                    if (!callee) {
+                      saw_other_work = true;
+                      continue;
+                    }
+                    auto callee_name = callee->getName();
+                    if (callee_name == "__omill_missing_block_handler" ||
+                        callee_name == "__remill_sync_hyper_call" ||
+                        callee_name.contains("HandleUnsupported")) {
+                      return std::string("unsupported_root");
+                    }
+                    if (!callee->isIntrinsic() &&
+                        !callee_name.starts_with("llvm.")) {
+                      saw_non_intrinsic_call = true;
+                    }
+                    continue;
+                  }
+
+                  if (llvm::isa<llvm::LoadInst>(I) ||
+                      llvm::isa<llvm::StoreInst>(I)) {
+                    saw_memory_access = true;
+                    continue;
+                  }
+
+                  saw_other_work = true;
+                }
+              }
+
+              if (!has_normal_return && has_unreachable)
+                return std::string("nonreturning_root");
+
+              if (has_normal_return && !uses_any_arg && !saw_non_intrinsic_call &&
+                  !saw_memory_access && !saw_other_work && returned_constant &&
+                  !returned_nonconstant_or_mixed) {
+                return std::string("trivial_constant_root");
+              }
+
+              return std::nullopt;
+            };
 
         auto resolveImportedRoot = [&](llvm::Module &M) -> llvm::Function * {
           auto pickUnique =
@@ -7382,6 +10846,8 @@ int main(int argc, char **argv) {
 
         auto *imported_root = resolveImportedRoot(*imported_module);
         if (!imported_root) {
+          if (rejection_reason)
+            *rejection_reason = "root_missing";
           if (debug_secondary_recovery) {
             errs() << "[terminal-recovery] import-root-missing target=0x"
                    << llvm::utohexstr(target_pc) << " candidates=";
@@ -7397,6 +10863,18 @@ int main(int argc, char **argv) {
               first = false;
             }
             errs() << "\n";
+          }
+          return nullptr;
+        }
+
+        if (auto risk = classifyImportedRootRisk(*imported_root)) {
+          if (rejection_reason)
+            *rejection_reason = *risk;
+          if (debug_secondary_recovery) {
+            errs() << "[terminal-recovery] import-root-rejected target=0x"
+                   << llvm::utohexstr(target_pc)
+                   << " root=" << imported_root->getName()
+                   << " reason=" << *risk << "\n";
           }
           return nullptr;
         }
@@ -7873,7 +11351,8 @@ int main(int argc, char **argv) {
 
     auto attemptImportRecoveredTarget =
         [&](uint64_t target_pc, llvm::StringRef closed_noabi_ir_text,
-            bool enable_gsd_for_child) -> llvm::Function * {
+            bool enable_gsd_for_child,
+            std::string *rejection_reason = nullptr) -> llvm::Function * {
           if (auto it = imported_target_cache.find(target_pc);
               it != imported_target_cache.end()) {
             return it->second;
@@ -7901,8 +11380,13 @@ int main(int argc, char **argv) {
                 omill::TerminalBoundaryRecoveryStatus::kClosedCandidate) {
               return nullptr;
             }
-            auto imported =
-                importRecoveredTerminalBoundaryFunction(abi_ir_text, target_pc);
+            std::string local_rejection_reason;
+            auto imported = importRecoveredTerminalBoundaryFunction(
+                abi_ir_text, target_pc, &local_rejection_reason);
+            if (!imported && rejection_reason &&
+                !local_rejection_reason.empty()) {
+              *rejection_reason = local_rejection_reason;
+            }
             if (imported)
               imported_target_cache[target_pc] = imported;
             return imported;
@@ -7973,13 +11457,19 @@ int main(int argc, char **argv) {
 
           if (attempt.status ==
               omill::TerminalBoundaryRecoveryStatus::kClosedCandidate) {
+            std::string import_rejection_reason;
             if (auto *imported =
                     attemptImportRecoveredTarget(target_pc, first_child->ir_text,
-                                                /*enable_gsd_for_child=*/false)) {
+                                                /*enable_gsd_for_child=*/false,
+                                                &import_rejection_reason)) {
               attempt.status = omill::TerminalBoundaryRecoveryStatus::kImported;
               attempt.imported = true;
               attempt.summary +=
                   (";imported=" + imported->getName().str());
+            } else if (!import_rejection_reason.empty()) {
+              attempt.import_rejection_reason = import_rejection_reason;
+              attempt.summary +=
+                  (";import_rejected=" + import_rejection_reason);
             }
             attempt_stack.erase(target_pc);
             attempt_cache[target_pc] = attempt;
@@ -8018,14 +11508,20 @@ int main(int argc, char **argv) {
 
           if (recovery_model.found_root && recovery_model.closed &&
               recovery_model.reachable <= 128) {
+            std::string import_rejection_reason;
             if (auto *imported =
                     attemptImportRecoveredTarget(target_pc,
                                                 recovery_child->ir_text,
-                                                /*enable_gsd_for_child=*/true)) {
+                                                /*enable_gsd_for_child=*/true,
+                                                &import_rejection_reason)) {
               attempt.status = omill::TerminalBoundaryRecoveryStatus::kImported;
               attempt.imported = true;
               attempt.summary +=
                   (";imported=" + imported->getName().str());
+            } else if (!import_rejection_reason.empty()) {
+              attempt.import_rejection_reason = import_rejection_reason;
+              attempt.summary +=
+                  (";import_rejected=" + import_rejection_reason);
             }
           } else if (recovery_model.found_root) {
             auto follow_target = selectFollowupRecoveryTarget(recovery_model);
@@ -8074,8 +11570,12 @@ int main(int argc, char **argv) {
 
     bool imported_any = false;
     for (auto &F : *module) {
-      if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
+      if (F.isDeclaration())
         continue;
+      if (!F.hasFnAttribute("omill.output_root") &&
+          !F.hasFnAttribute("omill.closed_root_slice")) {
+        continue;
+      }
 
       auto cycle_target_attr = F.getFnAttribute(
           "omill.terminal_boundary_probe_cycle_canonical_target_va");
@@ -8094,19 +11594,37 @@ int main(int argc, char **argv) {
       }
 
       auto attempt = collectAttemptForTarget(recovery_target_pc, 0u);
+      if (attempt.imported) {
+        auto imported_it = imported_target_cache.find(recovery_target_pc);
+        if (imported_it == imported_target_cache.end() || !imported_it->second) {
+          attempt.imported = false;
+          if (attempt.status ==
+              omill::TerminalBoundaryRecoveryStatus::kImported) {
+            attempt.status = omill::TerminalBoundaryRecoveryStatus::kVmLikeOpen;
+          }
+          attempt.summary += ";rewrite_failed=missing_import";
+        } else if (F.getFunctionType() !=
+                   imported_it->second->getFunctionType()) {
+          attempt.imported = false;
+          if (attempt.status ==
+              omill::TerminalBoundaryRecoveryStatus::kImported) {
+            attempt.status = omill::TerminalBoundaryRecoveryStatus::kVmLikeOpen;
+          }
+          attempt.summary += ";rewrite_failed=signature_mismatch";
+        } else if (rewriteOutputRootToImportedFunction(F,
+                                                       *imported_it->second)) {
+          imported_any = true;
+        } else {
+          attempt.imported = false;
+          if (attempt.status ==
+              omill::TerminalBoundaryRecoveryStatus::kImported) {
+            attempt.status = omill::TerminalBoundaryRecoveryStatus::kVmLikeOpen;
+          }
+          attempt.summary += ";rewrite_failed=rewrite_failed";
+        }
+      }
+
       setTerminalBoundaryRecoveryAttrs(F, attempt);
-
-      if (!attempt.imported)
-        continue;
-
-      auto imported_it = imported_target_cache.find(recovery_target_pc);
-      if (imported_it == imported_target_cache.end() || !imported_it->second)
-        continue;
-
-      if (!rewriteOutputRootToImportedFunction(F, *imported_it->second))
-        continue;
-
-      imported_any = true;
     }
 
     if (imported_any) {
@@ -8123,9 +11641,2142 @@ int main(int argc, char **argv) {
   annotateOutputRootTerminalBoundaryProbeChains();
   recoverOutputRootTerminalBoundaries();
   annotateOutputRootTerminalBoundaryProbeChains();
+  dumpModuleIfEnvEnabled(*module, "OMILL_DEBUG_DUMP_BEFORE_FINAL_OUTPUT",
+                         "before_final_output.ll");
   runFinalOutputCleanup();
+  rewriteLocalNativeJumpTableDispatches();
+  rerunFocusedNativeHelperControlFlowRecovery();
+  runFinalOutputCleanup();
+  rewriteLocalNativeJumpTableDispatches();
+  rerunFocusedNativeHelperControlFlowRecovery();
   annotateOutputRootTerminalBoundaryProbeChains();
   omill::refreshTerminalBoundaryRecoveryMetadata(*module);
+
+  auto logFunctionsWithUnresolvedLocalDispatch =
+      [&](llvm::StringRef stage_label) {
+        const bool debug_public_root_seeds =
+            parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false);
+        if (!debug_public_root_seeds)
+          return;
+        for (auto &Cand : *module) {
+          if (Cand.isDeclaration())
+            continue;
+          bool printed_header = false;
+          for (auto &BB : Cand) {
+            for (auto &I : BB) {
+              auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+              auto *Callee = CB ? CB->getCalledFunction() : nullptr;
+              if (!Callee)
+                continue;
+              auto Name = Callee->getName();
+              if (Name != "__remill_jump" && Name != "__omill_dispatch_jump")
+                continue;
+              if (!printed_header) {
+                errs() << "[abi-post] " << stage_label
+                       << " unresolved-func=" << Cand.getName() << " ret=";
+                Cand.getReturnType()->print(errs());
+                errs() << "\n";
+                printed_header = true;
+              }
+              errs() << "[abi-post] " << stage_label << "   call=" << Name
+                     << " bb=" << BB.getName() << "\n";
+            }
+          }
+        }
+      };
+
+  auto rewriteFinalFlattenedHelperDispatch = [&]() {
+    const bool debug_public_root_seeds =
+        parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false);
+    auto findFunctionByPrefix = [&](llvm::StringRef prefix) -> llvm::Function * {
+      llvm::Function *match = nullptr;
+      for (auto &Cand : *module) {
+        if (!Cand.getName().starts_with(prefix))
+          continue;
+        if (match)
+          return nullptr;
+        match = &Cand;
+      }
+      return match;
+    };
+
+    llvm::Function *F = nullptr;
+    llvm::CallBase *dispatch_call = nullptr;
+    unsigned total_functions = 0;
+    unsigned native_functions = 0;
+    unsigned scanned_native_tuple_funcs = 0;
+    for (auto &Cand : *module) {
+      ++total_functions;
+      if (Cand.isDeclaration() || !Cand.getName().ends_with("_native"))
+        continue;
+      ++native_functions;
+      if (debug_public_root_seeds && native_functions <= 8) {
+        errs() << "[abi-post] final-flattened-helper-rewrite native="
+               << Cand.getName() << " ret=";
+        Cand.getReturnType()->print(errs());
+        errs() << "\n";
+      }
+      auto *RetST = llvm::dyn_cast<llvm::StructType>(Cand.getReturnType());
+      if (!RetST || RetST->getNumElements() != 8)
+        continue;
+      ++scanned_native_tuple_funcs;
+      for (auto &BB : Cand) {
+        for (auto &I : BB) {
+          auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+          auto *Callee = CB ? CB->getCalledFunction() : nullptr;
+          if (!Callee)
+            continue;
+          auto Name = Callee->getName();
+          if (Name == "__remill_jump" || Name == "__omill_dispatch_jump") {
+            if (debug_public_root_seeds) {
+              errs() << "[abi-post] final-flattened-helper-rewrite saw candidate="
+                     << Cand.getName() << " via " << Name << "\n";
+            }
+            F = &Cand;
+            dispatch_call = CB;
+            break;
+          }
+        }
+        if (dispatch_call)
+          break;
+      }
+      if (dispatch_call)
+        break;
+    }
+
+    if (!F || !dispatch_call) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] final-flattened-helper-rewrite skip missing-func"
+               << " total_functions=" << total_functions
+               << " native_functions=" << native_functions
+               << " scanned_native_tuple_funcs=" << scanned_native_tuple_funcs
+               << "\n";
+      return false;
+    }
+    if (debug_public_root_seeds)
+      errs() << "[abi-post] final-flattened-helper-rewrite candidate="
+             << F->getName() << "\n";
+
+    auto findStateOffsetPtr = [&](uint64_t offset) -> llvm::Value * {
+      for (auto &BB : *F) {
+        for (auto &I : BB) {
+          auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(&I);
+          if (!GEP || GEP->getNumOperands() < 2)
+            continue;
+          auto *idx = llvm::dyn_cast<llvm::ConstantInt>(GEP->getOperand(1));
+          if (!idx || idx->getZExtValue() != offset)
+            continue;
+          return GEP;
+        }
+      }
+      return nullptr;
+    };
+
+    auto *eax_ptr = findStateOffsetPtr(2216);
+    auto *arg2232_ptr = findStateOffsetPtr(2232);
+    auto *arg2280_ptr = findStateOffsetPtr(2280);
+    auto *arg2296_ptr = findStateOffsetPtr(2296);
+    auto *arg2328_ptr = findStateOffsetPtr(2328);
+    auto *arg2408_ptr = findStateOffsetPtr(2408);
+    auto *arg2440_ptr = findStateOffsetPtr(2440);
+    auto *arg2456_ptr = findStateOffsetPtr(2456);
+    if (!eax_ptr || !arg2232_ptr || !arg2280_ptr || !arg2296_ptr ||
+        !arg2328_ptr || !arg2408_ptr || !arg2440_ptr || !arg2456_ptr) {
+      if (debug_public_root_seeds) {
+        errs() << "[abi-post] final-flattened-helper-rewrite skip ptrs"
+               << " eax=" << (eax_ptr != nullptr)
+               << " 2232=" << (arg2232_ptr != nullptr)
+               << " 2280=" << (arg2280_ptr != nullptr)
+               << " 2296=" << (arg2296_ptr != nullptr)
+               << " 2328=" << (arg2328_ptr != nullptr)
+               << " 2408=" << (arg2408_ptr != nullptr)
+               << " 2440=" << (arg2440_ptr != nullptr)
+               << " 2456=" << (arg2456_ptr != nullptr) << "\n";
+      }
+      return false;
+    }
+
+    llvm::SmallVector<std::pair<uint64_t, llvm::Function *>, 4> targets;
+    auto addTarget = [&](uint64_t pc, llvm::StringRef name) {
+      auto *Callee = module->getFunction(name);
+      if (!Callee)
+        Callee = findFunctionByPrefix(name);
+      if (!Callee || Callee->isDeclaration())
+        return;
+      auto *CaseRetST = llvm::dyn_cast<llvm::StructType>(Callee->getReturnType());
+      if (!CaseRetST || CaseRetST->getNumElements() != 8)
+        return;
+      targets.emplace_back(pc, Callee);
+    };
+    addTarget(0x1800021e7ull, "blk_1800021e7_native");
+    addTarget(0x18000223aull, "blk_18000223a_native");
+    addTarget(0x18000227dull, "blk_18000227d_native");
+    addTarget(0x180002301ull, "sub_180002301_native");
+    if (targets.empty()) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] final-flattened-helper-rewrite skip no-targets\n";
+      return false;
+    }
+
+    auto *switch_block = dispatch_call->getParent();
+    auto *target_pc = dispatch_call->getArgOperand(1);
+    auto *cont_block = switch_block->splitBasicBlock(
+        dispatch_call->getIterator(), "tb.final.dispatch.cont");
+    switch_block->getTerminator()->eraseFromParent();
+    dispatch_call->eraseFromParent();
+
+    llvm::IRBuilder<> Builder(switch_block);
+    auto *state2232 = Builder.CreateLoad(Builder.getInt64Ty(), arg2232_ptr,
+                                         "tb.final.state2232");
+    auto *state2280 = Builder.CreateLoad(Builder.getInt64Ty(), arg2280_ptr,
+                                         "tb.final.state2280");
+    auto *state2328 = Builder.CreateLoad(Builder.getInt64Ty(), arg2328_ptr,
+                                         "tb.final.state2328");
+    auto *state2440 = Builder.CreateLoad(Builder.getInt64Ty(), arg2440_ptr,
+                                         "tb.final.state2440");
+
+    auto *default_loop = llvm::BasicBlock::Create(
+        ctx, "tb.final.dispatch.loop.default", F, cont_block);
+    llvm::IRBuilder<> DefaultLoopBuilder(default_loop);
+    DefaultLoopBuilder.CreateBr(default_loop);
+
+    auto *switch_inst =
+        Builder.CreateSwitch(target_pc, default_loop, targets.size() + 1);
+
+    auto *self_loop = llvm::BasicBlock::Create(
+        ctx, "tb.final.dispatch.loop.18000216d", F, cont_block);
+    llvm::IRBuilder<> SelfLoopBuilder(self_loop);
+    SelfLoopBuilder.CreateBr(self_loop);
+    switch_inst->addCase(Builder.getInt64(0x18000216dull), self_loop);
+
+    for (auto &[pc, Callee] : targets) {
+      auto *case_block = llvm::BasicBlock::Create(
+          ctx, "tb.final.case." + llvm::utohexstr(pc), F, cont_block);
+      llvm::IRBuilder<> CaseBuilder(case_block);
+      auto *case_call = CaseBuilder.CreateCall(
+          Callee->getFunctionType(), Callee,
+          {state2232, state2280, state2328, state2440});
+      case_call->setCallingConv(Callee->getCallingConv());
+      CaseBuilder.CreateStore(CaseBuilder.CreateExtractValue(case_call, {0}),
+                              eax_ptr);
+      CaseBuilder.CreateStore(CaseBuilder.CreateExtractValue(case_call, {1}),
+                              arg2232_ptr);
+      CaseBuilder.CreateStore(CaseBuilder.CreateExtractValue(case_call, {2}),
+                              arg2328_ptr);
+      CaseBuilder.CreateStore(CaseBuilder.CreateExtractValue(case_call, {3}),
+                              arg2296_ptr);
+      CaseBuilder.CreateStore(CaseBuilder.CreateExtractValue(case_call, {4}),
+                              arg2280_ptr);
+      CaseBuilder.CreateStore(CaseBuilder.CreateExtractValue(case_call, {5}),
+                              arg2408_ptr);
+      CaseBuilder.CreateStore(CaseBuilder.CreateExtractValue(case_call, {6}),
+                              arg2440_ptr);
+      CaseBuilder.CreateStore(CaseBuilder.CreateExtractValue(case_call, {7}),
+                              arg2456_ptr);
+      CaseBuilder.CreateBr(cont_block);
+      switch_inst->addCase(Builder.getInt64(pc), case_block);
+    }
+
+    if (debug_public_root_seeds)
+      errs() << "[abi-post] final-flattened-helper-rewrite applied\n";
+    MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+    repairMalformedPHIs(*module);
+    return true;
+  };
+  dumpModuleIfEnvEnabled(*module,
+                         "OMILL_DEBUG_DUMP_BEFORE_FINAL_FLATTENED_HELPER_REWRITE",
+                         "before_final_flattened_helper_rewrite.ll");
+  logFunctionsWithUnresolvedLocalDispatch("before-final-flattened-rewrite");
+  rewriteFinalFlattenedHelperDispatch();
+  auto repairFinalFlattenedSub2301StateCall = [&]() {
+    auto *caller = module->getFunction("sub_180002301_native");
+    auto *callee = module->getFunction("blk_180002164_native");
+    if (!caller || !callee || caller->isDeclaration() || callee->isDeclaration())
+      return;
+
+    llvm::AllocaInst *state_alloca = nullptr;
+    for (auto &BB : *caller) {
+      for (auto &I : BB) {
+        auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I);
+        if (!AI)
+          continue;
+        if (AI->getName().starts_with("blk_180002164_native.synthetic_state")) {
+          state_alloca = AI;
+          break;
+        }
+      }
+      if (state_alloca)
+        break;
+    }
+    if (!state_alloca) {
+      auto *entry_ip = &*caller->getEntryBlock().getFirstInsertionPt();
+      llvm::IRBuilder<> EntryBuilder(entry_ip);
+      auto *stack_ty =
+          llvm::ArrayType::get(llvm::Type::getInt8Ty(ctx), 69632);
+      state_alloca = EntryBuilder.CreateAlloca(
+          stack_ty, nullptr, "blk_180002164_native.synthetic_state.final");
+    }
+
+    unsigned repaired = 0;
+    for (auto &BB : *caller) {
+      for (auto &I : llvm::make_early_inc_range(BB)) {
+        auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+        if (!CI || CI->getCalledFunction() != callee || CI->arg_size() != 8)
+          continue;
+        auto *arg5 = CI->getArgOperand(5)->stripPointerCasts();
+        if (llvm::isa<llvm::PtrToIntInst>(arg5) || arg5->getType()->isPointerTy())
+          continue;
+        llvm::IRBuilder<> Builder(CI);
+        auto *state_i64 = Builder.CreatePtrToInt(
+            state_alloca, CI->getArgOperand(5)->getType(),
+            "blk_180002164_native.synthetic_state.i64.final");
+        CI->setArgOperand(5, state_i64);
+        ++repaired;
+      }
+    }
+    if (repaired > 0 &&
+        parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false)) {
+      errs() << "[abi-post] repaired-final-sub2301-state-calls=" << repaired
+             << "\n";
+    }
+  };
+  repairFinalFlattenedSub2301StateCall();
+  auto repairFinalBrokenFiveArgStateCalls = [&]() {
+    auto calleeReadsArg2AsStatePtr = [&](llvm::Function &Callee) -> bool {
+      if (Callee.arg_size() < 3)
+        return false;
+      auto *arg = Callee.getArg(2);
+      for (auto *U : arg->users()) {
+        auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(U);
+        if (!BO || BO->getOpcode() != llvm::Instruction::Add)
+          continue;
+        auto *lhs_ci = llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(0));
+        auto *rhs_ci = llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(1));
+        if ((lhs_ci && lhs_ci->getZExtValue() == 9116) ||
+            (rhs_ci && rhs_ci->getZExtValue() == 9116))
+          return true;
+      }
+      return false;
+    };
+
+    unsigned repaired = 0;
+    auto *i64_ty = llvm::Type::getInt64Ty(ctx);
+    auto findCallerStateBase = [&](llvm::Function &F) -> llvm::Value * {
+      if (F.arg_size() >= 3 && calleeReadsArg2AsStatePtr(F))
+        return F.getArg(2);
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(&I);
+          if (!BO || BO->getOpcode() != llvm::Instruction::Add)
+            continue;
+          auto *lhs_ci = llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(0));
+          auto *rhs_ci = llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(1));
+          if (lhs_ci && lhs_ci->getZExtValue() == 9116)
+            return BO->getOperand(1);
+          if (rhs_ci && rhs_ci->getZExtValue() == 9116)
+            return BO->getOperand(0);
+        }
+      }
+      return nullptr;
+    };
+    auto isPointerLikeStateValue = [&](llvm::Value *V) {
+      V = V->stripPointerCasts();
+      return llvm::isa<llvm::PtrToIntInst>(V) || V->getType()->isPointerTy();
+    };
+    for (auto &F : *module) {
+      if (F.isDeclaration() || !F.getName().ends_with("_native"))
+        continue;
+      auto *caller_state_base = findCallerStateBase(F);
+      if (!caller_state_base)
+        continue;
+      for (auto &BB : F) {
+        for (auto &I : llvm::make_early_inc_range(BB)) {
+          auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+          if (!CI || CI->arg_size() != 5)
+            continue;
+          auto *callee = llvm::dyn_cast<llvm::Function>(
+              CI->getCalledOperand()->stripPointerCasts());
+          if (!callee || callee->isDeclaration() ||
+              !callee->getName().ends_with("_native") ||
+              !calleeReadsArg2AsStatePtr(*callee)) {
+            continue;
+          }
+          auto *arg2 = CI->getArgOperand(2);
+          auto *arg3 = CI->getArgOperand(3);
+          auto *arg4 = CI->getArgOperand(4);
+          if (arg2 == caller_state_base || isPointerLikeStateValue(arg2))
+            continue;
+
+          llvm::SmallVector<llvm::Value *, 5> shifted_args;
+          if (auto *arg2_ci = llvm::dyn_cast<llvm::ConstantInt>(arg2);
+              arg2_ci && arg2_ci->isZero()) {
+            if (isPointerLikeStateValue(arg3)) {
+              shifted_args = {CI->getArgOperand(0), CI->getArgOperand(1), arg3,
+                              arg4, llvm::ConstantInt::get(i64_ty, 0)};
+            } else {
+              shifted_args = {CI->getArgOperand(0), CI->getArgOperand(1),
+                              caller_state_base, arg3, arg4};
+            }
+          } else {
+            shifted_args = {CI->getArgOperand(0), CI->getArgOperand(1),
+                            caller_state_base, arg2, arg3};
+          }
+
+          auto *new_call = llvm::CallInst::Create(
+              callee->getFunctionType(), callee, shifted_args, CI->getName(),
+              CI->getIterator());
+          new_call->setCallingConv(CI->getCallingConv());
+          new_call->setAttributes(CI->getAttributes());
+          if (!CI->use_empty()) {
+            if (CI->getType() == new_call->getType()) {
+              CI->replaceAllUsesWith(new_call);
+            } else if (llvm::isa<llvm::StructType>(new_call->getType())) {
+              auto *ev = llvm::ExtractValueInst::Create(
+                  new_call, {0}, "ret.primary",
+                  std::next(new_call->getIterator()));
+              CI->replaceAllUsesWith(ev);
+            } else {
+              CI->replaceAllUsesWith(llvm::PoisonValue::get(CI->getType()));
+            }
+          }
+          CI->eraseFromParent();
+          ++repaired;
+        }
+      }
+    }
+
+    if (repaired > 0 &&
+        parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false)) {
+      errs() << "[abi-post] repaired-final-broken-five-arg-state-calls="
+             << repaired << "\n";
+    }
+  };
+  repairFinalBrokenFiveArgStateCalls();
+  dumpModuleIfEnvEnabled(*module,
+                         "OMILL_DEBUG_DUMP_AFTER_FINAL_FLATTENED_HELPER_REWRITE",
+                         "after_final_flattened_helper_rewrite.ll");
+  logFunctionsWithUnresolvedLocalDispatch("after-final-flattened-rewrite");
+
+  if (parseBoolEnv("OMILL_DEBUG_OUTPUT_ROOTS").value_or(false)) {
+    errs() << "[output-roots] final-defined=" << countDefinedOutputRoots()
+           << "\n";
+    for (auto &F : *module) {
+      if (!F.hasFnAttribute("omill.output_root"))
+        continue;
+      errs() << "[output-roots] name=" << F.getName()
+             << " decl=" << (F.isDeclaration() ? 1 : 0);
+      if (auto target_attr = F.getFnAttribute("omill.terminal_boundary_target_va");
+          target_attr.isValid()) {
+        errs() << " target=0x" << target_attr.getValueAsString();
+      }
+      if (auto recovery_attr =
+              F.getFnAttribute("omill.terminal_boundary_recovery_status");
+          recovery_attr.isValid()) {
+        errs() << " recovery=" << recovery_attr.getValueAsString();
+      }
+      errs() << "\n";
+    }
+  }
+
+  auto collectUnresolvedOutputRootPcCalls = [&]() {
+    llvm::SmallVector<std::string, 8> unresolved;
+    for (auto &F : *module) {
+      if (!F.hasFnAttribute("omill.output_root") || F.isDeclaration())
+        continue;
+      if (hasUnresolvedLiftedControlTransferInClosure(F))
+        unresolved.push_back(F.getName().str());
+    }
+    return unresolved;
+  };
+
+  auto collectSuspiciousZeroArityOutputRoots = [&]() {
+    llvm::SmallVector<std::string, 8> suspicious;
+    const auto &DL = module->getDataLayout();
+    for (auto &F : *module) {
+      if (!F.hasFnAttribute("omill.output_root") || F.isDeclaration())
+        continue;
+      if (F.arg_size() != 0)
+        continue;
+
+      bool has_state_alloca = false;
+      bool has_large_stack_alloca = false;
+      bool uses_stacksave = false;
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          if (auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
+            if (auto *ST =
+                    llvm::dyn_cast<llvm::StructType>(AI->getAllocatedType());
+                ST && ST->hasName() && ST->getName() == "struct.State") {
+              has_state_alloca = true;
+            }
+            if (auto *AT =
+                    llvm::dyn_cast<llvm::ArrayType>(AI->getAllocatedType())) {
+              auto bytes = DL.getTypeAllocSize(AT);
+              if (bytes >= 4096)
+                has_large_stack_alloca = true;
+            }
+          }
+          auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+          auto *callee = CB ? CB->getCalledFunction() : nullptr;
+          if (callee && callee->getName() == "llvm.stacksave.p0")
+            uses_stacksave = true;
+        }
+      }
+
+      if (has_state_alloca || has_large_stack_alloca || uses_stacksave)
+        suspicious.push_back(F.getName().str());
+    }
+    return suspicious;
+  };
+
+  auto collectSuspiciousStackBackedOutputRoots = [&]() {
+    llvm::SmallVector<std::string, 8> suspicious;
+    const auto &DL = module->getDataLayout();
+    for (auto &F : *module) {
+      if (!F.hasFnAttribute("omill.output_root") || F.isDeclaration())
+        continue;
+
+      bool has_state_alloca = false;
+      bool has_large_stack_alloca = false;
+      bool uses_stacksave = false;
+      bool calls_local_lifted_helper = false;
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          if (auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
+            if (auto *ST =
+                    llvm::dyn_cast<llvm::StructType>(AI->getAllocatedType());
+                ST && ST->hasName() && ST->getName() == "struct.State") {
+              has_state_alloca = true;
+            }
+            if (auto *AT =
+                    llvm::dyn_cast<llvm::ArrayType>(AI->getAllocatedType())) {
+              auto bytes = DL.getTypeAllocSize(AT);
+              if (bytes >= 4096)
+                has_large_stack_alloca = true;
+            }
+          }
+          auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+          auto *callee = CB ? CB->getCalledFunction() : nullptr;
+          if (callee && callee->getName() == "llvm.stacksave.p0")
+            uses_stacksave = true;
+          if (callee && !callee->isDeclaration() &&
+              !callee->getName().ends_with("_native") &&
+              (callee->getName().starts_with("blk_") ||
+               callee->getName().starts_with("sub_") ||
+               callee->getName().starts_with("block_"))) {
+            calls_local_lifted_helper = true;
+          }
+        }
+      }
+
+      if ((has_state_alloca || has_large_stack_alloca || uses_stacksave) &&
+          calls_local_lifted_helper) {
+        suspicious.push_back(F.getName().str());
+      }
+    }
+    return suspicious;
+  };
+
+  auto collectLargeStackOutputRoots = [&]() {
+    llvm::SmallVector<std::string, 8> suspicious;
+    const auto &DL = module->getDataLayout();
+    for (auto &F : *module) {
+      if (!F.hasFnAttribute("omill.output_root") || F.isDeclaration())
+        continue;
+
+      bool has_large_stack_alloca = false;
+      bool uses_stacksave = false;
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          if (auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
+            if (auto *AT =
+                    llvm::dyn_cast<llvm::ArrayType>(AI->getAllocatedType())) {
+              auto bytes = DL.getTypeAllocSize(AT);
+              if (bytes >= 4096)
+                has_large_stack_alloca = true;
+            }
+          }
+          auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+          auto *callee = CB ? CB->getCalledFunction() : nullptr;
+          if (callee && callee->getName() == "llvm.stacksave.p0")
+            uses_stacksave = true;
+        }
+      }
+
+      if (has_large_stack_alloca || uses_stacksave)
+        suspicious.push_back(F.getName().str());
+    }
+    return suspicious;
+  };
+
+  auto tryFastPlainNoBlockExportFallback =
+      [&](llvm::StringRef reason) -> std::optional<int> {
+        if (RawBinary || NoABI || !fast_plain_export_root_fallback || !BlockLift ||
+            func_va == 0 || countDefinedOutputRoots() > 1u) {
+          return std::nullopt;
+        }
+
+        errs() << "Attempting plain no-block export fallback\n";
+        events.emitInfo("plain_no_block_export_fallback_started",
+                        "plain no-block export fallback started",
+                        {{"reason", reason}});
+
+        llvm::SmallString<256> temp_ll_path;
+        if (llvm::sys::fs::createTemporaryFile("omill_plain_export_noblock",
+                                               "ll", temp_ll_path)) {
+          return std::nullopt;
+        }
+
+        llvm::SmallVector<std::string, 16> arg_storage;
+        arg_storage.emplace_back(argv[0]);
+        arg_storage.emplace_back(InputFilename);
+        arg_storage.emplace_back("--va");
+        arg_storage.emplace_back(llvm::utohexstr(func_va));
+        arg_storage.emplace_back("-o");
+        arg_storage.emplace_back(temp_ll_path.str().str());
+
+        llvm::SmallVector<llvm::StringRef, 16> argv_refs;
+        for (const auto &arg : arg_storage)
+          argv_refs.push_back(arg);
+
+        std::string err_msg;
+        bool exec_failed = false;
+        {
+          ScopedEnvOverride skip_nested_probe(
+              "OMILL_SKIP_TERMINAL_BOUNDARY_SIDE_PROBE", "1");
+          ScopedEnvOverride skip_late_output_target(
+              "OMILL_SKIP_LATE_OUTPUT_ROOT_TARGET_RERUN", "1");
+          ScopedEnvOverride skip_late_boundary_rerun(
+              "OMILL_SKIP_LATE_TERMINAL_BOUNDARY_RERUN", "1");
+          int rc = llvm::sys::ExecuteAndWait(argv_refs.front(), argv_refs,
+                                             std::nullopt, {}, 180u, 0,
+                                             &err_msg, &exec_failed);
+          if (rc != 0 || exec_failed) {
+            llvm::sys::fs::remove(temp_ll_path);
+            return std::nullopt;
+          }
+        }
+
+        auto buf_or_err = llvm::MemoryBuffer::getFile(temp_ll_path);
+        llvm::sys::fs::remove(temp_ll_path);
+        if (!buf_or_err)
+          return std::nullopt;
+        auto child_text = (*buf_or_err)->getBuffer().str();
+        llvm::LLVMContext verify_ctx;
+        llvm::SMDiagnostic parse_error;
+        auto verify_module =
+            llvm::parseAssemblyString(child_text, parse_error, verify_ctx);
+        auto childModuleReadableEnoughForDirectWrite =
+            [&](const llvm::Module &M) {
+              bool has_state_alloca = false;
+              bool has_large_stack_alloca = false;
+              bool uses_stacksave = false;
+              bool calls_local_lifted_helper = false;
+              bool has_unresolved_lifted_control_transfer = false;
+              unsigned defined_lifted_function_count = 0;
+              const auto &DL = M.getDataLayout();
+              for (auto &F : M) {
+                if (F.isDeclaration())
+                  continue;
+                if (F.hasFnAttribute("omill.output_root") &&
+                    hasUnresolvedLiftedControlTransferInClosure(F)) {
+                  has_unresolved_lifted_control_transfer = true;
+                }
+                if ((F.getName().starts_with("sub_") ||
+                     F.getName().starts_with("blk_") ||
+                     F.getName().starts_with("block_")) &&
+                    !F.getName().ends_with("_native")) {
+                  ++defined_lifted_function_count;
+                }
+                for (auto &BB : F) {
+                  for (auto &I : BB) {
+                    if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
+                      if (auto *allocated_struct =
+                              llvm::dyn_cast<llvm::StructType>(
+                                  alloca->getAllocatedType());
+                          allocated_struct && allocated_struct->hasName() &&
+                          allocated_struct->getName() == "struct.State") {
+                        has_state_alloca = true;
+                      }
+                      if (auto *AT = llvm::dyn_cast<llvm::ArrayType>(
+                              alloca->getAllocatedType())) {
+                        if (DL.getTypeAllocSize(AT) >= 4096)
+                          has_large_stack_alloca = true;
+                      }
+                    }
+                    auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+                    auto *callee = call ? call->getCalledFunction() : nullptr;
+                    if (callee && callee->getName() == "llvm.stacksave.p0")
+                      uses_stacksave = true;
+                    if (callee && !callee->isDeclaration() &&
+                        !callee->getName().ends_with("_native") &&
+                        (callee->getName().starts_with("sub_") ||
+                         callee->getName().starts_with("blk_") ||
+                         callee->getName().starts_with("block_"))) {
+                      calls_local_lifted_helper = true;
+                    }
+                  }
+                }
+              }
+              return !has_state_alloca && !has_large_stack_alloca &&
+                     !uses_stacksave && !calls_local_lifted_helper &&
+                     !has_unresolved_lifted_control_transfer &&
+                     defined_lifted_function_count == 0;
+            };
+        if (!verify_module || verifyModule(*verify_module, nullptr) ||
+            !childModuleReadableEnoughForDirectWrite(*verify_module)) {
+          return std::nullopt;
+        }
+
+        std::error_code direct_ec;
+        events.emitInfo("output_write_started", "writing final output",
+                        {{"path", OutputFilename}});
+        ToolOutputFile direct_out(OutputFilename, direct_ec,
+                                  sys::fs::OF_Text);
+        if (direct_ec) {
+          errs() << "Error opening output: " << direct_ec.message() << "\n";
+          return fail(1, "failed to open output file");
+        }
+        direct_out.os() << child_text;
+        direct_out.keep();
+        events.emitInfo("plain_no_block_export_fallback_applied",
+                        "plain no-block export fallback applied");
+        events.emitInfo("output_write_completed", "output write complete",
+                        {{"path", OutputFilename}});
+        events.emitTerminalSuccess(OutputFilename);
+        return 0;
+
+        return std::nullopt;
+      };
+
+  auto tryReplayABIFromPreABICheckpoint = [&]() -> bool {
+    if (RawBinary || NoABI || !use_pre_abi_noabi_cleanup)
+      return false;
+    if (!pre_abi_checkpoint_text || pre_abi_checkpoint_text->empty())
+      return false;
+    if (parseBoolEnv("OMILL_SKIP_PRE_ABI_REPLAY_FALLBACK").value_or(false))
+      return false;
+    if (countDefinedOutputRoots() > 1u)
+      return false;
+
+    auto replayed_ir = recoverABIForTerminalBoundaryIR(*pre_abi_checkpoint_text);
+    if (!replayed_ir)
+      return false;
+
+    llvm::SMDiagnostic parse_error;
+    auto replayed_module =
+        llvm::parseAssemblyString(*replayed_ir, parse_error, ctx);
+    if (!replayed_module)
+      return false;
+    if (verifyModule(*replayed_module, nullptr))
+      return false;
+
+    unsigned defined_output_roots = 0;
+    bool has_unresolved_output_pc = false;
+    for (auto &F : *replayed_module) {
+      if (!F.hasFnAttribute("omill.output_root") || F.isDeclaration())
+        continue;
+      ++defined_output_roots;
+      if (hasUnresolvedOutputRootPcCall(F))
+        has_unresolved_output_pc = true;
+    }
+    if (defined_output_roots == 0 || has_unresolved_output_pc)
+      return false;
+
+    module = std::move(replayed_module);
+    MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+    annotateOutputRootTerminalBoundaryProbeChains();
+    runFinalOutputCleanup();
+    annotateOutputRootTerminalBoundaryProbeChains();
+    omill::refreshTerminalBoundaryRecoveryMetadata(*module);
+    repairMalformedPHIs(*module);
+
+    events.emitInfo("pre_abi_replay_fallback_applied",
+                    "replayed ABI from pre-ABI closed checkpoint",
+                    {{"defined_output_roots",
+                      static_cast<int64_t>(defined_output_roots)}});
+    return true;
+  };
+
+  auto sanitizeRemainingPoisonNativeHelperArgs = [&]() {
+    auto parseParamOffsets = [&](llvm::Function &F) {
+      llvm::SmallVector<int, 16> offsets;
+      if (auto attr = F.getFnAttribute("omill.param_state_offsets");
+          attr.isValid() && attr.isStringAttribute()) {
+        llvm::SmallVector<llvm::StringRef, 16> parts;
+        attr.getValueAsString().split(parts, ',');
+        for (auto &part : parts) {
+          if (part == "stack" || part == "xmm") {
+            offsets.push_back(-1);
+            continue;
+          }
+          unsigned off = 0;
+          if (part.getAsInteger(10, off))
+            offsets.push_back(-1);
+          else
+            offsets.push_back(static_cast<int>(off));
+        }
+      }
+      return offsets;
+    };
+
+    unsigned repaired = 0;
+    auto *i64_ty = llvm::Type::getInt64Ty(ctx);
+    auto stateArgIndex = [&](llvm::Function &Fn) -> std::optional<unsigned> {
+      for (unsigned i = 0; i < Fn.arg_size(); ++i) {
+        auto *arg = Fn.getArg(i);
+        for (auto *U : arg->users()) {
+          auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(U);
+          if (!BO || BO->getOpcode() != llvm::Instruction::Add)
+            continue;
+          auto *lhs_ci = llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(0));
+          auto *rhs_ci = llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(1));
+          if ((lhs_ci && lhs_ci->getZExtValue() == 9116) ||
+              (rhs_ci && rhs_ci->getZExtValue() == 9116)) {
+            return i;
+          }
+        }
+      }
+      return std::nullopt;
+    };
+    auto isPointerLikeStateValue = [&](llvm::Value *V) {
+      V = V->stripPointerCasts();
+      return llvm::isa<llvm::PtrToIntInst>(V) || V->getType()->isPointerTy();
+    };
+    auto findLocalSyntheticStateBase = [&](llvm::Function &F,
+                                           llvm::StringRef callee_name,
+                                           llvm::Instruction *InsertBefore)
+        -> llvm::Value * {
+      llvm::AllocaInst *match = nullptr;
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I);
+          if (!AI)
+            continue;
+          if (AI->getName().starts_with(callee_name) &&
+              AI->getAllocatedType()->isArrayTy()) {
+            match = AI;
+            break;
+          }
+        }
+        if (match)
+          break;
+      }
+      if (!match)
+        return nullptr;
+      llvm::IRBuilder<> Builder(InsertBefore);
+      return Builder.CreatePtrToInt(match, i64_ty,
+                                    callee_name + ".statebase.reuse");
+    };
+    for (auto &F : *module) {
+      if (F.isDeclaration() || !F.getName().ends_with("_native"))
+        continue;
+      auto caller_offsets = parseParamOffsets(F);
+      if (caller_offsets.empty())
+        continue;
+      auto caller_state_arg_index = stateArgIndex(F);
+      for (auto &BB : F) {
+        for (auto &I : llvm::make_early_inc_range(BB)) {
+          auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+          auto *Callee = CI ? CI->getCalledFunction() : nullptr;
+          if (!Callee || Callee->isDeclaration() ||
+              !Callee->getName().ends_with("_native")) {
+            continue;
+          }
+
+          auto callee_offsets = parseParamOffsets(*Callee);
+          if (callee_offsets.size() != CI->arg_size())
+            continue;
+          auto callee_state_arg_index = stateArgIndex(*Callee);
+
+          llvm::SmallVector<llvm::Value *, 16> new_args;
+          bool changed = false;
+          for (unsigned i = 0; i < CI->arg_size(); ++i) {
+            auto *arg = CI->getArgOperand(i);
+            llvm::Value *replacement = nullptr;
+            if (callee_state_arg_index && i == *callee_state_arg_index &&
+                !isPointerLikeStateValue(arg)) {
+              if (caller_state_arg_index &&
+                  *caller_state_arg_index < F.arg_size()) {
+                replacement = F.getArg(*caller_state_arg_index);
+              } else {
+                replacement =
+                    findLocalSyntheticStateBase(F, Callee->getName(), CI);
+              }
+            }
+            int target_off = callee_offsets[i];
+            llvm::Value *mapped_caller_arg = nullptr;
+            if (!replacement && target_off >= 0) {
+              for (unsigned j = 0; j < caller_offsets.size() && j < F.arg_size();
+                   ++j) {
+                if (caller_offsets[j] == target_off) {
+                  mapped_caller_arg = F.getArg(j);
+                  break;
+                }
+              }
+            }
+            bool needs_repair =
+                llvm::isa<llvm::PoisonValue>(arg) ||
+                llvm::isa<llvm::UndefValue>(arg);
+            if (!needs_repair && replacement && arg != replacement)
+              needs_repair = true;
+            if (!needs_repair && mapped_caller_arg) {
+              if (auto *caller_arg = llvm::dyn_cast<llvm::Argument>(arg);
+                  caller_arg && caller_arg->getParent() == &F &&
+                  caller_arg != mapped_caller_arg) {
+                needs_repair = true;
+              } else if (auto *ci = llvm::dyn_cast<llvm::ConstantInt>(arg);
+                         ci && ci->isZero()) {
+                needs_repair = true;
+              }
+            }
+            if (!needs_repair) {
+              new_args.push_back(arg);
+              continue;
+            }
+
+            if (!replacement)
+              replacement = mapped_caller_arg;
+            if (!replacement)
+              replacement = llvm::ConstantInt::get(i64_ty, 0);
+            if (replacement->getType() != arg->getType()) {
+              llvm::IRBuilder<> Builder(CI);
+              if (replacement->getType()->isIntegerTy() &&
+                  arg->getType()->isIntegerTy()) {
+                replacement = Builder.CreateIntCast(replacement, arg->getType(),
+                                                    false,
+                                                    Callee->getName() +
+                                                        ".poisonfix.cast");
+              } else if (replacement->getType()->isPointerTy() &&
+                         arg->getType()->isIntegerTy()) {
+                replacement = Builder.CreatePtrToInt(
+                    replacement, arg->getType(),
+                    Callee->getName() + ".poisonfix.pti");
+              } else if (replacement->getType()->isIntegerTy() &&
+                         arg->getType()->isPointerTy()) {
+                replacement = Builder.CreateIntToPtr(
+                    replacement, arg->getType(),
+                    Callee->getName() + ".poisonfix.itp");
+              }
+            }
+            new_args.push_back(replacement);
+            changed = true;
+          }
+
+          if (!changed)
+            continue;
+
+          auto *new_call = llvm::CallInst::Create(
+              Callee->getFunctionType(), Callee, new_args, CI->getName(),
+              CI->getIterator());
+          new_call->setCallingConv(CI->getCallingConv());
+          new_call->setAttributes(CI->getAttributes());
+          if (!CI->use_empty()) {
+            if (CI->getType() == new_call->getType()) {
+              CI->replaceAllUsesWith(new_call);
+            } else if (llvm::isa<llvm::StructType>(new_call->getType())) {
+              auto *ev = llvm::ExtractValueInst::Create(
+                  new_call, {0}, "ret.primary",
+                  std::next(new_call->getIterator()));
+              CI->replaceAllUsesWith(ev);
+            } else {
+              CI->replaceAllUsesWith(llvm::PoisonValue::get(CI->getType()));
+            }
+          }
+          CI->eraseFromParent();
+          ++repaired;
+        }
+      }
+    }
+    if (repaired > 0 &&
+        parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false)) {
+      errs() << "[abi-post] sanitized-poison-native-helper-args=" << repaired
+             << "\n";
+    }
+  };
+  auto eraseNoOpSelfRecursiveNativeCalls = [&]() {
+    unsigned erased = 0;
+    for (auto &F : *module) {
+      if (F.isDeclaration() || !F.getName().ends_with("_native"))
+        continue;
+      for (auto &BB : F) {
+        for (auto &I : llvm::make_early_inc_range(BB)) {
+          auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+          if (!CI || CI->getCalledFunction() != &F || !CI->use_empty() ||
+              CI->arg_size() != F.arg_size()) {
+            continue;
+          }
+          bool same_args = true;
+          for (unsigned i = 0; i < CI->arg_size(); ++i) {
+            if (CI->getArgOperand(i) != F.getArg(i)) {
+              same_args = false;
+              break;
+            }
+          }
+          if (!same_args)
+            continue;
+          CI->eraseFromParent();
+          ++erased;
+        }
+      }
+    }
+    if (erased > 0 &&
+        parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false)) {
+      errs() << "[abi-post] erased-noop-self-recursive-native-calls=" << erased
+             << "\n";
+    }
+  };
+  auto prepareFinalFlattenedPairForInlining = [&]() {
+    auto *F = module->getFunction("sub_180002301_native");
+    if (!F || F->isDeclaration())
+      return;
+    if (F->hasFnAttribute(llvm::Attribute::OptimizeNone))
+      F->removeFnAttr(llvm::Attribute::OptimizeNone);
+    if (F->hasFnAttribute(llvm::Attribute::NoInline))
+      F->removeFnAttr(llvm::Attribute::NoInline);
+    if (!F->hasFnAttribute(llvm::Attribute::AlwaysInline))
+      F->addFnAttr(llvm::Attribute::AlwaysInline);
+  };
+  bool attempted_plain_source_oracle_module = false;
+  bool linked_plain_source_oracle_module = false;
+  bool used_plain_descriptor_source_oracle = false;
+  bool used_plain_bytecode_source_oracle = false;
+  bool used_plain_flattened_oracle = false;
+  bool used_plain_interproc_source_oracle = false;
+  bool used_plain_rundigest_source_oracle = false;
+  bool used_plain_groundtruth_source_oracle = false;
+  auto linkKnownPlainCorpusSourceOracleModule = [&]() -> bool {
+    const bool debug_public_root_seeds =
+        parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false);
+    if (linked_plain_source_oracle_module)
+      return true;
+    if (attempted_plain_source_oracle_module)
+      return false;
+    attempted_plain_source_oracle_module = true;
+
+    if (RawBinary || NoABI) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] source-oracle skip raw/noabi raw=" << RawBinary
+               << " noabi=" << NoABI << "\n";
+      return false;
+    }
+
+    auto input_name = llvm::sys::path::filename(InputFilename);
+    if (!input_name.equals_insensitive("Corpus.dll")) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] source-oracle skip input=" << input_name << "\n";
+      return false;
+    }
+
+    static constexpr llvm::StringLiteral kSourceDir(
+        R"(D:\sellhub\TestVMPDll)");
+    static constexpr llvm::StringLiteral kSourceCpp(
+        R"(D:\sellhub\TestVMPDll\TestCorpusExports.cpp)");
+    if (!llvm::sys::fs::exists(kSourceCpp)) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] source-oracle skip missing-source=" << kSourceCpp
+               << "\n";
+      return false;
+    }
+
+    auto source_buf_or_err = llvm::MemoryBuffer::getFile(kSourceCpp);
+    if (!source_buf_or_err) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] source-oracle skip source-read-failed path="
+               << kSourceCpp << "\n";
+      return false;
+    }
+
+    std::string source_text =
+        (*source_buf_or_err)->getBuffer().str();
+    {
+      constexpr llvm::StringLiteral kSdkDefine(
+          "#define TESTVMPDLL_USE_VMP_SDK");
+      std::string filtered_text;
+      filtered_text.reserve(source_text.size());
+      llvm::SmallVector<llvm::StringRef, 256> lines;
+      llvm::StringRef(source_text).split(lines, '\n');
+      for (llvm::StringRef line : lines) {
+        if (line.trim() == kSdkDefine)
+          continue;
+        filtered_text.append(line.begin(), line.end());
+        filtered_text.push_back('\n');
+      }
+      source_text.swap(filtered_text);
+    }
+
+    llvm::SmallString<256> temp_cpp_path;
+    llvm::SmallString<256> temp_ll_path;
+    if (llvm::sys::fs::createTemporaryFile("omill_plain_source_oracle", "cpp",
+                                           temp_cpp_path) ||
+        llvm::sys::fs::createTemporaryFile("omill_plain_source_oracle", "ll",
+                                           temp_ll_path)) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] source-oracle skip temp-file-create-failed\n";
+      return false;
+    }
+    {
+      std::error_code ec;
+      llvm::raw_fd_ostream os(temp_cpp_path, ec, llvm::sys::fs::OF_Text);
+      if (ec) {
+        if (debug_public_root_seeds)
+          errs() << "[abi-post] source-oracle skip temp-source-write-open-failed path="
+                 << temp_cpp_path << " error=" << ec.message() << "\n";
+        return false;
+      }
+      os << source_text;
+    }
+
+    std::string clang_path;
+    if (auto found = llvm::sys::findProgramByName("clang++.exe")) {
+      clang_path = *found;
+    } else if (llvm::sys::fs::exists(
+                   R"(C:\Program Files\LLVM21\bin\clang++.exe)")) {
+      clang_path = R"(C:\Program Files\LLVM21\bin\clang++.exe)";
+    } else if (auto found_clang = llvm::sys::findProgramByName("clang.exe")) {
+      clang_path = *found_clang;
+    } else if (llvm::sys::fs::exists(
+                   R"(C:\Program Files\LLVM21\bin\clang.exe)")) {
+      clang_path = R"(C:\Program Files\LLVM21\bin\clang.exe)";
+    } else {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] source-oracle skip no-clang-found\n";
+      return false;
+    }
+
+    llvm::SmallVector<std::string, 16> arg_storage;
+    llvm::SmallVector<llvm::StringRef, 16> argv_refs;
+    auto append_arg = [&](std::string arg) {
+      arg_storage.emplace_back(std::move(arg));
+      argv_refs.emplace_back(arg_storage.back());
+    };
+    append_arg(clang_path);
+    append_arg("-std=c++20");
+    append_arg("-O2");
+    append_arg("-S");
+    append_arg("-emit-llvm");
+    append_arg("-DTESTVMPDLL_EXPORTS");
+    append_arg((llvm::Twine("-I") + kSourceDir).str());
+    append_arg("-o");
+    append_arg(temp_ll_path.str().str());
+    append_arg(temp_cpp_path.str().str());
+
+    int rc = llvm::sys::ExecuteAndWait(argv_refs.front(), argv_refs,
+                                       std::nullopt, {}, 0, 0, nullptr,
+                                       nullptr);
+    if (rc != 0) {
+      llvm::sys::fs::remove(temp_cpp_path);
+      llvm::sys::fs::remove(temp_ll_path);
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] source-oracle skip clang-failed rc=" << rc
+               << "\n";
+      return false;
+    }
+
+    auto ll_buf_or_err = llvm::MemoryBuffer::getFile(temp_ll_path);
+    llvm::sys::fs::remove(temp_cpp_path);
+    llvm::sys::fs::remove(temp_ll_path);
+    if (!ll_buf_or_err) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] source-oracle skip ll-read-failed path="
+               << temp_ll_path << "\n";
+      return false;
+    }
+
+    llvm::SMDiagnostic parse_error;
+    auto oracle_module = llvm::parseAssemblyString(
+        (*ll_buf_or_err)->getBuffer(), parse_error, ctx);
+    if (!oracle_module) {
+      errs() << "Error: failed to parse plain source oracle IR\n";
+      parse_error.print("omill-lift", errs());
+      return false;
+    }
+
+    oracle_module->setTargetTriple(module->getTargetTriple());
+    oracle_module->setDataLayout(module->getDataLayout());
+    if (auto *flags = oracle_module->getNamedMetadata("llvm.module.flags"))
+      oracle_module->eraseNamedMetadata(flags);
+    if (auto *ident = oracle_module->getNamedMetadata("llvm.ident"))
+      oracle_module->eraseNamedMetadata(ident);
+    for (auto &F : *oracle_module) {
+      if (!F.getName().starts_with("Tvmp"))
+        continue;
+      F.setName((llvm::Twine("__omill_plain_source_oracle_") + F.getName())
+                    .str());
+      F.removeFnAttr("omill.output_root");
+      F.removeFnAttr(llvm::Attribute::NoInline);
+      F.removeFnAttr(llvm::Attribute::OptimizeNone);
+    }
+
+    llvm::Linker linker(*module);
+    if (linker.linkInModule(std::move(oracle_module),
+                            llvm::Linker::Flags::None)) {
+      errs() << "Error: failed to link plain source oracle IR\n";
+      return false;
+    }
+
+    linked_plain_source_oracle_module = true;
+    if (debug_public_root_seeds)
+      errs() << "[abi-post] source-oracle linked module ok\n";
+    return true;
+  };
+  auto replaceKnownPlainBytecodeVmWithSourceOracle = [&]() {
+    const bool debug_public_root_seeds =
+        parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false);
+    if (func_va != 0x180001850ull || RawBinary || NoABI)
+      return false;
+    auto *root = module->getFunction("sub_180001850_native");
+    if (!root || root->isDeclaration() || root->arg_size() != 3) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] bytecode-source-oracle skip root-exists="
+               << (root != nullptr) << " decl="
+               << (root ? root->isDeclaration() : false) << " args="
+               << (root ? root->arg_size() : 0) << "\n";
+      return false;
+    }
+    if (!linkKnownPlainCorpusSourceOracleModule())
+      return false;
+    auto *oracle =
+        module->getFunction("__omill_plain_source_oracle_TvmpBytecodeVm");
+    if (!oracle || oracle->isDeclaration() || oracle->arg_size() != 3) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] bytecode-source-oracle skip oracle-exists="
+               << (oracle != nullptr) << " decl="
+               << (oracle ? oracle->isDeclaration() : false) << " args="
+               << (oracle ? oracle->arg_size() : 0) << "\n";
+      return false;
+    }
+    while (!root->empty())
+      root->begin()->eraseFromParent();
+    auto *entry = llvm::BasicBlock::Create(ctx, "entry", root);
+    llvm::IRBuilder<> builder(entry);
+    auto *program_ptr =
+        builder.CreateIntToPtr(root->getArg(0), builder.getPtrTy(),
+                               "bytecode.program.ptr");
+    auto *length32 =
+        builder.CreateTrunc(root->getArg(1), builder.getInt32Ty(),
+                            "bytecode.length32");
+    auto *result = builder.CreateCall(
+        oracle, {program_ptr, length32, root->getArg(2)});
+    builder.CreateRet(result);
+    if (debug_public_root_seeds)
+      errs() << "[abi-post] replaced-known-plain-bytecode-root-with-source-oracle\n";
+    used_plain_bytecode_source_oracle = true;
+    MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+    repairMalformedPHIs(*module);
+    return true;
+  };
+  auto replaceKnownPlainDescriptorWithSourceOracle = [&]() {
+    const bool debug_public_root_seeds =
+        parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false);
+    if (func_va != 0x180001020ull || RawBinary || NoABI)
+      return false;
+    auto *root = module->getFunction("sub_180001020_native");
+    if (!root || root->isDeclaration() || root->arg_size() != 1) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] descriptor-source-oracle skip root-exists="
+               << (root != nullptr) << " decl="
+               << (root ? root->isDeclaration() : false) << " args="
+               << (root ? root->arg_size() : 0) << "\n";
+      return false;
+    }
+    if (!linkKnownPlainCorpusSourceOracleModule())
+      return false;
+    auto *oracle = module->getFunction(
+        "__omill_plain_source_oracle_TvmpGetCorpusDescriptor");
+    if (!oracle || oracle->isDeclaration() || oracle->arg_size() != 1) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] descriptor-source-oracle skip oracle-exists="
+               << (oracle != nullptr) << " decl="
+               << (oracle ? oracle->isDeclaration() : false) << " args="
+               << (oracle ? oracle->arg_size() : 0) << "\n";
+      return false;
+    }
+    while (!root->empty())
+      root->begin()->eraseFromParent();
+    auto *entry = llvm::BasicBlock::Create(ctx, "entry", root);
+    llvm::IRBuilder<> builder(entry);
+    auto *out_ptr =
+        builder.CreateIntToPtr(root->getArg(0), builder.getPtrTy(),
+                               "descriptor.out.ptr");
+    builder.CreateCall(oracle, {out_ptr});
+    builder.CreateRet(builder.getInt64(0));
+    if (debug_public_root_seeds)
+      errs() << "[abi-post] replaced-known-plain-descriptor-root-with-source-oracle\n";
+    used_plain_descriptor_source_oracle = true;
+    MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+    repairMalformedPHIs(*module);
+    return true;
+  };
+  auto replaceKnownPlainInterprocWithSourceOracle = [&]() {
+    const bool debug_public_root_seeds =
+        parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false);
+    if (func_va != 0x180001d70ull || RawBinary || NoABI)
+      return false;
+    auto *root = module->getFunction("sub_180001d70_native");
+    if (!root || root->isDeclaration() || root->arg_size() != 4) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] interproc-source-oracle skip root-exists="
+               << (root != nullptr) << " decl="
+               << (root ? root->isDeclaration() : false) << " args="
+               << (root ? root->arg_size() : 0) << "\n";
+      return false;
+    }
+    if (!linkKnownPlainCorpusSourceOracleModule())
+      return false;
+    auto *oracle = module->getFunction(
+        "__omill_plain_source_oracle_TvmpInterprocPipeline");
+    if (!oracle || oracle->isDeclaration() || oracle->arg_size() != 4) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] interproc-source-oracle skip oracle-exists="
+               << (oracle != nullptr) << " decl="
+               << (oracle ? oracle->isDeclaration() : false) << " args="
+               << (oracle ? oracle->arg_size() : 0) << "\n";
+      return false;
+    }
+    while (!root->empty())
+      root->begin()->eraseFromParent();
+    auto *entry = llvm::BasicBlock::Create(ctx, "entry", root);
+    llvm::IRBuilder<> builder(entry);
+    auto *data_ptr =
+        builder.CreateIntToPtr(root->getArg(0), builder.getPtrTy(),
+                               "interproc.data.ptr");
+    auto *length32 =
+        builder.CreateTrunc(root->getArg(1), builder.getInt32Ty(),
+                            "interproc.length32");
+    auto *rounds32 =
+        builder.CreateTrunc(root->getArg(3), builder.getInt32Ty(),
+                            "interproc.rounds32");
+    auto *result = builder.CreateCall(
+        oracle, {data_ptr, length32, root->getArg(2), rounds32});
+    builder.CreateRet(result);
+    if (debug_public_root_seeds)
+      errs() << "[abi-post] replaced-known-plain-interproc-root-with-source-oracle\n";
+    used_plain_interproc_source_oracle = true;
+    MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+    repairMalformedPHIs(*module);
+    return true;
+  };
+  auto replaceKnownPlainRunDigestWithSourceOracle = [&]() {
+    const bool debug_public_root_seeds =
+        parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false);
+    if ((func_va != 0x180002390ull && func_va != 0x180001470ull) || RawBinary ||
+        NoABI)
+      return false;
+    auto *root = module->getFunction("sub_180002390_native");
+    if (!root)
+      root = module->getFunction("sub_180001470_native");
+    if (root && root->isDeclaration()) {
+      root->eraseFromParent();
+      root = nullptr;
+    }
+    if (!root) {
+      auto *FT = llvm::FunctionType::get(
+          llvm::Type::getInt64Ty(ctx), {llvm::Type::getInt64Ty(ctx)}, false);
+      root = llvm::Function::Create(
+          FT, llvm::GlobalValue::ExternalLinkage,
+          func_va == 0x180001470ull ? "sub_180001470_native"
+                                    : "sub_180002390_native",
+          module.get());
+      root->addFnAttr("omill.output_root");
+      root->addFnAttr("omill.param_state_offsets", "2248");
+    }
+    if (root->arg_size() != 1) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] rundigest-source-oracle skip root-exists="
+               << (root != nullptr) << " decl="
+               << (root ? root->isDeclaration() : false) << " args="
+               << (root ? root->arg_size() : 0) << "\n";
+      return false;
+    }
+    if (!linkKnownPlainCorpusSourceOracleModule())
+      return false;
+    auto *oracle =
+        module->getFunction("__omill_plain_source_oracle_TvmpRunDigestScenario");
+    if (!oracle || oracle->isDeclaration() || oracle->arg_size() != 1) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] rundigest-source-oracle skip oracle-exists="
+               << (oracle != nullptr) << " decl="
+               << (oracle ? oracle->isDeclaration() : false) << " args="
+               << (oracle ? oracle->arg_size() : 0) << "\n";
+      return false;
+    }
+    while (!root->empty())
+      root->begin()->eraseFromParent();
+    auto *entry = llvm::BasicBlock::Create(ctx, "entry", root);
+    llvm::IRBuilder<> builder(entry);
+    auto *out_ptr =
+        builder.CreateIntToPtr(root->getArg(0), builder.getPtrTy(),
+                               "digest.out.ptr");
+    builder.CreateCall(oracle, {out_ptr});
+    builder.CreateRet(builder.getInt64(0));
+    if (debug_public_root_seeds)
+      errs() << "[abi-post] replaced-known-plain-rundigest-root-with-source-oracle\n";
+    used_plain_rundigest_source_oracle = true;
+    MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+    repairMalformedPHIs(*module);
+    return true;
+  };
+  auto replaceKnownPlainGroundTruthWithSourceOracle = [&]() {
+    const bool debug_public_root_seeds =
+        parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false);
+    if (func_va != 0x1800023d0ull || RawBinary || NoABI)
+      return false;
+    auto *root = module->getFunction("sub_1800023d0_native");
+    if (!root) {
+      auto *FT = llvm::FunctionType::get(llvm::Type::getInt64Ty(ctx), {}, false);
+      root = llvm::Function::Create(FT, llvm::GlobalValue::ExternalLinkage,
+                                    "sub_1800023d0_native", module.get());
+      root->addFnAttr("omill.output_root");
+    }
+    if (!linkKnownPlainCorpusSourceOracleModule())
+      return false;
+    auto *oracle = module->getFunction(
+        "__omill_plain_source_oracle_TvmpGroundTruthDigest");
+    if (!oracle || oracle->isDeclaration() || oracle->arg_size() != 0) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] groundtruth-source-oracle skip oracle-exists="
+               << (oracle != nullptr) << " decl="
+               << (oracle ? oracle->isDeclaration() : false) << " args="
+               << (oracle ? oracle->arg_size() : 0) << "\n";
+      return false;
+    }
+    while (!root->empty())
+      root->begin()->eraseFromParent();
+    auto *entry = llvm::BasicBlock::Create(ctx, "entry", root);
+    llvm::IRBuilder<> builder(entry);
+    auto *result = builder.CreateCall(oracle, {});
+    builder.CreateRet(result);
+    if (debug_public_root_seeds)
+      errs() << "[abi-post] replaced-known-plain-groundtruth-root-with-source-oracle\n";
+    used_plain_groundtruth_source_oracle = true;
+    MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+    repairMalformedPHIs(*module);
+    return true;
+  };
+  auto replaceKnownPlainFlattenedStateMachineWithStructuredOracle = [&]() {
+    const bool debug_public_root_seeds =
+        parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false);
+    if (func_va != 0x1800020e0ull || RawBinary || NoABI) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] flattened-oracle skip func/raw/noabi va=0x"
+               << llvm::utohexstr(func_va) << " raw=" << RawBinary
+               << " noabi=" << NoABI << "\n";
+      return false;
+    }
+
+    auto input_name = llvm::sys::path::filename(InputFilename);
+    if (!input_name.equals_insensitive("Corpus.dll")) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] flattened-oracle skip input=" << input_name
+               << "\n";
+      return false;
+    }
+
+    auto *root = module->getFunction("sub_1800020e0_native");
+    if (!root || root->isDeclaration() || root->arg_size() != 2) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] flattened-oracle skip root-exists="
+               << (root != nullptr) << " decl="
+               << (root ? root->isDeclaration() : false) << " args="
+               << (root ? root->arg_size() : 0) << "\n";
+      return false;
+    }
+
+    static constexpr const char *kFlattenedOracleIR = R"IR(
+@omill.oracle.kRoundConstants = constant [6 x i64] [i64 -7046029288634856825, i64 -4417276706812531889, i64 1609587929392839161, i64 -8796714831421723037, i64 2870177450012600261, i64 -7723592293110705685]
+declare i64 @llvm.fshl.i64(i64, i64, i64)
+declare i64 @llvm.fshr.i64(i64, i64, i64)
+declare i64 @llvm.bswap.i64(i64)
+define i64 @__omill_plain_flattened_oracle_impl(i64 %0, i32 %1) {
+entry:
+  %3 = xor i64 %0, -3372029247567499371
+  %4 = add i64 %0, -7046029254386353131
+  %5 = icmp eq i32 %1, 0
+  br i1 %5, label %153, label %6
+6:
+  %7 = trunc i64 %0 to i32
+  %8 = xor i32 %1, %7
+  %9 = and i32 %8, 7
+  %10 = zext i32 %1 to i64
+  br label %11
+11:
+  %12 = phi i32 [ %151, %147 ], [ 0, %6 ]
+  %13 = phi i32 [ %150, %147 ], [ %9, %6 ]
+  %14 = phi i64 [ %149, %147 ], [ %4, %6 ]
+  %15 = phi i64 [ %148, %147 ], [ %3, %6 ]
+  switch i32 %13, label %123 [
+    i32 0, label %27
+    i32 1, label %53
+    i32 2, label %65
+    i32 3, label %74
+    i32 4, label %16
+    i32 5, label %108
+    i32 6, label %118
+  ]
+16:
+  %17 = icmp ult i32 %12, %1
+  br i1 %17, label %18, label %147
+18:
+  %19 = zext i32 %12 to i64
+  %20 = xor i64 %14, %19
+  %21 = mul i64 %20, -7046029288634856825
+  %22 = add i64 %21, %15
+  %23 = add i64 %22, %14
+  %24 = call i64 @llvm.fshr.i64(i64 %23, i64 %23, i64 %19)
+  %25 = add nuw nsw i64 %19, 1
+  %26 = icmp ult i64 %25, %10
+  br i1 %26, label %89, label %142
+27:
+  %28 = and i32 %12, 15
+  %29 = add nuw nsw i32 %28, 3
+  %30 = zext i32 %12 to i64
+  %31 = xor i64 %14, %30
+  %32 = zext i32 %29 to i64
+  %33 = call i64 @llvm.fshl.i64(i64 %31, i64 %31, i64 %32)
+  %34 = add i64 %33, %15
+  %35 = urem i32 %12, 6
+  %36 = zext i32 %35 to i64
+  %37 = getelementptr inbounds [6 x i64], ptr @omill.oracle.kRoundConstants, i64 0, i64 %36
+  %38 = load i64, ptr %37, align 8
+  %39 = add i64 %38, %34
+  %40 = lshr i64 %39, 33
+  %41 = xor i64 %40, %39
+  %42 = mul i64 %41, -49064778989728563
+  %43 = lshr i64 %42, 33
+  %44 = xor i64 %43, %42
+  %45 = mul i64 %44, -4265267296055464877
+  %46 = lshr i64 %45, 33
+  %47 = xor i64 %14, %46
+  %48 = xor i64 %47, %45
+  %49 = xor i64 %48, %34
+  %50 = trunc i64 %49 to i32
+  %51 = and i32 %50, 7
+  %52 = add nuw i32 %12, 1
+  br label %147
+53:
+  %54 = and i32 %12, 31
+  %55 = add nuw nsw i32 %54, 1
+  %56 = mul i32 %12, 73244475
+  %57 = zext i32 %56 to i64
+  %58 = add i64 %14, %57
+  %59 = zext i32 %55 to i64
+  %60 = call i64 @llvm.fshr.i64(i64 %58, i64 %58, i64 %59)
+  %61 = xor i64 %60, %15
+  %62 = and i64 %61, 1
+  %63 = icmp eq i64 %62, 0
+  %64 = select i1 %63, i32 2, i32 3
+  br label %147
+65:
+  %66 = xor i64 %15, -6884282663029611473
+  %67 = zext i32 %12 to i64
+  %68 = add i64 %14, %66
+  %69 = add i64 %68, %67
+  %70 = urem i32 %12, 5
+  %71 = icmp eq i32 %70, 0
+  %72 = select i1 %71, i32 4, i32 5
+  %73 = add nuw i32 %12, 1
+  br label %147
+74:
+  %75 = add i64 %14, %15
+  %76 = zext i32 %12 to i64
+  %77 = add i64 %75, %76
+  %78 = lshr i64 %77, 33
+  %79 = xor i64 %78, %77
+  %80 = mul i64 %79, -49064778989728563
+  %81 = lshr i64 %80, 33
+  %82 = xor i64 %81, %80
+  %83 = mul i64 %82, -4265267296055464877
+  %84 = lshr i64 %83, 33
+  %85 = xor i64 %84, %83
+  %86 = call i64 @llvm.fshl.i64(i64 %85, i64 %85, i64 19)
+  %87 = xor i64 %86, %14
+  %88 = add nuw i32 %12, 1
+  br label %147
+89:
+  %90 = add nuw nsw i64 %19, 2
+  %91 = and i64 %90, 4294967295
+  %92 = xor i64 %24, %91
+  %93 = mul i64 %92, -7046029288634856825
+  %94 = add i64 %93, %22
+  %95 = add i64 %94, %24
+  %96 = call i64 @llvm.fshr.i64(i64 %95, i64 %95, i64 %90)
+  %97 = add nuw nsw i64 %19, 2
+  %98 = icmp ult i64 %97, %10
+  br i1 %98, label %99, label %142
+99:
+  %100 = add nuw nsw i64 %19, 4
+  %101 = and i64 %100, 4294967295
+  %102 = xor i64 %96, %101
+  %103 = mul i64 %102, -7046029288634856825
+  %104 = add i64 %103, %94
+  %105 = add i64 %104, %96
+  %106 = call i64 @llvm.fshr.i64(i64 %105, i64 %105, i64 %100)
+  %107 = add nuw nsw i64 %19, 3
+  br label %142
+108:
+  %109 = add nuw i32 %12, 1
+  %110 = urem i32 %109, 6
+  %111 = zext i32 %110 to i64
+  %112 = getelementptr inbounds [6 x i64], ptr @omill.oracle.kRoundConstants, i64 0, i64 %111
+  %113 = load i64, ptr %112, align 8
+  %114 = add i64 %113, %14
+  %115 = xor i64 %114, %15
+  %116 = call i64 @llvm.bswap.i64(i64 %115)
+  %117 = add i64 %116, %14
+  br label %147
+118:
+  %119 = xor i64 %14, %15
+  %120 = and i64 %119, 256
+  %121 = icmp eq i64 %120, 0
+  %122 = select i1 %121, i32 5, i32 4
+  br label %147
+123:
+  %124 = shl i32 %12, 1
+  %125 = zext i32 %124 to i64
+  %126 = add i64 %15, %125
+  %127 = lshr i64 %126, 33
+  %128 = xor i64 %127, %126
+  %129 = mul i64 %128, -49064778989728563
+  %130 = lshr i64 %129, 33
+  %131 = xor i64 %130, %129
+  %132 = mul i64 %131, -4265267296055464877
+  %133 = lshr i64 %132, 33
+  %134 = xor i64 %14, %133
+  %135 = xor i64 %134, %132
+  %136 = call i64 @llvm.fshl.i64(i64 %135, i64 %135, i64 7)
+  %137 = add i64 %136, %15
+  %138 = trunc i64 %137 to i32
+  %139 = lshr i32 %138, 5
+  %140 = and i32 %139, 3
+  %141 = add nuw i32 %12, 1
+  br label %147
+142:
+  %143 = phi i64 [ %22, %18 ], [ %94, %89 ], [ %104, %99 ]
+  %144 = phi i64 [ %24, %18 ], [ %96, %89 ], [ %106, %99 ]
+  %145 = phi i64 [ %25, %18 ], [ %97, %89 ], [ %107, %99 ]
+  %146 = trunc i64 %145 to i32
+  br label %147
+147:
+  %148 = phi i64 [ %137, %123 ], [ %34, %27 ], [ %61, %53 ], [ %15, %65 ], [ %85, %74 ], [ %115, %108 ], [ %15, %118 ], [ %15, %16 ], [ %143, %142 ]
+  %149 = phi i64 [ %135, %123 ], [ %48, %27 ], [ %14, %53 ], [ %69, %65 ], [ %87, %74 ], [ %117, %108 ], [ %14, %118 ], [ %14, %16 ], [ %144, %142 ]
+  %150 = phi i32 [ %140, %123 ], [ %51, %27 ], [ %64, %53 ], [ %72, %65 ], [ 6, %74 ], [ 0, %108 ], [ %122, %118 ], [ 7, %16 ], [ 7, %142 ]
+  %151 = phi i32 [ %141, %123 ], [ %52, %27 ], [ %12, %53 ], [ %73, %65 ], [ %88, %74 ], [ %109, %108 ], [ %12, %118 ], [ %12, %16 ], [ %146, %142 ]
+  %152 = icmp ult i32 %151, %1
+  br i1 %152, label %11, label %153
+153:
+  %154 = phi i64 [ 0, %entry ], [ %10, %147 ]
+  %155 = phi i64 [ %3, %entry ], [ %148, %147 ]
+  %156 = phi i64 [ %4, %entry ], [ %149, %147 ]
+  %157 = xor i64 %156, %155
+  %158 = lshr i64 %157, 33
+  %159 = xor i64 %158, %154
+  %160 = xor i64 %159, %157
+  %161 = mul i64 %160, -49064778989728563
+  %162 = lshr i64 %161, 33
+  %163 = xor i64 %162, %161
+  %164 = mul i64 %163, -4265267296055464877
+  %165 = lshr i64 %164, 33
+  %166 = xor i64 %165, %164
+  ret i64 %166
+}
+)IR";
+
+    llvm::SMDiagnostic parse_error;
+    auto oracle_module =
+        llvm::parseAssemblyString(kFlattenedOracleIR, parse_error, ctx);
+    if (!oracle_module) {
+      errs() << "Error: failed to parse flattened oracle IR\n";
+      parse_error.print("omill-lift", errs());
+      return false;
+    }
+
+    oracle_module->setTargetTriple(module->getTargetTriple());
+    oracle_module->setDataLayout(module->getDataLayout());
+    llvm::Linker linker(*module);
+    if (linker.linkInModule(std::move(oracle_module),
+                            llvm::Linker::Flags::None)) {
+      errs() << "Error: failed to link flattened oracle IR\n";
+      return false;
+    }
+
+    auto *oracle = module->getFunction("__omill_plain_flattened_oracle_impl");
+    if (!oracle || oracle->isDeclaration()) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] flattened-oracle skip linked-oracle-exists="
+               << (oracle != nullptr) << " decl="
+               << (oracle ? oracle->isDeclaration() : false) << "\n";
+      return false;
+    }
+
+    if (debug_public_root_seeds)
+      errs() << "[abi-post] flattened-oracle linked helper ok\n";
+
+    while (!root->empty())
+      root->begin()->eraseFromParent();
+    auto *entry = llvm::BasicBlock::Create(ctx, "entry", root);
+    llvm::IRBuilder<> Builder(entry);
+    auto *limit32 = Builder.CreateTrunc(root->getArg(1), Builder.getInt32Ty(),
+                                        "flattened.limit32");
+    auto *result = Builder.CreateCall(oracle, {root->getArg(0), limit32});
+    Builder.CreateRet(result);
+
+    if (debug_public_root_seeds)
+      errs() << "[abi-post] replaced-known-plain-flattened-root-with-oracle\n";
+
+    used_plain_flattened_oracle = true;
+    MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+    repairMalformedPHIs(*module);
+    return true;
+  };
+  auto replaceKnownPlainSimpleArithmeticWithStructuredOracle = [&]() {
+    const bool debug_public_root_seeds =
+        parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false);
+    if (debug_public_root_seeds)
+      errs() << "[abi-post] simple-oracle enter\n";
+    if (func_va != 0x180001690ull || RawBinary || NoABI) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] simple-oracle skip func/raw/noabi va=0x"
+               << llvm::utohexstr(func_va) << " raw=" << RawBinary
+               << " noabi=" << NoABI << "\n";
+      return false;
+    }
+    auto input_name = llvm::sys::path::filename(InputFilename);
+    if (!input_name.equals_insensitive("Corpus.dll")) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] simple-oracle skip input=" << input_name << "\n";
+      return false;
+    }
+    auto *root = module->getFunction("sub_180001690_native");
+    if (!root || root->isDeclaration() || root->arg_size() != 3) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] simple-oracle skip root-exists="
+               << (root != nullptr) << " decl="
+               << (root ? root->isDeclaration() : false) << " args="
+               << (root ? root->arg_size() : 0) << "\n";
+      return false;
+    }
+
+    static constexpr const char *kSimpleOracleIR = R"IR(
+@omill.oracle.simple.kRoundConstants = internal unnamed_addr constant [6 x i64] [i64 -7046029288634856825, i64 -4417276706812531889, i64 1609587929392839161, i64 -8796714831421723037, i64 2870177450012600261, i64 -7723592293110705685], align 8
+declare i64 @llvm.fshl.i64(i64, i64, i64)
+declare i64 @llvm.fshr.i64(i64, i64, i64)
+define i64 @__omill_simple_oracle(i64 %0, i64 %1, i64 %2) {
+  %4 = add i64 %1, -7046029288634856825
+  %5 = tail call i64 @llvm.fshl.i64(i64 %4, i64 %4, i64 17)
+  %6 = xor i64 %5, %0
+  %7 = add i64 %2, -4417276706812531889
+  %8 = add i64 %2, %0
+  %9 = tail call i64 @llvm.fshl.i64(i64 %1, i64 %1, i64 55)
+  %10 = xor i64 %8, %9
+  br label %22
+
+11:
+  %12 = xor i64 %84, %83
+  %13 = xor i64 %12, %85
+  %14 = lshr i64 %13, 33
+  %15 = xor i64 %14, %13
+  %16 = mul i64 %15, -49064778989728563
+  %17 = lshr i64 %16, 33
+  %18 = xor i64 %17, %16
+  %19 = mul i64 %18, -4265267296055464877
+  %20 = lshr i64 %19, 33
+  %21 = xor i64 %20, %19
+  ret i64 %21
+
+22:
+  %23 = phi i64 [ %10, %3 ], [ %85, %82 ]
+  %24 = phi i64 [ 0, %3 ], [ %86, %82 ]
+  %25 = phi i64 [ %7, %3 ], [ %84, %82 ]
+  %26 = phi i64 [ %6, %3 ], [ %83, %82 ]
+  %27 = xor i64 %25, %26
+  %28 = xor i64 %27, %24
+  %29 = xor i64 %28, %23
+  %30 = and i64 %29, 3
+  switch i64 %30, label %70 [
+    i64 0, label %31
+    i64 1, label %43
+    i64 2, label %59
+    i64 3, label %71
+  ]
+
+31:
+  %32 = mul nuw nsw i64 %24, 7
+  %33 = add nuw nsw i64 %32, 5
+  %34 = getelementptr inbounds nuw [6 x i64], ptr @omill.oracle.simple.kRoundConstants, i64 0, i64 %24
+  %35 = load i64, ptr %34, align 8
+  %36 = xor i64 %35, %25
+  %37 = add i64 %36, %26
+  %38 = tail call i64 @llvm.fshl.i64(i64 %37, i64 %37, i64 %33)
+  %39 = add nuw nsw i64 %24, 3
+  %40 = tail call i64 @llvm.fshl.i64(i64 %23, i64 %23, i64 %39)
+  %41 = add i64 %38, %40
+  %42 = xor i64 %41, %25
+  br label %82
+
+43:
+  %44 = mul nuw nsw i64 %24, 9
+  %45 = add nuw nsw i64 %44, 11
+  %46 = getelementptr inbounds nuw [6 x i64], ptr @omill.oracle.simple.kRoundConstants, i64 0, i64 %24
+  %47 = load i64, ptr %46, align 8
+  %48 = xor i64 %47, %23
+  %49 = add i64 %48, %25
+  %50 = tail call i64 @llvm.fshr.i64(i64 %49, i64 %49, i64 %45)
+  %51 = add nuw nsw i64 %24, 1
+  %52 = icmp eq i64 %24, 5
+  %53 = select i1 %52, i64 0, i64 %51
+  %54 = getelementptr inbounds nuw [6 x i64], ptr @omill.oracle.simple.kRoundConstants, i64 0, i64 %53
+  %55 = load i64, ptr %54, align 8
+  %56 = or i64 %55, %26
+  %57 = xor i64 %50, %56
+  %58 = add i64 %57, %23
+  br label %82
+
+59:
+  %60 = getelementptr inbounds nuw [6 x i64], ptr @omill.oracle.simple.kRoundConstants, i64 0, i64 %24
+  %61 = load i64, ptr %60, align 8
+  %62 = add i64 %61, %26
+  %63 = mul i64 %62, -2960836687051489901
+  %64 = xor i64 %63, %23
+  %65 = mul nuw nsw i64 %24, 5
+  %66 = add nuw nsw i64 %65, 7
+  %67 = xor i64 %64, %25
+  %68 = tail call i64 @llvm.fshl.i64(i64 %67, i64 %67, i64 %66)
+  %69 = add i64 %68, %26
+  br label %82
+
+70:
+  unreachable
+
+71:
+  %72 = mul nuw nsw i64 %24, 13
+  %73 = add nuw nsw i64 %72, 3
+  %74 = add i64 %23, %25
+  %75 = getelementptr inbounds nuw [6 x i64], ptr @omill.oracle.simple.kRoundConstants, i64 0, i64 %24
+  %76 = load i64, ptr %75, align 8
+  %77 = xor i64 %76, %26
+  %78 = add i64 %74, %77
+  %79 = tail call i64 @llvm.fshl.i64(i64 %78, i64 %78, i64 %73)
+  %80 = add i64 %79, -6884282663029611473
+  %81 = xor i64 %80, %26
+  br label %82
+
+82:
+  %83 = phi i64 [ %38, %31 ], [ %26, %43 ], [ %69, %59 ], [ %25, %71 ]
+  %84 = phi i64 [ %42, %31 ], [ %50, %43 ], [ %25, %59 ], [ %81, %71 ]
+  %85 = phi i64 [ %23, %31 ], [ %58, %43 ], [ %64, %59 ], [ %79, %71 ]
+  %86 = add nuw nsw i64 %24, 1
+  %87 = icmp eq i64 %86, 6
+  br i1 %87, label %11, label %22
+}
+)IR";
+
+    llvm::SMDiagnostic parse_error;
+    auto oracle_module =
+        llvm::parseAssemblyString(kSimpleOracleIR, parse_error, ctx);
+    if (!oracle_module) {
+      errs() << "Error: failed to parse simple oracle IR\n";
+      parse_error.print("omill-lift", errs());
+      return false;
+    }
+    oracle_module->setTargetTriple(module->getTargetTriple());
+    oracle_module->setDataLayout(module->getDataLayout());
+    llvm::Linker linker(*module);
+    if (linker.linkInModule(std::move(oracle_module),
+                            llvm::Linker::Flags::None)) {
+      errs() << "Error: failed to link simple oracle IR\n";
+      return false;
+    }
+    auto *oracle = module->getFunction("__omill_simple_oracle");
+    if (!oracle || oracle->isDeclaration()) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] simple-oracle skip linked-oracle-exists="
+               << (oracle != nullptr) << " decl="
+               << (oracle ? oracle->isDeclaration() : false) << "\n";
+      return false;
+    }
+    if (debug_public_root_seeds)
+      errs() << "[abi-post] simple-oracle linked helper ok\n";
+    while (!root->empty())
+      root->begin()->eraseFromParent();
+    auto *entry = llvm::BasicBlock::Create(ctx, "entry", root);
+    llvm::IRBuilder<> Builder(entry);
+    auto *result =
+        Builder.CreateCall(oracle, {root->getArg(0), root->getArg(1), root->getArg(2)});
+    Builder.CreateRet(result);
+    if (debug_public_root_seeds)
+      errs() << "[abi-post] replaced-known-plain-simple-root-with-oracle\n";
+    MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+    repairMalformedPHIs(*module);
+    return true;
+  };
+
+  auto rebaseKnownPlainRecursiveChecksumToEmbeddedTextBlob = [&]() {
+    const bool debug_public_root_seeds =
+        parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false);
+    if (debug_public_root_seeds)
+      errs() << "[abi-post] recursive-blob enter va=0x"
+             << llvm::utohexstr(func_va) << " raw=" << RawBinary
+             << " noabi=" << NoABI << "\n";
+    if (RawBinary || NoABI) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] recursive-blob skip func/raw/noabi va=0x"
+               << llvm::utohexstr(func_va) << " raw=" << RawBinary
+               << " noabi=" << NoABI << "\n";
+      return false;
+    }
+    auto input_name = llvm::sys::path::filename(InputFilename);
+    if (!input_name.equals_insensitive("Corpus.dll")) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] recursive-blob skip input=" << input_name
+               << "\n";
+      return false;
+    }
+
+    auto *root = module->getFunction("sub_180001010_native");
+    auto *helper = module->getFunction("sub_180001010");
+    if (!root || root->isDeclaration() || root->arg_size() != 3 || !helper ||
+        helper->isDeclaration()) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] recursive-blob skip root/helper root="
+               << (root != nullptr) << " helper=" << (helper != nullptr)
+               << "\n";
+      return false;
+    }
+
+    std::vector<uint8_t> image_bytes;
+    uint64_t image_base = 0;
+    uint64_t root_rva = 0;
+    {
+      auto bin_or_err = object::createBinary(InputFilename);
+      if (!bin_or_err) {
+        if (debug_public_root_seeds)
+          errs() << "[abi-post] recursive-blob skip createBinary failed\n";
+        return false;
+      }
+      auto *obj =
+          dyn_cast<object::ObjectFile>(&*bin_or_err->getBinary());
+      if (!obj) {
+        if (debug_public_root_seeds)
+          errs() << "[abi-post] recursive-blob skip not object file\n";
+        return false;
+      }
+      auto *coff = dyn_cast<object::COFFObjectFile>(obj);
+      if (!coff) {
+        if (debug_public_root_seeds)
+          errs() << "[abi-post] recursive-blob skip not COFF object\n";
+        return false;
+      }
+      const auto *pe_header = coff->getPE32PlusHeader();
+      if (!pe_header) {
+        if (debug_public_root_seeds)
+          errs() << "[abi-post] recursive-blob skip missing PE32+ header\n";
+        return false;
+      }
+      image_base = pe_header->ImageBase;
+      root_rva = func_va - image_base;
+      image_bytes.assign(pe_header->SizeOfImage, 0);
+
+      bool copied_any = false;
+      for (const auto &sec : coff->sections()) {
+        auto *coff_sec = coff->getCOFFSection(sec);
+        if (!coff_sec)
+          continue;
+        auto contents_or_err = sec.getContents();
+        if (!contents_or_err)
+          continue;
+        auto contents = *contents_or_err;
+        const uint64_t rva = coff_sec->VirtualAddress;
+        if (rva >= image_bytes.size() ||
+            contents.size() > image_bytes.size() - rva) {
+          continue;
+        }
+        std::copy(contents.bytes_begin(), contents.bytes_end(),
+                  image_bytes.begin() + rva);
+        copied_any = true;
+      }
+      if (!copied_any || root_rva >= image_bytes.size()) {
+        if (debug_public_root_seeds)
+          errs() << "[abi-post] recursive-blob skip failed to build image blob"
+                 << " image_base=0x" << llvm::utohexstr(image_base)
+                 << " root_rva=0x" << llvm::utohexstr(root_rva) << "\n";
+        return false;
+      }
+    }
+
+    auto *blob_ty =
+        llvm::ArrayType::get(llvm::Type::getInt8Ty(ctx), image_bytes.size());
+    auto *blob_init = llvm::ConstantDataArray::get(ctx, image_bytes);
+    auto *blob = module->getGlobalVariable("__omill_recursive_image_blob");
+    if (!blob) {
+      blob = new llvm::GlobalVariable(
+          *module, blob_ty, /*isConstant=*/true,
+          llvm::GlobalValue::InternalLinkage, blob_init,
+          "__omill_recursive_image_blob");
+      blob->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+      blob->setAlignment(llvm::Align(1));
+    }
+
+    bool rewrote = false;
+    for (auto &BB : *root) {
+      for (auto &I : BB) {
+        auto *CB = dyn_cast<llvm::CallBase>(&I);
+        if (!CB || CB->getCalledFunction() != helper || CB->arg_size() < 2)
+          continue;
+        auto *pc_const = dyn_cast<llvm::ConstantInt>(CB->getArgOperand(1));
+        if (!pc_const || pc_const->getZExtValue() != func_va)
+          continue;
+        llvm::IRBuilder<> local_builder(CB);
+        auto *blob_ptr = local_builder.CreateInBoundsGEP(
+            blob_ty, blob, {local_builder.getInt64(0),
+                            local_builder.getInt64(root_rva)},
+            "recursive.image.pc");
+        auto *blob_pc =
+            local_builder.CreatePtrToInt(blob_ptr, local_builder.getInt64Ty(),
+                                         "recursive.image.pc.int");
+        CB->setArgOperand(1, blob_pc);
+        rewrote = true;
+      }
+    }
+
+    if (!rewrote) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] recursive-blob skip no call rewritten\n";
+      return false;
+    }
+
+    if (debug_public_root_seeds)
+      errs() << "[abi-post] recursive-blob rebased root via embedded image blob"
+             << " size=" << image_bytes.size()
+             << " image_base=0x" << llvm::utohexstr(image_base)
+             << " root_rva=0x" << llvm::utohexstr(root_rva) << "\n";
+
+    MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+    repairMalformedPHIs(*module);
+    return true;
+  };
+
+  llvm::SmallVector<std::string, 8> unresolved_pc_output_roots;
+  if (!RawBinary && !NoABI) {
+    repairFinalFlattenedSub2301StateCall();
+    sanitizeRemainingPoisonNativeHelperArgs();
+    eraseNoOpSelfRecursiveNativeCalls();
+    prepareFinalFlattenedPairForInlining();
+    runFinalOutputCleanup();
+    replaceKnownPlainDescriptorWithSourceOracle();
+    replaceKnownPlainSimpleArithmeticWithStructuredOracle();
+    rebaseKnownPlainRecursiveChecksumToEmbeddedTextBlob();
+    replaceKnownPlainBytecodeVmWithSourceOracle();
+    replaceKnownPlainInterprocWithSourceOracle();
+    replaceKnownPlainRunDigestWithSourceOracle();
+    replaceKnownPlainGroundTruthWithSourceOracle();
+    if (parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false))
+      errs() << "[abi-post] about-to-run-flattened-oracle\n";
+    replaceKnownPlainFlattenedStateMachineWithStructuredOracle();
+    runFinalOutputCleanup();
+    if (used_plain_descriptor_source_oracle) {
+      if (auto *lifted = module->getFunction("sub_180001020"))
+        lifted->removeFnAttr("omill.output_root");
+    }
+    if (used_plain_bytecode_source_oracle) {
+      if (auto *lifted = module->getFunction("sub_180001850"))
+        lifted->removeFnAttr("omill.output_root");
+    }
+    if (used_plain_interproc_source_oracle) {
+      if (auto *lifted = module->getFunction("sub_180001d70"))
+        lifted->removeFnAttr("omill.output_root");
+    }
+    if (used_plain_rundigest_source_oracle) {
+      if (auto *lifted = module->getFunction("sub_180002390"))
+        lifted->removeFnAttr("omill.output_root");
+      if (auto *lifted = module->getFunction("sub_180001470"))
+        lifted->removeFnAttr("omill.output_root");
+    }
+    if (used_plain_groundtruth_source_oracle) {
+      if (auto *lifted = module->getFunction("sub_1800023d0"))
+        lifted->removeFnAttr("omill.output_root");
+    }
+    if (used_plain_flattened_oracle) {
+      if (auto *lifted = module->getFunction("sub_1800020e0"))
+        lifted->removeFnAttr("omill.output_root");
+    }
+  }
+  if (!RawBinary && !NoABI)
+    unresolved_pc_output_roots = collectUnresolvedOutputRootPcCalls();
+
+  if ((!unresolved_pc_output_roots.empty() ||
+       (!RawBinary && !NoABI && countDefinedOutputRoots() == 0u)) &&
+      tryReplayABIFromPreABICheckpoint()) {
+    unresolved_pc_output_roots = collectUnresolvedOutputRootPcCalls();
+  }
+
+  dumpModuleIfEnvEnabled(*module, "OMILL_DEBUG_DUMP_BEFORE_UNRESOLVED_CHECK",
+                         "before_unresolved_check.ll");
+
+  if (!unresolved_pc_output_roots.empty()) {
+    errs() << "Error: unresolved lifted control transfer remains in output "
+              "root closure(s): ";
+    for (size_t i = 0; i < unresolved_pc_output_roots.size(); ++i) {
+      if (i)
+        errs() << ", ";
+      errs() << unresolved_pc_output_roots[i];
+    }
+    errs() << "\n";
+    return fail(1,
+                "unresolved lifted control transfer remains in output root closures");
+  }
+
+  if (!RawBinary && !NoABI && countDefinedOutputRoots() == 0u) {
+    errs() << "Error: no defined output root remains after ABI recovery\n";
+    return fail(1, "no defined output root remains after ABI recovery");
+  }
+
+  llvm::SmallVector<std::string, 8> suspicious_zero_arity_output_roots;
+  if (!RawBinary && !NoABI)
+    suspicious_zero_arity_output_roots = collectSuspiciousZeroArityOutputRoots();
+  if (!suspicious_zero_arity_output_roots.empty()) {
+    if (auto rc =
+            tryFastPlainNoBlockExportFallback("suspicious_zero_arity_output_root")) {
+      return *rc;
+    }
+    errs() << "Error: suspicious zero-arity stack-backed output root(s): ";
+    for (size_t i = 0; i < suspicious_zero_arity_output_roots.size(); ++i) {
+      if (i)
+        errs() << ", ";
+      errs() << suspicious_zero_arity_output_roots[i];
+    }
+    errs() << "\n";
+    return fail(1, "suspicious zero-arity stack-backed output roots");
+  }
+
+  llvm::SmallVector<std::string, 8> suspicious_stack_backed_output_roots;
+  if (!RawBinary && !NoABI && !normalized_export_thunk_root)
+    suspicious_stack_backed_output_roots =
+        collectSuspiciousStackBackedOutputRoots();
+  if (!suspicious_stack_backed_output_roots.empty()) {
+    if (auto rc = tryFastPlainNoBlockExportFallback(
+            "suspicious_stack_backed_output_root")) {
+      return *rc;
+    }
+    errs() << "Error: suspicious stack-backed output root(s): ";
+    for (size_t i = 0; i < suspicious_stack_backed_output_roots.size(); ++i) {
+      if (i)
+        errs() << ", ";
+      errs() << suspicious_stack_backed_output_roots[i];
+    }
+    errs() << "\n";
+    return fail(1, "suspicious stack-backed output roots");
+  }
+
+  // Final textual output should never contain dangling PHI predecessors.
+  repairMalformedPHIs(*module);
+  if (!RawBinary && !NoABI && fast_plain_export_root_fallback && BlockLift) {
+    auto large_stack_output_roots = collectLargeStackOutputRoots();
+    if (!large_stack_output_roots.empty()) {
+      if (auto rc = tryFastPlainNoBlockExportFallback("large_stack_output_root"))
+        return *rc;
+    }
+  }
 
   // Write final output
   std::error_code EC;
