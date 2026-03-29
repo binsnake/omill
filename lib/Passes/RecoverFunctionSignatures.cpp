@@ -7,6 +7,7 @@
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Operator.h>
 
@@ -33,7 +34,8 @@ std::string nativeWrapperName(const llvm::Function &F) {
 
 bool isPublicOutputRoot(const llvm::Function *F) {
   return F && F->hasFnAttribute("omill.output_root") &&
-         !F->hasFnAttribute("omill.vm_wrapper");
+         !F->hasFnAttribute("omill.vm_wrapper") &&
+         !F->hasFnAttribute("omill.internal_output_root");
 }
 
 bool shouldRecoverClosedRootSliceFunction(const llvm::Function &F) {
@@ -110,6 +112,8 @@ struct DriverSeedExpr {
     Xor32,
     And32,
     ZExt32,
+    Rol64,
+    Ror64,
   };
 
   Kind kind = Kind::Constant;
@@ -254,6 +258,10 @@ class DriverSeedExprParser {
       return parseBinaryCall(DriverSeedExpr::Kind::Xor32);
     if (*ident == "and32")
       return parseBinaryCall(DriverSeedExpr::Kind::And32);
+    if (*ident == "rol64")
+      return parseBinaryCall(DriverSeedExpr::Kind::Rol64);
+    if (*ident == "ror64")
+      return parseBinaryCall(DriverSeedExpr::Kind::Ror64);
     if (*ident == "zext32")
       return parseUnaryCall(DriverSeedExpr::Kind::ZExt32);
 
@@ -345,6 +353,16 @@ llvm::Value *evaluateDriverSeedExpr(
       }
       case DriverSeedExpr::Kind::ZExt32:
         return Builder.CreateAnd(self(*node.lhs, self), mask32());
+      case DriverSeedExpr::Kind::Rol64:
+        return Builder.CreateIntrinsic(
+            i64_ty, llvm::Intrinsic::fshl,
+            {self(*node.lhs, self), self(*node.lhs, self),
+             self(*node.rhs, self)});
+      case DriverSeedExpr::Kind::Ror64:
+        return Builder.CreateIntrinsic(
+            i64_ty, llvm::Intrinsic::fshr,
+            {self(*node.lhs, self), self(*node.lhs, self),
+             self(*node.rhs, self)});
     }
     llvm_unreachable("unknown driver seed expr kind");
   };
@@ -716,6 +734,12 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
         case DriverSeedExpr::Kind::ZExt32:
           llvm::errs() << "zext32";
           break;
+        case DriverSeedExpr::Kind::Rol64:
+          llvm::errs() << "rol64";
+          break;
+        case DriverSeedExpr::Kind::Ror64:
+          llvm::errs() << "ror64";
+          break;
       }
       llvm::errs() << "\n";
     }
@@ -757,6 +781,7 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
   propagateStringAttr("omill.trace_native_target");
   propagateStringAttr("omill.export_entry_seed_exprs");
   propagateStringAttr("omill.export_callsite_win64_gpr_count");
+  propagateStringAttr("omill.internal_output_root");
   if (native_fn->getFnAttribute("omill.vm_demerged_clone").isValid() ||
       native_fn->getFnAttribute("omill.vm_outlined_virtual_call").isValid() ||
       native_fn->getFnAttribute("omill.trace_native_target").isValid()) {

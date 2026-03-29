@@ -398,6 +398,71 @@ static bool moduleHasGenericStaticDevirtualizationCandidatesImpl(
   return false;
 }
 
+static bool moduleHasRootLocalGenericStaticDevirtualizationShapeImpl(
+    const llvm::Module &M) {
+  auto isRootLocalGenericStaticDevirtSignalFunction =
+      [](const llvm::Function &F) {
+        auto name = F.getName();
+        if (name.starts_with("vm_entry_"))
+          return true;
+
+        return F.hasFnAttribute("omill.vm_handler") ||
+               F.hasFnAttribute("omill.vm_wrapper") ||
+               F.hasFnAttribute("omill.vm_newly_lifted") ||
+               F.hasFnAttribute("omill.newly_lifted") ||
+               F.hasFnAttribute("omill.virtual_specialized") ||
+               F.getFnAttribute("omill.vm_demerged_clone").isValid() ||
+               F.getFnAttribute("omill.vm_outlined_virtual_call").isValid();
+      };
+
+  llvm::SmallVector<const llvm::Function *, 16> worklist;
+  llvm::SmallPtrSet<const llvm::Function *, 32> seen;
+  bool saw_dispatch_call = false;
+  bool saw_block_helper_edge = false;
+
+  for (const auto &F : M) {
+    if (!F.isDeclaration() && F.hasFnAttribute("omill.output_root") &&
+        seen.insert(&F).second) {
+      worklist.push_back(&F);
+    }
+  }
+
+  constexpr size_t kMaxReachable = 256;
+  while (!worklist.empty() && seen.size() <= kMaxReachable) {
+    const llvm::Function *F = worklist.pop_back_val();
+    if (!F->hasFnAttribute("omill.output_root") &&
+        isRootLocalGenericStaticDevirtSignalFunction(*F)) {
+      return true;
+    }
+
+    for (const auto &BB : *F) {
+      for (const auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+        if (!call)
+          continue;
+        auto *callee = call->getCalledFunction();
+        if (!callee)
+          continue;
+
+        auto callee_name = callee->getName();
+        if (callee_name == "__omill_dispatch_jump")
+          return true;
+        if (callee_name == "__omill_dispatch_call") {
+          saw_dispatch_call = true;
+        } else if (callee_name.starts_with("blk_") ||
+                   callee_name.starts_with("block_")) {
+          saw_block_helper_edge = true;
+        }
+
+        if (!callee->isDeclaration() && seen.insert(callee).second)
+          worklist.push_back(callee);
+      }
+    }
+  }
+
+  return saw_dispatch_call && saw_block_helper_edge;
+}
+
 static constexpr llvm::StringLiteral kLoopifiedTerminalPcMetadata =
     "omill.loopified_terminal_pc";
 static constexpr llvm::StringLiteral kLoopifiedTerminalPcAttr =
@@ -5276,6 +5341,11 @@ bool moduleHasGenericStaticDevirtualizationCandidates(const llvm::Module &M) {
   return moduleHasGenericStaticDevirtualizationCandidatesImpl(M);
 }
 
+bool moduleHasRootLocalGenericStaticDevirtualizationShape(
+    const llvm::Module &M) {
+  return moduleHasRootLocalGenericStaticDevirtualizationShapeImpl(M);
+}
+
 bool shouldAutoSkipGenericStaticDevirtualizationForRoot(
     const llvm::Module &M, bool vm_mode, bool requested_root_is_export,
     bool force_generic_static_devirtualize,
@@ -6409,9 +6479,14 @@ struct InternalizeRemillSemanticsPass
       if (F.hasLocalLinkage()) continue;
 
       auto name = F.getName();
-      // Keep lifted functions and remill intrinsics.
+      // Keep lifted/output-root entrypoints and remill intrinsics. Replay-mode
+      // ABI recovery can synthesize additional output roots whose names do not
+      // follow the plain sub_/block_ prefixes (for example imported native
+      // wrappers). Internalizing those here lets the trailing GlobalDCE erase
+      // them before the caller can reason about multiple replayed roots.
       if (name.starts_with("sub_") || name.starts_with("block_") ||
-          name.starts_with("__remill_"))
+          name.starts_with("__remill_") ||
+          F.hasFnAttribute("omill.output_root"))
         continue;
 
       F.setLinkage(llvm::GlobalValue::InternalLinkage);
@@ -7272,15 +7347,17 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
             out.push_back(current);
             for (auto &BB : *current) {
               for (auto &I : BB) {
-                auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
-                if (!call)
-                  continue;
-                llvm::Function *callee = call->getCalledFunction();
-                if (!callee)
-                  return false;
-                auto callee_name = callee->getName();
-                if (callee_name == "__omill_dispatch_call" ||
-                    callee_name == "__omill_dispatch_jump" ||
+                 auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+                 if (!call)
+                   continue;
+                 llvm::Function *callee = call->getCalledFunction();
+                 if (!callee) {
+                   if (call->isInlineAsm())
+                     continue;
+                   return false;
+                 }
+                 auto callee_name = callee->getName();
+                if (callee_name == "__omill_dispatch_jump" ||
                     callee_name == "__omill_missing_block_handler") {
                   return false;
                 }
@@ -7356,6 +7433,22 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
     if (abiAlwaysInlinerEnabled()) {
       MPM.addPass(llvm::AlwaysInlinerPass());
     }
+  }
+
+  // Final standalone outputs can still carry direct loads from read-only image
+  // data (for example kRoundConstants in compact wrappers). Re-run binary-aware
+  // constant folding here so final output cleanup can materialize those loads
+  // even after earlier passes have reshaped the output-root closure.
+  if (!envDisabled("OMILL_SKIP_LATE_CONST_MEMORY_FOLD")) {
+    MPM.addPass(
+        llvm::RequireAnalysisPass<BinaryMemoryAnalysis, llvm::Module>());
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(ConstantMemoryFoldingPass());
+    FPM.addPass(RecoverGlobalTypesPass());
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::GVNPass());
+    FPM.addPass(llvm::InstCombinePass());
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
   // Eliminate calls to unresolved remill-signature semantic functions.

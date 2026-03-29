@@ -318,6 +318,8 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
 
   auto is_terminal_frontier =
       [&](const VirtualRootSliceSummary::FrontierEdge &frontier) {
+        const bool has_image_context =
+            binary_memory.imageBase() != 0 && binary_memory.imageSize() != 0;
         switch (frontier.kind) {
           case VirtualRootFrontierKind::kCall:
             return frontier.reason == "call_target_import_pointer" ||
@@ -334,13 +336,18 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
               return false;
             if (!frontier.canonical_target_va.has_value() &&
                 !frontier.target_pc.has_value()) {
-              return true;
+              return has_image_context;
             }
+            if (!has_image_context)
+              return false;
             if (frontier.canonical_target_va.has_value()) {
-              return !isTargetExecutable(binary_memory,
+              return !isTargetMapped(binary_memory,
+                                     *frontier.canonical_target_va) ||
+                     !isTargetExecutable(binary_memory,
                                          *frontier.canonical_target_va);
             }
-            return !isTargetExecutable(binary_memory, *frontier.target_pc);
+            return !isTargetMapped(binary_memory, *frontier.target_pc) ||
+                   !isTargetExecutable(binary_memory, *frontier.target_pc);
         }
         return false;
       };

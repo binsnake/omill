@@ -13,7 +13,15 @@ LocalCallSiteState computeLocalFactsBeforeCall(
     const std::map<unsigned, VirtualValueExpr> &base_slot_facts,
     const std::map<unsigned, VirtualValueExpr> &base_stack_facts,
     const std::map<unsigned, VirtualValueExpr> &caller_argument_map) {
-  LocalCallSiteState state{base_slot_facts, base_stack_facts};
+  LocalCallSiteState state;
+  for (const auto &[slot_id, value] : base_slot_facts) {
+    if (!isUnknownLikeExpr(value))
+      state.slot_facts.emplace(slot_id, value);
+  }
+  for (const auto &[cell_id, value] : base_stack_facts) {
+    if (!isUnknownLikeExpr(value))
+      state.stack_facts.emplace(cell_id, value);
+  }
   auto *block = call.getParent();
   if (!block)
     return state;
@@ -58,7 +66,15 @@ LocalCallSiteState computeLocalFactsBeforeCall(
         auto slot_id = lookupSlotIdForSummary(*slot, slot_ids);
         if (!slot_id)
           continue;
-        state.slot_facts[*slot_id] = record_value(store->getValueOperand());
+        auto value = record_value(store->getValueOperand());
+        vmModelImportDebugLog("precall-slot-store caller=" + caller_name +
+                              " callee=" + callee_name + " slot=" +
+                              std::to_string(*slot_id) + " expr=" +
+                              renderVirtualValueExpr(value));
+        if (isUnknownLikeExpr(value))
+          state.slot_facts.erase(*slot_id);
+        else
+          state.slot_facts[*slot_id] = std::move(value);
         continue;
       }
       auto pointer_expr = summarizeValueExpr(store->getPointerOperand(), dl);
@@ -68,7 +84,15 @@ LocalCallSiteState computeLocalFactsBeforeCall(
         auto cell_id = lookupStackCellIdForSummary(*cell, stack_cell_ids);
         if (!cell_id)
           continue;
-        state.stack_facts[*cell_id] = record_value(store->getValueOperand());
+        auto value = record_value(store->getValueOperand());
+        vmModelImportDebugLog("precall-cell-store caller=" + caller_name +
+                              " callee=" + callee_name + " cell=" +
+                              std::to_string(*cell_id) + " expr=" +
+                              renderVirtualValueExpr(value));
+        if (isUnknownLikeExpr(value))
+          state.stack_facts.erase(*cell_id);
+        else
+          state.stack_facts[*cell_id] = std::move(value);
       }
       continue;
     }
@@ -88,7 +112,15 @@ LocalCallSiteState computeLocalFactsBeforeCall(
       auto cell_id = lookupStackCellIdForSummary(*cell, stack_cell_ids);
       if (!cell_id)
         continue;
-      state.stack_facts[*cell_id] = record_value(cb->getArgOperand(2));
+      auto value = record_value(cb->getArgOperand(2));
+      vmModelImportDebugLog("precall-write-memory caller=" + caller_name +
+                            " callee=" + callee_name + " cell=" +
+                            std::to_string(*cell_id) + " expr=" +
+                            renderVirtualValueExpr(value));
+      if (isUnknownLikeExpr(value))
+        state.stack_facts.erase(*cell_id);
+      else
+        state.stack_facts[*cell_id] = std::move(value);
     }
   }
 
@@ -110,9 +142,20 @@ VirtualValueExpr summarizeSpecializedCallArg(
   if (arg_index >= call.arg_size())
     return VirtualValueExpr{};
   auto expr = summarizeValueExpr(call.getArgOperand(arg_index), dl);
-  return specializeExprToFixpoint(expr, caller_outgoing, &caller_outgoing_stack,
-                                  &caller_argument_map, slot_ids,
-                                  stack_cell_ids);
+  auto specialized = specializeExprToFixpoint(expr, caller_outgoing,
+                                              &caller_outgoing_stack,
+                                              &caller_argument_map, slot_ids,
+                                              stack_cell_ids);
+  if (call.getCalledFunction()) {
+    auto caller_name = call.getFunction() ? call.getFunction()->getName().str()
+                                          : std::string("<null>");
+    vmModelImportDebugLog("call-arg-raw caller=" + caller_name + " callee=" +
+                          call.getCalledFunction()->getName().str() + " arg=" +
+                          std::to_string(arg_index) + " raw=" +
+                          renderVirtualValueExpr(expr) + " specialized=" +
+                          renderVirtualValueExpr(specialized));
+  }
+  return specialized;
 }
 
 std::map<unsigned, VirtualValueExpr> buildSpecializedCallArgumentMap(

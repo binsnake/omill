@@ -18,6 +18,59 @@
 
 namespace omill::virtual_model::detail {
 
+namespace {
+
+static std::optional<std::pair<VirtualValueExpr, int64_t>>
+stripConstantAddSubChain(const VirtualValueExpr &expr) {
+  if ((expr.kind != VirtualExprKind::kAdd &&
+       expr.kind != VirtualExprKind::kSub) ||
+      expr.operands.size() != 2) {
+    return std::make_pair(expr, int64_t{0});
+  }
+
+  auto accumulate = [&](const VirtualValueExpr &base,
+                        uint64_t raw_delta) -> std::optional<
+      std::pair<VirtualValueExpr, int64_t>> {
+    auto nested = stripConstantAddSubChain(base);
+    if (!nested)
+      return std::nullopt;
+    int64_t delta = static_cast<int64_t>(raw_delta);
+    if (expr.kind == VirtualExprKind::kSub)
+      delta = -delta;
+    nested->second += delta;
+    return nested;
+  };
+
+  if (expr.operands[1].constant.has_value())
+    return accumulate(expr.operands[0], *expr.operands[1].constant);
+  if (expr.kind == VirtualExprKind::kAdd &&
+      expr.operands[0].constant.has_value())
+    return accumulate(expr.operands[1], *expr.operands[0].constant);
+
+  return std::make_pair(expr, int64_t{0});
+}
+
+static VirtualValueExpr rebuildAddSubChain(const VirtualValueExpr &base,
+                                           int64_t delta,
+                                           unsigned result_bits) {
+  VirtualValueExpr rebuilt = base;
+  rebuilt.bit_width = result_bits;
+  if (delta == 0)
+    return rebuilt;
+
+  VirtualValueExpr expr;
+  expr.kind = delta >= 0 ? VirtualExprKind::kAdd : VirtualExprKind::kSub;
+  expr.bit_width = result_bits;
+  expr.complete = rebuilt.complete;
+  expr.operands.push_back(rebuilt);
+  expr.operands.push_back(
+      constantExpr(static_cast<uint64_t>(delta >= 0 ? delta : -delta),
+                   result_bits));
+  return expr;
+}
+
+}  // namespace
+
 static std::optional<BooleanSlotExprKey> booleanSlotExprKeyForExpr(
     const VirtualValueExpr &expr) {
   if (expr.kind != VirtualExprKind::kStateSlot || !expr.state_base_name ||
@@ -212,7 +265,7 @@ bool collectEvaluatedTargetChoices(
                                            boolean_slot_expr_keys,
                                            visiting_slots, visiting_cells, pcs,
                                            /*depth=*/0, binary_memory) &&
-         pcs.size() >= 2;
+         !pcs.empty();
 }
 
 static bool collectEvaluatedValueChoicesImpl(
@@ -513,21 +566,30 @@ VirtualValueExpr specializeExpr(
   if (expr.kind == VirtualExprKind::kArgument &&
       expr.argument_index.has_value() && incoming_args) {
     auto it = incoming_args->find(*expr.argument_index);
-    if (it != incoming_args->end())
+    if (it != incoming_args->end()) {
+      if (isUnknownLikeExpr(it->second))
+        return expr;
       return it->second;
+    }
     return expr;
   }
   if (expr.kind == VirtualExprKind::kStateSlot && expr.slot_id.has_value()) {
     auto it = incoming.find(*expr.slot_id);
-    if (it != incoming.end())
+    if (it != incoming.end()) {
+      if (isUnknownLikeExpr(it->second))
+        return expr;
       return it->second;
+    }
     return expr;
   }
   if (expr.kind == VirtualExprKind::kStackCell && expr.stack_cell_id.has_value() &&
       incoming_stack) {
     auto it = incoming_stack->find(*expr.stack_cell_id);
-    if (it != incoming_stack->end())
+    if (it != incoming_stack->end()) {
+      if (isUnknownLikeExpr(it->second))
+        return expr;
       return it->second;
+    }
     return expr;
   }
 
@@ -584,10 +646,20 @@ VirtualValueExpr specializeExpr(
     case VirtualExprKind::kAdd:
       if (auto folded = fold_binary([](uint64_t a, uint64_t b) { return a + b; }))
         return *folded;
+      if (auto stripped = stripConstantAddSubChain(result)) {
+        if (stripped->second != 0 || !exprEquals(stripped->first, result))
+          return rebuildAddSubChain(stripped->first, stripped->second,
+                                    result.bit_width);
+      }
       break;
     case VirtualExprKind::kSub:
       if (auto folded = fold_binary([](uint64_t a, uint64_t b) { return a - b; }))
         return *folded;
+      if (auto stripped = stripConstantAddSubChain(result)) {
+        if (stripped->second != 0 || !exprEquals(stripped->first, result))
+          return rebuildAddSubChain(stripped->first, stripped->second,
+                                    result.bit_width);
+      }
       break;
     case VirtualExprKind::kMul:
       if (auto folded = fold_binary([](uint64_t a, uint64_t b) { return a * b; }))

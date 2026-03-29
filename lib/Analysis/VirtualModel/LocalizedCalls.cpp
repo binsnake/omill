@@ -496,6 +496,10 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeCallsiteLocalizedOutgoingFa
   log_localization_step("stack-liveins-done");
 
   for (const auto &[arg_index, specialized] : specialized_call_args) {
+    vmModelImportDebugLog("specialized-call-arg callee=" +
+                          callee_fn->getName().str() + " arg=" +
+                          std::to_string(arg_index) + " expr=" +
+                          renderVirtualValueExpr(specialized));
     if (!isBoundedArgumentFactExpr(specialized))
       continue;
     mergeFactIntoMap(callee_incoming_args, arg_index, specialized);

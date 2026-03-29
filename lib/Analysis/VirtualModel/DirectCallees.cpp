@@ -9,6 +9,102 @@ namespace omill::virtual_model::detail {
 
 namespace {
 
+static bool slotSummaryMatchesInfo(const VirtualStateSlotSummary &summary,
+                                   const VirtualStateSlotInfo &info) {
+  return summary.base_name == info.base_name &&
+         summary.offset == info.offset &&
+         summary.width == info.width &&
+         summary.from_argument == info.from_argument &&
+         summary.from_alloca == info.from_alloca;
+}
+
+static bool stackCellSummaryMatchesInfo(const VirtualStackCellSummary &summary,
+                                        const VirtualStackCellInfo &info) {
+  return summary.base_name == info.base_name &&
+         summary.base_offset == info.base_offset &&
+         summary.base_width == info.base_width &&
+         summary.base_from_argument == info.base_from_argument &&
+         summary.base_from_alloca == info.base_from_alloca &&
+         summary.offset == info.cell_offset && summary.width == info.width;
+}
+
+static std::optional<VirtualValueExpr> structurallySpecializeHelperExpr(
+    const VirtualValueExpr &expr, llvm::ArrayRef<VirtualSlotFact> slot_facts,
+    llvm::ArrayRef<VirtualStackFact> stack_facts,
+    const std::map<unsigned, const VirtualStateSlotInfo *> &slot_info,
+    const std::map<unsigned, const VirtualStackCellInfo *> &stack_cell_info) {
+  if (expr.kind == VirtualExprKind::kStateSlot) {
+    if (auto summary = extractStateSlotSummaryFromExpr(expr, slot_info)) {
+      for (const auto &fact : slot_facts) {
+        auto it = slot_info.find(fact.slot_id);
+        if (it == slot_info.end() ||
+            !slotSummaryMatchesInfo(*summary, *it->second)) {
+          continue;
+        }
+        return castExprToBitWidth(fact.value, expr.bit_width);
+      }
+    }
+  } else if (expr.kind == VirtualExprKind::kStackCell) {
+    if (auto summary = extractStackCellSummaryFromExpr(expr, exprByteWidth(expr))) {
+      for (const auto &fact : stack_facts) {
+        auto it = stack_cell_info.find(fact.cell_id);
+        if (it == stack_cell_info.end() ||
+            !stackCellSummaryMatchesInfo(*summary, *it->second)) {
+          continue;
+        }
+        return castExprToBitWidth(fact.value, expr.bit_width);
+      }
+    }
+  }
+
+  bool changed = false;
+  VirtualValueExpr specialized = expr;
+  specialized.operands.clear();
+  for (const auto &operand : expr.operands) {
+    if (auto rewritten = structurallySpecializeHelperExpr(
+            operand, slot_facts, stack_facts, slot_info, stack_cell_info)) {
+      specialized.operands.push_back(*rewritten);
+      changed = true;
+    } else {
+      specialized.operands.push_back(operand);
+    }
+  }
+  if (!changed)
+    return std::nullopt;
+  return specialized;
+}
+
+static bool exprContainsStackCellBasedOnSlot(
+    const VirtualValueExpr &expr, const VirtualStateSlotInfo &slot_info) {
+  if (auto summary =
+          extractStackCellSummaryFromExpr(expr, exprByteWidth(expr))) {
+    if (summary->base_name == slot_info.base_name &&
+        summary->base_offset == slot_info.offset &&
+        summary->base_width == slot_info.width &&
+        summary->base_from_argument == slot_info.from_argument &&
+        summary->base_from_alloca == slot_info.from_alloca) {
+      return true;
+    }
+  }
+  for (const auto &operand : expr.operands) {
+    if (exprContainsStackCellBasedOnSlot(operand, slot_info))
+      return true;
+  }
+  return false;
+}
+
+static bool exprContainsSlotId(const VirtualValueExpr &expr, unsigned slot_id) {
+  if (expr.kind == VirtualExprKind::kStateSlot && expr.slot_id.has_value() &&
+      *expr.slot_id == slot_id) {
+    return true;
+  }
+  for (const auto &operand : expr.operands) {
+    if (exprContainsSlotId(operand, slot_id))
+      return true;
+  }
+  return false;
+}
+
 static llvm::SmallVector<unsigned, 4> collectRequiredSpecializedCallArgIndices(
     const VirtualHandlerSummary &callee_summary,
     const std::map<unsigned, const VirtualStateSlotInfo *> &slot_info,
@@ -534,6 +630,16 @@ bool applySingleDirectCalleeEffects(
                        " callee=" + callee->getName().str() +
                        " step=localized-callsite-done success=" +
                        llvm::Twine(localized_outgoing.has_value()).str());
+  if (localized_outgoing) {
+    vmModelImportDebugLog("callsite-local summary call=" +
+                          callee->getName().str() + " slots=" +
+                          std::to_string(localized_outgoing->outgoing_slots.size()) +
+                          " stack=" +
+                          std::to_string(localized_outgoing->outgoing_stack.size()) +
+                          " structural=" +
+                          std::to_string(
+                              localized_outgoing->structural_outgoing_stack.size()));
+  }
   const auto &callee_outgoing_map =
       localized_outgoing ? localized_outgoing->outgoing_slots
                          : outgoing_maps[callee_it->second];
@@ -594,35 +700,84 @@ bool applySingleDirectCalleeEffects(
     vmModelImportDebugLog("slot-import before call=" + callee->getName().str() +
                           " expr=" + renderVirtualValueExpr(callee_value) +
                           " remapped=" + renderVirtualValueExpr(remapped));
+    auto effective_caller_outgoing_stack =
+        rebaseOutgoingStackFacts(model, caller_outgoing, caller_outgoing_stack);
+    auto effective_slot_facts = slotFactsForMap(caller_outgoing);
+    auto effective_stack_facts = stackFactsForMap(effective_caller_outgoing_stack);
     auto specialized =
         localized_outgoing
             ? normalizeLocalizedExprForCaller(
                   callee_value, caller_fn, slot_ids, stack_cell_ids,
-                  caller_outgoing, caller_outgoing_stack,
+                  caller_outgoing, effective_caller_outgoing_stack,
                   &caller_structural_outgoing_stack, caller_argument_map)
             : normalizeImportedExprForCaller(
                   callee_value, call, slot_info, stack_cell_info, slot_ids,
-                  stack_cell_ids, dl, caller_outgoing, caller_outgoing_stack,
+                  stack_cell_ids, dl, caller_outgoing,
+                  effective_caller_outgoing_stack,
                   &caller_structural_outgoing_stack, caller_argument_map);
     if (localized_outgoing && specialized.has_value() &&
         containsArgumentExpr(*specialized)) {
       if (auto remapped = normalizeImportedExprForCaller(
               callee_value, call, slot_info, stack_cell_info, slot_ids,
-              stack_cell_ids, dl, caller_outgoing, caller_outgoing_stack,
+              stack_cell_ids, dl, caller_outgoing,
+              effective_caller_outgoing_stack,
               &caller_structural_outgoing_stack, caller_argument_map)) {
-        specialized = std::move(remapped);
+          specialized = std::move(remapped);
       }
+    }
+    if (localized_outgoing &&
+        (!specialized.has_value() ||
+         isUnknownLikeExpr(*specialized) ||
+         !isBoundedLocalizedTransferExpr(*specialized)) &&
+        isBoundedLocalizedTransferExpr(remapped)) {
+      specialized = remapped;
+    }
+    if (localized_outgoing &&
+        (!specialized.has_value() ||
+         isUnknownLikeExpr(*specialized) ||
+         !isBoundedLocalizedTransferExpr(*specialized))) {
+      specialized = remapped;
     }
     if (localized_outgoing &&
         (!specialized.has_value() ||
          (specialized.has_value() &&
           (isUnknownLikeExpr(*specialized) ||
            !isBoundedLocalizedTransferExpr(*specialized))))) {
-      if (auto remapped = normalizeImportedExprForCaller(
+      if (auto imported = normalizeImportedExprForCaller(
               callee_value, call, slot_info, stack_cell_info, slot_ids,
-              stack_cell_ids, dl, caller_outgoing, caller_outgoing_stack,
+              stack_cell_ids, dl, caller_outgoing,
+              effective_caller_outgoing_stack,
               &caller_structural_outgoing_stack, caller_argument_map)) {
-        specialized = std::move(remapped);
+        if (!specialized.has_value() || isUnknownLikeExpr(*specialized) ||
+            !isBoundedLocalizedTransferExpr(*specialized)) {
+          if (!isUnknownLikeExpr(*imported) &&
+              isBoundedLocalizedTransferExpr(*imported)) {
+            specialized = std::move(imported);
+          }
+        }
+      }
+    }
+    if (specialized.has_value() &&
+        (containsStackCellExpr(*specialized) || containsStateSlotExpr(*specialized))) {
+      if (auto structural = structurallySpecializeHelperExpr(
+              *specialized, effective_slot_facts, effective_stack_facts,
+              slot_info, stack_cell_info)) {
+        specialized = std::move(structural);
+      }
+    }
+    if (localized_outgoing &&
+        (!specialized.has_value() || isUnknownLikeExpr(*specialized) ||
+         !isBoundedLocalizedTransferExpr(*specialized)) &&
+        isBoundedLocalizedTransferExpr(remapped)) {
+      specialized = remapped;
+    }
+    if (specialized.has_value() && containsStackCellExpr(*specialized)) {
+      auto mapped_slot_info_it = slot_info.find(*mapped_slot_id);
+      if (mapped_slot_info_it != slot_info.end() &&
+          (exprContainsStackCellBasedOnSlot(*specialized,
+                                            *mapped_slot_info_it->second) ||
+           exprContainsSlotId(remapped, *mapped_slot_id))) {
+        specialized = remapped;
       }
     }
     bool acceptable =
@@ -690,12 +845,39 @@ bool applySingleDirectCalleeEffects(
   for (const auto &[callee_cell_id, callee_value] : callee_outgoing_stack_map) {
     if (!written_stack_cells.empty() &&
         !written_stack_cells.count(callee_cell_id)) {
+      vmModelImportDebugLog("stack-import skip call=" + callee->getName().str() +
+                            " reason=not-written cell=" +
+                            std::to_string(callee_cell_id));
       continue;
     }
     auto cell_info_it = stack_cell_info.find(callee_cell_id);
-    if (cell_info_it == stack_cell_info.end())
+    if (cell_info_it == stack_cell_info.end()) {
+      vmModelImportDebugLog("stack-import skip call=" + callee->getName().str() +
+                            " reason=missing-cell-info cell=" +
+                            std::to_string(callee_cell_id));
       continue;
+    }
     std::optional<unsigned> mapped_cell_id;
+    std::optional<StackCellKey> mapped_structural_key;
+    auto validate_exact_mapped_cell =
+        [&](const VirtualStackCellSummary &mapped_cell) {
+          if (!mapped_cell_id)
+            return;
+          auto mapped_info_it = stack_cell_info.find(*mapped_cell_id);
+          if (mapped_info_it == stack_cell_info.end() ||
+              mapped_info_it->second->base_name != mapped_cell.base_name ||
+              mapped_info_it->second->base_offset != mapped_cell.base_offset ||
+              mapped_info_it->second->base_width != mapped_cell.base_width ||
+              mapped_info_it->second->base_from_argument !=
+                  mapped_cell.base_from_argument ||
+              mapped_info_it->second->base_from_alloca !=
+                  mapped_cell.base_from_alloca ||
+              mapped_info_it->second->cell_offset != mapped_cell.offset ||
+              mapped_info_it->second->width != mapped_cell.width) {
+            mapped_structural_key = stackCellKeyForSummary(mapped_cell);
+            mapped_cell_id.reset();
+          }
+        };
     if (auto arg_index = parseArgumentBaseName(cell_info_it->second->base_name);
         !mapped_cell_id && arg_index) {
       if (auto expr_it = specialized_call_args.find(*arg_index);
@@ -713,25 +895,60 @@ bool applySingleDirectCalleeEffects(
           mapped_cell.width = cell_info_it->second->width;
           mapped_cell_id =
               lookupStackCellIdForSummary(mapped_cell, stack_cell_ids);
+          validate_exact_mapped_cell(mapped_cell);
+          if (!mapped_cell_id)
+            mapped_structural_key = stackCellKeyForSummary(mapped_cell);
         } else if (auto actual_cell = extractStackCellSummaryFromExpr(
                        expr_it->second, cell_info_it->second->width)) {
           VirtualStackCellSummary mapped_cell = *actual_cell;
           mapped_cell.base_offset += cell_info_it->second->base_offset;
           mapped_cell.offset += cell_info_it->second->cell_offset;
           mapped_cell.width = cell_info_it->second->width;
+          vmModelImportDebugLog(
+              "stack-import map-attempt call=" + callee->getName().str() +
+              " callee_cell_base=" + cell_info_it->second->base_name + "+" +
+              std::to_string(cell_info_it->second->base_offset) +
+              " callee_cell_off=" +
+              std::to_string(cell_info_it->second->cell_offset) +
+              " actual_expr=" + renderVirtualValueExpr(expr_it->second) +
+              " mapped_base=" + mapped_cell.base_name + "+" +
+              std::to_string(mapped_cell.base_offset) + " mapped_off=" +
+              std::to_string(mapped_cell.offset));
           mapped_cell_id =
               lookupStackCellIdForSummary(mapped_cell, stack_cell_ids);
+          validate_exact_mapped_cell(mapped_cell);
+          if (mapped_cell_id)
+            vmModelImportDebugLog("stack-import map-hit call=" +
+                                  callee->getName().str() + " mapped_cell_id=" +
+                                  std::to_string(*mapped_cell_id));
+          if (!mapped_cell_id)
+            mapped_structural_key = stackCellKeyForSummary(mapped_cell);
         }
       }
     }
-    if (!mapped_cell_id) {
+    if (!mapped_cell_id && !mapped_structural_key) {
+      if (localized_outgoing &&
+          stack_cell_info.find(callee_cell_id) != stack_cell_info.end()) {
+        mapped_cell_id = callee_cell_id;
+      }
+    }
+    if (!mapped_cell_id && !mapped_structural_key) {
       mapped_cell_id = lookupMappedCallerStackCellId(
           call, *cell_info_it->second, slot_ids, stack_cell_ids, dl);
     }
-    if (!mapped_cell_id)
+    if (!mapped_cell_id && !mapped_structural_key) {
+      vmModelImportDebugLog("stack-import skip call=" + callee->getName().str() +
+                            " reason=no-mapped-cell cell=" +
+                            std::to_string(callee_cell_id));
       continue;
-    if (!relevant_caller_stack_cell_ids.empty() &&
+    }
+    if (!localized_outgoing && mapped_cell_id &&
+        !relevant_caller_stack_cell_ids.empty() &&
         !containsSortedId(relevant_caller_stack_cell_ids, *mapped_cell_id)) {
+      vmModelImportDebugLog("stack-import skip call=" + callee->getName().str() +
+                            " reason=irrelevant-mapped-cell cell=" +
+                            std::to_string(callee_cell_id) + " mapped=" +
+                            std::to_string(*mapped_cell_id));
       continue;
     }
 
@@ -741,36 +958,76 @@ bool applySingleDirectCalleeEffects(
     vmModelImportDebugLog("stack-import before call=" + callee->getName().str() +
                           " expr=" + renderVirtualValueExpr(callee_value) +
                           " remapped=" + renderVirtualValueExpr(remapped));
+    auto effective_caller_outgoing_stack =
+        rebaseOutgoingStackFacts(model, caller_outgoing, caller_outgoing_stack);
+    auto effective_slot_facts = slotFactsForMap(caller_outgoing);
+    auto effective_stack_facts = stackFactsForMap(effective_caller_outgoing_stack);
     auto specialized =
         localized_outgoing
             ? normalizeLocalizedExprForCaller(
                   callee_value, caller_fn, slot_ids, stack_cell_ids,
-                  caller_outgoing, caller_outgoing_stack,
+                  caller_outgoing, effective_caller_outgoing_stack,
                   &caller_structural_outgoing_stack, caller_argument_map)
             : normalizeImportedExprForCaller(
                   callee_value, call, slot_info, stack_cell_info, slot_ids,
-                  stack_cell_ids, dl, caller_outgoing, caller_outgoing_stack,
+                  stack_cell_ids, dl, caller_outgoing,
+                  effective_caller_outgoing_stack,
                   &caller_structural_outgoing_stack, caller_argument_map);
     if (localized_outgoing && specialized.has_value() &&
         containsArgumentExpr(*specialized)) {
       if (auto remapped = normalizeImportedExprForCaller(
               callee_value, call, slot_info, stack_cell_info, slot_ids,
-              stack_cell_ids, dl, caller_outgoing, caller_outgoing_stack,
+              stack_cell_ids, dl, caller_outgoing,
+              effective_caller_outgoing_stack,
               &caller_structural_outgoing_stack, caller_argument_map)) {
-        specialized = std::move(remapped);
+          specialized = std::move(remapped);
       }
+    }
+    if (localized_outgoing &&
+        (!specialized.has_value() ||
+         isUnknownLikeExpr(*specialized) ||
+         !isBoundedLocalizedTransferExpr(*specialized)) &&
+        isBoundedLocalizedTransferExpr(remapped)) {
+      specialized = remapped;
+    }
+    if (localized_outgoing &&
+        (!specialized.has_value() ||
+         isUnknownLikeExpr(*specialized) ||
+         !isBoundedLocalizedTransferExpr(*specialized))) {
+      specialized = remapped;
     }
     if (localized_outgoing &&
         (!specialized.has_value() ||
          (specialized.has_value() &&
           (isUnknownLikeExpr(*specialized) ||
            !isBoundedLocalizedTransferExpr(*specialized))))) {
-      if (auto remapped = normalizeImportedExprForCaller(
+      if (auto imported = normalizeImportedExprForCaller(
               callee_value, call, slot_info, stack_cell_info, slot_ids,
-              stack_cell_ids, dl, caller_outgoing, caller_outgoing_stack,
+              stack_cell_ids, dl, caller_outgoing,
+              effective_caller_outgoing_stack,
               &caller_structural_outgoing_stack, caller_argument_map)) {
-        specialized = std::move(remapped);
+        if (!specialized.has_value() || isUnknownLikeExpr(*specialized) ||
+            !isBoundedLocalizedTransferExpr(*specialized)) {
+          if (!isUnknownLikeExpr(*imported) &&
+              isBoundedLocalizedTransferExpr(*imported)) {
+            specialized = std::move(imported);
+          }
+        }
       }
+    }
+    if (specialized.has_value() &&
+        (containsStackCellExpr(*specialized) || containsStateSlotExpr(*specialized))) {
+      if (auto structural = structurallySpecializeHelperExpr(
+              *specialized, effective_slot_facts, effective_stack_facts,
+              slot_info, stack_cell_info)) {
+        specialized = std::move(structural);
+      }
+    }
+    if (localized_outgoing &&
+        (!specialized.has_value() || isUnknownLikeExpr(*specialized) ||
+         !isBoundedLocalizedTransferExpr(*specialized)) &&
+        isBoundedLocalizedTransferExpr(remapped)) {
+      specialized = remapped;
     }
     bool acceptable =
         specialized.has_value() &&
@@ -778,6 +1035,26 @@ bool applySingleDirectCalleeEffects(
                             : isBoundedStateProvenanceExpr(*specialized));
     if (!specialized.has_value() || isUnknownLikeExpr(*specialized) ||
         !acceptable) {
+      std::string reason = !specialized.has_value()
+                               ? "no-specialized"
+                               : (isUnknownLikeExpr(*specialized) ? "unknown"
+                                                                  : "unbounded");
+      vmModelImportDebugLog("stack-import skip call=" + callee->getName().str() +
+                            " reason=" + reason + " cell=" +
+                            std::to_string(callee_cell_id) + " expr=" +
+                            renderVirtualValueExpr(callee_value));
+      continue;
+    }
+    if (!mapped_cell_id && mapped_structural_key) {
+      auto existing = caller_structural_outgoing_stack.find(*mapped_structural_key);
+      if (existing == caller_structural_outgoing_stack.end() ||
+          !exprEquals(existing->second, *specialized)) {
+        vmModelImportDebugLog("structural-stack-import after call=" +
+                              callee->getName().str() + " expr=" +
+                              renderVirtualValueExpr(*specialized));
+        caller_structural_outgoing_stack[*mapped_structural_key] =
+            std::move(*specialized);
+      }
       continue;
     }
     auto existing = caller_outgoing_stack.find(*mapped_cell_id);
@@ -817,8 +1094,21 @@ bool applySingleDirectCalleeEffects(
         continue;
       auto specialized = normalizeLocalizedExprForCaller(
           callee_value, caller_fn, slot_ids, stack_cell_ids, caller_outgoing,
-          caller_outgoing_stack, &caller_structural_outgoing_stack,
+          rebaseOutgoingStackFacts(model, caller_outgoing, caller_outgoing_stack),
+          &caller_structural_outgoing_stack,
           caller_argument_map);
+      auto structural_stack_map =
+          rebaseOutgoingStackFacts(model, caller_outgoing, caller_outgoing_stack);
+      auto structural_slot_facts = slotFactsForMap(caller_outgoing);
+      auto structural_stack_facts = stackFactsForMap(structural_stack_map);
+      if (specialized.has_value() &&
+          (containsStackCellExpr(*specialized) || containsStateSlotExpr(*specialized))) {
+        if (auto structural = structurallySpecializeHelperExpr(
+                *specialized, structural_slot_facts, structural_stack_facts,
+                slot_info, stack_cell_info)) {
+          specialized = std::move(structural);
+        }
+      }
       if (!specialized.has_value() ||
           (specialized.has_value() && containsArgumentExpr(*specialized))) {
         if (auto remapped = normalizeImportedExprForCaller(
@@ -897,8 +1187,8 @@ void applyDirectCalleeEffectsImpl(
                            " step=resolve-begin");
 
       auto local_state = computeLocalFactsBeforeCall(
-          *call, dl, slot_ids, stack_cell_ids,
-          /*base_slot_facts=*/{}, /*base_stack_facts=*/{}, caller_argument_map);
+          *call, dl, slot_ids, stack_cell_ids, caller_outgoing,
+          caller_outgoing_stack, caller_argument_map);
       auto callsite = resolveCallSiteInfo(
           *call, dl, slot_ids, stack_cell_ids, local_state.slot_facts,
           local_state.stack_facts, caller_argument_map);
@@ -952,8 +1242,21 @@ void applyDirectCalleeEffectsImpl(
         }
         auto specialized = normalizeLocalizedExprForCaller(
             value, caller_fn, slot_ids, stack_cell_ids, caller_outgoing,
-            caller_outgoing_stack, &caller_structural_outgoing_stack,
+            rebaseOutgoingStackFacts(model, caller_outgoing, caller_outgoing_stack),
+            &caller_structural_outgoing_stack,
             caller_argument_map);
+        auto structural_stack_map =
+            rebaseOutgoingStackFacts(model, caller_outgoing, caller_outgoing_stack);
+        auto structural_slot_facts = slotFactsForMap(caller_outgoing);
+        auto structural_stack_facts = stackFactsForMap(structural_stack_map);
+        if (specialized.has_value() &&
+            (containsStackCellExpr(*specialized) || containsStateSlotExpr(*specialized))) {
+          if (auto structural = structurallySpecializeHelperExpr(
+                  *specialized, structural_slot_facts, structural_stack_facts,
+                  slot_info, stack_cell_info)) {
+            specialized = std::move(structural);
+          }
+        }
         if (!specialized.has_value() || isUnknownLikeExpr(*specialized) ||
             !isBoundedLocalizedTransferExpr(*specialized)) {
           continue;
@@ -977,14 +1280,27 @@ void applyDirectCalleeEffectsImpl(
             !containsSortedId(relevant_caller_stack_cell_ids, cell_id)) {
           continue;
         }
-        auto specialized = normalizeLocalizedExprForCaller(
-            value, caller_fn, slot_ids, stack_cell_ids, caller_outgoing,
-            caller_outgoing_stack, &caller_structural_outgoing_stack,
-            caller_argument_map);
-        if (!specialized.has_value() || isUnknownLikeExpr(*specialized) ||
-            !isBoundedLocalizedTransferExpr(*specialized)) {
-          continue;
+      auto specialized = normalizeLocalizedExprForCaller(
+          value, caller_fn, slot_ids, stack_cell_ids, caller_outgoing,
+          rebaseOutgoingStackFacts(model, caller_outgoing, caller_outgoing_stack),
+          &caller_structural_outgoing_stack,
+          caller_argument_map);
+      auto structural_stack_map =
+          rebaseOutgoingStackFacts(model, caller_outgoing, caller_outgoing_stack);
+      auto structural_slot_facts = slotFactsForMap(caller_outgoing);
+      auto structural_stack_facts = stackFactsForMap(structural_stack_map);
+      if (specialized.has_value() &&
+          (containsStackCellExpr(*specialized) || containsStateSlotExpr(*specialized))) {
+        if (auto structural = structurallySpecializeHelperExpr(
+                *specialized, structural_slot_facts, structural_stack_facts,
+                slot_info, stack_cell_info)) {
+          specialized = std::move(structural);
         }
+      }
+      if (!specialized.has_value() || isUnknownLikeExpr(*specialized) ||
+          !isBoundedLocalizedTransferExpr(*specialized)) {
+        continue;
+      }
         auto existing = caller_outgoing_stack.find(cell_id);
         if (existing != caller_outgoing_stack.end() &&
             !exprEquals(existing->second, *specialized) &&

@@ -284,6 +284,12 @@ static bool isSyntheticBlockLikeFunctionName(llvm::StringRef name) {
   return name.starts_with("blk_") || name.starts_with("block_");
 }
 
+static bool hasOutputRootOrClosedSliceMarker(const llvm::Function &F) {
+  return F.hasFnAttribute("omill.output_root") ||
+         F.hasFnAttribute("omill.closed_root_slice") ||
+         F.hasFnAttribute("omill.closed_root_slice_root");
+}
+
 static uint64_t extractSyntheticBlockLikePC(llvm::StringRef name) {
   if (name.starts_with("blk_"))
     name = name.drop_front(4);
@@ -296,6 +302,130 @@ static uint64_t extractSyntheticBlockLikePC(llvm::StringRef name) {
   if (name.getAsInteger(16, pc))
     return 0;
   return pc;
+}
+
+static void annotateUnresolvedVmContinuations(llvm::Module &M) {
+  constexpr llvm::StringLiteral kCountAttr =
+      "omill.vm_unresolved_continuation_count";
+  constexpr llvm::StringLiteral kTargetsAttr =
+      "omill.vm_unresolved_continuation_targets";
+  constexpr llvm::StringLiteral kSummaryAttr =
+      "omill.vm_unresolved_continuation_summary";
+  constexpr llvm::StringLiteral kNamedMetadata =
+      "omill.vm_unresolved_continuations";
+
+  auto clearAttrs = [&](llvm::Function &F) {
+    F.removeFnAttr(kCountAttr);
+    F.removeFnAttr(kTargetsAttr);
+    F.removeFnAttr(kSummaryAttr);
+  };
+
+  for (auto &F : M)
+    clearAttrs(F);
+
+  if (auto *named_md = M.getNamedMetadata(kNamedMetadata))
+    named_md->clearOperands();
+  auto *named_md = M.getOrInsertNamedMetadata(kNamedMetadata);
+
+  llvm::DenseMap<llvm::Function *, llvm::SmallVector<std::pair<uint64_t, std::string>, 8>>
+      local_infos;
+
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+        if (!call || call->arg_size() < 2)
+          continue;
+        auto *callee = call->getCalledFunction();
+        if (!callee)
+          continue;
+        auto callee_name = callee->getName();
+        if (callee_name != "__omill_dispatch_call" &&
+            callee_name != "__omill_dispatch_jump") {
+          continue;
+        }
+
+        auto *pc_ci = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+        if (!pc_ci)
+          continue;
+
+        std::string reason =
+            callee_name == "__omill_dispatch_jump" ? "dispatch_jump"
+                                                    : "dispatch_call";
+        if (auto *prev =
+                llvm::dyn_cast_or_null<llvm::CallInst>(call->getPrevNonDebugInstruction())) {
+          if (auto *prev_callee = prev->getCalledFunction()) {
+            if (prev_callee->getName().contains("CALLI"))
+              reason += ":paired_CALLI";
+            else if (prev_callee->getName().contains("JMPI"))
+              reason += ":paired_JMPI";
+          }
+        }
+        local_infos[&F].push_back({pc_ci->getZExtValue(), std::move(reason)});
+      }
+    }
+  }
+
+  auto annotateFunction = [&](llvm::Function &F,
+                              llvm::ArrayRef<std::pair<uint64_t, std::string>> infos) {
+    if (infos.empty())
+      return;
+
+    llvm::SmallVector<std::string, 8> target_parts;
+    llvm::SmallVector<std::string, 8> summary_parts;
+    llvm::SmallDenseSet<uint64_t, 8> seen_targets;
+    for (const auto &[pc, reason] : infos) {
+      if (seen_targets.insert(pc).second)
+        target_parts.push_back(llvm::utohexstr(pc));
+      summary_parts.push_back(reason + "@0x" + llvm::utohexstr(pc));
+    }
+
+    F.addFnAttr(kCountAttr, std::to_string(infos.size()));
+    F.addFnAttr(kTargetsAttr, llvm::join(target_parts, ","));
+    F.addFnAttr(kSummaryAttr, llvm::join(summary_parts, ","));
+
+    llvm::Metadata *ops[] = {
+        llvm::ValueAsMetadata::get(&F),
+        llvm::MDString::get(M.getContext(), std::to_string(infos.size())),
+        llvm::MDString::get(M.getContext(), llvm::join(target_parts, ",")),
+        llvm::MDString::get(M.getContext(), llvm::join(summary_parts, ","))};
+    named_md->addOperand(llvm::MDNode::get(M.getContext(), ops));
+  };
+
+  for (auto &F : M) {
+    if (F.isDeclaration() || !hasOutputRootOrClosedSliceMarker(F))
+      continue;
+
+    llvm::SmallVector<llvm::Function *, 16> worklist = {&F};
+    llvm::SmallPtrSet<llvm::Function *, 16> visited;
+    llvm::SmallVector<std::pair<uint64_t, std::string>, 8> closure_infos;
+
+    while (!worklist.empty()) {
+      auto *current = worklist.pop_back_val();
+      if (!current || current->isDeclaration() || !visited.insert(current).second)
+        continue;
+
+      if (auto it = local_infos.find(current); it != local_infos.end()) {
+        closure_infos.append(it->second.begin(), it->second.end());
+      }
+
+      for (auto &BB : *current) {
+        for (auto &I : BB) {
+          for (llvm::Value *operand : I.operands()) {
+            auto *callee = llvm::dyn_cast<llvm::Function>(operand);
+            if (!callee || callee->isDeclaration())
+              continue;
+            worklist.push_back(callee);
+          }
+        }
+      }
+    }
+
+    annotateFunction(F, closure_infos);
+  }
 }
 
 static std::optional<unsigned> lookupProgramCounterOffset(llvm::Module &M) {
@@ -657,6 +787,18 @@ static bool lowerToDirectCall(llvm::CallInst *dispatch_call, llvm::Function *tar
   if (dispatch_call->arg_size() < 3 || !target_fn)
     return false;
 
+  if (auto *helper_call = llvm::dyn_cast<llvm::CallInst>(dispatch_call->getArgOperand(2))) {
+    if (auto *helper_callee = helper_call->getCalledFunction();
+        helper_callee &&
+        (helper_callee->getName() == "__omill_dispatch_jump" ||
+         helper_callee->getName() == "__omill_dispatch_call") &&
+        helper_call->arg_size() >= 3) {
+      dispatch_call->setArgOperand(2, helper_call->getArgOperand(2));
+      if (helper_call->use_empty())
+        helper_call->eraseFromParent();
+    }
+  }
+
   auto *pc_val = llvm::ConstantInt::get(
       llvm::Type::getInt64Ty(dispatch_call->getContext()), target_pc);
   if (store_pc_to_state) {
@@ -676,6 +818,69 @@ static bool lowerToDirectCall(llvm::CallInst *dispatch_call, llvm::Function *tar
     }
   }
   return true;
+}
+
+static bool lowerTerminalContinuationCallToDirectTarget(
+    llvm::CallInst *continuation_call, const ResolvedTarget &target) {
+  if (!continuation_call || !continuation_call->getParent() ||
+      !target.function)
+    return false;
+  if (continuation_call->arg_size() < 3)
+    return false;
+
+  auto *callee = continuation_call->getCalledFunction();
+  if (!callee || !isSyntheticBlockLikeFunctionName(callee->getName()) ||
+      !hasLiftedSignature(*callee)) {
+    return false;
+  }
+
+  auto *ret = llvm::dyn_cast_or_null<llvm::ReturnInst>(
+      continuation_call->getNextNonDebugInstruction());
+  if (!ret || ret->getReturnValue() != continuation_call)
+    return false;
+
+  llvm::IRBuilder<> builder(continuation_call);
+  maybeStoreProgramCounter(builder, continuation_call->getArgOperand(0), target);
+
+  continuation_call->setCalledFunction(target.function);
+  continuation_call->setArgOperand(
+      1, llvm::ConstantInt::get(llvm::Type::getInt64Ty(builder.getContext()),
+                                target.pc));
+  return true;
+}
+
+static bool hasSyntheticPathTo(llvm::Function *from, llvm::Function *goal) {
+  if (!from || !goal)
+    return false;
+  llvm::SmallVector<llvm::Function *, 16> worklist;
+  llvm::SmallPtrSet<llvm::Function *, 16> visited;
+  worklist.push_back(from);
+  while (!worklist.empty()) {
+    llvm::Function *current = worklist.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    if (current == goal)
+      return true;
+    if (current->isDeclaration())
+      continue;
+    for (auto &BB : *current) {
+      for (auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+        if (!call)
+          continue;
+        auto *callee = call->getCalledFunction();
+        if (!callee || callee->isDeclaration())
+          continue;
+        if (!isSyntheticBlockLikeFunctionName(callee->getName()) &&
+            !hasLiftedSignature(*callee)) {
+          continue;
+        }
+        if (!visited.contains(callee))
+          worklist.push_back(callee);
+      }
+    }
+  }
+  return false;
 }
 
 static bool lowerSelectDispatchToBranches(llvm::CallInst *dispatch_call,
@@ -2220,6 +2425,24 @@ static MaterializationResult runMaterialization(llvm::Module &M,
         collectReachableHandlerNames(final_model, has_root_slices);
     auto reachable_rewrite_functions = collectReachableRewriteFunctionNames(
         M, final_model, reachable_handlers, has_root_slices);
+    std::set<std::string> closed_slice_handlers;
+    if (terminal_boundary_recovery_mode) {
+      for (const auto &slice : final_model.rootSlices()) {
+        if (!slice.is_closed)
+          continue;
+        closed_slice_handlers.insert(slice.reachable_handler_names.begin(),
+                                     slice.reachable_handler_names.end());
+      }
+    }
+    auto is_terminal_recovery_relevant_handler =
+        [&](const VirtualHandlerSummary &summary) {
+          if (summary.is_candidate || summary.is_output_root)
+            return true;
+          if (!terminal_boundary_recovery_mode)
+            return false;
+          return closed_slice_handlers.find(summary.function_name) !=
+                 closed_slice_handlers.end();
+        };
     if (terminal_boundary_recovery_mode &&
         reachable_handlers.size() > max_reachable_handlers) {
       result.diagnostics.push_back(
@@ -2272,6 +2495,14 @@ static MaterializationResult runMaterialization(llvm::Module &M,
               frontier.target_pc.value_or(0));
           if (target_pc == 0)
             continue;
+          genericDebugLog("iteration " + llvm::Twine(iteration).str() +
+                          " frontier-attempt source=" +
+                          frontier.source_handler_name + " kind=" +
+                          (frontier.kind == VirtualRootFrontierKind::kDispatch
+                               ? "dispatch"
+                               : "call") +
+                          " reason=" + frontier.reason + " target=0x" +
+                          llvm::utohexstr(target_pc));
           if (terminal_boundary_recovery_mode &&
               tryAttachExistingLiftedTargetForRecovery(
                   M, target_pc, reachable_handlers, &result.diagnostics)) {
@@ -2407,6 +2638,49 @@ static MaterializationResult runMaterialization(llvm::Module &M,
       }
     }
 
+    bool lifted_terminal_next_pc_target = false;
+    for (auto &F : M) {
+      if (F.isDeclaration())
+        continue;
+      if (has_root_slices &&
+          reachable_rewrite_functions.find(F.getName().str()) ==
+              reachable_rewrite_functions.end()) {
+        continue;
+      }
+
+      const auto *summary = final_model.lookupHandler(F.getName());
+      if (!summary)
+        continue;
+      if (!is_terminal_recovery_relevant_handler(*summary))
+        continue;
+
+      auto target_pc =
+          resolveTerminalNextPcFromFacts(*summary, binary_memory,
+                                         &result.diagnostics);
+      if (!target_pc || !isExecutableTargetAddress(binary_memory, *target_pc))
+        continue;
+
+      auto resolved = resolveTarget(M, binary_memory, final_model,
+                                    F.getFunctionType(), *target_pc,
+                                    &result.diagnostics);
+      if (resolved.function)
+        continue;
+
+      if (!tryLiftTarget(M, AM, *target_pc, failed_lift_targets,
+                         &result.diagnostics))
+        continue;
+      if (terminal_boundary_recovery_mode)
+        markLiftedTargetForRecoverySeed(M, *target_pc, &result.diagnostics);
+      lifted_terminal_next_pc_target = true;
+      result.changed = true;
+      final_model_current = false;
+      genericDebugLog("iteration " + llvm::Twine(iteration).str() +
+                      " terminal-next-pc-lift source=" + F.getName().str() +
+                      " target=0x" + llvm::utohexstr(*target_pc));
+    }
+    if (lifted_terminal_next_pc_target)
+      continue;
+
     struct Candidate {
       llvm::CallInst *call = nullptr;
       llvm::Function *source_fn = nullptr;
@@ -2435,12 +2709,59 @@ static MaterializationResult runMaterialization(llvm::Module &M,
       uint64_t target_pc = 0;
       bool store_pc_to_state = false;
     };
+    struct DeclContinuationCandidate {
+      llvm::CallInst *call = nullptr;
+      llvm::Function *source_fn = nullptr;
+      llvm::Function *target_fn = nullptr;
+      uint64_t target_pc = 0;
+    };
+    struct TerminalJumpCandidate {
+      llvm::CallInst *continuation_call = nullptr;
+      llvm::Function *source_fn = nullptr;
+      ResolvedTarget target;
+    };
 
     llvm::SmallVector<Candidate, 16> candidates;
     llvm::SmallVector<BranchCandidate, 8> branch_candidates;
     llvm::SmallVector<ChoiceCandidate, 8> switch_candidates;
     llvm::SmallVector<MissingCandidate, 8> missing_candidates;
+    llvm::SmallVector<DeclContinuationCandidate, 8> decl_continuation_candidates;
+    llvm::SmallVector<TerminalJumpCandidate, 8> terminal_jump_candidates;
     llvm::SmallPtrSet<llvm::CallInst *, 16> missing_candidate_calls;
+    std::map<std::pair<std::string, unsigned>, ResolvedTarget>
+        dispatch_frontier_overrides;
+    std::map<std::string, ResolvedTarget> sole_dispatch_call_frontier_overrides;
+    if (envFlagEnabled("OMILL_ENABLE_CALL_FRONTIER_DISPATCH_OVERRIDE")) {
+      for (const auto &slice : final_model.rootSlices()) {
+        for (const auto &frontier : slice.frontier_edges) {
+          uint64_t target_pc = frontier.canonical_target_va.value_or(
+              frontier.target_pc.value_or(0));
+          if (!target_pc)
+            continue;
+          auto resolved = resolveTarget(M, binary_memory, final_model, nullptr,
+                                        target_pc, &result.diagnostics);
+          if (!resolved.function)
+            continue;
+          if (frontier.kind == VirtualRootFrontierKind::kDispatch) {
+            dispatch_frontier_overrides[{frontier.source_handler_name,
+                                         frontier.dispatch_index}] = resolved;
+            continue;
+          }
+
+          const auto *source_summary =
+              final_model.lookupHandler(frontier.source_handler_name);
+          if (!source_summary || !source_summary->callsites.empty() ||
+              source_summary->dispatches.size() != 1) {
+            continue;
+          }
+          auto [it, inserted] = sole_dispatch_call_frontier_overrides.emplace(
+              frontier.source_handler_name, resolved);
+          if (!inserted && it->second.pc != resolved.pc) {
+            sole_dispatch_call_frontier_overrides.erase(it);
+          }
+        }
+      }
+    }
 
     auto enqueue_missing_candidate = [&](llvm::CallInst *call,
                                          llvm::Function *source_fn,
@@ -2490,8 +2811,47 @@ static MaterializationResult runMaterialization(llvm::Module &M,
         }
       }
 
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+          if (!call || call->arg_size() < 3)
+            continue;
+          auto *callee = call->getCalledFunction();
+          if (!callee || !callee->isDeclaration() ||
+              !isSyntheticBlockLikeFunctionName(callee->getName()) ||
+              !hasLiftedSignature(*callee)) {
+            continue;
+          }
+          auto *pc_arg =
+              llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+          if (!pc_arg)
+            continue;
+
+          auto resolved =
+              resolveTarget(M, binary_memory, final_model,
+                            call->getFunctionType(), pc_arg->getZExtValue(),
+                            &result.diagnostics);
+          if (!resolved.function || resolved.function == callee ||
+              resolved.function == &F ||
+              resolved.function->getName() == "__remill_missing_block") {
+            continue;
+          }
+          if (has_root_slices &&
+              reachable_rewrite_functions.find(
+                  resolved.function->getName().str()) ==
+                  reachable_rewrite_functions.end()) {
+            continue;
+          }
+          decl_continuation_candidates.push_back(
+              DeclContinuationCandidate{call, &F, resolved.function,
+                                        resolved.pc});
+        }
+      }
+
       const auto *summary = final_model.lookupHandler(F.getName());
       if (!summary)
+        continue;
+      if (!is_terminal_recovery_relevant_handler(*summary))
         continue;
 
       if (auto target_pc = resolveTerminalNextPcFromFacts(*summary, binary_memory,
@@ -2513,6 +2873,36 @@ static MaterializationResult runMaterialization(llvm::Module &M,
             }
           }
         }
+
+        if (resolved.function && resolved.function != &F &&
+            resolved.function->getName() != "__remill_missing_block") {
+          if (has_root_slices &&
+              reachable_rewrite_functions.find(
+                  resolved.function->getName().str()) ==
+                  reachable_rewrite_functions.end()) {
+            if (!lookupHandlerByVA(final_model, resolved.pc)) {
+              continue;
+            }
+          }
+          for (auto &BB : F) {
+            auto *ret = llvm::dyn_cast<llvm::ReturnInst>(BB.getTerminator());
+            if (!ret)
+              continue;
+            auto *call = llvm::dyn_cast_or_null<llvm::CallInst>(
+                ret->getPrevNonDebugInstruction());
+            if (!call || call->getParent() != &BB)
+              continue;
+            auto *callee = call->getCalledFunction();
+            if (!callee || !isSyntheticBlockLikeFunctionName(callee->getName()) ||
+                !hasLiftedSignature(*callee)) {
+              continue;
+            }
+            if (ret->getReturnValue() != call)
+              continue;
+            terminal_jump_candidates.push_back(
+                TerminalJumpCandidate{call, &F, resolved});
+          }
+        }
       }
 
       size_t dispatch_index = 0;
@@ -2530,7 +2920,9 @@ static MaterializationResult runMaterialization(llvm::Module &M,
           if (dispatch_index >= summary->dispatches.size())
             continue;
 
-          const auto &dispatch = summary->dispatches[dispatch_index++];
+          const unsigned current_dispatch_index =
+              static_cast<unsigned>(dispatch_index++);
+          const auto &dispatch = summary->dispatches[current_dispatch_index];
 
           if (auto *select =
                   llvm::dyn_cast<llvm::SelectInst>(call->getArgOperand(1));
@@ -2588,25 +2980,45 @@ static MaterializationResult runMaterialization(llvm::Module &M,
             }
           }
 
-          uint64_t resolved_pc = 0;
-          if (!dispatch.successors.empty()) {
-            const auto &successor = dispatch.successors.front();
-            if (dispatch.successors.size() == 1 && successor.target_pc != 0)
-              resolved_pc = successor.target_pc;
-          }
-          if (!resolved_pc) {
-            if (auto fallback =
-                    resolveDispatchFromFacts(final_model, *summary, dispatch,
-                                             &result.diagnostics)) {
-              resolved_pc = *fallback;
+          ResolvedTarget resolved;
+          if (auto it = dispatch_frontier_overrides.find(
+                  {F.getName().str(), current_dispatch_index});
+              it != dispatch_frontier_overrides.end()) {
+            resolved = it->second;
+            genericDebugLog("iteration " + llvm::Twine(iteration).str() +
+                            " dispatch-frontier-override source=" +
+                            F.getName().str() + " idx=" +
+                            llvm::Twine(current_dispatch_index).str() +
+                            " pc=0x" + llvm::utohexstr(resolved.pc));
+          } else if (auto it = sole_dispatch_call_frontier_overrides.find(
+                         F.getName().str());
+                     it != sole_dispatch_call_frontier_overrides.end()) {
+            resolved = it->second;
+            genericDebugLog("iteration " + llvm::Twine(iteration).str() +
+                            " call-frontier-dispatch-override source=" +
+                            F.getName().str() + " pc=0x" +
+                            llvm::utohexstr(resolved.pc));
+          } else {
+            uint64_t resolved_pc = 0;
+            if (!dispatch.successors.empty()) {
+              const auto &successor = dispatch.successors.front();
+              if (dispatch.successors.size() == 1 && successor.target_pc != 0)
+                resolved_pc = successor.target_pc;
             }
-          }
-          if (!resolved_pc)
-            continue;
+            if (!resolved_pc) {
+              if (auto fallback =
+                      resolveDispatchFromFacts(final_model, *summary, dispatch,
+                                               &result.diagnostics)) {
+                resolved_pc = *fallback;
+              }
+            }
+            if (!resolved_pc)
+              continue;
 
-          auto resolved = resolveTarget(M, binary_memory, final_model,
-                                        call->getFunctionType(), resolved_pc,
-                                        &result.diagnostics);
+            resolved = resolveTarget(M, binary_memory, final_model,
+                                     call->getFunctionType(), resolved_pc,
+                                     &result.diagnostics);
+          }
           const bool self_jump_target =
               resolved.function == &F && name == "__omill_dispatch_jump";
           if (!resolved.function ||
@@ -2620,6 +3032,17 @@ static MaterializationResult runMaterialization(llvm::Module &M,
         }
       }
     }
+
+    genericDebugLog("iteration " + llvm::Twine(iteration).str() +
+                    " candidates dispatch=" +
+                    llvm::Twine(candidates.size()).str() + " branch=" +
+                    llvm::Twine(branch_candidates.size()).str() + " switch=" +
+                    llvm::Twine(switch_candidates.size()).str() + " missing=" +
+                    llvm::Twine(missing_candidates.size()).str() +
+                    " decl-cont=" +
+                    llvm::Twine(decl_continuation_candidates.size()).str() +
+                    " terminal=" +
+                    llvm::Twine(terminal_jump_candidates.size()).str());
 
     bool iteration_changed = false;
     for (const auto &branch_candidate : branch_candidates) {
@@ -2652,9 +3075,24 @@ static MaterializationResult runMaterialization(llvm::Module &M,
     for (const auto &candidate : candidates) {
       if (!candidate.call || !candidate.call->getParent())
         continue;
+      if (candidate.is_jump &&
+          hasSyntheticPathTo(candidate.target_fn, candidate.source_fn)) {
+        genericDebugLog("iteration " + llvm::Twine(iteration).str() +
+                        " skip-jump-cycle source=" +
+                        candidate.source_fn->getName().str() + " target=" +
+                        candidate.target_fn->getName().str() + " pc=0x" +
+                        llvm::utohexstr(candidate.target_pc));
+        continue;
+      }
       if (lowerToDirectCall(candidate.call, candidate.target_fn,
                             candidate.target_pc, candidate.is_jump,
                             candidate.store_pc_to_state)) {
+        genericDebugLog("iteration " + llvm::Twine(iteration).str() +
+                        " dispatch-rewrite source=" +
+                        candidate.source_fn->getName().str() + " target=" +
+                        candidate.target_fn->getName().str() + " pc=0x" +
+                        llvm::utohexstr(candidate.target_pc) + " kind=" +
+                        (candidate.is_jump ? "jump" : "call"));
         result.changed = true;
         iteration_changed = true;
         final_model_current = false;
@@ -2669,11 +3107,68 @@ static MaterializationResult runMaterialization(llvm::Module &M,
       if (lowerToDirectCall(candidate.call, candidate.target_fn,
                             candidate.target_pc, /*is_jump=*/false,
                             candidate.store_pc_to_state)) {
+        genericDebugLog("iteration " + llvm::Twine(iteration).str() +
+                        " missing-rewrite source=" +
+                        candidate.source_fn->getName().str() + " target=" +
+                        candidate.target_fn->getName().str() + " pc=0x" +
+                        llvm::utohexstr(candidate.target_pc));
         result.changed = true;
         iteration_changed = true;
         final_model_current = false;
         ++total_direct_rewrites;
         result.changed_functions.insert(candidate.source_fn);
+      }
+    }
+
+    for (const auto &candidate : decl_continuation_candidates) {
+      if (!candidate.call || !candidate.call->getParent())
+        continue;
+      if (lowerToDirectCall(candidate.call, candidate.target_fn,
+                            candidate.target_pc, /*is_jump=*/false,
+                            /*store_pc_to_state=*/false)) {
+        genericDebugLog("iteration " + llvm::Twine(iteration).str() +
+                        " decl-cont-rewrite source=" +
+                        candidate.source_fn->getName().str() + " target=" +
+                        candidate.target_fn->getName().str() + " pc=0x" +
+                        llvm::utohexstr(candidate.target_pc));
+        result.changed = true;
+        iteration_changed = true;
+        final_model_current = false;
+        ++total_direct_rewrites;
+        result.changed_functions.insert(candidate.source_fn);
+      }
+    }
+
+    for (const auto &candidate : terminal_jump_candidates) {
+      if (!candidate.continuation_call || !candidate.continuation_call->getParent())
+        continue;
+      if (lowerTerminalContinuationCallToDirectTarget(
+              candidate.continuation_call, candidate.target)) {
+        genericDebugLog(
+            "iteration " + llvm::Twine(iteration).str() +
+            " terminal-rewrite source=" +
+            candidate.source_fn->getName().str() + " target=" +
+            candidate.target.function->getName().str() + " pc=0x" +
+            llvm::utohexstr(candidate.target.pc));
+        result.changed = true;
+        iteration_changed = true;
+        final_model_current = false;
+        ++total_direct_rewrites;
+        result.changed_functions.insert(candidate.source_fn);
+        if (&candidate.continuation_call->getParent()->front() !=
+            candidate.continuation_call) {
+          auto *prev =
+              llvm::dyn_cast_or_null<llvm::CallInst>(
+                  candidate.continuation_call->getPrevNonDebugInstruction());
+          if (prev && prev->use_empty()) {
+            auto *prev_callee = prev->getCalledFunction();
+            if (prev_callee &&
+                (prev_callee->getName().contains("JMPI") ||
+                 prev_callee->getName().contains("CALLI"))) {
+              prev->eraseFromParent();
+            }
+          }
+        }
       }
     }
 
@@ -2711,6 +3206,8 @@ static MaterializationResult runMaterialization(llvm::Module &M,
     result.changed = true;
     final_model_current = true;
   }
+
+  annotateUnresolvedVmContinuations(M);
 
   llvm::SmallVector<llvm::Function *, 8> dead_missing_stubs;
   for (auto &F : M) {

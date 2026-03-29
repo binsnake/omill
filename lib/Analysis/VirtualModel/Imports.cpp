@@ -112,9 +112,19 @@ static std::optional<VirtualValueExpr> remapStateSlotExprByShape(
   auto arg_index = parseArgumentBaseName(*expr.state_base_name);
   VirtualStateSlotSummary remapped_slot;
   if (arg_index && *arg_index < call.arg_size()) {
-    if (auto actual_slot = extractStateSlotSummary(
-            call.getArgOperand(*arg_index), exprByteWidth(expr), dl)) {
+    auto *actual_arg = call.getArgOperand(*arg_index);
+    if (auto actual_slot =
+            extractStateSlotSummary(actual_arg, exprByteWidth(expr), dl)) {
       remapped_slot = *actual_slot;
+    } else if (auto actual_expr = summarizeValueExpr(actual_arg, dl);
+               actual_expr.kind == VirtualExprKind::kArgument &&
+               actual_expr.argument_index.has_value()) {
+      remapped_slot.base_name =
+          ("arg" + std::to_string(*actual_expr.argument_index));
+      remapped_slot.offset = 0;
+      remapped_slot.width = exprByteWidth(expr);
+      remapped_slot.from_argument = true;
+      remapped_slot.from_alloca = false;
     } else {
       return std::nullopt;
     }
@@ -190,6 +200,16 @@ static std::optional<VirtualValueExpr> remapStackCellExprByShape(
         remapped_cell.base_from_alloca = actual_cell->base_from_alloca;
         remapped_cell.offset = actual_cell->offset + *expr.stack_offset;
         remapped_cell.width = exprByteWidth(expr);
+      } else if (actual_expr.kind == VirtualExprKind::kArgument &&
+                 actual_expr.argument_index.has_value()) {
+        remapped_cell.base_name =
+            ("arg" + std::to_string(*actual_expr.argument_index));
+        remapped_cell.base_offset = *expr.state_offset;
+        remapped_cell.base_width = base_width;
+        remapped_cell.base_from_argument = true;
+        remapped_cell.base_from_alloca = false;
+        remapped_cell.offset = *expr.stack_offset;
+        remapped_cell.width = exprByteWidth(expr);
       } else {
         return std::nullopt;
       }
@@ -256,6 +276,86 @@ static bool containsInvalidCallerArgumentRelativeState(
   });
 }
 
+static std::optional<int64_t> stackBaseDeltaForExpr(const VirtualValueExpr &expr,
+                                                    unsigned slot_id) {
+  if (expr.kind == VirtualExprKind::kStateSlot && expr.slot_id == slot_id)
+    return 0;
+
+  if ((expr.kind == VirtualExprKind::kAdd || expr.kind == VirtualExprKind::kSub) &&
+      expr.operands.size() == 2) {
+    if (auto nested = stackBaseDeltaForExpr(expr.operands[0], slot_id);
+        nested && expr.operands[1].constant.has_value()) {
+      int64_t delta = static_cast<int64_t>(*expr.operands[1].constant);
+      if (expr.kind == VirtualExprKind::kSub)
+        delta = -delta;
+      return *nested + delta;
+    }
+    if (expr.kind == VirtualExprKind::kAdd &&
+        expr.operands[0].constant.has_value()) {
+      if (auto nested = stackBaseDeltaForExpr(expr.operands[1], slot_id))
+        return *nested + static_cast<int64_t>(*expr.operands[0].constant);
+    }
+  }
+
+  return std::nullopt;
+}
+
+static std::optional<int64_t> findStackBaseDeltaForSlot(
+    const std::map<unsigned, VirtualValueExpr> &slot_facts, unsigned slot_id) {
+  std::optional<int64_t> found_delta;
+  auto consider_delta = [&](const VirtualValueExpr &value) {
+    auto delta = stackBaseDeltaForExpr(value, slot_id);
+    if (!delta)
+      return true;
+    if (!found_delta) {
+      found_delta = *delta;
+      return true;
+    }
+    return *found_delta == *delta;
+  };
+
+  if (auto it = slot_facts.find(slot_id); it != slot_facts.end()) {
+    if (!consider_delta(it->second))
+      return std::nullopt;
+  }
+
+  for (const auto &[fact_slot_id, value] : slot_facts) {
+    if (fact_slot_id == slot_id)
+      continue;
+    if (!consider_delta(value))
+      return std::nullopt;
+  }
+
+  return found_delta;
+}
+
+static VirtualValueExpr rebaseStackCellExprThroughCallerSlots(
+    const VirtualValueExpr &expr, const std::map<SlotKey, unsigned> &slot_ids,
+    const std::map<StackCellKey, unsigned> &stack_cell_ids,
+    const std::map<unsigned, VirtualValueExpr> &caller_outgoing) {
+  auto summary = extractStackCellSummaryFromExpr(expr, exprByteWidth(expr));
+  if (!summary)
+    return expr;
+
+  auto slot_it = slot_ids.find(
+      SlotKey{summary->base_name, summary->base_offset, summary->base_width,
+              summary->base_from_argument, summary->base_from_alloca});
+  if (slot_it == slot_ids.end())
+    return expr;
+
+  auto delta = findStackBaseDeltaForSlot(caller_outgoing, slot_it->second);
+  if (!delta || *delta == 0)
+    return expr;
+
+  VirtualStackCellSummary rebased = *summary;
+  rebased.offset -= *delta;
+
+  VirtualValueExpr rewritten = stackCellExpr(rebased);
+  annotateExprSlots(rewritten, slot_ids);
+  annotateExprStackCells(rewritten, stack_cell_ids, slot_ids);
+  return rewritten;
+}
+
 static std::optional<StackCellKey> extractStackCellKeyFromExpr(
     const VirtualValueExpr &expr) {
   auto summary = extractStackCellSummaryFromExpr(expr, exprByteWidth(expr));
@@ -303,12 +403,23 @@ std::optional<unsigned> lookupMappedCallerSlotId(
     const std::map<SlotKey, unsigned> &slot_ids, const llvm::DataLayout &dl) {
   if (auto arg_index = parseArgumentBaseName(callee_slot.base_name);
       arg_index && *arg_index < call.arg_size()) {
-    auto actual_slot = extractStateSlotSummary(call.getArgOperand(*arg_index),
-                                               callee_slot.width, dl);
-    if (!actual_slot)
+    auto *actual_arg = call.getArgOperand(*arg_index);
+    VirtualStateSlotSummary mapped_slot;
+    if (auto actual_slot =
+            extractStateSlotSummary(actual_arg, callee_slot.width, dl)) {
+      mapped_slot = *actual_slot;
+    } else if (auto actual_expr = summarizeValueExpr(actual_arg, dl);
+               actual_expr.kind == VirtualExprKind::kArgument &&
+               actual_expr.argument_index.has_value()) {
+      mapped_slot.base_name =
+          ("arg" + std::to_string(*actual_expr.argument_index));
+      mapped_slot.offset = 0;
+      mapped_slot.width = callee_slot.width;
+      mapped_slot.from_argument = true;
+      mapped_slot.from_alloca = false;
+    } else {
       return std::nullopt;
-
-    VirtualStateSlotSummary mapped_slot = *actual_slot;
+    }
     mapped_slot.offset += callee_slot.offset;
     mapped_slot.width = callee_slot.width;
 
@@ -332,10 +443,34 @@ std::optional<unsigned> lookupMappedCallerStackCellId(
     const std::map<SlotKey, unsigned> &slot_ids,
     const std::map<StackCellKey, unsigned> &stack_cell_ids,
     const llvm::DataLayout &dl) {
+  auto exact_mapped_cell_id = [&](const VirtualStackCellSummary &mapped_cell,
+                                  std::optional<unsigned> candidate)
+      -> std::optional<unsigned> {
+    if (!candidate)
+      return std::nullopt;
+    auto it = llvm::find_if(stack_cell_ids, [&](const auto &entry) {
+      return entry.second == *candidate;
+    });
+    if (it == stack_cell_ids.end())
+      return std::nullopt;
+    const auto &key = it->first;
+    if (key.base_slot.base_name != mapped_cell.base_name ||
+        key.base_slot.offset != mapped_cell.base_offset ||
+        key.base_slot.width != mapped_cell.base_width ||
+        key.base_slot.from_argument != mapped_cell.base_from_argument ||
+        key.base_slot.from_alloca != mapped_cell.base_from_alloca ||
+        key.cell_offset != mapped_cell.offset ||
+        key.width != mapped_cell.width) {
+      return std::nullopt;
+    }
+    return candidate;
+  };
+
   if (callee_cell.base_from_argument) {
     if (auto arg_index = parseArgumentBaseName(callee_cell.base_name);
         arg_index && *arg_index < call.arg_size()) {
-      auto actual_expr = summarizeValueExpr(call.getArgOperand(*arg_index), dl);
+      auto *actual_arg = call.getArgOperand(*arg_index);
+      auto actual_expr = summarizeValueExpr(actual_arg, dl);
       if (auto actual_cell =
               extractStackCellSummaryFromExpr(actual_expr, callee_cell.width)) {
         VirtualStackCellSummary mapped_cell = *actual_cell;
@@ -343,7 +478,27 @@ std::optional<unsigned> lookupMappedCallerStackCellId(
         mapped_cell.offset += callee_cell.cell_offset;
         mapped_cell.width = callee_cell.width;
         if (auto mapped_cell_id =
-                lookupStackCellIdForSummary(mapped_cell, stack_cell_ids)) {
+                exact_mapped_cell_id(
+                    mapped_cell,
+                    lookupStackCellIdForSummary(mapped_cell, stack_cell_ids))) {
+          return mapped_cell_id;
+        }
+      } else if (actual_expr.kind == VirtualExprKind::kArgument &&
+                 actual_expr.argument_index.has_value()) {
+        VirtualStackCellSummary mapped_cell;
+        mapped_cell.base_name =
+            ("arg" + std::to_string(*actual_expr.argument_index));
+        mapped_cell.base_offset = callee_cell.base_offset;
+        mapped_cell.base_width =
+            std::max(1u, getValueBitWidth(actual_arg, dl) / 8u);
+        mapped_cell.base_from_argument = true;
+        mapped_cell.base_from_alloca = false;
+        mapped_cell.offset = callee_cell.cell_offset;
+        mapped_cell.width = callee_cell.width;
+        if (auto mapped_cell_id =
+                exact_mapped_cell_id(
+                    mapped_cell,
+                    lookupStackCellIdForSummary(mapped_cell, stack_cell_ids))) {
           return mapped_cell_id;
         }
       }
@@ -485,6 +640,13 @@ std::optional<StackCellKey> remapCalleeStructuralStackKeyToCaller(
   cell.offset = key.cell_offset;
   cell.width = key.width;
 
+  auto original_expr = stackCellExpr(cell);
+  if (!containsInvalidCallerArgumentRelativeState(original_expr,
+                                                  *call.getFunction())) {
+    if (auto direct_key = extractStackCellKeyFromExpr(original_expr))
+      return direct_key;
+  }
+
   auto remapped = remapCalleeExprToCaller(stackCellExpr(cell), call, slot_info,
                                           stack_cell_info, slot_ids,
                                           stack_cell_ids, dl);
@@ -519,6 +681,11 @@ std::optional<VirtualValueExpr> normalizeImportedExprForCaller(
                                     &caller_argument_map);
   specialized = substituteStructuralStackFacts(
       specialized, caller_structural_outgoing_stack);
+  annotateExprSlots(specialized, slot_ids);
+  annotateExprStackCells(specialized, stack_cell_ids, slot_ids);
+  specialized = rebaseStackCellExprThroughCallerSlots(specialized, slot_ids,
+                                                      stack_cell_ids,
+                                                      caller_outgoing);
   annotateExprSlots(specialized, slot_ids);
   annotateExprStackCells(specialized, stack_cell_ids, slot_ids);
   specialized = specializeExpr(specialized, caller_outgoing,
@@ -563,12 +730,23 @@ std::optional<VirtualValueExpr> normalizeLocalizedExprForCaller(
                                               caller_structural_outgoing_stack);
   annotateExprSlots(normalized, slot_ids);
   annotateExprStackCells(normalized, stack_cell_ids, slot_ids);
+  VirtualValueExpr base_normalized = normalized;
   normalized = specializeExpr(normalized, caller_outgoing,
                               &caller_outgoing_stack, &caller_argument_map);
   normalized = substituteStructuralStackFacts(normalized,
                                               caller_structural_outgoing_stack);
   annotateExprSlots(normalized, slot_ids);
   annotateExprStackCells(normalized, stack_cell_ids, slot_ids);
+  normalized = rebaseStackCellExprThroughCallerSlots(normalized, slot_ids,
+                                                     stack_cell_ids,
+                                                     caller_outgoing);
+  annotateExprSlots(normalized, slot_ids);
+  annotateExprStackCells(normalized, stack_cell_ids, slot_ids);
+  if ((isUnknownLikeExpr(normalized) ||
+       !isBoundedLocalizedTransferExpr(normalized)) &&
+      isBoundedLocalizedTransferExpr(base_normalized)) {
+    normalized = std::move(base_normalized);
+  }
   if (containsInvalidCallerArgumentRelativeState(normalized, caller_fn))
     return std::nullopt;
   return normalized;

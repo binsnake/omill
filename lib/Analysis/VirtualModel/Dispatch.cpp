@@ -401,8 +401,11 @@ void summarizeDispatchSuccessors(llvm::Module &M, VirtualMachineModel &model,
         auto specialized = specializeExpr(dispatch.target, outgoing_map,
                                           &outgoing_stack_map,
                                           &incoming_arg_map);
+        auto rebased_outgoing_stack_map =
+            rebaseOutgoingStackFacts(model, outgoing_map, outgoing_stack_map);
         collect_from_expr(
-            specialized, summary.outgoing_facts, summary.outgoing_stack_facts,
+            specialized, slotFactsForMap(outgoing_map),
+            stackFactsForMap(rebased_outgoing_stack_map),
             exprEquals(specialized, dispatch.target)
                 ? VirtualDispatchResolutionSource::kOutgoingFacts
                 : VirtualDispatchResolutionSource::kHelperArgumentSpecialization);
@@ -411,25 +414,34 @@ void summarizeDispatchSuccessors(llvm::Module &M, VirtualMachineModel &model,
         auto specialized = specializeExpr(dispatch.target, region_outgoing_map,
                                           &region_outgoing_stack_map,
                                           &incoming_arg_map);
+        auto rebased_region_outgoing_stack_map = rebaseOutgoingStackFacts(
+            model, region_outgoing_map, region_outgoing_stack_map);
         collect_from_expr(
-            specialized, region->outgoing_facts, region->outgoing_stack_facts,
+            specialized, slotFactsForMap(region_outgoing_map),
+            stackFactsForMap(rebased_region_outgoing_stack_map),
             exprEquals(specialized, dispatch.target)
                 ? VirtualDispatchResolutionSource::kRegionOutgoingFacts
                 : VirtualDispatchResolutionSource::kHelperArgumentSpecialization);
       }
       if (resolved_pcs.empty()) {
-        collect_from_expr(
-            specializeExpr(dispatch.target, incoming_map, &incoming_stack_map,
-                           &incoming_arg_map),
-            summary.incoming_facts, summary.incoming_stack_facts,
-            VirtualDispatchResolutionSource::kIncomingFacts);
+        auto specialized = specializeExpr(dispatch.target, incoming_map,
+                                          &incoming_stack_map,
+                                          &incoming_arg_map);
+        auto rebased_incoming_stack_map =
+            rebaseOutgoingStackFacts(model, incoming_map, incoming_stack_map);
+        collect_from_expr(specialized, slotFactsForMap(incoming_map),
+                          stackFactsForMap(rebased_incoming_stack_map),
+                          VirtualDispatchResolutionSource::kIncomingFacts);
       }
       if (resolved_pcs.empty() && region) {
-        collect_from_expr(
-            specializeExpr(dispatch.target, region_incoming_map,
-                           &region_incoming_stack_map, &incoming_arg_map),
-            region->incoming_facts, region->incoming_stack_facts,
-            VirtualDispatchResolutionSource::kRegionIncomingFacts);
+        auto specialized = specializeExpr(dispatch.target, region_incoming_map,
+                                          &region_incoming_stack_map,
+                                          &incoming_arg_map);
+        auto rebased_region_incoming_stack_map = rebaseOutgoingStackFacts(
+            model, region_incoming_map, region_incoming_stack_map);
+        collect_from_expr(specialized, slotFactsForMap(region_incoming_map),
+                          stackFactsForMap(rebased_region_incoming_stack_map),
+                          VirtualDispatchResolutionSource::kRegionIncomingFacts);
       }
       if (resolved_pcs.empty() && !reverse_prelude_indices[summary_index].empty()) {
         for (size_t predecessor_index : reverse_prelude_indices[summary_index]) {
@@ -452,9 +464,11 @@ void summarizeDispatchSuccessors(llvm::Module &M, VirtualMachineModel &model,
                                             localized->outgoing_slots,
                                             &localized->outgoing_stack,
                                             &localized_args);
+          auto rebased_localized_outgoing_stack = rebaseOutgoingStackFacts(
+              model, localized->outgoing_slots, localized->outgoing_stack);
           collect_from_expr(
               specialized, slotFactsForMap(localized->outgoing_slots),
-              stackFactsForMap(localized->outgoing_stack),
+              stackFactsForMap(rebased_localized_outgoing_stack),
               VirtualDispatchResolutionSource::kPreludeLocalization);
         }
       }
@@ -486,6 +500,14 @@ void summarizeDispatchSuccessors(llvm::Module &M, VirtualMachineModel &model,
       }
 
       if (dispatch.successors.empty()) {
+        vmModelStageDebugLog("dispatch-unresolved fn=" + summary.function_name +
+                             " target=" +
+                             renderVirtualValueExpr(dispatch.target) +
+                             " specialized=" +
+                             renderVirtualValueExpr(dispatch.specialized_target) +
+                             " source=" +
+                             std::to_string(static_cast<int>(
+                                 dispatch.specialized_target_source)));
         if (summary.stack_memory_budget_exceeded) {
           dispatch.unresolved_reason = "stack_fact_budget_exceeded";
         } else if (containsStateSlotExpr(dispatch.specialized_target) &&

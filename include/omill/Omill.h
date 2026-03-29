@@ -200,6 +200,12 @@ void buildPostPatchCleanupPipeline(llvm::ModulePassManager &MPM,
 /// running the generic static devirtualization pipeline.
 bool moduleHasGenericStaticDevirtualizationCandidates(const llvm::Module &M);
 
+/// Return true when the output-root reachable closure contains VM-like
+/// signals that justify keeping generic static devirtualization enabled for
+/// an exported root, even if the broader module would normally be skipped.
+bool moduleHasRootLocalGenericStaticDevirtualizationShape(
+    const llvm::Module &M);
+
 /// Return true when driver-side policy should auto-disable generic static
 /// devirtualization for the requested root.
 bool shouldAutoSkipGenericStaticDevirtualizationForRoot(

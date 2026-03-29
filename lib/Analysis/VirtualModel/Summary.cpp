@@ -311,7 +311,15 @@ void collectExprReferencedStateSlots(
 
 VirtualHandlerSummary summarizeFunction(
     llvm::Function &F) {
-  constexpr unsigned kMaxSummaryStackCells = 16;
+  constexpr unsigned kDefaultMaxSummaryStackCells = 16;
+  const unsigned kMaxSummaryStackCells = []() {
+    if (const char *v = std::getenv("OMILL_VM_SUMMARY_STACK_CELL_BUDGET")) {
+      unsigned parsed = 0;
+      if (!llvm::StringRef(v).getAsInteger(10, parsed) && parsed != 0)
+        return parsed;
+    }
+    return kDefaultMaxSummaryStackCells;
+  }();
 
   VirtualHandlerSummary summary;
   summary.function_name = F.getName().str();
@@ -358,15 +366,15 @@ VirtualHandlerSummary summarizeFunction(
                              bool is_store) {
     auto it = std::find_if(stack_cell_accum.begin(), stack_cell_accum.end(),
                            [&](const auto &current) {
-                             return std::get<0>(current) == cell.base_name &&
-                                    std::get<1>(current) == cell.base_offset &&
-                                    std::get<2>(current) == cell.base_width &&
-                                    std::get<3>(current) == cell.offset &&
-                                    std::get<4>(current) == cell.width &&
-                                    std::get<7>(current) ==
-                                        cell.base_from_argument &&
-                                    std::get<8>(current) ==
-                                        cell.base_from_alloca;
+                              return std::get<0>(current) == cell.base_name &&
+                                     std::get<1>(current) == cell.base_offset &&
+                                     std::get<2>(current) == cell.base_width &&
+                                     std::get<3>(current) == cell.offset &&
+                                     std::get<4>(current) == cell.width &&
+                                     std::get<7>(current) ==
+                                         cell.base_from_argument &&
+                                     std::get<8>(current) ==
+                                         cell.base_from_alloca;
                            });
     if (it == stack_cell_accum.end()) {
       if (stack_cell_accum.size() >= kMaxSummaryStackCells) {

@@ -252,7 +252,8 @@ FunctionABI analyzeFunction(llvm::Function &F, const llvm::DataLayout &DL,
   FunctionABI abi;
   const bool is_public_output_root =
       F.hasFnAttribute("omill.output_root") &&
-      !F.hasFnAttribute("omill.vm_wrapper");
+      !F.hasFnAttribute("omill.vm_wrapper") &&
+      !F.hasFnAttribute("omill.internal_output_root");
 
   if (F.isDeclaration() || F.empty()) return abi;
   if (F.arg_size() == 0) return abi;

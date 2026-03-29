@@ -3613,6 +3613,107 @@ TEST_F(PipelineTest,
   EXPECT_FALSE(found_unreachable);
 }
 
+TEST_F(PipelineTest, LateCleanupFoldsReadOnlyImageLoadInOutputRoot) {
+  auto M = createModule();
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *root = llvm::Function::Create(
+      llvm::FunctionType::get(i64_ty, false),
+      llvm::GlobalValue::ExternalLinkage, "sub_401000_native", *M);
+  root->addFnAttr("omill.output_root");
+
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *ptr = B.CreateIntToPtr(B.getInt64(0x402000ULL),
+                                 llvm::PointerType::get(Ctx, 0));
+    auto *loaded = B.CreateLoad(i64_ty, ptr);
+    B.CreateRet(loaded);
+  }
+
+  const uint64_t value = 0x8877665544332211ULL;
+  omill::BinaryMemoryMap map;
+  map.setImageBase(0x400000);
+  map.setImageSize(0x4000);
+  map.addRegion(0x402000, reinterpret_cast<const uint8_t *>(&value),
+                sizeof(value), /*read_only=*/true, /*executable=*/false);
+
+  llvm::ModulePassManager MPM;
+  omill::buildLateCleanupPipeline(MPM);
+  runMPM(MPM, *M, std::move(map));
+
+  auto *root_after = M->getFunction("sub_401000_native");
+  ASSERT_NE(root_after, nullptr);
+  auto *ret = llvm::dyn_cast<llvm::ReturnInst>(
+      root_after->getEntryBlock().getTerminator());
+  ASSERT_NE(ret, nullptr);
+  auto *ret_ci = llvm::dyn_cast<llvm::ConstantInt>(ret->getReturnValue());
+  ASSERT_NE(ret_ci, nullptr);
+  EXPECT_EQ(ret_ci->getZExtValue(), value);
+
+  bool saw_load = false;
+  for (auto &BB : *root_after) {
+    for (auto &I : BB)
+      saw_load |= llvm::isa<llvm::LoadInst>(I);
+  }
+  EXPECT_FALSE(saw_load);
+}
+
+TEST_F(PipelineTest, LateCleanupRewritesIndexedReadOnlyImageLoadToGlobal) {
+  auto M = createModule();
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *root = llvm::Function::Create(
+      llvm::FunctionType::get(i64_ty, {i64_ty}, false),
+      llvm::GlobalValue::ExternalLinkage, "sub_401000_native", *M);
+  root->addFnAttr("omill.output_root");
+
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *byte_off = B.CreateShl(root->getArg(0), 3);
+    auto *addr = B.CreateAdd(B.getInt64(0x402000ULL), byte_off);
+    auto *ptr = B.CreateIntToPtr(addr, llvm::PointerType::get(Ctx, 0));
+    auto *loaded = B.CreateLoad(i64_ty, ptr);
+    B.CreateRet(loaded);
+  }
+
+  const uint64_t table[6] = {
+      0x1111111111111111ULL, 0x2222222222222222ULL, 0x3333333333333333ULL,
+      0x4444444444444444ULL, 0x5555555555555555ULL, 0x6666666666666666ULL};
+  omill::BinaryMemoryMap map;
+  map.setImageBase(0x400000);
+  map.setImageSize(0x8000);
+  map.addRegion(0x402000, reinterpret_cast<const uint8_t *>(table),
+                sizeof(table), /*read_only=*/true, /*executable=*/false);
+
+  llvm::ModulePassManager MPM;
+  omill::buildLateCleanupPipeline(MPM);
+  runMPM(MPM, *M, std::move(map));
+
+  bool saw_absolute_inttoptr = false;
+  bool saw_rodata_global = false;
+  for (auto &G : M->globals()) {
+    if (G.getName().starts_with(".omill.rodata.0x"))
+      saw_rodata_global = true;
+  }
+  auto *root_after = M->getFunction("sub_401000_native");
+  ASSERT_NE(root_after, nullptr);
+  for (auto &BB : *root_after) {
+    for (auto &I : BB) {
+      if (auto *ITP = llvm::dyn_cast<llvm::IntToPtrInst>(&I)) {
+        if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(ITP->getOperand(0))) {
+          if (CI->getZExtValue() == 0x402000ULL)
+            saw_absolute_inttoptr = true;
+        }
+      }
+    }
+  }
+
+  EXPECT_TRUE(saw_rodata_global);
+  EXPECT_FALSE(saw_absolute_inttoptr);
+}
+
 TEST_F(PipelineTest, GlobalAlwaysInlineSkipSuppressesAlwaysInlinerPasses) {
   auto M = createModule();
   createDefinedFunction(*M, "sub_401000");
@@ -3670,6 +3771,82 @@ TEST_F(PipelineTest,
       *M, /*vm_mode=*/false, /*requested_root_is_export=*/true,
       /*force_generic_static_devirtualize=*/false,
       /*root_local_generic_static_devirtualization_shape=*/true));
+}
+
+TEST_F(PipelineTest,
+       RootLocalGenericStaticDevirtualizationShapeFindsDispatchCallBytecodePattern) {
+  auto M = createModule();
+  auto *lifted_ty = liftedFnTy();
+  auto *dispatch_call = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage, "__omill_dispatch_call",
+      *M);
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::GlobalValue::ExternalLinkage,
+                                      "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  auto *helper = llvm::Function::Create(lifted_ty,
+                                        llvm::GlobalValue::InternalLinkage,
+                                        "blk_401020", *M);
+
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *call = B.CreateCall(lifted_ty, helper,
+                              {root->getArg(0), root->getArg(1), root->getArg(2)});
+    B.CreateRet(call);
+  }
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", helper);
+    llvm::IRBuilder<> B(entry);
+    auto *call = B.CreateCall(lifted_ty, dispatch_call,
+                              {helper->getArg(0), helper->getArg(1),
+                               helper->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  EXPECT_TRUE(
+      omill::moduleHasRootLocalGenericStaticDevirtualizationShape(*M));
+  EXPECT_FALSE(omill::shouldAutoSkipGenericStaticDevirtualizationForRoot(
+      *M, /*vm_mode=*/false, /*requested_root_is_export=*/true,
+      /*force_generic_static_devirtualize=*/false,
+      omill::moduleHasRootLocalGenericStaticDevirtualizationShape(*M)));
+}
+
+TEST_F(PipelineTest,
+       RootLocalGenericStaticDevirtualizationShapeIgnoresDispatchCallWithoutBlockClosure) {
+  auto M = createModule();
+  auto *lifted_ty = liftedFnTy();
+  auto *dispatch_call = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage, "__omill_dispatch_call",
+      *M);
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::GlobalValue::ExternalLinkage,
+                                      "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  auto *helper = llvm::Function::Create(lifted_ty,
+                                        llvm::GlobalValue::InternalLinkage,
+                                        "sub_401020", *M);
+
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *call = B.CreateCall(lifted_ty, helper,
+                              {root->getArg(0), root->getArg(1), root->getArg(2)});
+    B.CreateRet(call);
+  }
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", helper);
+    llvm::IRBuilder<> B(entry);
+    auto *call = B.CreateCall(lifted_ty, dispatch_call,
+                              {helper->getArg(0), helper->getArg(1),
+                               helper->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  EXPECT_FALSE(
+      omill::moduleHasRootLocalGenericStaticDevirtualizationShape(*M));
 }
 
 TEST_F(PipelineTest,

@@ -7,15 +7,20 @@
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/Hashing.h>
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/ADT/SmallString.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DataLayout.h>
 #include <llvm/IR/Function.h>
+#include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/MDBuilder.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Operator.h>
+#include <llvm/Support/Format.h>
+#include <llvm/Support/raw_ostream.h>
 
 #include "omill/Analysis/BinaryMemoryMap.h"
+#include "omill/Utils/LiftedNames.h"
 
 namespace omill {
 
@@ -225,6 +230,51 @@ std::optional<uint64_t> resolveConstantIntegerValue(llvm::Value *V,
   return resolveConstantIntegerValueImpl(V, DL, cache, visiting);
 }
 
+struct MappedRegionRef {
+  uint64_t base = 0;
+  size_t size = 0;
+  const uint8_t *data = nullptr;
+  bool read_only = true;
+};
+
+std::optional<MappedRegionRef> findMappedRegionContaining(
+    const BinaryMemoryMap &map, uint64_t addr, unsigned min_size) {
+  std::optional<MappedRegionRef> result;
+  map.forEachRegion([&](uint64_t base, const uint8_t *data, size_t size) {
+    if (result)
+      return;
+    if (addr < base)
+      return;
+    const uint64_t end = addr + static_cast<uint64_t>(min_size);
+    if (end < addr)
+      return;
+    if (end > base + size)
+      return;
+    result = MappedRegionRef{base, size, data, map.isReadOnly(base, 1)};
+  });
+  return result;
+}
+
+llvm::GlobalVariable *getOrCreateMappedRegionGlobal(llvm::Module &M,
+                                                    MappedRegionRef region) {
+  llvm::SmallString<32> name;
+  llvm::raw_svector_ostream os(name);
+  os << ".omill.rodata.0x" << llvm::format_hex_no_prefix(region.base, 1);
+
+  if (auto *existing = M.getGlobalVariable(name))
+    return existing;
+
+  auto *init = llvm::ConstantDataArray::get(
+      M.getContext(),
+      llvm::ArrayRef<uint8_t>(region.data, region.size));
+  auto *GV = new llvm::GlobalVariable(
+      M, init->getType(), /*isConstant=*/region.read_only,
+      llvm::GlobalValue::PrivateLinkage, init, name);
+  GV->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+  GV->setAlignment(llvm::Align(1));
+  return GV;
+}
+
 llvm::Constant *readMappedConstant(llvm::Type *ty, uint64_t addr,
                                    unsigned bytes, const BinaryMemoryMap &map,
                                    bool suspicious_base) {
@@ -405,6 +455,111 @@ llvm::PreservedAnalyses ConstantMemoryFoldingPass::run(
 
   const auto &DL = F.getDataLayout();
   bool changed = false;
+  auto resolveKnownImageBase =
+      [&](llvm::Value *base) -> std::optional<uint64_t> {
+    if (auto direct = resolveConstantIntegerValue(base, DL))
+      return direct;
+
+    auto *arg = llvm::dyn_cast<llvm::Argument>(base);
+    if (!arg || arg->getParent() != &F || arg->getArgNo() != 1)
+      return std::nullopt;
+
+    uint64_t entry_va = extractEntryVA(F.getName());
+    if (!entry_va)
+      return std::nullopt;
+
+    return entry_va;
+  };
+  std::function<std::optional<uint64_t>(llvm::Value *)>
+      resolveKnownConstantIntegerValue =
+          [&](llvm::Value *V) -> std::optional<uint64_t> {
+    if (auto direct = resolveKnownImageBase(V))
+      return direct;
+
+    if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(V))
+      return CI->getZExtValue();
+
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(V)) {
+      auto *ptr = load->getPointerOperand()->stripPointerCasts();
+      auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(ptr);
+      if (!alloca)
+        return std::nullopt;
+
+      auto it = load->getIterator();
+      while (it != load->getParent()->begin()) {
+        --it;
+        auto *store = llvm::dyn_cast<llvm::StoreInst>(&*it);
+        if (!store)
+          continue;
+        if (store->getPointerOperand()->stripPointerCasts() != alloca)
+          continue;
+        return resolveKnownConstantIntegerValue(store->getValueOperand());
+      }
+      return std::nullopt;
+    }
+
+    if (auto *cast = llvm::dyn_cast<llvm::CastInst>(V)) {
+      auto inner = resolveKnownConstantIntegerValue(cast->getOperand(0));
+      if (!inner)
+        return std::nullopt;
+
+      unsigned src_bits = scalarBitWidth(cast->getOperand(0)->getType(), DL);
+      unsigned dst_bits = scalarBitWidth(cast->getType(), DL);
+      if (src_bits == 0 || dst_bits == 0 || src_bits > 64 || dst_bits > 64)
+        return std::nullopt;
+
+      llvm::APInt ap(src_bits, *inner);
+      switch (cast->getOpcode()) {
+        case llvm::Instruction::ZExt:
+        case llvm::Instruction::IntToPtr:
+        case llvm::Instruction::PtrToInt:
+        case llvm::Instruction::BitCast:
+          return ap.zextOrTrunc(dst_bits).getZExtValue();
+        case llvm::Instruction::SExt:
+          return ap.sextOrTrunc(dst_bits).getZExtValue();
+        case llvm::Instruction::Trunc:
+          return ap.trunc(dst_bits).getZExtValue();
+        default:
+          return std::nullopt;
+      }
+    }
+
+    if (auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(V)) {
+      auto lhs = resolveKnownConstantIntegerValue(BO->getOperand(0));
+      auto rhs = resolveKnownConstantIntegerValue(BO->getOperand(1));
+      if (!lhs || !rhs)
+        return std::nullopt;
+
+      unsigned bits = scalarBitWidth(BO->getType(), DL);
+      if (bits == 0 || bits > 64)
+        return std::nullopt;
+
+      llvm::APInt lhs_ap(bits, *lhs);
+      llvm::APInt rhs_ap(bits, *rhs);
+      switch (BO->getOpcode()) {
+        case llvm::Instruction::Add:
+          return (lhs_ap + rhs_ap).getZExtValue();
+        case llvm::Instruction::Sub:
+          return (lhs_ap - rhs_ap).getZExtValue();
+        case llvm::Instruction::And:
+          return (lhs_ap & rhs_ap).getZExtValue();
+        case llvm::Instruction::Or:
+          return (lhs_ap | rhs_ap).getZExtValue();
+        case llvm::Instruction::Xor:
+          return (lhs_ap ^ rhs_ap).getZExtValue();
+        case llvm::Instruction::Shl:
+          return (lhs_ap.shl(rhs_ap.getLimitedValue(bits))).getZExtValue();
+        case llvm::Instruction::LShr:
+          return (lhs_ap.lshr(rhs_ap.getLimitedValue(bits))).getZExtValue();
+        case llvm::Instruction::AShr:
+          return (lhs_ap.ashr(rhs_ap.getLimitedValue(bits))).getZExtValue();
+        default:
+          return std::nullopt;
+      }
+    }
+
+    return std::nullopt;
+  };
 
   llvm::SmallVector<llvm::LoadInst *, 16> loads;
   for (auto &BB : F)
@@ -516,7 +671,7 @@ llvm::PreservedAnalyses ConstantMemoryFoldingPass::run(
       if (!width)
         continue;
 
-      auto addr = resolveConstantIntegerValue(call->getArgOperand(1), DL);
+      auto addr = resolveKnownConstantIntegerValue(call->getArgOperand(1));
       if (!addr)
         continue;
 
@@ -532,6 +687,175 @@ llvm::PreservedAnalyses ConstantMemoryFoldingPass::run(
   }
   for (auto *call : folded_reads)
     call->eraseFromParent();
+
+  llvm::SmallVector<llvm::LoadInst *, 16> constant_region_rewritten_loads;
+  for (auto &BB : F) {
+    for (auto &I : BB) {
+      auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I);
+      if (!LI)
+        continue;
+
+      auto addr = resolveConstantAddress(LI->getPointerOperand(), DL);
+      if (!addr)
+        continue;
+
+      auto width = loadOrStoreByteWidth(LI->getType());
+      if (!width)
+        continue;
+
+      auto region = findMappedRegionContaining(*map, *addr, *width);
+      if (!region)
+        continue;
+
+      auto *GV = getOrCreateMappedRegionGlobal(*F.getParent(), *region);
+      llvm::IRBuilder<> B(LI);
+      auto *arr_ty = llvm::cast<llvm::ArrayType>(GV->getValueType());
+      auto *region_start = B.CreateInBoundsGEP(
+          arr_ty, GV, {B.getInt64(0), B.getInt64(0)},
+          LI->getName() + ".const.start");
+      auto *rewritten_ptr = B.CreateInBoundsGEP(
+          B.getInt8Ty(), region_start,
+          B.getInt64(*addr - region->base),
+          LI->getName() + ".const.ptr");
+      auto *rewritten_load = B.CreateLoad(LI->getType(), rewritten_ptr);
+      rewritten_load->setAlignment(LI->getAlign());
+      rewritten_load->copyMetadata(*LI);
+      LI->replaceAllUsesWith(rewritten_load);
+      constant_region_rewritten_loads.push_back(LI);
+      changed = true;
+    }
+  }
+  for (auto *LI : constant_region_rewritten_loads)
+    LI->eraseFromParent();
+
+  llvm::SmallVector<llvm::LoadInst *, 16> image_relative_rewritten_loads;
+  for (auto &BB : F) {
+    for (auto &I : BB) {
+      auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I);
+      if (!LI)
+        continue;
+
+      if (resolveConstantAddress(LI->getPointerOperand(), DL))
+        continue;
+
+      auto sym_addr = resolveSymbolicAddress(LI->getPointerOperand(), DL);
+      if (!sym_addr || !sym_addr->base)
+        continue;
+
+      auto base_addr = resolveKnownImageBase(sym_addr->base);
+      if (!base_addr)
+        continue;
+
+      auto width = loadOrStoreByteWidth(LI->getType());
+      if (!width)
+        continue;
+
+      const int64_t signed_offset = sym_addr->offset;
+      uint64_t absolute_addr = *base_addr;
+      if (signed_offset >= 0) {
+        absolute_addr += static_cast<uint64_t>(signed_offset);
+      } else {
+        uint64_t delta = static_cast<uint64_t>(-signed_offset);
+        if (delta > absolute_addr)
+          continue;
+        absolute_addr -= delta;
+      }
+
+      auto region = findMappedRegionContaining(*map, absolute_addr, *width);
+      if (!region)
+        continue;
+
+      auto *GV = getOrCreateMappedRegionGlobal(*F.getParent(), *region);
+      llvm::IRBuilder<> B(LI);
+      auto *arr_ty = llvm::cast<llvm::ArrayType>(GV->getValueType());
+      auto *region_start = B.CreateInBoundsGEP(
+          arr_ty, GV, {B.getInt64(0), B.getInt64(0)},
+          LI->getName() + ".img.start");
+      auto *rewritten_ptr = B.CreateInBoundsGEP(
+          B.getInt8Ty(), region_start,
+          B.getInt64(absolute_addr - region->base),
+          LI->getName() + ".img.ptr");
+      auto *rewritten_load = B.CreateLoad(LI->getType(), rewritten_ptr);
+      rewritten_load->setAlignment(LI->getAlign());
+      rewritten_load->copyMetadata(*LI);
+      LI->replaceAllUsesWith(rewritten_load);
+      image_relative_rewritten_loads.push_back(LI);
+      changed = true;
+    }
+  }
+  for (auto *LI : image_relative_rewritten_loads)
+    LI->eraseFromParent();
+
+  llvm::SmallVector<llvm::LoadInst *, 16> region_rewritten_loads;
+  for (auto &BB : F) {
+    for (auto &I : BB) {
+      auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I);
+      if (!LI)
+        continue;
+
+      if (resolveConstantAddress(LI->getPointerOperand(), DL))
+        continue;
+
+      auto sym_addr = resolveSymbolicAddress(LI->getPointerOperand(), DL);
+      if (!sym_addr || !sym_addr->base || sym_addr->offset < 0)
+        continue;
+
+      if (llvm::isa<llvm::ConstantInt>(sym_addr->base))
+        continue;
+
+      auto width = loadOrStoreByteWidth(LI->getType());
+      if (!width)
+        continue;
+
+      const uint64_t anchor_addr = static_cast<uint64_t>(sym_addr->offset);
+      if (!map->isReadOnly(anchor_addr, *width))
+        continue;
+
+      auto region = findMappedRegionContaining(*map, anchor_addr, *width);
+      if (!region)
+        continue;
+
+      auto *GV = getOrCreateMappedRegionGlobal(*F.getParent(), *region);
+      llvm::IRBuilder<> B(LI);
+      auto *arr_ty = llvm::cast<llvm::ArrayType>(GV->getValueType());
+      auto *region_start = B.CreateInBoundsGEP(
+          arr_ty, GV,
+          {B.getInt64(0), B.getInt64(0)},
+          GV->getName() + ".start");
+
+      llvm::Value *base_index = sym_addr->base;
+      if (base_index->getType()->isPointerTy()) {
+        base_index = B.CreatePtrToInt(base_index, B.getInt64Ty(),
+                                      LI->getName() + ".ro.base");
+      } else if (base_index->getType()->isIntegerTy()) {
+        base_index = B.CreateIntCast(base_index, B.getInt64Ty(),
+                                     /*isSigned=*/false,
+                                     LI->getName() + ".ro.base");
+      } else {
+        continue;
+      }
+
+      uint64_t region_delta = anchor_addr - region->base;
+      llvm::Value *byte_offset = base_index;
+      if (region_delta != 0) {
+        byte_offset = B.CreateAdd(
+            byte_offset, B.getInt64(region_delta),
+            LI->getName() + ".ro.off");
+      }
+
+      auto *rewritten_ptr = B.CreateInBoundsGEP(
+          B.getInt8Ty(), region_start, byte_offset,
+          LI->getName() + ".ro.ptr");
+      auto *rewritten_load = B.CreateLoad(LI->getType(), rewritten_ptr);
+      rewritten_load->setAlignment(LI->getAlign());
+      rewritten_load->copyMetadata(*LI);
+      LI->replaceAllUsesWith(rewritten_load);
+      region_rewritten_loads.push_back(LI);
+      changed = true;
+    }
+  }
+  for (auto *LI : region_rewritten_loads)
+    LI->eraseFromParent();
 
   // Local fold: track constant bytes for stack-like symbolic addresses
   // (inttoptr(base + const)) and fold subsequent scalar loads.

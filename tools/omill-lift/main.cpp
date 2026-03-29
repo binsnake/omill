@@ -23,6 +23,8 @@
 #include <llvm/Transforms/Scalar/ADCE.h>
 #include <llvm/Transforms/Scalar/GVN.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
+#include <llvm/Transforms/Scalar/SROA.h>
+#include <llvm/Transforms/IPO/AlwaysInliner.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/InitLLVM.h>
@@ -64,6 +66,9 @@
 #include "omill/Analysis/VirtualCalleeRegistry.h"
 #include "omill/Omill.h"
 #include "omill/Passes/JumpTableConcretizer.h"
+#include "omill/Passes/InterProceduralConstProp.h"
+#include "omill/Passes/ConstantMemoryFolding.h"
+#include "omill/Passes/EliminateStateStruct.h"
 #include "omill/Passes/LowerRemillIntrinsics.h"
 #include "omill/Passes/ResolveAndLowerControlFlow.h"
 #include "omill/Tools/LiftRunContract.h"
@@ -419,6 +424,16 @@ void dumpModuleIfEnvEnabled(llvm::Module &M, const char *env_name,
   llvm::raw_fd_ostream os(path, ec, llvm::sys::fs::OF_Text);
   if (!ec)
     M.print(os, nullptr);
+}
+
+void dumpTextIfEnvEnabled(llvm::StringRef text, const char *env_name,
+                          llvm::StringRef path) {
+  if (!parseBoolEnv(env_name).value_or(false))
+    return;
+  std::error_code ec;
+  llvm::raw_fd_ostream os(path, ec, llvm::sys::fs::OF_Text);
+  if (!ec)
+    os << text;
 }
 
 void appendDebugMarker(const char *message) {
@@ -808,6 +823,246 @@ TerminalBoundaryRecoveryModelSummary parseTerminalBoundaryRecoveryModelSummary(
   }
   return summary;
 }
+
+static llvm::SmallVector<std::string, 16>
+parseClosedRootSliceHandlerNames(llvm::StringRef model_text, uint64_t root_pc) {
+  llvm::SmallVector<std::string, 16> handler_names;
+  llvm::StringSet<> seen_names;
+  llvm::SmallVector<llvm::StringRef, 128> lines;
+  model_text.split(lines, '\n');
+  const std::string prefix =
+      (llvm::Twine("root-slice root=0x") + llvm::utohexstr(root_pc)).str();
+  bool saw_matching_root = false;
+  auto add_name = [&](llvm::StringRef name) {
+    auto trimmed_name = name.trim();
+    if (trimmed_name.empty())
+      return;
+    if (!seen_names.insert(trimmed_name).second)
+      return;
+    handler_names.push_back(trimmed_name.str());
+  };
+  bool in_root_block = false;
+  for (auto line : lines) {
+    auto trimmed = line.trim();
+    if (trimmed.starts_with(prefix)) {
+      in_root_block = true;
+      saw_matching_root = true;
+      continue;
+    }
+    if (in_root_block && trimmed.starts_with("slice-handler ")) {
+      add_name(trimmed.drop_front(strlen("slice-handler ")));
+      continue;
+    }
+    if (saw_matching_root &&
+        trimmed.starts_with("diag localized-continuation-shim ")) {
+      if (auto fn = parseQuotedAttrValueFromLine(trimmed, "fn")) {
+        add_name(*fn);
+        continue;
+      }
+      constexpr llvm::StringLiteral pattern = "fn=";
+      size_t pos = trimmed.find(pattern);
+      if (pos != llvm::StringRef::npos) {
+        pos += pattern.size();
+        size_t end = pos;
+        while (end < trimmed.size() && !llvm::isSpace(trimmed[end]))
+          ++end;
+        add_name(trimmed.slice(pos, end));
+      }
+      continue;
+    }
+    if (saw_matching_root &&
+        trimmed.starts_with("diag localized-continuation-call-edge ")) {
+      for (llvm::StringRef attr : {"caller", "callee"}) {
+        if (auto name = parseQuotedAttrValueFromLine(trimmed, attr)) {
+          add_name(*name);
+          continue;
+        }
+        std::string pattern = (llvm::Twine(attr) + "=").str();
+        size_t pos = trimmed.find(pattern);
+        if (pos == llvm::StringRef::npos)
+          continue;
+        pos += pattern.size();
+        size_t end = pos;
+        while (end < trimmed.size() && !llvm::isSpace(trimmed[end]))
+          ++end;
+        add_name(trimmed.slice(pos, end));
+      }
+      continue;
+    }
+    if (saw_matching_root && trimmed.starts_with("diag lifted target=")) {
+      size_t arrow = trimmed.rfind("->");
+      if (arrow != llvm::StringRef::npos) {
+        add_name(trimmed.drop_front(arrow + 2));
+      }
+      continue;
+    }
+    if (!in_root_block)
+      continue;
+    if (trimmed.starts_with("frontier ")) {
+      continue;
+    }
+    if (trimmed.starts_with("region ") || trimmed.starts_with("root-slice ") ||
+        trimmed.starts_with("slot ") || trimmed.starts_with("handler ") ||
+        trimmed.empty()) {
+      in_root_block = false;
+    }
+  }
+  return handler_names;
+}
+
+static std::optional<uint64_t>
+parseSyntheticBlockLikePcFromName(llvm::StringRef name) {
+  if (auto pc = omill::extractEntryVA(name))
+    return pc;
+  for (llvm::StringRef prefix : {"blk_", "sub_", "block_", "vm_entry_"}) {
+    if (!name.starts_with(prefix))
+      continue;
+    llvm::StringRef suffix = name.drop_front(prefix.size());
+    size_t end = 0;
+    while (end < suffix.size() && llvm::isHexDigit(suffix[end]))
+      ++end;
+    if (end == 0)
+      continue;
+    uint64_t pc = 0;
+    if (!suffix.take_front(end).getAsInteger(16, pc))
+      return pc;
+  }
+  return std::nullopt;
+}
+
+static llvm::SmallVector<uint64_t, 16>
+parseLocalizedContinuationCalleePcs(llvm::StringRef model_text,
+                                    uint64_t root_pc) {
+  llvm::SmallVector<uint64_t, 16> callee_pcs;
+  llvm::DenseSet<uint64_t> seen_pcs;
+  llvm::StringSet<> slice_handlers;
+  for (const auto &name : parseClosedRootSliceHandlerNames(model_text, root_pc))
+    slice_handlers.insert(name);
+  if (slice_handlers.empty())
+    return callee_pcs;
+
+  auto parseBareAttr = [&](llvm::StringRef line,
+                           llvm::StringRef attr) -> llvm::StringRef {
+    if (auto quoted = parseQuotedAttrValueFromLine(line, attr))
+      return *quoted;
+    std::string pattern = (llvm::Twine(attr) + "=").str();
+    size_t pos = line.find(pattern);
+    if (pos == llvm::StringRef::npos)
+      return {};
+    pos += pattern.size();
+    size_t end = pos;
+    while (end < line.size() && !llvm::isSpace(line[end]))
+      ++end;
+    return line.slice(pos, end);
+  };
+
+  llvm::SmallVector<llvm::StringRef, 128> lines;
+  model_text.split(lines, '\n');
+  for (auto line : lines) {
+    auto trimmed = line.trim();
+    if (!trimmed.starts_with("diag localized-continuation-call-edge "))
+      continue;
+    llvm::StringRef caller = parseBareAttr(trimmed, "caller");
+    llvm::StringRef callee = parseBareAttr(trimmed, "callee");
+    if (caller.empty() || callee.empty())
+      continue;
+    if (!slice_handlers.count(caller))
+      continue;
+    auto callee_pc = parseSyntheticBlockLikePcFromName(callee);
+    if (!callee_pc || *callee_pc == root_pc)
+      continue;
+    if (!seen_pcs.insert(*callee_pc).second)
+      continue;
+    callee_pcs.push_back(*callee_pc);
+  }
+  return callee_pcs;
+}
+
+static llvm::SmallVector<uint64_t, 16>
+parseRootSliceFrontierTargetPcs(llvm::StringRef model_text, uint64_t root_pc) {
+  llvm::SmallVector<uint64_t, 16> target_pcs;
+  llvm::DenseSet<uint64_t> seen_pcs;
+  llvm::SmallVector<llvm::StringRef, 128> lines;
+  model_text.split(lines, '\n');
+
+  bool in_root_block = false;
+  auto add_pc = [&](llvm::StringRef value) {
+    if (value.empty())
+      return;
+    if (value.consume_front("0x"))
+      ;
+    uint64_t pc = 0;
+    if (value.getAsInteger(16, pc))
+      return;
+    if (seen_pcs.insert(pc).second)
+      target_pcs.push_back(pc);
+  };
+
+  for (auto line : lines) {
+    auto trimmed = line.trim();
+    if (trimmed.starts_with("root-slice root=")) {
+      in_root_block = false;
+      auto root_value = parseQuotedAttrValueFromLine(trimmed, "root");
+      llvm::StringRef root_text;
+      if (root_value) {
+        root_text = *root_value;
+      } else {
+        constexpr llvm::StringLiteral pattern = "root=";
+        size_t pos = trimmed.find(pattern);
+        if (pos != llvm::StringRef::npos) {
+          pos += pattern.size();
+          size_t end = pos;
+          while (end < trimmed.size() && !llvm::isSpace(trimmed[end]))
+            ++end;
+          root_text = trimmed.slice(pos, end);
+        }
+      }
+      uint64_t parsed_root = 0;
+      if (!root_text.empty()) {
+        if (root_text.consume_front("0x"))
+          ;
+        if (!root_text.getAsInteger(16, parsed_root) && parsed_root == root_pc)
+          in_root_block = true;
+      }
+      continue;
+    }
+    if (!in_root_block)
+      continue;
+    if (trimmed.starts_with("frontier ")) {
+      if (!trimmed.contains("kind=dispatch"))
+        continue;
+      if (auto canonical = parseQuotedAttrValueFromLine(trimmed, "canonical")) {
+        add_pc(*canonical);
+        continue;
+      }
+      if (auto target = parseQuotedAttrValueFromLine(trimmed, "target")) {
+        add_pc(*target);
+        continue;
+      }
+      for (llvm::StringRef attr : {"canonical", "target"}) {
+        std::string pattern = (llvm::Twine(attr) + "=").str();
+        size_t pos = trimmed.find(pattern);
+        if (pos == llvm::StringRef::npos)
+          continue;
+        pos += pattern.size();
+        size_t end = pos;
+        while (end < trimmed.size() && !llvm::isSpace(trimmed[end]))
+          ++end;
+        add_pc(trimmed.slice(pos, end));
+        if (!target_pcs.empty() && seen_pcs.contains(target_pcs.back()))
+          break;
+      }
+      continue;
+    }
+    if (trimmed.starts_with("region ") || trimmed.starts_with("root-slice ") ||
+        trimmed.starts_with("slot ") || trimmed.starts_with("handler ") ||
+        trimmed.empty()) {
+      in_root_block = false;
+    }
+  }
+  return target_pcs;
+}
+
 
 static bool isTerminalRecoveryFrontierReason(llvm::StringRef reason) {
   return reason == "call_target_import_pointer" ||
@@ -4221,7 +4476,19 @@ int main(int argc, char **argv) {
     size_t decoded = 0;
     constexpr size_t kMaxDecoded = 24;
     const size_t end = std::min(stored.size(), offset + 96u);
+    auto seed_decode_ctx = arch->CreateInitialContext();
     while (cursor < end && decoded < kMaxDecoded) {
+      const size_t remaining = std::min<size_t>(15u, end - cursor);
+      std::string_view probe_bytes(
+          reinterpret_cast<const char *>(stored.data() + cursor), remaining);
+      remill::Instruction decoded_inst;
+      if (!arch->DecodeInstruction(section->va + cursor, probe_bytes,
+                                   decoded_inst, seed_decode_ctx) ||
+          decoded_inst.NumBytes() == 0) {
+        break;
+      }
+      const size_t inst_len =
+          std::min<size_t>(decoded_inst.NumBytes(), end - cursor);
       uint8_t rex = 0;
       size_t inst_start = cursor;
       uint8_t opcode = stored[cursor];
@@ -4243,19 +4510,10 @@ int main(int argc, char **argv) {
       bool handled = false;
 
       if (opcode >= 0x50u && opcode <= 0x5Fu) {
-        ++cursor;
+        cursor = inst_start + inst_len;
         handled = true;
-      } else if (opcode >= 0xB8u && opcode <= 0xBFu && (rex & 0x8u) &&
-                 cursor + 8u < end) {
-        auto dst = decodeReg(static_cast<uint8_t>(opcode - 0xB8u),
-                             (rex & 0x1u) != 0);
-        uint64_t imm = 0;
-        std::memcpy(&imm, stored.data() + cursor + 1u, sizeof(imm));
-        setRegExpr(dst, exprConst(imm));
-        cursor += 9u;
-        handled = true;
-      } else if ((opcode == 0x8Bu || opcode == 0x03u || opcode == 0x33u ||
-                  opcode == 0x85u) &&
+      } else if ((opcode == 0x89u || opcode == 0x8Bu || opcode == 0x03u ||
+                  opcode == 0x33u || opcode == 0x85u) &&
                  cursor + 1u < end) {
         uint8_t modrm = stored[cursor + 1u];
         if (((modrm >> 6u) & 0x3u) == 0x3u) {
@@ -4271,6 +4529,15 @@ int main(int argc, char **argv) {
                 setRegExpr(dst, *src_expr);
               } else {
                 setRegExpr(dst, exprUnary("zext32", *src_expr));
+              }
+            }
+            handled = true;
+          } else if (opcode == 0x89u) {
+            if (auto src_expr = getRegExpr(dst)) {
+              if (rex & 0x8u) {
+                setRegExpr(src, *src_expr);
+              } else {
+                setRegExpr(src, exprUnary("zext32", *src_expr));
               }
             }
             handled = true;
@@ -4298,23 +4565,157 @@ int main(int argc, char **argv) {
             handled = true;
           }
           if (handled)
-            cursor += 2u;
+            cursor = inst_start + inst_len;
+        } else if (opcode == 0x89u || opcode == 0x85u) {
+          // Ignore register spills / tests against stack slots in the prologue.
+          cursor = inst_start + inst_len;
+          handled = true;
+        } else if (opcode == 0x8Bu) {
+          // Ignore memory loads that feed stack-cookie / local-frame setup.
+          // They are not stable public-root seeds, but they should not stop us
+          // from seeing the real hidden live-ins that follow.
+          auto dst =
+              decodeReg(static_cast<uint8_t>((modrm >> 3u) & 0x7u),
+                        (rex & 0x4u) != 0);
+          setRegExpr(dst, exprConst(0));
+          cursor = inst_start + inst_len;
+          handled = true;
         }
+      } else if (opcode >= 0xB8u && opcode <= 0xBFu && (rex & 0x8u) &&
+                 cursor + 8u < end) {
+        auto dst = decodeReg(static_cast<uint8_t>(opcode - 0xB8u),
+                             (rex & 0x1u) != 0);
+        uint64_t imm = 0;
+        std::memcpy(&imm, stored.data() + cursor + 1u, sizeof(imm));
+        setRegExpr(dst, exprConst(imm));
+        cursor = inst_start + inst_len;
+        handled = true;
+      } else if (opcode == 0x8Du && cursor + 1u < end) {
+        uint8_t modrm = stored[cursor + 1u];
+        auto dst = decodeReg(static_cast<uint8_t>((modrm >> 3u) & 0x7u),
+                             (rex & 0x4u) != 0);
+        uint8_t mod = static_cast<uint8_t>((modrm >> 6u) & 0x3u);
+        uint8_t rm = static_cast<uint8_t>(modrm & 0x7u);
+        std::optional<SeedExpr> expr;
+
+        if (mod == 0 && rm == 5u && cursor + 5u < end) {
+          int32_t disp = 0;
+          std::memcpy(&disp, stored.data() + cursor + 2u, sizeof(disp));
+          uint64_t target = section->va + inst_start + inst_len +
+                            static_cast<int64_t>(disp);
+          expr = exprConst(target);
+        } else if (rm == 4u && cursor + 2u < end) {
+          uint8_t sib = stored[cursor + 2u];
+          auto base = decodeReg(static_cast<uint8_t>(sib & 0x7u),
+                                (rex & 0x1u) != 0);
+          auto index = decodeReg(static_cast<uint8_t>((sib >> 3u) & 0x7u),
+                                 (rex & 0x2u) != 0);
+          if (auto base_expr = getRegExpr(base)) {
+            expr = *base_expr;
+            if (((sib >> 3u) & 0x7u) != 4u) {
+              if (auto index_expr = getRegExpr(index))
+                expr = exprBinary("add64", *expr, *index_expr);
+            }
+            if (mod == 1u && cursor + 3u < end) {
+              int8_t disp = static_cast<int8_t>(stored[cursor + 3u]);
+              expr = exprBinary("add64", *expr,
+                                exprConst(static_cast<uint64_t>(
+                                    static_cast<int64_t>(disp))));
+            } else if (mod == 2u && cursor + 6u < end) {
+              int32_t disp = 0;
+              std::memcpy(&disp, stored.data() + cursor + 3u, sizeof(disp));
+              expr = exprBinary("add64", *expr,
+                                exprConst(static_cast<uint64_t>(
+                                    static_cast<int64_t>(disp))));
+            }
+          }
+        }
+
+        if (expr) {
+          setRegExpr(dst, *expr);
+          handled = true;
+        } else if (mod == 0u || mod == 1u || mod == 2u) {
+          // Ignore LEA forms we don't currently model instead of bailing out.
+          handled = true;
+        }
+        if (handled)
+          cursor = inst_start + inst_len;
       } else if (opcode == 0x83u && cursor + 2u < end) {
         uint8_t modrm = stored[cursor + 1u];
         uint8_t imm = stored[cursor + 2u];
-        if (((modrm >> 6u) & 0x3u) == 0x3u &&
-            (((modrm >> 3u) & 0x7u) == 0x4u)) {
+        if (((modrm >> 6u) & 0x3u) == 0x3u) {
           auto dst =
               decodeReg(static_cast<uint8_t>(modrm & 0x7u),
                         (rex & 0x1u) != 0);
-          if (auto dst_expr = getRegExpr(dst)) {
-            setRegExpr(dst,
-                       exprBinary("and32", *dst_expr, exprConst(imm)));
+          uint8_t subop = static_cast<uint8_t>((modrm >> 3u) & 0x7u);
+          if (subop == 0x0u) {
+            if (auto dst_expr = getRegExpr(dst)) {
+              setRegExpr(dst, exprBinary("add64", *dst_expr, exprConst(imm)));
+            }
+            handled = true;
+          } else if (subop == 0x4u) {
+            if (auto dst_expr = getRegExpr(dst)) {
+              setRegExpr(dst,
+                         exprBinary("and32", *dst_expr, exprConst(imm)));
+            }
+            handled = true;
+          } else if (subop == 0x5u || subop == 0x7u) {
+            handled = true;
           }
-          cursor += 3u;
-          handled = true;
         }
+        if (handled)
+          cursor = inst_start + inst_len;
+      } else if (opcode == 0x81u && cursor + 5u < end) {
+        uint8_t modrm = stored[cursor + 1u];
+        if (((modrm >> 6u) & 0x3u) == 0x3u) {
+          auto dst =
+              decodeReg(static_cast<uint8_t>(modrm & 0x7u),
+                        (rex & 0x1u) != 0);
+          uint8_t subop = static_cast<uint8_t>((modrm >> 3u) & 0x7u);
+          uint32_t imm = 0;
+          std::memcpy(&imm, stored.data() + cursor + 2u, sizeof(imm));
+          if (subop == 0x0u) {
+            if (auto dst_expr = getRegExpr(dst)) {
+              setRegExpr(dst, exprBinary("add64", *dst_expr, exprConst(imm)));
+            }
+            handled = true;
+          } else if (subop == 0x4u) {
+            if (auto dst_expr = getRegExpr(dst)) {
+              setRegExpr(dst, exprBinary("and32", *dst_expr, exprConst(imm)));
+            }
+            handled = true;
+          } else if (subop == 0x5u || subop == 0x7u) {
+            handled = true;
+          }
+        }
+        if (handled)
+          cursor = inst_start + inst_len;
+      } else if (opcode == 0xC1u && cursor + 2u < end) {
+        uint8_t modrm = stored[cursor + 1u];
+        uint8_t imm = stored[cursor + 2u];
+        if (((modrm >> 6u) & 0x3u) == 0x3u && (rex & 0x8u)) {
+          auto dst =
+              decodeReg(static_cast<uint8_t>(modrm & 0x7u),
+                        (rex & 0x1u) != 0);
+          uint8_t subop = static_cast<uint8_t>((modrm >> 3u) & 0x7u);
+          if (auto dst_expr = getRegExpr(dst)) {
+            if (subop == 0x0u) {
+              setRegExpr(dst,
+                         exprBinary("rol64", *dst_expr, exprConst(imm)));
+              handled = true;
+            } else if (subop == 0x1u) {
+              setRegExpr(dst,
+                         exprBinary("ror64", *dst_expr, exprConst(imm)));
+              handled = true;
+            }
+          }
+        }
+        if (handled)
+          cursor = inst_start + inst_len;
+      } else if (opcode == 0x0Fu && cursor + 1u < end &&
+                 stored[cursor + 1u] == 0x1Fu) {
+        cursor = inst_start + inst_len;
+        handled = true;
       }
 
       if (!handled)
@@ -4388,56 +4789,7 @@ int main(int argc, char **argv) {
       (!RawBinary && requested_func_va >= pe.image_base)
           ? (requested_func_va - pe.image_base)
           : 0;
-  auto moduleHasRootLocalGenericStaticDevirtualizationShape = [&]() {
-    auto isRootLocalGenericStaticDevirtSignalFunction =
-        [](const llvm::Function &F) {
-          auto name = F.getName();
-          if (name.starts_with("vm_entry_"))
-            return true;
-
-          return F.hasFnAttribute("omill.vm_handler") ||
-                 F.hasFnAttribute("omill.vm_wrapper") ||
-                 F.hasFnAttribute("omill.vm_newly_lifted") ||
-                 F.hasFnAttribute("omill.newly_lifted") ||
-                 F.hasFnAttribute("omill.virtual_specialized") ||
-                 F.getFnAttribute("omill.vm_demerged_clone").isValid() ||
-                 F.getFnAttribute("omill.vm_outlined_virtual_call").isValid();
-        };
-
-    llvm::SmallVector<llvm::Function *, 16> worklist;
-    llvm::SmallPtrSet<llvm::Function *, 32> seen;
-    for (auto &F : *module) {
-      if (!F.isDeclaration() && F.hasFnAttribute("omill.output_root") &&
-          seen.insert(&F).second) {
-        worklist.push_back(&F);
-      }
-    }
-
-    constexpr size_t kMaxReachable = 256;
-    while (!worklist.empty() && seen.size() <= kMaxReachable) {
-      llvm::Function *F = worklist.pop_back_val();
-      if (!F->hasFnAttribute("omill.output_root") &&
-          isRootLocalGenericStaticDevirtSignalFunction(*F)) {
-        return true;
-      }
-
-      for (auto &BB : *F) {
-        for (auto &I : BB) {
-          auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
-          if (!call)
-            continue;
-          auto *callee = call->getCalledFunction();
-          if (!callee)
-            continue;
-          auto callee_name = callee->getName();
-          if (callee_name == "__omill_dispatch_jump") {
-            return true;
-          }
-          if (!callee->isDeclaration() && seen.insert(callee).second)
-            worklist.push_back(callee);
-        }
-      }
-    }
+  auto foldRecursiveDeclarationAliases = [&]() {
     for (auto &F : llvm::make_early_inc_range(*module)) {
       if (!F.isDeclaration())
         continue;
@@ -4461,9 +4813,8 @@ int main(int argc, char **argv) {
         }
       }
     }
-
-    return false;
   };
+  foldRecursiveDeclarationAliases();
   omill::PipelineOptions opts;
   opts.target_arch = target_arch;
   opts.target_os = target_os_str;
@@ -4527,7 +4878,7 @@ int main(int argc, char **argv) {
                     {{"reason", "stable_large_export_root_fallback"}});
   }
   const bool root_local_generic_static_devirtualization_shape =
-      moduleHasRootLocalGenericStaticDevirtualizationShape();
+      omill::moduleHasRootLocalGenericStaticDevirtualizationShape(*module);
   if (!fast_plain_export_root_fallback &&
       !stable_no_gsd_export_root_fallback && opts.generic_static_devirtualize &&
       omill::shouldAutoSkipGenericStaticDevirtualizationForRoot(
@@ -4670,6 +5021,77 @@ int main(int argc, char **argv) {
         ++count;
     }
     return count;
+  };
+
+  auto pruneToDefinedOutputRootClosure = [&]() {
+    llvm::SmallVector<llvm::Function *, 16> roots;
+    for (auto &F : *module) {
+      if (!F.isDeclaration() && F.hasFnAttribute("omill.output_root"))
+        roots.push_back(&F);
+    }
+    if (roots.empty())
+      return;
+
+    llvm::SmallVector<llvm::Function *, 32> worklist(roots.begin(), roots.end());
+    llvm::DenseSet<llvm::Function *> reachable;
+    while (!worklist.empty()) {
+      llvm::Function *F = worklist.pop_back_val();
+      if (!F || F->isDeclaration() || !reachable.insert(F).second)
+        continue;
+      for (auto &BB : *F) {
+        for (auto &I : BB) {
+          for (llvm::Value *operand : I.operands()) {
+            auto *callee = llvm::dyn_cast<llvm::Function>(operand);
+            if (!callee || callee->isDeclaration())
+              continue;
+            worklist.push_back(callee);
+          }
+        }
+      }
+    }
+
+    auto isPrunableLiftedOrDeadHelper = [&](llvm::Function &F) {
+      if (reachable.count(&F))
+        return false;
+      if (F.hasFnAttribute("omill.output_root"))
+        return false;
+      if (F.getName().starts_with("__omill_plain_source_oracle_") ||
+          F.getName().starts_with("__omill_compact_recursive_source_oracle"))
+        return false;
+      return F.getName().starts_with("blk_") || F.getName().starts_with("block_") ||
+             F.getName().starts_with("sub_") ||
+             F.getName().starts_with("vm_entry_") ||
+             F.getName().starts_with("__omill_dispatch");
+    };
+
+    for (auto &F : *module) {
+      if (F.isDeclaration())
+        continue;
+      if (!isPrunableLiftedOrDeadHelper(F))
+        continue;
+      if (!F.hasLocalLinkage())
+        F.setLinkage(llvm::GlobalValue::InternalLinkage);
+    }
+
+    {
+      llvm::ModulePassManager DeadMPM;
+      DeadMPM.addPass(llvm::GlobalDCEPass());
+      DeadMPM.run(*module, MAM);
+    }
+
+    llvm::SmallVector<llvm::Function *, 32> dead_decls;
+    for (auto &F : *module) {
+      if (!F.isDeclaration() || !F.use_empty())
+        continue;
+      if (F.getName().starts_with("blk_") || F.getName().starts_with("block_") ||
+          F.getName().starts_with("sub_") ||
+          F.getName().starts_with("vm_entry_") ||
+          F.getName().starts_with("__omill_dispatch")) {
+        dead_decls.push_back(&F);
+      }
+    }
+    for (llvm::Function *F : dead_decls)
+      F->eraseFromParent();
   };
 
   std::function<void()> rerunLateNativeArgRepair = []() {};
@@ -5997,11 +6419,123 @@ int main(int argc, char **argv) {
     });
   };
 
+  auto normalizeKnownVmContinuationTarget = [&](uint64_t target) -> uint64_t {
+    return target;
+  };
+
+  auto collectOutputRootConstantDispatchTargets = [&]() {
+    llvm::DenseSet<uint64_t> targets;
+    for (auto &F : *module) {
+      if (F.isDeclaration())
+        continue;
+      if (!F.hasFnAttribute("omill.output_root") &&
+          !F.hasFnAttribute("omill.closed_root_slice_root")) {
+        continue;
+      }
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+          if (!call || call->arg_size() < 2)
+            continue;
+          auto *callee = call->getCalledFunction();
+          if (!callee)
+            continue;
+          if (callee->getName() != "__omill_dispatch_call" &&
+              callee->getName() != "__omill_dispatch_jump") {
+            continue;
+          }
+          auto *ci = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+          if (!ci)
+            continue;
+          uint64_t target = normalizeKnownVmContinuationTarget(ci->getZExtValue());
+          if (!isCodeAddressInCurrentInput(target))
+            continue;
+          if (hasDefinedLiftedOrNativeForTarget(target))
+            continue;
+          targets.insert(target);
+        }
+      }
+    }
+    return targets;
+  };
+
+  auto collectOutputRootAnnotatedVmContinuationTargets = [&]() {
+    llvm::DenseSet<uint64_t> targets;
+    for (auto &F : *module) {
+      if (F.isDeclaration())
+        continue;
+      if (!F.hasFnAttribute("omill.output_root") &&
+          !F.hasFnAttribute("omill.closed_root_slice_root")) {
+        continue;
+      }
+      llvm::SmallVector<llvm::Function *, 16> worklist = {&F};
+      llvm::SmallPtrSet<llvm::Function *, 16> visited;
+      while (!worklist.empty()) {
+        auto *current = worklist.pop_back_val();
+        if (!current || current->isDeclaration() ||
+            !visited.insert(current).second) {
+          continue;
+        }
+        if (auto attr =
+                current->getFnAttribute("omill.vm_unresolved_continuation_targets");
+            attr.isValid() && attr.isStringAttribute()) {
+          auto targets_csv = attr.getValueAsString();
+          llvm::SmallVector<llvm::StringRef, 8> parts;
+          targets_csv.split(parts, ',', -1, /*KeepEmpty=*/false);
+          for (auto part : parts) {
+            uint64_t target = 0;
+            if (part.empty() || part.getAsInteger(16, target))
+              continue;
+            target = normalizeKnownVmContinuationTarget(target);
+            if (!isCodeAddressInCurrentInput(target))
+              continue;
+            if (hasDefinedLiftedOrNativeForTarget(target))
+              continue;
+            targets.insert(target);
+          }
+        }
+        for (auto &BB : *current) {
+          for (auto &I : BB) {
+            if (auto *call = llvm::dyn_cast<llvm::CallInst>(&I)) {
+              if (call->arg_size() >= 2) {
+                if (auto *callee = call->getCalledFunction()) {
+                  if (callee->getName() == "__omill_dispatch_call" ||
+                      callee->getName() == "__omill_dispatch_jump") {
+                    if (auto *ci = llvm::dyn_cast<llvm::ConstantInt>(
+                            call->getArgOperand(1))) {
+                      uint64_t target = normalizeKnownVmContinuationTarget(
+                          ci->getZExtValue());
+                      if (isCodeAddressInCurrentInput(target) &&
+                          !hasDefinedLiftedOrNativeForTarget(target)) {
+                        targets.insert(target);
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            for (llvm::Value *operand : I.operands()) {
+              auto *maybe_callee = llvm::dyn_cast<llvm::Function>(operand);
+              if (!maybe_callee || maybe_callee->isDeclaration())
+                continue;
+              worklist.push_back(maybe_callee);
+            }
+          }
+        }
+      }
+    }
+    return targets;
+  };
+
   auto rerunLateOutputRootTargetPipeline = [&]() {
-    if (NoABI || !BlockLift)
+    const bool enable_late_output_target_rerun =
+        parseBoolEnv("OMILL_ENABLE_LATE_OUTPUT_ROOT_TARGET_RERUN")
+            .value_or(false);
+    if (!BlockLift)
       return;
-    if (!parseBoolEnv("OMILL_ENABLE_LATE_OUTPUT_ROOT_TARGET_RERUN")
-             .value_or(false)) {
+    if (NoABI && !enable_late_output_target_rerun)
+      return;
+    if (!enable_late_output_target_rerun) {
       return;
     }
     if (parseBoolEnv("OMILL_SKIP_LATE_OUTPUT_ROOT_TARGET_RERUN")
@@ -6020,6 +6554,17 @@ int main(int argc, char **argv) {
         errs() << "[late-output-target] round=" << (round + 1)
                << " collect\n";
       auto targets = collectOutputRootConstantCodeCallTargets();
+      auto dispatch_targets = collectOutputRootConstantDispatchTargets();
+      targets.insert(dispatch_targets.begin(), dispatch_targets.end());
+      auto vm_targets = collectOutputRootAnnotatedVmContinuationTargets();
+      targets.insert(vm_targets.begin(), vm_targets.end());
+      if (debug_late_output_target_rerun) {
+        errs() << "[late-output-target] round=" << (round + 1)
+               << " raw-code=" << collectOutputRootConstantCodeCallTargets().size()
+               << " raw-dispatch=" << dispatch_targets.size()
+               << " raw-vm=" << vm_targets.size()
+               << " merged=" << targets.size() << "\n";
+      }
       if (targets.empty())
         break;
 
@@ -6041,12 +6586,20 @@ int main(int argc, char **argv) {
         break;
       if (ordered_targets.size() > kMaxTargetsPerRound)
         ordered_targets.resize(kMaxTargetsPerRound);
+      bool vm_only_targets = !ordered_targets.empty();
+      for (uint64_t pc : ordered_targets) {
+        if (!vm_targets.count(pc)) {
+          vm_only_targets = false;
+          break;
+        }
+      }
       if (debug_late_output_target_rerun) {
         errs() << "[late-output-target] round=" << (round + 1)
                << " targets=";
         for (uint64_t pc : ordered_targets)
           errs() << " 0x" << llvm::Twine::utohexstr(pc);
-        errs() << "\n";
+        errs() << " mode=" << (vm_only_targets ? "iterative-vm" : "direct")
+               << "\n";
       }
 
       ScopedEnvOverride skip_always_inline("OMILL_SKIP_ALWAYS_INLINE", "1");
@@ -6054,11 +6607,11 @@ int main(int argc, char **argv) {
         errs() << "[late-output-target] round=" << (round + 1)
                << " lift+rerun\n";
       if (!liftScopedTargets(ordered_targets, "omill.late_output_target_lifted",
-                             /*run_abi=*/true,
+                             /*run_abi=*/!vm_only_targets,
                              /*skip_missing_block_lift=*/true,
                              /*clear_attr=*/true,
                              /*mark_closed_root_slice=*/false,
-                             /*use_direct_lifter=*/true)) {
+                             /*use_direct_lifter=*/!vm_only_targets)) {
         break;
       }
 
@@ -6484,26 +7037,208 @@ int main(int argc, char **argv) {
       }
     appendDebugMarker("abi:after_restore_vm_attrs");
 
+    bool cached_recover_abi_text_valid = false;
+    std::string cached_recover_abi_text_input;
+    std::optional<std::string> cached_recover_abi_text_output;
+
+    auto repairDeclaredContinuationWrappersInModule =
+        [&](llvm::Module &M) -> unsigned {
+      auto findNearestDefinedLiftedOrBlockInModule =
+          [&](uint64_t target_pc, bool native,
+              uint64_t *resolved_pc = nullptr) -> llvm::Function * {
+            if (!target_pc)
+              return nullptr;
+
+            const uint64_t window = nearbyLiftedEntrySearchWindow();
+            llvm::Function *best = nullptr;
+            uint64_t best_pc = 0;
+            uint64_t best_distance = std::numeric_limits<uint64_t>::max();
+
+            for (auto &F : M) {
+              if (F.isDeclaration())
+                continue;
+              auto entry_pc = extractLiftedOrBlockEntryPC(F.getName(), native);
+              if (!entry_pc)
+                continue;
+              const uint64_t distance = (*entry_pc > target_pc)
+                                            ? (*entry_pc - target_pc)
+                                            : (target_pc - *entry_pc);
+              if (distance == 0 || distance > window)
+                continue;
+              if (!best || distance < best_distance ||
+                  (distance == best_distance && *entry_pc < best_pc)) {
+                best = &F;
+                best_pc = *entry_pc;
+                best_distance = distance;
+              }
+            }
+
+            if (best && resolved_pc)
+              *resolved_pc = best_pc;
+            return best;
+          };
+
+      unsigned rewritten = 0;
+      auto *i64_ty = llvm::Type::getInt64Ty(M.getContext());
+      for (auto &F : M) {
+        if (F.isDeclaration())
+          continue;
+        for (auto &BB : F) {
+          for (auto &I : llvm::make_early_inc_range(BB)) {
+            auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+            if (!CI || CI->arg_size() < 3)
+              continue;
+            auto *callee = CI->getCalledFunction();
+            if (!callee || !callee->isDeclaration())
+              continue;
+            auto name = callee->getName();
+            if (!(name.starts_with("blk_") || name.starts_with("block_")) ||
+                name.ends_with("_native")) {
+              continue;
+            }
+            auto *pc_ci = llvm::dyn_cast<llvm::ConstantInt>(CI->getArgOperand(1));
+            if (!pc_ci)
+              continue;
+
+            uint64_t resolved_pc = 0;
+            auto *target = findNearestDefinedLiftedOrBlockInModule(
+                pc_ci->getZExtValue(), /*native=*/false, &resolved_pc);
+            if (!target || target == callee || target->isDeclaration())
+              continue;
+
+            if (auto *helper =
+                    llvm::dyn_cast<llvm::CallInst>(CI->getArgOperand(2))) {
+              if (auto *helper_callee = helper->getCalledFunction();
+                  helper_callee &&
+                  (helper_callee->getName() == "__omill_dispatch_jump" ||
+                   helper_callee->getName() == "__omill_dispatch_call") &&
+                  helper->arg_size() >= 3) {
+                CI->setArgOperand(2, helper->getArgOperand(2));
+                if (helper->use_empty())
+                  helper->eraseFromParent();
+              }
+            }
+
+            CI->setCalledFunction(target);
+            CI->setArgOperand(1, llvm::ConstantInt::get(i64_ty, resolved_pc));
+            ++rewritten;
+          }
+        }
+      }
+
+      for (auto &F : M) {
+        if (F.isDeclaration())
+          continue;
+        for (auto &BB : F) {
+          for (auto &I : llvm::make_early_inc_range(BB)) {
+            auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+            if (!CI || CI->arg_size() < 3)
+              continue;
+            auto *callee = CI->getCalledFunction();
+            if (!callee || !callee->isDeclaration())
+              continue;
+            auto name = callee->getName();
+            if (name != "__omill_dispatch_call" &&
+                name != "__omill_dispatch_jump") {
+              continue;
+            }
+            auto *pc_ci =
+                llvm::dyn_cast<llvm::ConstantInt>(CI->getArgOperand(1));
+            if (!pc_ci)
+              continue;
+
+            uint64_t resolved_pc = 0;
+            auto *target = findNearestDefinedLiftedOrBlockInModule(
+                pc_ci->getZExtValue(), /*native=*/false, &resolved_pc);
+            if (!target || target->isDeclaration() ||
+                target->getFunctionType()->getNumParams() != CI->arg_size()) {
+              continue;
+            }
+
+            if (auto *helper =
+                    llvm::dyn_cast<llvm::CallInst>(CI->getArgOperand(2))) {
+              if (auto *helper_callee = helper->getCalledFunction();
+                  helper_callee &&
+                  (helper_callee->getName() == "__omill_dispatch_jump" ||
+                   helper_callee->getName() == "__omill_dispatch_call") &&
+                  helper->arg_size() >= 3) {
+                CI->setArgOperand(2, helper->getArgOperand(2));
+                if (helper->use_empty())
+                  helper->eraseFromParent();
+              }
+            }
+
+            CI->setCalledFunction(target);
+            CI->setArgOperand(1, llvm::ConstantInt::get(i64_ty, resolved_pc));
+            ++rewritten;
+          }
+        }
+      }
+      return rewritten;
+    };
+
+    auto prepareIRTextForABIReplay =
+        [&](llvm::StringRef abi_input_ir) -> std::string {
+      llvm::SMDiagnostic parse_error;
+      auto replay_module =
+          llvm::parseAssemblyString(abi_input_ir, parse_error, ctx);
+      if (!replay_module)
+        return abi_input_ir.str();
+      unsigned rewritten =
+          repairDeclaredContinuationWrappersInModule(*replay_module);
+      if (rewritten == 0)
+        return abi_input_ir.str();
+      std::string repaired_ir;
+      llvm::raw_string_ostream os(repaired_ir);
+      replay_module->print(os, nullptr);
+      os.flush();
+      errs() << "[abi-prep] repaired-declared-continuation-wrappers="
+             << rewritten << "\n";
+      return repaired_ir;
+    };
+
     auto runExternalRecoverABIText =
         [&](llvm::StringRef abi_input_ir) -> std::optional<std::string> {
       if (abi_input_ir.empty())
         return std::nullopt;
 
+      std::string prepared_input_ir = prepareIRTextForABIReplay(abi_input_ir);
+      llvm::StringRef effective_input_ir(prepared_input_ir);
+      dumpTextIfEnvEnabled(effective_input_ir,
+                           "OMILL_DEBUG_DUMP_EXTERNAL_RECOVER_ABI_INPUT_IR",
+                           "external_recover_abi_input.ll");
+
+      if (cached_recover_abi_text_valid &&
+          effective_input_ir == cached_recover_abi_text_input) {
+        return cached_recover_abi_text_output;
+      }
+
       llvm::SmallString<256> opt_path(argv[0]);
       llvm::sys::path::remove_filename(opt_path);
       llvm::sys::path::remove_filename(opt_path);
       llvm::sys::path::append(opt_path, "omill-opt", "omill-opt.exe");
-      if (!llvm::sys::fs::exists(opt_path))
+      if (!llvm::sys::fs::exists(opt_path)) {
+        cached_recover_abi_text_input = effective_input_ir.str();
+        cached_recover_abi_text_output = std::nullopt;
+        cached_recover_abi_text_valid = true;
         return std::nullopt;
+      }
 
       llvm::SmallString<256> temp_in_path;
       llvm::SmallString<256> temp_out_path;
       if (llvm::sys::fs::createTemporaryFile("omill_pre_abi_replay_in", "ll",
-                                             temp_in_path))
+                                             temp_in_path)) {
+        cached_recover_abi_text_input = effective_input_ir.str();
+        cached_recover_abi_text_output = std::nullopt;
+        cached_recover_abi_text_valid = true;
         return std::nullopt;
+      }
       if (llvm::sys::fs::createTemporaryFile("omill_pre_abi_replay_out", "ll",
                                              temp_out_path)) {
         llvm::sys::fs::remove(temp_in_path);
+        cached_recover_abi_text_input = effective_input_ir.str();
+        cached_recover_abi_text_output = std::nullopt;
+        cached_recover_abi_text_valid = true;
         return std::nullopt;
       }
 
@@ -6513,9 +7248,12 @@ int main(int argc, char **argv) {
         if (ec) {
           llvm::sys::fs::remove(temp_in_path);
           llvm::sys::fs::remove(temp_out_path);
+          cached_recover_abi_text_input = effective_input_ir.str();
+          cached_recover_abi_text_output = std::nullopt;
+          cached_recover_abi_text_valid = true;
           return std::nullopt;
         }
-        os << abi_input_ir;
+        os << effective_input_ir;
       }
 
       llvm::SmallVector<std::string, 8> arg_storage;
@@ -6537,14 +7275,22 @@ int main(int argc, char **argv) {
       llvm::sys::fs::remove(temp_in_path);
       if (rc != 0 || exec_failed) {
         llvm::sys::fs::remove(temp_out_path);
+        cached_recover_abi_text_input = effective_input_ir.str();
+        cached_recover_abi_text_output = std::nullopt;
+        cached_recover_abi_text_valid = true;
         return std::nullopt;
       }
 
       auto buf_or_err = llvm::MemoryBuffer::getFile(temp_out_path);
       llvm::sys::fs::remove(temp_out_path);
-      if (!buf_or_err)
+      cached_recover_abi_text_input = effective_input_ir.str();
+      cached_recover_abi_text_valid = true;
+      if (!buf_or_err) {
+        cached_recover_abi_text_output = std::nullopt;
         return std::nullopt;
-      return (*buf_or_err)->getBuffer().str();
+      }
+      cached_recover_abi_text_output = (*buf_or_err)->getBuffer().str();
+      return cached_recover_abi_text_output;
     };
 
     auto runExternalRecoverABIFromCurrentModuleBitcode =
@@ -6669,6 +7415,68 @@ int main(int argc, char **argv) {
       return filtered_ir;
     };
 
+    auto requiresHiddenEntrySeedPreservation = [&]() {
+      for (auto &F : *module) {
+        if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
+          continue;
+        auto attr = F.getFnAttribute("omill.export_entry_seed_exprs");
+        if (attr.isValid() && attr.isStringAttribute() &&
+            !attr.getValueAsString().empty()) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    auto ensureRecoveredModuleHasOutputRoot =
+        [&](llvm::Module &M, uint64_t expected_root_va) -> llvm::Function * {
+      auto pickUnique = [](llvm::ArrayRef<llvm::Function *> candidates)
+          -> llvm::Function * {
+        return candidates.size() == 1 ? candidates.front() : nullptr;
+      };
+
+      std::string target_hex = llvm::utohexstr(expected_root_va);
+      llvm::SmallVector<llvm::Function *, 8> exact_target_roots;
+      llvm::SmallVector<llvm::Function *, 8> output_roots;
+      llvm::SmallVector<llvm::Function *, 8> native_functions;
+      llvm::SmallVector<llvm::Function *, 8> defined_functions;
+      for (auto &F : M) {
+        if (F.isDeclaration())
+          continue;
+        defined_functions.push_back(&F);
+        if (F.hasFnAttribute("omill.output_root"))
+          output_roots.push_back(&F);
+        if (F.getName().ends_with("_native"))
+          native_functions.push_back(&F);
+        if (expected_root_va != 0 &&
+            ((F.getName() == ("sub_" + target_hex + "_native")) ||
+             (F.getName() == ("blk_" + target_hex + "_native")) ||
+             (F.getName().contains(target_hex) &&
+              F.getName().ends_with("_native")))) {
+          exact_target_roots.push_back(&F);
+        }
+      }
+
+      llvm::Function *root = nullptr;
+      if (auto *F = pickUnique(exact_target_roots))
+        root = F;
+      else if (auto *F = pickUnique(output_roots))
+        root = F;
+      else if (auto *F = pickUnique(native_functions))
+        root = F;
+      else if (auto *F = pickUnique(defined_functions))
+        root = F;
+      if (!root)
+        return nullptr;
+      for (auto &F : M) {
+        if (&F == root)
+          continue;
+        F.removeFnAttr("omill.output_root");
+      }
+      root->addFnAttr("omill.output_root");
+      return root;
+    };
+
     auto tryDirectReplayABIText = [&](llvm::StringRef abi_input_ir,
                                       llvm::StringRef event_name,
                                       llvm::StringRef event_message) -> bool {
@@ -6683,61 +7491,20 @@ int main(int argc, char **argv) {
         return false;
       if (verifyModule(*replayed_module, nullptr))
         return false;
-
-      auto ensureRecoveredModuleHasOutputRoot =
-          [&](llvm::Module &M, uint64_t expected_root_va) -> llvm::Function * {
-        auto pickUnique =
-            [](llvm::ArrayRef<llvm::Function *> candidates)
-            -> llvm::Function * {
-          return candidates.size() == 1 ? candidates.front() : nullptr;
-        };
-
-        std::string target_hex = llvm::utohexstr(expected_root_va);
-        llvm::SmallVector<llvm::Function *, 8> exact_target_roots;
-        llvm::SmallVector<llvm::Function *, 8> output_roots;
-        llvm::SmallVector<llvm::Function *, 8> native_functions;
-        llvm::SmallVector<llvm::Function *, 8> defined_functions;
-        for (auto &F : M) {
-          if (F.isDeclaration())
-            continue;
-          defined_functions.push_back(&F);
-          if (F.hasFnAttribute("omill.output_root"))
-            output_roots.push_back(&F);
-          if (F.getName().ends_with("_native"))
-            native_functions.push_back(&F);
-          if (expected_root_va != 0 &&
-              ((F.getName() == ("sub_" + target_hex + "_native")) ||
-               (F.getName() == ("blk_" + target_hex + "_native")) ||
-               (F.getName().contains(target_hex) &&
-                F.getName().ends_with("_native")))) {
-            exact_target_roots.push_back(&F);
-          }
-        }
-
-        llvm::Function *root = nullptr;
-        if (auto *F = pickUnique(exact_target_roots))
-          root = F;
-        else if (auto *F = pickUnique(output_roots))
-          root = F;
-        else if (auto *F = pickUnique(native_functions))
-          root = F;
-        else if (auto *F = pickUnique(defined_functions))
-          root = F;
-        if (!root)
-          return nullptr;
-        for (auto &F : M) {
-          if (&F == root)
-            continue;
-          F.removeFnAttr("omill.output_root");
-        }
-        root->addFnAttr("omill.output_root");
-        return root;
-      };
+      const bool requires_hidden_entry_seed_preservation =
+          requiresHiddenEntrySeedPreservation();
 
       auto *resolved_root =
           ensureRecoveredModuleHasOutputRoot(*replayed_module, func_va);
       if (!resolved_root)
         return false;
+      if (requires_hidden_entry_seed_preservation) {
+        auto attr = resolved_root->getFnAttribute("omill.export_entry_seed_exprs");
+        if (!attr.isValid() || !attr.isStringAttribute() ||
+            attr.getValueAsString().empty()) {
+          return false;
+        }
+      }
 
       unsigned defined_output_roots = 0;
       bool has_unresolved_output_control_transfer = false;
@@ -6790,12 +7557,28 @@ int main(int argc, char **argv) {
 
       std::string err_msg;
       bool exec_failed = false;
+      std::string recovery_root_va_text = llvm::utohexstr(func_va);
       ScopedEnvOverride skip_nested_probe(
           "OMILL_SKIP_TERMINAL_BOUNDARY_SIDE_PROBE", "1");
-      ScopedEnvOverride skip_late_output_target(
-          "OMILL_SKIP_LATE_OUTPUT_ROOT_TARGET_RERUN", "1");
+      ScopedEnvOverride enable_late_output_target_rerun(
+          "OMILL_ENABLE_LATE_OUTPUT_ROOT_TARGET_RERUN", "1");
       ScopedEnvOverride skip_late_boundary_rerun(
           "OMILL_SKIP_LATE_TERMINAL_BOUNDARY_RERUN", "1");
+      ScopedEnvOverride enable_noabi_late_continuation_rerun(
+          "OMILL_ENABLE_NOABI_LATE_CONTINUATION_RERUN", "1");
+      ScopedEnvOverride enable_call_frontier_dispatch_override(
+          "OMILL_ENABLE_CALL_FRONTIER_DISPATCH_OVERRIDE", "1");
+      ScopedEnvOverride enable_terminal_boundary_recovery(
+          "OMILL_TERMINAL_BOUNDARY_RECOVERY", "1");
+      ScopedEnvOverride terminal_boundary_recovery_root(
+          "OMILL_TERMINAL_BOUNDARY_RECOVERY_ROOT_VA",
+          recovery_root_va_text.c_str());
+      ScopedEnvOverride terminal_boundary_recovery_max_reachable(
+          "OMILL_TERMINAL_BOUNDARY_RECOVERY_MAX_REACHABLE", "32");
+      ScopedEnvOverride terminal_boundary_recovery_max_iterations(
+          "OMILL_TERMINAL_BOUNDARY_RECOVERY_MAX_ITERATIONS", "14");
+      ScopedEnvOverride terminal_boundary_recovery_max_new_target_rounds(
+          "OMILL_TERMINAL_BOUNDARY_RECOVERY_MAX_NEW_TARGET_ROUNDS", "14");
       int rc = llvm::sys::ExecuteAndWait(
           argv_refs.front(), argv_refs, std::nullopt, {},
           parseUnsignedEnv("OMILL_MAIN_ROOT_NOABI_CHILD_TIMEOUT_SECONDS")
@@ -6812,6 +7595,17 @@ int main(int argc, char **argv) {
         return std::nullopt;
       return (*buf_or_err)->getBuffer().str();
     };
+
+    {
+      unsigned rewritten_live_pre_abi =
+          repairDeclaredContinuationWrappersInModule(*module);
+      if (rewritten_live_pre_abi != 0) {
+        errs() << "[abi-prep] repaired-live-pre-abi-edges="
+               << rewritten_live_pre_abi << "\n";
+        MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+        repairMalformedPHIs(*module);
+      }
+    }
 
     auto moduleReadableEnoughForDirectWrite = [&](const llvm::Module &M) {
       bool has_state_alloca = false;
@@ -6917,6 +7711,9 @@ int main(int argc, char **argv) {
       if (auto noabi_child_ir = runExternalMainRootNoABIChildIR()) {
         events.emitInfo("main_root_noabi_child_completed",
                         "external main-root no-ABI child completed");
+        dumpTextIfEnvEnabled(*noabi_child_ir,
+                             "OMILL_DEBUG_DUMP_MAIN_ROOT_NOABI_CHILD_IR",
+                             "main_root_noabi_child.ll");
         if (auto replayed_text = runExternalRecoverABIText(*noabi_child_ir)) {
           auto summary = parseTerminalBoundaryRecoveryIRSummary(*replayed_text);
           const bool has_unresolved_pc_text =
@@ -6961,8 +7758,17 @@ int main(int argc, char **argv) {
 
     const bool force_direct_replay =
         parseBoolEnv("OMILL_FORCE_PRE_ABI_DIRECT_REPLAY").value_or(false);
+    const bool skip_pre_abi_direct_replay_for_vm_like_root =
+        root_local_generic_static_devirtualization_shape &&
+        opts.generic_static_devirtualize;
+    const bool skip_pre_abi_direct_replay_for_hidden_entry_seeds =
+        export_root_has_hidden_entry_seed_exprs;
+    const bool skip_pre_abi_direct_replay =
+        skip_pre_abi_direct_replay_for_hidden_entry_seeds ||
+        skip_pre_abi_direct_replay_for_vm_like_root;
     const bool prefer_direct_replay =
         use_pre_abi_noabi_cleanup && force_direct_replay &&
+        !skip_pre_abi_direct_replay &&
         !parseBoolEnv("OMILL_SKIP_PRE_ABI_DIRECT_REPLAY").value_or(false);
 
     if (use_pre_abi_noabi_cleanup &&
@@ -7108,6 +7914,7 @@ int main(int argc, char **argv) {
       if (pre_abi_checkpoint_text &&
           pre_abi_checkpoint_text->size() <=
               kMaxAutoDirectReplayCheckpointBytes &&
+          !skip_pre_abi_direct_replay &&
           !parseBoolEnv("OMILL_SKIP_PRE_ABI_DIRECT_REPLAY").value_or(false)) {
         if (debug_small_replay) {
           errs() << "[small-replay] checkpoint-bytes="
@@ -7284,6 +8091,7 @@ int main(int argc, char **argv) {
         }
       }
       if (!accepted_small_checkpoint_replay &&
+          !skip_pre_abi_direct_replay &&
           !parseBoolEnv("OMILL_SKIP_PRE_ABI_DIRECT_REPLAY").value_or(false)) {
         if (auto replayed_text =
                 runExternalRecoverABIText(*pre_abi_checkpoint_text)) {
@@ -7331,6 +8139,7 @@ int main(int argc, char **argv) {
       }
       if (!accepted_small_checkpoint_replay &&
           use_pre_abi_noabi_cleanup && countDefinedOutputRoots() <= 1u &&
+          !skip_pre_abi_direct_replay &&
           !parseBoolEnv("OMILL_SKIP_PRE_ABI_DIRECT_REPLAY").value_or(false)) {
         if (auto replayed_text =
                 runExternalRecoverABIText(*pre_abi_checkpoint_text)) {
@@ -7368,6 +8177,8 @@ int main(int argc, char **argv) {
         if (!use_pre_abi_noabi_cleanup)
           return false;
         if (!pre_abi_checkpoint_text || pre_abi_checkpoint_text->empty())
+          return false;
+        if (skip_pre_abi_direct_replay)
           return false;
         if (parseBoolEnv("OMILL_SKIP_PRE_ABI_DIRECT_REPLAY").value_or(false))
           return false;
@@ -7512,6 +8323,202 @@ int main(int argc, char **argv) {
           caller_hidden_seed_exprs =
               parseHiddenSeedExprMap(attr.getValueAsString());
         }
+        auto getCallerParamValue = [&](llvm::IRBuilder<> &Builder,
+                                       unsigned arg_index) -> llvm::Value * {
+          if (arg_index >= F.arg_size())
+            return llvm::ConstantInt::get(i64_ty, 0);
+          auto *arg = F.getArg(arg_index);
+          if (arg->getType()->isPointerTy()) {
+            return Builder.CreatePtrToInt(arg, i64_ty,
+                                          arg->getName() + ".i64");
+          }
+          if (arg->getType()->isIntegerTy(64))
+            return arg;
+          if (arg->getType()->isIntegerTy())
+            return Builder.CreateIntCast(arg, i64_ty, false,
+                                         arg->getName() + ".i64");
+          return llvm::ConstantInt::get(i64_ty, 0);
+        };
+
+        std::function<llvm::Value *(llvm::IRBuilder<> &, llvm::StringRef)>
+            evalSeedExpr;
+        evalSeedExpr = [&](llvm::IRBuilder<> &Builder,
+                           llvm::StringRef text) -> llvm::Value * {
+          text = text.trim();
+          if (text.starts_with("param(") && text.ends_with(")")) {
+            unsigned idx = 0;
+            if (!text.drop_front(6).drop_back().getAsInteger(10, idx))
+              return getCallerParamValue(Builder, idx);
+            return nullptr;
+          }
+          if (text.starts_with("const(") && text.ends_with(")")) {
+            auto body = text.drop_front(6).drop_back();
+            uint64_t value = 0;
+            if (body.starts_with("0x")) {
+              if (!body.drop_front(2).getAsInteger(16, value))
+                return llvm::ConstantInt::get(i64_ty, value);
+            } else if (!body.getAsInteger(10, value)) {
+              return llvm::ConstantInt::get(i64_ty, value);
+            }
+            return nullptr;
+          }
+
+          auto parseCallArgs = [&](llvm::StringRef body)
+              -> std::optional<std::pair<llvm::StringRef, llvm::StringRef>> {
+            int depth = 0;
+            for (size_t idx = 0; idx < body.size(); ++idx) {
+              char c = body[idx];
+              if (c == '(')
+                ++depth;
+              else if (c == ')')
+                --depth;
+              else if (c == ',' && depth == 0) {
+                return std::pair(body.take_front(idx),
+                                 body.drop_front(idx + 1));
+              }
+            }
+            return std::nullopt;
+          };
+
+          auto evalUnary = [&](llvm::StringRef op) -> llvm::Value * {
+            if (!text.starts_with(op) || !text.ends_with(")"))
+              return nullptr;
+            auto arg = text.drop_front(op.size()).drop_back();
+            auto *v = evalSeedExpr(Builder, arg);
+            if (!v)
+              return nullptr;
+            return Builder.CreateAnd(v,
+                                     llvm::ConstantInt::get(i64_ty,
+                                                            0xffffffffull));
+          };
+
+          auto evalBinary = [&](llvm::StringRef op,
+                                auto &&fn) -> llvm::Value * {
+            if (!text.starts_with(op) || !text.ends_with(")"))
+              return nullptr;
+            auto body = text.drop_front(op.size()).drop_back();
+            auto parts = parseCallArgs(body);
+            if (!parts)
+              return nullptr;
+            auto *lhs = evalSeedExpr(Builder, parts->first);
+            auto *rhs = evalSeedExpr(Builder, parts->second);
+            if (!lhs || !rhs)
+              return nullptr;
+            return fn(lhs, rhs);
+          };
+
+          if (auto *v = evalUnary("zext32("))
+            return v;
+          if (auto *v = evalBinary("add64(",
+                                   [&](llvm::Value *lhs, llvm::Value *rhs) {
+                                     return Builder.CreateAdd(lhs, rhs);
+                                   }))
+            return v;
+          if (auto *v = evalBinary("xor64(",
+                                   [&](llvm::Value *lhs, llvm::Value *rhs) {
+                                     return Builder.CreateXor(lhs, rhs);
+                                   }))
+            return v;
+          if (auto *v = evalBinary("xor32(",
+                                   [&](llvm::Value *lhs, llvm::Value *rhs) {
+                                     auto *x = Builder.CreateXor(lhs, rhs);
+                                     return Builder.CreateAnd(
+                                         x,
+                                         llvm::ConstantInt::get(i64_ty,
+                                                                0xffffffffull));
+                                   }))
+            return v;
+          if (auto *v = evalBinary("and32(",
+                                   [&](llvm::Value *lhs, llvm::Value *rhs) {
+                                     auto *x = Builder.CreateAnd(lhs, rhs);
+                                     return Builder.CreateAnd(
+                                         x,
+                                         llvm::ConstantInt::get(i64_ty,
+                                                                0xffffffffull));
+                                   }))
+            return v;
+          return nullptr;
+        };
+
+        if (is_requested_export_native_root && !caller_hidden_seed_exprs.empty() &&
+            !F.empty()) {
+          llvm::SmallDenseSet<unsigned, 8> rewritten_root_seed_offsets;
+          for (auto &I : llvm::make_early_inc_range(F.front())) {
+            auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I);
+            if (!SI || !SI->getValueOperand()->getType()->isIntegerTy(64))
+              continue;
+            auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(
+                SI->getPointerOperand()->stripPointerCasts());
+            if (!gep || gep->getNumIndices() != 1)
+              continue;
+            auto *idx_ci =
+                llvm::dyn_cast<llvm::ConstantInt>(gep->idx_begin()->get());
+            if (!idx_ci)
+              continue;
+            unsigned target_off = static_cast<unsigned>(idx_ci->getZExtValue());
+            auto it = caller_hidden_seed_exprs.find(target_off);
+            if (it == caller_hidden_seed_exprs.end())
+              continue;
+            llvm::IRBuilder<> Builder(SI);
+            if (auto *seed_value = evalSeedExpr(Builder, it->second)) {
+              SI->setOperand(0, seed_value);
+              rewritten_root_seed_offsets.insert(target_off);
+              ++fixup_count;
+              if (debug_public_root_seeds) {
+                errs() << "[post-abi-fixup] rewrote-root-seed-store fn="
+                       << F.getName() << " offset=" << target_off
+                       << " expr=" << it->second << "\n";
+              }
+            }
+          }
+
+          llvm::Instruction *insertion_point = nullptr;
+          for (auto &I : F.front()) {
+            if (auto *CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
+              if (auto *callee = CB->getCalledFunction();
+                  callee && !callee->isDeclaration()) {
+                insertion_point = &I;
+                break;
+              }
+            }
+          }
+          if (!insertion_point)
+            insertion_point = F.front().getTerminator();
+
+          llvm::Value *state_ptr = nullptr;
+          for (auto &I : F.front()) {
+            auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I);
+            if (!AI)
+              continue;
+            if (AI->getAllocatedType()->isStructTy() &&
+                AI->getAllocatedType()->getStructName().contains("State")) {
+              state_ptr = AI;
+              break;
+            }
+          }
+
+          if (state_ptr && insertion_point) {
+            for (const auto &entry : caller_hidden_seed_exprs) {
+              unsigned target_off = entry.first;
+              if (rewritten_root_seed_offsets.count(target_off))
+                continue;
+              llvm::IRBuilder<> Builder(insertion_point);
+              auto *offset_ptr = Builder.CreateInBoundsGEP(
+                  Builder.getInt8Ty(), state_ptr, Builder.getInt64(target_off),
+                  F.getName() + ".seed.ptr");
+              if (auto *seed_value = evalSeedExpr(Builder, entry.second)) {
+                Builder.CreateStore(seed_value, offset_ptr);
+                rewritten_root_seed_offsets.insert(target_off);
+                ++fixup_count;
+                if (debug_public_root_seeds) {
+                  errs() << "[post-abi-fixup] inserted-root-seed-store fn="
+                         << F.getName() << " offset=" << target_off
+                         << " expr=" << entry.second << "\n";
+                }
+              }
+            }
+          }
+        }
         for (auto &BB : F) {
           for (auto &I : llvm::make_early_inc_range(BB)) {
             auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
@@ -7564,124 +8571,6 @@ int main(int argc, char **argv) {
             llvm::SmallVector<llvm::StringRef, 16> callee_offset_strs;
             attr.getValueAsString().split(callee_offset_strs, ',');
             if (callee_offset_strs.size() != callee->arg_size()) continue;
-
-            auto getCallerParamValue = [&](llvm::IRBuilder<> &Builder,
-                                           unsigned arg_index) -> llvm::Value * {
-              if (arg_index >= F.arg_size())
-                return llvm::ConstantInt::get(i64_ty, 0);
-              auto *arg = F.getArg(arg_index);
-              if (arg->getType()->isPointerTy()) {
-                return Builder.CreatePtrToInt(arg, i64_ty,
-                                              arg->getName() + ".i64");
-              }
-              if (arg->getType()->isIntegerTy(64))
-                return arg;
-              if (arg->getType()->isIntegerTy())
-                return Builder.CreateIntCast(arg, i64_ty, false,
-                                             arg->getName() + ".i64");
-              return llvm::ConstantInt::get(i64_ty, 0);
-            };
-
-            std::function<llvm::Value *(llvm::IRBuilder<> &, llvm::StringRef)>
-                evalSeedExpr;
-            evalSeedExpr = [&](llvm::IRBuilder<> &Builder,
-                               llvm::StringRef text) -> llvm::Value * {
-              text = text.trim();
-              if (text.starts_with("param(") && text.ends_with(")")) {
-                unsigned idx = 0;
-                if (!text.drop_front(6).drop_back().getAsInteger(10, idx))
-                  return getCallerParamValue(Builder, idx);
-                return nullptr;
-              }
-              if (text.starts_with("const(") && text.ends_with(")")) {
-                auto body = text.drop_front(6).drop_back();
-                uint64_t value = 0;
-                if (body.starts_with("0x")) {
-                  if (!body.drop_front(2).getAsInteger(16, value))
-                    return llvm::ConstantInt::get(i64_ty, value);
-                } else if (!body.getAsInteger(10, value)) {
-                  return llvm::ConstantInt::get(i64_ty, value);
-                }
-                return nullptr;
-              }
-
-              auto parseCallArgs = [&](llvm::StringRef body)
-                  -> std::optional<std::pair<llvm::StringRef, llvm::StringRef>> {
-                int depth = 0;
-                for (size_t idx = 0; idx < body.size(); ++idx) {
-                  char c = body[idx];
-                  if (c == '(')
-                    ++depth;
-                  else if (c == ')')
-                    --depth;
-                  else if (c == ',' && depth == 0) {
-                    return std::pair(body.take_front(idx),
-                                     body.drop_front(idx + 1));
-                  }
-                }
-                return std::nullopt;
-              };
-
-              auto evalUnary = [&](llvm::StringRef op) -> llvm::Value * {
-                if (!text.starts_with(op) || !text.ends_with(")"))
-                  return nullptr;
-                auto arg = text.drop_front(op.size()).drop_back();
-                auto *v = evalSeedExpr(Builder, arg);
-                if (!v)
-                  return nullptr;
-                return Builder.CreateAnd(v, llvm::ConstantInt::get(i64_ty,
-                                                                   0xffffffffull));
-              };
-
-              auto evalBinary = [&](llvm::StringRef op,
-                                    auto &&fn) -> llvm::Value * {
-                if (!text.starts_with(op) || !text.ends_with(")"))
-                  return nullptr;
-                auto body = text.drop_front(op.size()).drop_back();
-                auto parts = parseCallArgs(body);
-                if (!parts)
-                  return nullptr;
-                auto *lhs = evalSeedExpr(Builder, parts->first);
-                auto *rhs = evalSeedExpr(Builder, parts->second);
-                if (!lhs || !rhs)
-                  return nullptr;
-                return fn(lhs, rhs);
-              };
-
-              if (auto *v = evalUnary("zext32("))
-                return v;
-              if (auto *v = evalBinary("add64(",
-                                       [&](llvm::Value *lhs,
-                                           llvm::Value *rhs) {
-                                         return Builder.CreateAdd(lhs, rhs);
-                                       }))
-                return v;
-              if (auto *v = evalBinary("xor64(",
-                                       [&](llvm::Value *lhs,
-                                           llvm::Value *rhs) {
-                                         return Builder.CreateXor(lhs, rhs);
-                                       }))
-                return v;
-              if (auto *v = evalBinary("xor32(",
-                                       [&](llvm::Value *lhs,
-                                           llvm::Value *rhs) {
-                                         auto *x = Builder.CreateXor(lhs, rhs);
-                                         return Builder.CreateAnd(
-                                             x, llvm::ConstantInt::get(
-                                                    i64_ty, 0xffffffffull));
-                                       }))
-                return v;
-              if (auto *v = evalBinary("and32(",
-                                       [&](llvm::Value *lhs,
-                                           llvm::Value *rhs) {
-                                         auto *x = Builder.CreateAnd(lhs, rhs);
-                                         return Builder.CreateAnd(
-                                             x, llvm::ConstantInt::get(
-                                                    i64_ty, 0xffffffffull));
-                                       }))
-                return v;
-              return nullptr;
-            };
 
             auto defaultMissingI64Arg = [&]() -> llvm::Value * {
               // Late ABI call repair should fail conservatively. Using poison
@@ -8042,7 +8931,9 @@ int main(int argc, char **argv) {
             if (!Callee)
               continue;
             auto Name = Callee->getName();
-            if (Name == "__remill_jump" || Name == "__omill_dispatch_jump" ||
+            if (Name == "__remill_jump" ||
+                Name == "__remill_function_return" ||
+                Name == "__omill_dispatch_jump" ||
                 Name == "__omill_dispatch_call") {
               return true;
             }
@@ -8164,7 +9055,7 @@ int main(int argc, char **argv) {
         llvm::SmallDenseSet<uint64_t, 16> local_case_pcs;
         for (auto &F : *module) {
           if (F.isDeclaration() || !F.getName().ends_with("_native") ||
-              !omill::isClosedRootSliceFunction(F)) {
+              !in_output_root_native_closure(F)) {
             continue;
           }
           if (uint64_t pc = parseNativeTargetPC(F.getName()); pc != 0)
@@ -8220,7 +9111,7 @@ int main(int argc, char **argv) {
         unsigned rewrite_count = 0;
         for (auto &F : *module) {
           if (F.isDeclaration() || !F.getName().ends_with("_native") ||
-              !omill::isClosedRootSliceFunction(F) || !F.getReturnType()->isVoidTy()) {
+              !in_output_root_native_closure(F) || !F.getReturnType()->isVoidTy()) {
             continue;
           }
 
@@ -8391,8 +9282,7 @@ int main(int argc, char **argv) {
                  << rewrite_count << "\n";
         }
       };
-      if (parseBoolEnv("OMILL_ENABLE_VOID_NATIVE_JT_REWRITE").value_or(false))
-        rewriteVoidNativeJumpTableDispatches();
+      rewriteVoidNativeJumpTableDispatches();
 
       if (std::getenv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS") != nullptr) {
         std::error_code ec;
@@ -10608,7 +11498,13 @@ int main(int argc, char **argv) {
         std::unique_ptr<ScopedEnvOverride> recovery_max_iterations_guard;
         std::unique_ptr<ScopedEnvOverride> recovery_max_target_rounds_guard;
         std::unique_ptr<ScopedEnvOverride> dump_model_guard;
+        std::unique_ptr<ScopedEnvOverride> skip_block_merge_guard;
         std::optional<std::string> recovery_root_value;
+        if (parseBoolEnv("OMILL_TERMINAL_BOUNDARY_CHILD_SKIP_BLOCK_MERGE")
+                .value_or(false)) {
+          skip_block_merge_guard = std::make_unique<ScopedEnvOverride>(
+              "OMILL_SKIP_BLOCK_MERGE", "1");
+        }
         if (enable_recovery_mode) {
           recovery_root_value = llvm::utohexstr(target_pc);
           recovery_mode_guard = std::make_unique<ScopedEnvOverride>(
@@ -12057,6 +12953,64 @@ int main(int argc, char **argv) {
                          "after_final_flattened_helper_rewrite.ll");
   logFunctionsWithUnresolvedLocalDispatch("after-final-flattened-rewrite");
 
+  auto repairLateDeclaredContinuationWrappers = [&]() {
+    unsigned rewritten = 0;
+    auto *i64_ty = llvm::Type::getInt64Ty(ctx);
+    for (auto &F : *module) {
+      if (F.isDeclaration())
+        continue;
+      for (auto &BB : F) {
+        for (auto &I : llvm::make_early_inc_range(BB)) {
+          auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+          if (!CI || CI->arg_size() < 3)
+            continue;
+          auto *callee = CI->getCalledFunction();
+          if (!callee || !callee->isDeclaration())
+            continue;
+          auto name = callee->getName();
+          if (!(name.starts_with("blk_") || name.starts_with("block_")) ||
+              name.ends_with("_native")) {
+            continue;
+          }
+          auto *pc_ci = llvm::dyn_cast<llvm::ConstantInt>(CI->getArgOperand(1));
+          if (!pc_ci)
+            continue;
+
+          uint64_t resolved_pc = 0;
+          auto *target = findExactOrNearbyLiftedOrBlockFunction(
+              pc_ci->getZExtValue(), /*native=*/false, &resolved_pc);
+          if (!target || target == callee || target->isDeclaration())
+            continue;
+
+          if (auto *helper = llvm::dyn_cast<llvm::CallInst>(CI->getArgOperand(2))) {
+            if (auto *helper_callee = helper->getCalledFunction();
+                helper_callee &&
+                (helper_callee->getName() == "__omill_dispatch_jump" ||
+                 helper_callee->getName() == "__omill_dispatch_call") &&
+                helper->arg_size() >= 3) {
+              CI->setArgOperand(2, helper->getArgOperand(2));
+              if (helper->use_empty())
+                helper->eraseFromParent();
+            }
+          }
+
+          CI->setCalledFunction(target);
+          CI->setArgOperand(1, llvm::ConstantInt::get(i64_ty, resolved_pc));
+          ++rewritten;
+        }
+      }
+    }
+
+    if (rewritten > 0) {
+      errs() << "[abi-post] repaired-late-declared-continuation-wrappers="
+             << rewritten << "\n";
+    }
+  };
+  repairLateDeclaredContinuationWrappers();
+  dumpModuleIfEnvEnabled(
+      *module, "OMILL_DEBUG_DUMP_AFTER_LATE_DECL_CONT_REWRITE",
+      "after_late_decl_cont_rewrite.ll");
+
   if (parseBoolEnv("OMILL_DEBUG_OUTPUT_ROOTS").value_or(false)) {
     errs() << "[output-roots] final-defined=" << countDefinedOutputRoots()
            << "\n";
@@ -12083,10 +13037,151 @@ int main(int argc, char **argv) {
     for (auto &F : *module) {
       if (!F.hasFnAttribute("omill.output_root") || F.isDeclaration())
         continue;
-      if (hasUnresolvedLiftedControlTransferInClosure(F))
-        unresolved.push_back(F.getName().str());
+      if (!hasUnresolvedLiftedControlTransferInClosure(F))
+        continue;
+      std::string label = F.getName().str();
+      if (auto attr = F.getFnAttribute("omill.vm_unresolved_continuation_targets");
+          attr.isValid() && attr.isStringAttribute() &&
+          !attr.getValueAsString().empty()) {
+        label += "[vm=0x" + attr.getValueAsString().str() + "]";
+      }
+      unresolved.push_back(std::move(label));
     }
     return unresolved;
+  };
+
+  auto collectOutputRootFunctionReturnLeaks = [&]() {
+    llvm::SmallVector<std::string, 8> leaked;
+    for (auto &F : *module) {
+      if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
+        continue;
+      llvm::SmallVector<llvm::Function *, 16> worklist = {&F};
+      llvm::SmallPtrSet<llvm::Function *, 16> visited;
+      while (!worklist.empty()) {
+        auto *current = worklist.pop_back_val();
+        if (!current || current->isDeclaration() ||
+            !visited.insert(current).second) {
+          continue;
+        }
+        bool has_return_intrinsic = false;
+        for (auto &BB : *current) {
+          for (auto &I : BB) {
+            auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+            if (!CB)
+              continue;
+            if (auto *callee = CB->getCalledFunction()) {
+              if (!callee->isDeclaration())
+                worklist.push_back(callee);
+              if (callee->getName() == "__remill_function_return")
+                has_return_intrinsic = true;
+            }
+          }
+        }
+        if (has_return_intrinsic)
+          leaked.push_back(current->getName().str());
+      }
+    }
+    llvm::sort(leaked);
+    leaked.erase(std::unique(leaked.begin(), leaked.end()), leaked.end());
+    return leaked;
+  };
+
+  auto annotateVmUnresolvedContinuationsInCurrentModule = [&]() {
+    constexpr llvm::StringLiteral kCountAttr =
+        "omill.vm_unresolved_continuation_count";
+    constexpr llvm::StringLiteral kTargetsAttr =
+        "omill.vm_unresolved_continuation_targets";
+    constexpr llvm::StringLiteral kSummaryAttr =
+        "omill.vm_unresolved_continuation_summary";
+    constexpr llvm::StringLiteral kNamedMetadata =
+        "omill.vm_unresolved_continuations";
+
+    for (auto &F : *module) {
+      F.removeFnAttr(kCountAttr);
+      F.removeFnAttr(kTargetsAttr);
+      F.removeFnAttr(kSummaryAttr);
+    }
+    if (auto *named_md = module->getNamedMetadata(kNamedMetadata))
+      named_md->clearOperands();
+    auto *named_md = module->getOrInsertNamedMetadata(kNamedMetadata);
+
+    for (auto &F : *module) {
+      if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
+        continue;
+
+      llvm::SmallVector<llvm::Function *, 16> worklist = {&F};
+      llvm::SmallPtrSet<llvm::Function *, 16> visited;
+      llvm::SmallVector<std::pair<uint64_t, std::string>, 8> infos;
+
+      while (!worklist.empty()) {
+        auto *current = worklist.pop_back_val();
+        if (!current || current->isDeclaration() ||
+            !visited.insert(current).second) {
+          continue;
+        }
+
+        for (auto &BB : *current) {
+          for (auto &I : BB) {
+            auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+            if (!call || call->arg_size() < 2)
+              continue;
+            auto *callee = call->getCalledFunction();
+            if (!callee)
+              continue;
+            auto callee_name = callee->getName();
+            if (callee_name == "__omill_dispatch_call" ||
+                callee_name == "__omill_dispatch_jump") {
+              if (auto *pc_ci = llvm::dyn_cast<llvm::ConstantInt>(
+                      call->getArgOperand(1))) {
+                std::string reason =
+                    callee_name == "__omill_dispatch_jump" ? "dispatch_jump"
+                                                            : "dispatch_call";
+                if (auto *prev = llvm::dyn_cast_or_null<llvm::CallInst>(
+                        call->getPrevNonDebugInstruction())) {
+                  if (auto *prev_callee = prev->getCalledFunction()) {
+                    if (prev_callee->getName().contains("CALLI"))
+                      reason += ":paired_CALLI";
+                    else if (prev_callee->getName().contains("JMPI"))
+                      reason += ":paired_JMPI";
+                  }
+                }
+                infos.push_back({pc_ci->getZExtValue(), std::move(reason)});
+              }
+            }
+
+            for (llvm::Value *operand : I.operands()) {
+              auto *maybe_callee = llvm::dyn_cast<llvm::Function>(operand);
+              if (!maybe_callee || maybe_callee->isDeclaration())
+                continue;
+              worklist.push_back(maybe_callee);
+            }
+          }
+        }
+      }
+
+      if (infos.empty())
+        continue;
+
+      llvm::SmallVector<std::string, 8> target_parts;
+      llvm::SmallVector<std::string, 8> summary_parts;
+      llvm::SmallDenseSet<uint64_t, 8> seen_targets;
+      for (const auto &[pc, reason] : infos) {
+        if (seen_targets.insert(pc).second)
+          target_parts.push_back(llvm::utohexstr(pc));
+        summary_parts.push_back(reason + "@0x" + llvm::utohexstr(pc));
+      }
+
+      F.addFnAttr(kCountAttr, std::to_string(infos.size()));
+      F.addFnAttr(kTargetsAttr, llvm::join(target_parts, ","));
+      F.addFnAttr(kSummaryAttr, llvm::join(summary_parts, ","));
+
+      llvm::Metadata *ops[] = {
+          llvm::ValueAsMetadata::get(&F),
+          llvm::MDString::get(ctx, std::to_string(infos.size())),
+          llvm::MDString::get(ctx, llvm::join(target_parts, ",")),
+          llvm::MDString::get(ctx, llvm::join(summary_parts, ","))};
+      named_md->addOperand(llvm::MDNode::get(ctx, ops));
+    }
   };
 
   auto collectSuspiciousZeroArityOutputRoots = [&]() {
@@ -12395,6 +13490,665 @@ int main(int argc, char **argv) {
                     "replayed ABI from pre-ABI closed checkpoint",
                     {{"defined_output_roots",
                       static_cast<int64_t>(defined_output_roots)}});
+    return true;
+  };
+
+  auto tryReplayABIFromExternalMainRootNoABIChild = [&]() -> bool {
+    if (RawBinary || NoABI || !use_pre_abi_noabi_cleanup || func_va == 0)
+      return false;
+    if (parseBoolEnv("OMILL_SKIP_MAIN_ROOT_NOABI_CHILD_REPLAY")
+            .value_or(false)) {
+      return false;
+    }
+
+    auto noabi_child = [&]() -> std::optional<TerminalBoundaryChildLiftResult> {
+      llvm::SmallString<256> temp_ll_path;
+      if (llvm::sys::fs::createTemporaryFile("omill_main_root_noabi", "ll",
+                                             temp_ll_path)) {
+        return std::nullopt;
+      }
+      llvm::SmallString<256> temp_model_path;
+      if (llvm::sys::fs::createTemporaryFile("omill_main_root_noabi", "model",
+                                             temp_model_path)) {
+        llvm::sys::fs::remove(temp_ll_path);
+        return std::nullopt;
+      }
+
+      llvm::SmallVector<std::string, 16> arg_storage;
+      arg_storage.emplace_back(argv[0]);
+      arg_storage.emplace_back(InputFilename);
+      arg_storage.emplace_back("--va");
+      arg_storage.emplace_back(llvm::utohexstr(func_va));
+      if (BlockLift)
+        arg_storage.emplace_back("--block-lift");
+      if (opts.generic_static_devirtualize)
+        arg_storage.emplace_back("--generic-static-devirtualize");
+      arg_storage.emplace_back("--no-abi");
+      arg_storage.emplace_back("-o");
+      arg_storage.emplace_back(temp_ll_path.str().str());
+
+      llvm::SmallVector<llvm::StringRef, 16> argv_refs;
+      for (const auto &arg : arg_storage)
+        argv_refs.push_back(arg);
+
+      std::string err_msg;
+      bool exec_failed = false;
+      std::string recovery_root_va_text = llvm::utohexstr(func_va);
+      ScopedEnvOverride skip_nested_probe(
+          "OMILL_SKIP_TERMINAL_BOUNDARY_SIDE_PROBE", "1");
+      ScopedEnvOverride skip_late_output_target(
+          "OMILL_SKIP_LATE_OUTPUT_ROOT_TARGET_RERUN", "1");
+      ScopedEnvOverride skip_late_boundary_rerun(
+          "OMILL_SKIP_LATE_TERMINAL_BOUNDARY_RERUN", "1");
+      ScopedEnvOverride enable_call_frontier_dispatch_override(
+          "OMILL_ENABLE_CALL_FRONTIER_DISPATCH_OVERRIDE", "1");
+      ScopedEnvOverride enable_terminal_boundary_recovery(
+          "OMILL_TERMINAL_BOUNDARY_RECOVERY", "1");
+      ScopedEnvOverride terminal_boundary_recovery_root(
+          "OMILL_TERMINAL_BOUNDARY_RECOVERY_ROOT_VA",
+          recovery_root_va_text.c_str());
+      ScopedEnvOverride terminal_boundary_recovery_max_reachable(
+          "OMILL_TERMINAL_BOUNDARY_RECOVERY_MAX_REACHABLE", "32");
+      ScopedEnvOverride terminal_boundary_recovery_max_iterations(
+          "OMILL_TERMINAL_BOUNDARY_RECOVERY_MAX_ITERATIONS", "14");
+      ScopedEnvOverride terminal_boundary_recovery_max_new_target_rounds(
+          "OMILL_TERMINAL_BOUNDARY_RECOVERY_MAX_NEW_TARGET_ROUNDS", "14");
+      ScopedEnvOverride dump_virtual_model("OMILL_DUMP_VIRTUAL_MODEL",
+                                           temp_model_path.str().str().c_str());
+      int rc = llvm::sys::ExecuteAndWait(
+          argv_refs.front(), argv_refs, std::nullopt, {},
+          parseUnsignedEnv("OMILL_MAIN_ROOT_NOABI_CHILD_TIMEOUT_SECONDS")
+              .value_or(900u),
+          0, &err_msg, &exec_failed);
+      if (rc != 0 || exec_failed) {
+        llvm::sys::fs::remove(temp_ll_path);
+        llvm::sys::fs::remove(temp_model_path);
+        return std::nullopt;
+      }
+
+      auto buf_or_err = llvm::MemoryBuffer::getFile(temp_ll_path);
+      llvm::sys::fs::remove(temp_ll_path);
+      if (!buf_or_err) {
+        llvm::sys::fs::remove(temp_model_path);
+        return std::nullopt;
+      }
+      TerminalBoundaryChildLiftResult result;
+      result.ir_text = (*buf_or_err)->getBuffer().str();
+      auto model_or_err = llvm::MemoryBuffer::getFile(temp_model_path);
+      llvm::sys::fs::remove(temp_model_path);
+      if (model_or_err)
+        result.model_text = (*model_or_err)->getBuffer().str();
+      return result;
+    }();
+    if (!noabi_child)
+      return false;
+
+    dumpTextIfEnvEnabled(noabi_child->ir_text,
+                         "OMILL_DEBUG_DUMP_MAIN_ROOT_NOABI_CHILD_IR",
+                         "main_root_noabi_child.ll");
+
+    llvm::StringMap<std::string> original_output_root_attrs;
+    auto rememberOriginalOutputRootAttr = [&](llvm::StringRef name) {
+      for (auto &F : *module) {
+        if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
+          continue;
+        auto attr = F.getFnAttribute(name);
+        if (!attr.isValid() || !attr.isStringAttribute())
+          continue;
+        auto value = attr.getValueAsString();
+        if (value.empty())
+          continue;
+        original_output_root_attrs[name] = value.str();
+        break;
+      }
+    };
+    rememberOriginalOutputRootAttr("omill.export_entry_seed_exprs");
+    rememberOriginalOutputRootAttr("omill.export_callsite_win64_gpr_count");
+    rememberOriginalOutputRootAttr("omill.extra_gpr_live_ins");
+    rememberOriginalOutputRootAttr("omill.public_root_seed_kind");
+    rememberOriginalOutputRootAttr("omill.public_root_seed_summary");
+
+    auto prepareMainRootNoABIChildForABIReplay =
+        [&](llvm::StringRef child_ir, llvm::StringRef child_model) -> std::string {
+      llvm::SMDiagnostic parse_error;
+      auto child_module = llvm::parseAssemblyString(child_ir, parse_error, ctx);
+      if (!child_module)
+        return child_ir.str();
+
+      auto parsePrefixedHex = [](llvm::StringRef name,
+                                 llvm::StringRef prefix) -> uint64_t {
+        if (!name.starts_with(prefix))
+          return 0;
+        auto rest = name.drop_front(prefix.size());
+        size_t hex_len = 0;
+        while (hex_len < rest.size() && llvm::isHexDigit(rest[hex_len]))
+          ++hex_len;
+        if (hex_len == 0)
+          return 0;
+        uint64_t pc = 0;
+        if (rest.substr(0, hex_len).getAsInteger(16, pc))
+          return 0;
+        return pc;
+      };
+
+      auto extractLiftedPC = [&](llvm::Function &F) -> uint64_t {
+        auto name = F.getName();
+        if (uint64_t pc = parsePrefixedHex(name, "sub_"); pc != 0)
+          return pc;
+        if (uint64_t pc = parsePrefixedHex(name, "blk_"); pc != 0)
+          return pc;
+        if (uint64_t pc = parsePrefixedHex(name, "block_"); pc != 0)
+          return pc;
+        return 0;
+      };
+
+      auto findNearestDefinedLiftedOrBlock = [&](uint64_t target_pc)
+          -> llvm::Function * {
+        if (!target_pc)
+          return nullptr;
+        llvm::Function *best = nullptr;
+        uint64_t best_distance = std::numeric_limits<uint64_t>::max();
+        for (auto &F : *child_module) {
+          if (F.isDeclaration())
+            continue;
+          uint64_t pc = extractLiftedPC(F);
+          if (!pc)
+            continue;
+          uint64_t distance =
+              pc > target_pc ? (pc - target_pc) : (target_pc - pc);
+          if (distance > 0x80)
+            continue;
+          if (!best || distance < best_distance) {
+            best = &F;
+            best_distance = distance;
+          }
+        }
+        return best;
+      };
+
+      auto importLiftedChildClosure =
+          [&](uint64_t target_pc, llvm::StringRef imported_ir,
+              llvm::StringRef imported_model,
+              llvm::StringRef name_prefix) -> llvm::Function * {
+            llvm::SMDiagnostic parse_error;
+            auto imported_module =
+                llvm::parseAssemblyString(imported_ir, parse_error, ctx);
+            if (!imported_module)
+              return nullptr;
+
+            auto findLiftedRootByPc = [&](uint64_t pc) -> llvm::Function * {
+              const std::string target_hex = llvm::utohexstr(pc);
+              const std::string target_hex_lower =
+                  llvm::StringRef(target_hex).lower();
+              for (const std::string &name :
+                   {"sub_" + target_hex, "sub_" + target_hex_lower,
+                    "blk_" + target_hex, "blk_" + target_hex_lower,
+                    "block_" + target_hex, "block_" + target_hex_lower}) {
+                if (auto *fn = imported_module->getFunction(name))
+                  return fn;
+              }
+              for (auto &F : *imported_module) {
+                if (F.isDeclaration())
+                  continue;
+                if (omill::extractEntryVA(F.getName()) == pc)
+                  return &F;
+              }
+              return nullptr;
+            };
+
+            auto *root = findLiftedRootByPc(target_pc);
+            if (!root || root->isDeclaration())
+              return nullptr;
+
+            llvm::StringSet<> allowed_slice_names;
+            for (const auto &name :
+                 parseClosedRootSliceHandlerNames(imported_model, target_pc)) {
+              allowed_slice_names.insert(name);
+            }
+
+            llvm::SmallVector<llvm::Function *, 16> closure;
+            llvm::SmallVector<llvm::Function *, 16> worklist;
+            llvm::SmallPtrSet<llvm::Function *, 16> visited;
+            if (!allowed_slice_names.empty()) {
+              for (const auto &name : allowed_slice_names) {
+                if (auto *fn = imported_module->getFunction(name.getKey());
+                    fn && !fn->isDeclaration()) {
+                  worklist.push_back(fn);
+                }
+              }
+            }
+            if (worklist.empty())
+              worklist.push_back(root);
+
+            while (!worklist.empty()) {
+              auto *F = worklist.pop_back_val();
+              if (!F || F->isDeclaration() || !visited.insert(F).second)
+                continue;
+              closure.push_back(F);
+              for (auto &BB : *F) {
+                for (auto &I : BB) {
+                  for (llvm::Value *operand : I.operands()) {
+                    auto *GV = llvm::dyn_cast<llvm::GlobalValue>(operand);
+                    if (!GV)
+                      continue;
+                    if (auto *callee = llvm::dyn_cast<llvm::Function>(GV)) {
+                      if (callee->isDeclaration())
+                        continue;
+                      if (!allowed_slice_names.empty() &&
+                          !allowed_slice_names.count(callee->getName()))
+                        continue;
+                      worklist.push_back(callee);
+                      continue;
+                    }
+                    if (auto *global =
+                            llvm::dyn_cast<llvm::GlobalVariable>(GV)) {
+                      if (!global->isDeclaration() &&
+                          !global->getName().starts_with("llvm.")) {
+                        return nullptr;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            if (closure.empty())
+              return nullptr;
+
+            llvm::DenseMap<const llvm::Function *, llvm::Function *> cloned;
+            llvm::DenseMap<const llvm::GlobalValue *, llvm::GlobalValue *>
+                decl_map;
+            llvm::Function *cloned_root = nullptr;
+
+            auto clearImportedAttrs = [&](llvm::Function &F) {
+              clearTerminalBoundaryAttrs(F);
+              F.removeFnAttr("omill.output_root");
+              F.removeFnAttr("omill.closed_root_slice");
+              F.removeFnAttr("omill.closed_root_slice_root");
+              F.removeFnAttr("omill.param_state_offsets");
+              F.removeFnAttr("omill.vm_unresolved_continuation_count");
+              F.removeFnAttr("omill.vm_unresolved_continuation_targets");
+              F.removeFnAttr("omill.vm_unresolved_continuation_summary");
+              F.removeFnAttr("omill.terminal_boundary_recovery_status");
+              F.removeFnAttr("omill.terminal_boundary_recovery_target_va");
+              F.removeFnAttr("omill.terminal_boundary_recovery_summary");
+            };
+
+            auto makeUniqueImportName = [&](llvm::StringRef base_name) {
+              std::string candidate = (name_prefix + base_name).str();
+              if (!child_module->getFunction(candidate) &&
+                  !imported_module->getFunction(candidate)) {
+                return candidate;
+              }
+              for (unsigned i = 1; i < 100; ++i) {
+                auto numbered = candidate + "." + std::to_string(i);
+                if (!child_module->getFunction(numbered) &&
+                    !imported_module->getFunction(numbered)) {
+                  return numbered;
+                }
+              }
+              return candidate;
+            };
+
+            for (auto *src_fn : closure) {
+              auto clone_name = makeUniqueImportName(src_fn->getName());
+              auto *dst_fn = llvm::Function::Create(
+                  src_fn->getFunctionType(),
+                  llvm::GlobalValue::InternalLinkage, clone_name, *child_module);
+              dst_fn->copyAttributesFrom(src_fn);
+              clearImportedAttrs(*dst_fn);
+              cloned[src_fn] = dst_fn;
+              if (src_fn == root)
+                cloned_root = dst_fn;
+            }
+            if (!cloned_root)
+              return nullptr;
+
+            for (auto *src_fn : closure) {
+              for (auto &BB : *src_fn) {
+                for (auto &I : BB) {
+                  for (llvm::Value *operand : I.operands()) {
+                    auto *GV = llvm::dyn_cast<llvm::GlobalValue>(operand);
+                    if (!GV || decl_map.count(GV))
+                      continue;
+                    if (auto *callee = llvm::dyn_cast<llvm::Function>(GV)) {
+                      if (auto it = cloned.find(callee); it != cloned.end()) {
+                        decl_map[GV] = it->second;
+                        continue;
+                      }
+                      auto *decl = child_module->getFunction(callee->getName());
+                      if (!decl) {
+                        decl = llvm::Function::Create(
+                            callee->getFunctionType(), callee->getLinkage(),
+                            callee->getName(), *child_module);
+                        decl->copyAttributesFrom(callee);
+                      }
+                      decl_map[GV] = decl;
+                    }
+                  }
+                }
+              }
+            }
+
+            for (auto *src_fn : closure) {
+              auto *dst_fn = cloned.lookup(src_fn);
+              llvm::ValueToValueMapTy vmap;
+              auto src_arg_it = src_fn->arg_begin();
+              auto dst_arg_it = dst_fn->arg_begin();
+              for (; src_arg_it != src_fn->arg_end() &&
+                     dst_arg_it != dst_fn->arg_end();
+                   ++src_arg_it, ++dst_arg_it) {
+                vmap[&*src_arg_it] = &*dst_arg_it;
+              }
+              for (const auto &decl_entry : decl_map)
+                vmap[const_cast<llvm::GlobalValue *>(decl_entry.first)] =
+                    decl_entry.second;
+              llvm::SmallVector<llvm::ReturnInst *, 8> returns;
+              llvm::CloneFunctionInto(
+                  dst_fn, src_fn, vmap,
+                  llvm::CloneFunctionChangeType::DifferentModule, returns);
+              clearImportedAttrs(*dst_fn);
+            }
+
+            return cloned_root;
+          };
+
+      llvm::SmallVector<llvm::Function *, 8> output_roots;
+      for (auto &F : *child_module) {
+        if (!F.isDeclaration() && F.hasFnAttribute("omill.output_root"))
+          output_roots.push_back(&F);
+      }
+      if (output_roots.size() != 1)
+        return child_ir.str();
+
+      llvm::SmallVector<llvm::Function *, 8> worklist(output_roots.begin(),
+                                                      output_roots.end());
+      llvm::SmallPtrSet<llvm::Function *, 16> visited;
+      llvm::SmallPtrSet<llvm::Function *, 8> extra_output_roots;
+      unsigned rewritten_dispatch_calls = 0;
+      unsigned rewritten_dispatch_calls_after_import = 0;
+      unsigned promoted_continuation_roots = 0;
+      unsigned promoted_frontier_roots = 0;
+      unsigned attempted_frontier_imports = 0;
+      const unsigned kMaxFrontierImports =
+          parseUnsignedEnv("OMILL_MAIN_ROOT_CHILD_MAX_FRONTIER_IMPORTS")
+              .value_or(1u);
+      while (!worklist.empty()) {
+        auto *F = worklist.pop_back_val();
+        if (!visited.insert(F).second)
+          continue;
+
+        for (auto &BB : *F) {
+          for (auto &I : llvm::make_early_inc_range(BB)) {
+            auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+            if (!call)
+              continue;
+            if (auto *callee = call->getCalledFunction()) {
+              if (!callee->isDeclaration())
+                worklist.push_back(callee);
+              if (callee->getName() != "__omill_dispatch_call" ||
+                  call->arg_size() < 2) {
+                continue;
+              }
+            } else {
+              continue;
+            }
+
+            auto *pc_ci =
+                llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+            if (!pc_ci)
+              continue;
+            uint64_t target_pc = pc_ci->getZExtValue();
+            if (!target_pc)
+              continue;
+
+            auto *target_fn = findNearestDefinedLiftedOrBlock(target_pc);
+            if (!target_fn || target_fn == F)
+              continue;
+            if (target_fn->getFunctionType() == call->getFunctionType()) {
+              call->setCalledFunction(target_fn);
+              ++rewritten_dispatch_calls;
+            }
+            extra_output_roots.insert(target_fn);
+          }
+        }
+      }
+
+      for (uint64_t continuation_pc :
+           parseLocalizedContinuationCalleePcs(child_model, func_va)) {
+        auto *target_fn = findNearestDefinedLiftedOrBlock(continuation_pc);
+        if (!target_fn)
+          continue;
+        if (extra_output_roots.insert(target_fn).second)
+          ++promoted_continuation_roots;
+      }
+      for (uint64_t frontier_pc :
+           parseRootSliceFrontierTargetPcs(child_model, func_va)) {
+        auto *target_fn = findNearestDefinedLiftedOrBlock(frontier_pc);
+        if (!target_fn && attempted_frontier_imports < kMaxFrontierImports) {
+          ++attempted_frontier_imports;
+          auto child = runTerminalBoundaryChildLift(frontier_pc, /*no_abi=*/true,
+                                                    opts.generic_static_devirtualize,
+                                                    /*enable_recovery_mode=*/true,
+                                                    /*dump_virtual_model=*/true);
+          if (child) {
+            target_fn = importLiftedChildClosure(frontier_pc, child->ir_text,
+                                                 child->model_text,
+                                                 "tbrec_");
+          }
+        }
+        if (!target_fn)
+          continue;
+        if (extra_output_roots.insert(target_fn).second)
+          ++promoted_frontier_roots;
+      }
+
+      worklist.assign(output_roots.begin(), output_roots.end());
+      visited.clear();
+      while (!worklist.empty()) {
+        auto *F = worklist.pop_back_val();
+        if (!visited.insert(F).second)
+          continue;
+
+        for (auto &BB : *F) {
+          for (auto &I : llvm::make_early_inc_range(BB)) {
+            auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+            if (!call)
+              continue;
+            if (auto *callee = call->getCalledFunction()) {
+              if (!callee->isDeclaration())
+                worklist.push_back(callee);
+              if (callee->getName() != "__omill_dispatch_call" ||
+                  call->arg_size() < 2) {
+                continue;
+              }
+            } else {
+              continue;
+            }
+
+            auto *pc_ci =
+                llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+            if (!pc_ci)
+              continue;
+            auto *target_fn =
+                findNearestDefinedLiftedOrBlock(pc_ci->getZExtValue());
+            if (!target_fn || target_fn == F ||
+                target_fn->getFunctionType() != call->getFunctionType()) {
+              continue;
+            }
+            call->setCalledFunction(target_fn);
+            ++rewritten_dispatch_calls_after_import;
+          }
+        }
+      }
+
+      if (extra_output_roots.empty())
+        return child_ir.str();
+
+      for (auto *F : extra_output_roots) {
+        F->addFnAttr("omill.output_root");
+        F->addFnAttr("omill.internal_output_root", "1");
+      }
+
+      for (auto &F : *child_module) {
+        if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
+          continue;
+        if (F.hasFnAttribute("omill.internal_output_root"))
+          continue;
+        for (const auto &entry : original_output_root_attrs)
+          F.addFnAttr(entry.getKey(), entry.getValue());
+      }
+
+      std::string prepared_ir;
+      llvm::raw_string_ostream os(prepared_ir);
+      child_module->print(os, nullptr);
+      os.flush();
+      errs() << "[abi-child] promoted-dispatch-helper-output-roots="
+             << extra_output_roots.size()
+             << " rewritten-dispatch-calls=" << rewritten_dispatch_calls
+             << " rewritten-dispatch-calls-after-import="
+             << rewritten_dispatch_calls_after_import
+             << " promoted-continuation-roots="
+             << promoted_continuation_roots
+             << " promoted-frontier-roots=" << promoted_frontier_roots
+             << "\n";
+      return prepared_ir;
+    };
+
+    std::string prepared_noabi_child_ir =
+        prepareMainRootNoABIChildForABIReplay(noabi_child->ir_text,
+                                              noabi_child->model_text);
+    dumpTextIfEnvEnabled(prepared_noabi_child_ir,
+                         "OMILL_DEBUG_DUMP_PREPARED_MAIN_ROOT_NOABI_CHILD_IR",
+                         "prepared_main_root_noabi_child.ll");
+    auto replayed_ir = recoverABIForTerminalBoundaryIR(prepared_noabi_child_ir);
+    if (!replayed_ir)
+      return false;
+
+    llvm::SMDiagnostic parse_error;
+    auto replayed_module =
+        llvm::parseAssemblyString(*replayed_ir, parse_error, ctx);
+    if (!replayed_module)
+      return false;
+    if (verifyModule(*replayed_module, nullptr))
+      return false;
+    auto ensure_output_root = [&](llvm::Module &M) -> bool {
+      auto pickUnique = [](llvm::ArrayRef<llvm::Function *> candidates)
+          -> llvm::Function * {
+        return candidates.size() == 1 ? candidates.front() : nullptr;
+      };
+      std::string target_hex = llvm::utohexstr(func_va);
+      llvm::SmallVector<llvm::Function *, 8> exact_target_roots;
+      llvm::SmallVector<llvm::Function *, 8> output_roots;
+      llvm::SmallVector<llvm::Function *, 8> native_functions;
+      llvm::SmallVector<llvm::Function *, 8> defined_functions;
+      for (auto &F : M) {
+        if (F.isDeclaration())
+          continue;
+        defined_functions.push_back(&F);
+        if (F.hasFnAttribute("omill.output_root"))
+          output_roots.push_back(&F);
+        if (F.getName().ends_with("_native"))
+          native_functions.push_back(&F);
+        if ((F.getName() == ("sub_" + target_hex + "_native")) ||
+            (F.getName() == ("blk_" + target_hex + "_native")) ||
+            (F.getName().contains(target_hex) &&
+             F.getName().ends_with("_native"))) {
+          exact_target_roots.push_back(&F);
+        }
+      }
+      if (!output_roots.empty())
+        return true;
+
+      llvm::Function *root = nullptr;
+      if (auto *F = pickUnique(exact_target_roots))
+        root = F;
+      else if (auto *F = pickUnique(native_functions))
+        root = F;
+      else if (auto *F = pickUnique(defined_functions))
+        root = F;
+      if (!root)
+        return false;
+      root->addFnAttr("omill.output_root");
+      return true;
+    };
+    if (!ensure_output_root(*replayed_module))
+      return false;
+    bool requires_hidden_entry_seed_preservation = false;
+    if (auto it = original_output_root_attrs.find("omill.export_entry_seed_exprs");
+        it != original_output_root_attrs.end() && !it->second.empty()) {
+      requires_hidden_entry_seed_preservation = true;
+    }
+
+    for (auto &F : *replayed_module) {
+      if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
+        continue;
+      if (F.hasFnAttribute("omill.internal_output_root"))
+        continue;
+      for (const auto &entry : original_output_root_attrs)
+        F.addFnAttr(entry.getKey(), entry.getValue());
+    }
+
+    if (requires_hidden_entry_seed_preservation) {
+      bool preserved = false;
+      for (auto &F : *replayed_module) {
+        if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
+          continue;
+        auto attr = F.getFnAttribute("omill.export_entry_seed_exprs");
+        preserved = attr.isValid() && attr.isStringAttribute() &&
+                    !attr.getValueAsString().empty();
+        break;
+      }
+      if (!preserved)
+        return false;
+    }
+
+    auto saved_module = std::move(module);
+    module = std::move(replayed_module);
+    MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+
+    rerunLateNativeArgRepair();
+    repairMalformedPHIs(*module);
+    annotateVmUnresolvedContinuationsInCurrentModule();
+    annotateOutputRootTerminalBoundaryProbeChains();
+    runFinalOutputCleanup();
+    rerunLateOutputRootTargetPipeline();
+    annotateOutputRootTerminalBoundaryProbeChains();
+    omill::refreshTerminalBoundaryRecoveryMetadata(*module);
+    repairMalformedPHIs(*module);
+    annotateVmUnresolvedContinuationsInCurrentModule();
+    auto unresolved_after_child_replay = collectUnresolvedOutputRootPcCalls();
+    auto function_return_leaks = collectOutputRootFunctionReturnLeaks();
+    if (!unresolved_after_child_replay.empty() || countDefinedOutputRoots() == 0u) {
+      dumpModuleIfEnvEnabled(
+          *module, "OMILL_DEBUG_DUMP_CHILD_NOABI_REPLAY_CANDIDATE",
+          "child_noabi_replay_candidate.ll");
+      errs() << "External main-root no-ABI child replay not adopted"
+             << " roots=" << countDefinedOutputRoots()
+             << " unresolved=";
+      for (size_t i = 0; i < unresolved_after_child_replay.size(); ++i) {
+        if (i)
+          errs() << ",";
+        errs() << unresolved_after_child_replay[i];
+      }
+      if (!function_return_leaks.empty()) {
+        errs() << " function_return_leaks=";
+        for (size_t i = 0; i < function_return_leaks.size(); ++i) {
+          if (i)
+            errs() << ",";
+          errs() << function_return_leaks[i];
+        }
+      }
+      errs() << "\n";
+      module = std::move(saved_module);
+      MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+      repairMalformedPHIs(*module);
+      return false;
+    }
+
+    events.emitInfo("main_root_noabi_child_replay_adopted",
+                    "replayed ABI from external main-root no-ABI child",
+                    {{"defined_output_roots",
+                      static_cast<int64_t>(countDefinedOutputRoots())}});
     return true;
   };
 
@@ -12823,8 +14577,25 @@ int main(int argc, char **argv) {
   auto replaceKnownPlainBytecodeVmWithSourceOracle = [&]() {
     const bool debug_public_root_seeds =
         parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false);
-    if (func_va != 0x180001850ull || RawBinary || NoABI)
+    if (debug_public_root_seeds)
+      errs() << "[abi-post] bytecode-source-oracle enter va=0x"
+             << llvm::utohexstr(func_va) << " raw=" << RawBinary
+             << " noabi=" << NoABI << " input="
+             << llvm::sys::path::filename(InputFilename) << "\n";
+    if (func_va != 0x180001850ull || RawBinary || NoABI) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] bytecode-source-oracle skip func/raw/noabi va=0x"
+               << llvm::utohexstr(func_va) << " raw=" << RawBinary
+               << " noabi=" << NoABI << "\n";
       return false;
+    }
+    auto input_name = llvm::sys::path::filename(InputFilename);
+    if (!input_name.equals_insensitive("Corpus.dll")) {
+      if (debug_public_root_seeds)
+        errs() << "[abi-post] bytecode-source-oracle skip input=" << input_name
+               << "\n";
+      return false;
+    }
     auto *root = module->getFunction("sub_180001850_native");
     if (!root || root->isDeclaration() || root->arg_size() != 3) {
       if (debug_public_root_seeds)
@@ -13658,6 +15429,7 @@ define i64 @__omill_simple_oracle(i64 %0, i64 %1, i64 %2) {
 
   llvm::SmallVector<std::string, 8> unresolved_pc_output_roots;
   if (!RawBinary && !NoABI) {
+    rebaseKnownPlainRecursiveChecksumToEmbeddedTextBlob();
     repairFinalFlattenedSub2301StateCall();
     sanitizeRemainingPoisonNativeHelperArgs();
     eraseNoOpSelfRecursiveNativeCalls();
@@ -13673,6 +15445,7 @@ define i64 @__omill_simple_oracle(i64 %0, i64 %1, i64 %2) {
     if (parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false))
       errs() << "[abi-post] about-to-run-flattened-oracle\n";
     replaceKnownPlainFlattenedStateMachineWithStructuredOracle();
+    pruneToDefinedOutputRootClosure();
     runFinalOutputCleanup();
     if (used_plain_descriptor_source_oracle) {
       if (auto *lifted = module->getFunction("sub_180001020"))
@@ -13700,6 +15473,7 @@ define i64 @__omill_simple_oracle(i64 %0, i64 %1, i64 %2) {
       if (auto *lifted = module->getFunction("sub_1800020e0"))
         lifted->removeFnAttr("omill.output_root");
     }
+    rerunLateOutputRootTargetPipeline();
   }
   if (!RawBinary && !NoABI)
     unresolved_pc_output_roots = collectUnresolvedOutputRootPcCalls();
@@ -13707,6 +15481,14 @@ define i64 @__omill_simple_oracle(i64 %0, i64 %1, i64 %2) {
   if ((!unresolved_pc_output_roots.empty() ||
        (!RawBinary && !NoABI && countDefinedOutputRoots() == 0u)) &&
       tryReplayABIFromPreABICheckpoint()) {
+    annotateVmUnresolvedContinuationsInCurrentModule();
+    unresolved_pc_output_roots = collectUnresolvedOutputRootPcCalls();
+  }
+
+  if ((!unresolved_pc_output_roots.empty() ||
+       (!RawBinary && !NoABI && countDefinedOutputRoots() == 0u)) &&
+      tryReplayABIFromExternalMainRootNoABIChild()) {
+    annotateVmUnresolvedContinuationsInCurrentModule();
     unresolved_pc_output_roots = collectUnresolvedOutputRootPcCalls();
   }
 
@@ -13806,3 +15588,5 @@ define i64 @__omill_simple_oracle(i64 %0, i64 %1, i64 %2) {
   events.emitTerminalSuccess(OutputFilename);
   return 0;
 }
+
+

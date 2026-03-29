@@ -161,11 +161,52 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
   std::set<StackCellKey> localized_written_structural_stack_keys;
   auto normalize_expr = [&](VirtualValueExpr expr,
                             unsigned fallback_bits = 0u) {
+    std::function<bool(const VirtualValueExpr &, unsigned)> contains_slot_id =
+        [&](const VirtualValueExpr &value, unsigned slot_id) {
+          auto self_it = slot_info.find(slot_id);
+          if (value.kind == VirtualExprKind::kStateSlot &&
+              (value.slot_id == slot_id ||
+               (self_it != slot_info.end() && value.state_base_name &&
+                value.state_offset &&
+                *value.state_base_name == self_it->second->base_name &&
+                *value.state_offset == self_it->second->offset))) {
+            return true;
+          }
+          return llvm::any_of(value.operands, [&](const VirtualValueExpr &op) {
+            return contains_slot_id(op, slot_id);
+          });
+        };
+    std::function<bool(const VirtualValueExpr &, unsigned)> contains_stack_id =
+        [&](const VirtualValueExpr &value, unsigned cell_id) {
+          auto self_it = stack_cell_info.find(cell_id);
+          if (value.kind == VirtualExprKind::kStackCell &&
+              (value.stack_cell_id == cell_id ||
+               (self_it != stack_cell_info.end() && value.state_base_name &&
+                value.state_offset && value.stack_offset &&
+                *value.state_base_name == self_it->second->base_name &&
+                *value.state_offset == self_it->second->base_offset &&
+                *value.stack_offset == self_it->second->cell_offset))) {
+            return true;
+          }
+          return llvm::any_of(value.operands, [&](const VirtualValueExpr &op) {
+            return contains_stack_id(op, cell_id);
+          });
+        };
+    std::map<unsigned, VirtualValueExpr> sanitized_slots;
+    for (const auto &[slot_id, value] : state.slot_facts) {
+      if (!contains_slot_id(value, slot_id))
+        sanitized_slots.emplace(slot_id, value);
+    }
+    std::map<unsigned, VirtualValueExpr> sanitized_stack;
+    for (const auto &[cell_id, value] : state.stack_facts) {
+      if (!contains_stack_id(value, cell_id))
+        sanitized_stack.emplace(cell_id, value);
+    }
     if (!expr.bit_width)
       expr.bit_width = fallback_bits;
     annotateExprSlots(expr, slot_ids);
     annotateExprStackCells(expr, stack_cell_ids, slot_ids);
-    expr = specializeExprToFixpoint(expr, state.slot_facts, &state.stack_facts,
+    expr = specializeExprToFixpoint(expr, sanitized_slots, &sanitized_stack,
                                     &incoming_args, slot_ids,
                                     stack_cell_ids);
     annotateExprSlots(expr, slot_ids);
@@ -174,12 +215,78 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
       expr.bit_width = fallback_bits;
     return expr;
   };
+  auto normalize_expr_without_state_facts =
+      [&](VirtualValueExpr expr, unsigned fallback_bits = 0u) {
+        if (!expr.bit_width)
+          expr.bit_width = fallback_bits;
+        annotateExprSlots(expr, slot_ids);
+        annotateExprStackCells(expr, stack_cell_ids, slot_ids);
+        std::map<unsigned, VirtualValueExpr> empty_slots;
+        std::map<unsigned, VirtualValueExpr> empty_stack;
+        expr = specializeExprToFixpoint(expr, empty_slots, &empty_stack,
+                                        &incoming_args, slot_ids,
+                                        stack_cell_ids);
+        annotateExprSlots(expr, slot_ids);
+        annotateExprStackCells(expr, stack_cell_ids, slot_ids);
+        if (!expr.bit_width)
+          expr.bit_width = fallback_bits;
+        return expr;
+      };
+  auto normalize_expr_avoiding_self_slot =
+      [&](VirtualValueExpr expr, unsigned self_slot_id,
+          unsigned fallback_bits = 0u) {
+        auto slot_facts = state.slot_facts;
+        slot_facts.erase(self_slot_id);
+        if (!expr.bit_width)
+          expr.bit_width = fallback_bits;
+        annotateExprSlots(expr, slot_ids);
+        annotateExprStackCells(expr, stack_cell_ids, slot_ids);
+        expr = specializeExprToFixpoint(expr, slot_facts, &state.stack_facts,
+                                        &incoming_args, slot_ids,
+                                        stack_cell_ids);
+        annotateExprSlots(expr, slot_ids);
+        annotateExprStackCells(expr, stack_cell_ids, slot_ids);
+        if (!expr.bit_width)
+          expr.bit_width = fallback_bits;
+        return expr;
+      };
+  auto normalize_expr_avoiding_self_stack =
+      [&](VirtualValueExpr expr, unsigned self_cell_id,
+          unsigned fallback_bits = 0u) {
+        auto stack_facts = state.stack_facts;
+        stack_facts.erase(self_cell_id);
+        if (!expr.bit_width)
+          expr.bit_width = fallback_bits;
+        annotateExprSlots(expr, slot_ids);
+        annotateExprStackCells(expr, stack_cell_ids, slot_ids);
+        expr = specializeExprToFixpoint(expr, state.slot_facts, &stack_facts,
+                                        &incoming_args, slot_ids,
+                                        stack_cell_ids);
+        annotateExprSlots(expr, slot_ids);
+        annotateExprStackCells(expr, stack_cell_ids, slot_ids);
+        if (!expr.bit_width)
+          expr.bit_width = fallback_bits;
+        return expr;
+      };
   auto canonicalize_slot = [&](VirtualStateSlotSummary slot) {
     slot.canonical_id = lookupSlotIdForSummary(slot, slot_ids);
     return slot;
   };
   auto canonicalize_cell = [&](VirtualStackCellSummary cell) {
     cell.canonical_id = lookupStackCellIdForSummary(cell, stack_cell_ids);
+    if (cell.canonical_id.has_value()) {
+      auto info_it = stack_cell_info.find(*cell.canonical_id);
+      if (info_it == stack_cell_info.end() ||
+          info_it->second->base_name != cell.base_name ||
+          info_it->second->base_offset != cell.base_offset ||
+          info_it->second->base_width != cell.base_width ||
+          info_it->second->base_from_argument != cell.base_from_argument ||
+          info_it->second->base_from_alloca != cell.base_from_alloca ||
+          info_it->second->cell_offset != cell.offset ||
+          info_it->second->width != cell.width) {
+        cell.canonical_id.reset();
+      }
+    }
     VirtualStateSlotSummary base_slot;
     base_slot.base_name = cell.base_name;
     base_slot.offset = cell.base_offset;
@@ -208,6 +315,15 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
         }
       };
   seed_structural_from_canonical_map(state.stack_facts);
+  if (vmModelLocalReplayDebugEnabled()) {
+    std::string rendered;
+    llvm::raw_string_ostream os(rendered);
+    os << "helper=" << F.getName() << " initial-slot-facts";
+    for (const auto &[slot_id, value] : state.slot_facts) {
+      os << " [" << slot_id << "]=" << renderVirtualValueExpr(value);
+    }
+    vmModelLocalReplayDebugLog(os.str());
+  }
   auto render_update = [&](llvm::StringRef kind, unsigned id,
                            const VirtualValueExpr &value) {
     std::string rendered;
@@ -316,6 +432,78 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
       summary.canonical_id = cell_id;
       return summary;
     };
+    auto stack_base_delta_for_expr =
+        [&](const auto &self, const VirtualValueExpr &expr,
+            unsigned slot_id) -> std::optional<int64_t> {
+      if (expr.kind == VirtualExprKind::kStateSlot && expr.slot_id.has_value() &&
+          *expr.slot_id == slot_id) {
+        return 0;
+      }
+      if ((expr.kind == VirtualExprKind::kAdd ||
+           expr.kind == VirtualExprKind::kSub) &&
+          expr.operands.size() == 2) {
+        if (!expr.operands[1].constant.has_value())
+          return std::nullopt;
+        if (auto nested = self(self, expr.operands[0], slot_id)) {
+          int64_t delta = static_cast<int64_t>(*expr.operands[1].constant);
+          if (expr.kind == VirtualExprKind::kSub)
+            delta = -delta;
+          return *nested + delta;
+        }
+        if (expr.kind == VirtualExprKind::kAdd &&
+            expr.operands[0].constant.has_value()) {
+          if (auto nested = self(self, expr.operands[1], slot_id)) {
+            return *nested + static_cast<int64_t>(*expr.operands[0].constant);
+          }
+        }
+      }
+      return std::nullopt;
+    };
+    auto find_stack_base_delta_for_slot =
+        [&](const std::map<unsigned, VirtualValueExpr> &slot_facts,
+            unsigned slot_id) -> std::optional<int64_t> {
+      std::optional<int64_t> found_delta;
+      auto consider_delta = [&](const VirtualValueExpr &value) {
+        auto delta = stack_base_delta_for_expr(stack_base_delta_for_expr, value,
+                                               slot_id);
+        if (!delta)
+          return true;
+        if (!found_delta) {
+          found_delta = *delta;
+          return true;
+        }
+        return *found_delta == *delta;
+      };
+
+      if (auto it = slot_facts.find(slot_id); it != slot_facts.end()) {
+        if (!consider_delta(it->second))
+          return std::nullopt;
+      }
+      for (const auto &[fact_slot_id, value] : slot_facts) {
+        if (fact_slot_id == slot_id)
+          continue;
+        if (!consider_delta(value))
+          return std::nullopt;
+      }
+      return found_delta;
+    };
+    auto rebase_query_through_slot_facts =
+        [&](const VirtualStackCellSummary &query,
+            const std::map<unsigned, VirtualValueExpr> &slot_facts)
+            -> std::optional<VirtualStackCellSummary> {
+      auto slot_it = slot_ids.find(
+          SlotKey{query.base_name, query.base_offset, query.base_width,
+                  query.base_from_argument, query.base_from_alloca});
+      if (slot_it == slot_ids.end())
+        return std::nullopt;
+      auto delta = find_stack_base_delta_for_slot(slot_facts, slot_it->second);
+      if (!delta || *delta == 0)
+        return std::nullopt;
+      VirtualStackCellSummary rebased = query;
+      rebased.offset -= *delta;
+      rebased.canonical_id = lookupStackCellIdForSummary(rebased, stack_cell_ids);
+      return rebased;
+    };
     auto lookup_canonical_or_equivalent_caller_fact =
         [&](const std::map<unsigned, VirtualValueExpr> *stack_facts,
             const VirtualStackCellSummary &query)
@@ -339,12 +527,19 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
       if (!stack_facts)
         return std::nullopt;
       auto canonical_query = canonicalize_cell(query);
-      if (!canonical_query.canonical_id.has_value())
+      if (!canonical_query.canonical_id.has_value()) {
+        if (auto rebased_query =
+                rebase_query_through_slot_facts(canonical_query, slot_facts)) {
+          return lookup_canonical_or_equivalent_caller_fact(stack_facts,
+                                                            *rebased_query);
+        }
         return std::nullopt;
+      }
       unsigned direct_id = *canonical_query.canonical_id;
       unsigned rebased_id = rebaseSingleStackCellId(model, slot_facts, direct_id);
       if (rebased_id == direct_id)
-        return std::nullopt;
+        return lookup_canonical_or_equivalent_caller_fact(stack_facts,
+                                                          canonical_query);
       if (auto it = stack_facts->find(rebased_id); it != stack_facts->end()) {
         return it->second;
       }
@@ -428,6 +623,14 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
         mapped_cell.base_from_argument = actual_cell->base_from_argument;
         mapped_cell.base_from_alloca = actual_cell->base_from_alloca;
         mapped_cell.offset += actual_cell->offset;
+      } else if (actual_expr.kind == VirtualExprKind::kArgument &&
+                 actual_expr.argument_index.has_value()) {
+        mapped_cell.base_name =
+            ("arg" + std::to_string(*actual_expr.argument_index));
+        mapped_cell.base_width =
+            std::max(1u, getValueBitWidth(actual_arg, dl) / 8u);
+        mapped_cell.base_from_argument = true;
+        mapped_cell.base_from_alloca = false;
       } else {
         return std::nullopt;
       }
@@ -468,7 +671,12 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
     if (auto *arg = llvm::dyn_cast<llvm::Argument>(value)) {
       if (auto it = incoming_args.find(static_cast<unsigned>(arg->getArgNo()));
           it != incoming_args.end()) {
-        return normalize_expr(it->second, getValueBitWidth(value, dl));
+        auto incoming = it->second;
+        if (!incoming.bit_width)
+          incoming.bit_width = getValueBitWidth(value, dl);
+        annotateExprSlots(incoming, slot_ids);
+        annotateExprStackCells(incoming, stack_cell_ids, slot_ids);
+        return incoming;
       }
       return argumentExpr(static_cast<unsigned>(arg->getArgNo()),
                           getValueBitWidth(value, dl));
@@ -537,7 +745,18 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
         if (canonical_slot.canonical_id.has_value()) {
           if (auto it = state.slot_facts.find(*canonical_slot.canonical_id);
               it != state.slot_facts.end()) {
-            result = normalize_expr(it->second, width.getFixedValue() * 8u);
+            result = normalize_expr_avoiding_self_slot(
+                it->second, *canonical_slot.canonical_id,
+                width.getFixedValue() * 8u);
+            if (vmModelLocalReplayDebugEnabled()) {
+              std::string rendered;
+              llvm::raw_string_ostream os(rendered);
+              os << "helper=" << F.getName() << " load-slot["
+                 << *canonical_slot.canonical_id << "] raw="
+                 << renderVirtualValueExpr(it->second) << " normalized="
+                 << renderVirtualValueExpr(result);
+              vmModelLocalReplayDebugLog(os.str());
+            }
           } else {
             result = normalize_expr(result, width.getFixedValue() * 8u);
           }
@@ -559,7 +778,18 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
         if (canonical_slot.canonical_id.has_value()) {
           if (auto it = state.slot_facts.find(*canonical_slot.canonical_id);
               it != state.slot_facts.end()) {
-            result = normalize_expr(it->second, width.getFixedValue() * 8u);
+            result = normalize_expr_avoiding_self_slot(
+                it->second, *canonical_slot.canonical_id,
+                width.getFixedValue() * 8u);
+            if (vmModelLocalReplayDebugEnabled()) {
+              std::string rendered;
+              llvm::raw_string_ostream os(rendered);
+              os << "helper=" << F.getName() << " load-slot["
+                 << *canonical_slot.canonical_id << "] raw="
+                 << renderVirtualValueExpr(it->second) << " normalized="
+                 << renderVirtualValueExpr(result);
+              vmModelLocalReplayDebugLog(os.str());
+            }
           } else {
             result = normalize_expr(result, width.getFixedValue() * 8u);
           }
@@ -588,7 +818,8 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
           bool caller_hit = false;
           if (auto it = state.stack_facts.find(cell_id);
               it != state.stack_facts.end()) {
-            result = normalize_expr(it->second, width.getFixedValue() * 8u);
+            result = normalize_expr_avoiding_self_stack(
+                it->second, cell_id, width.getFixedValue() * 8u);
           } else if ((rebased_cell_id =
                           rebaseSingleStackCellId(model, state.slot_facts,
                                                   cell_id)),
@@ -666,7 +897,11 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
       result.complete = lhs->complete && rhs->complete;
       result.operands.push_back(*lhs);
       result.operands.push_back(*rhs);
-      result = normalize_expr(result, result.bit_width);
+      if (containsStateSlotExpr(result) || containsStackCellExpr(result)) {
+        result = normalize_expr_without_state_facts(result, result.bit_width);
+      } else {
+        result = normalize_expr(result, result.bit_width);
+      }
       cache_instruction_expr(result);
       return result;
     }
@@ -801,12 +1036,13 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
             bool local_hit = state.stack_facts.count(cell_id);
             bool rebased_hit = false;
             bool caller_hit = false;
-            if (auto it = state.stack_facts.find(cell_id);
-                it != state.stack_facts.end()) {
-              result = normalize_expr(it->second, width_bits);
-            } else if ((rebased_cell_id =
-                            rebaseSingleStackCellId(model, state.slot_facts,
-                                                    cell_id)),
+          if (auto it = state.stack_facts.find(cell_id);
+              it != state.stack_facts.end()) {
+            result =
+                normalize_expr_avoiding_self_stack(it->second, cell_id, width_bits);
+          } else if ((rebased_cell_id =
+                          rebaseSingleStackCellId(model, state.slot_facts,
+                                                  cell_id)),
                        rebased_cell_id.has_value() &&
                        *rebased_cell_id != cell_id &&
                        (rebased_hit = state.stack_facts.count(*rebased_cell_id))) {
@@ -973,7 +1209,29 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
                                      " reason=store-target");
           return std::nullopt;
         }
+        if (vmModelLocalReplayDebugEnabled()) {
+          std::string rendered;
+          llvm::raw_string_ostream os(rendered);
+          os << "helper=" << F.getName()
+             << " store-target-expr=" << renderVirtualValueExpr(*pointer_expr)
+             << " summary_base=" << cell->base_name << "+" << cell->base_offset
+             << " cell_off=" << cell->offset << " width=" << cell->width;
+          vmModelLocalReplayDebugLog(os.str());
+        }
         auto canonical_cell = canonicalize_cell(*cell);
+        if (vmModelLocalReplayDebugEnabled()) {
+          std::string rendered;
+          llvm::raw_string_ostream os(rendered);
+          os << "helper=" << F.getName() << " store-target-canonical base="
+             << canonical_cell.base_name << "+" << canonical_cell.base_offset
+             << " cell_off=" << canonical_cell.offset
+             << " canonical_id=";
+          if (canonical_cell.canonical_id)
+            os << *canonical_cell.canonical_id;
+          else
+            os << "none";
+          vmModelLocalReplayDebugLog(os.str());
+        }
         auto structural_key = stackCellKeyForSummary(canonical_cell);
         state.structural_stack_facts[structural_key] = normalized_value;
         localized_written_structural_stack_keys.insert(structural_key);
@@ -1033,7 +1291,29 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
                                      " reason=write-memory-target");
           return std::nullopt;
         }
+        if (vmModelLocalReplayDebugEnabled()) {
+          std::string rendered;
+          llvm::raw_string_ostream os(rendered);
+          os << "helper=" << F.getName()
+             << " write-target-expr=" << renderVirtualValueExpr(*address_expr)
+             << " summary_base=" << cell->base_name << "+" << cell->base_offset
+             << " cell_off=" << cell->offset << " width=" << cell->width;
+          vmModelLocalReplayDebugLog(os.str());
+        }
         auto canonical_cell = canonicalize_cell(*cell);
+        if (vmModelLocalReplayDebugEnabled()) {
+          std::string rendered;
+          llvm::raw_string_ostream os(rendered);
+          os << "helper=" << F.getName() << " write-target-canonical base="
+             << canonical_cell.base_name << "+" << canonical_cell.base_offset
+             << " cell_off=" << canonical_cell.offset
+             << " canonical_id=";
+          if (canonical_cell.canonical_id)
+            os << *canonical_cell.canonical_id;
+          else
+            os << "none";
+          vmModelLocalReplayDebugLog(os.str());
+        }
         auto structural_key = stackCellKeyForSummary(canonical_cell);
         state.structural_stack_facts[structural_key] = normalized_value;
         localized_written_structural_stack_keys.insert(structural_key);
