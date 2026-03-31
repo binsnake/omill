@@ -105,6 +105,110 @@ static bool exprContainsSlotId(const VirtualValueExpr &expr, unsigned slot_id) {
   return false;
 }
 
+static std::optional<int64_t> stackBaseDeltaForExpr(const VirtualValueExpr &expr,
+                                                    unsigned slot_id) {
+  if (expr.kind == VirtualExprKind::kStateSlot && expr.slot_id == slot_id)
+    return 0;
+
+  if (expr.kind == VirtualExprKind::kStackCell && expr.slot_id == slot_id &&
+      expr.stack_offset.has_value()) {
+    return *expr.stack_offset;
+  }
+
+  if ((expr.kind == VirtualExprKind::kAdd || expr.kind == VirtualExprKind::kSub) &&
+      expr.operands.size() == 2) {
+    if (auto nested = stackBaseDeltaForExpr(expr.operands[0], slot_id);
+        nested && expr.operands[1].constant.has_value()) {
+      int64_t delta = static_cast<int64_t>(*expr.operands[1].constant);
+      if (expr.kind == VirtualExprKind::kSub)
+        delta = -delta;
+      return *nested + delta;
+    }
+    if (expr.kind == VirtualExprKind::kAdd &&
+        expr.operands[0].constant.has_value()) {
+      if (auto nested = stackBaseDeltaForExpr(expr.operands[1], slot_id)) {
+        return *nested + static_cast<int64_t>(*expr.operands[0].constant);
+      }
+    }
+  }
+
+  return std::nullopt;
+}
+
+static std::optional<int64_t> findStackBaseDeltaForSlot(
+    const std::map<unsigned, VirtualValueExpr> &slot_facts, unsigned slot_id) {
+  std::optional<int64_t> found_delta;
+  auto consider_delta = [&](const VirtualValueExpr &value) {
+    auto delta = stackBaseDeltaForExpr(value, slot_id);
+    if (!delta)
+      return true;
+    if (!found_delta) {
+      found_delta = *delta;
+      return true;
+    }
+    return *found_delta == *delta;
+  };
+
+  if (auto it = slot_facts.find(slot_id); it != slot_facts.end()) {
+    if (!consider_delta(it->second))
+      return std::nullopt;
+  }
+
+  for (const auto &[fact_slot_id, value] : slot_facts) {
+    if (fact_slot_id == slot_id)
+      continue;
+    if (!consider_delta(value))
+      return std::nullopt;
+  }
+
+  return found_delta;
+}
+
+static std::optional<VirtualValueExpr> resolveStructuralStackFallback(
+    const VirtualValueExpr &expr,
+    const std::map<StackCellKey, VirtualValueExpr> &structural_stack_facts,
+    const std::map<SlotKey, unsigned> &slot_ids,
+    const std::map<unsigned, VirtualValueExpr> &caller_outgoing) {
+  auto summary = extractStackCellSummaryFromExpr(expr, exprByteWidth(expr));
+  if (!summary)
+    return std::nullopt;
+
+  std::optional<unsigned> base_slot_id = expr.slot_id;
+  if (!base_slot_id) {
+    auto slot_it = slot_ids.find(
+        SlotKey{summary->base_name, summary->base_offset, summary->base_width,
+                summary->base_from_argument, summary->base_from_alloca});
+    if (slot_it != slot_ids.end())
+      base_slot_id = slot_it->second;
+  }
+  if (!base_slot_id)
+    return std::nullopt;
+
+  auto delta = findStackBaseDeltaForSlot(caller_outgoing, *base_slot_id);
+  llvm::SmallVector<int64_t, 5> candidate_offsets{summary->offset};
+  if (delta && *delta != 0) {
+    candidate_offsets.push_back(summary->offset - *delta);
+    candidate_offsets.push_back(summary->offset + *delta);
+    candidate_offsets.push_back(summary->offset - (2 * *delta));
+    candidate_offsets.push_back(summary->offset + (2 * *delta));
+  }
+
+  for (int64_t candidate_offset : candidate_offsets) {
+    StackCellKey candidate_key{
+        SlotKey{summary->base_name, summary->base_offset, summary->base_width,
+                summary->base_from_argument, summary->base_from_alloca},
+        candidate_offset, summary->width};
+    auto it = structural_stack_facts.find(candidate_key);
+    if (it == structural_stack_facts.end())
+      continue;
+    if (exprEquals(it->second, expr))
+      continue;
+    return it->second;
+  }
+
+  return std::nullopt;
+}
+
 static llvm::SmallVector<unsigned, 4> collectRequiredSpecializedCallArgIndices(
     const VirtualHandlerSummary &callee_summary,
     const std::map<unsigned, const VirtualStateSlotInfo *> &slot_info,
@@ -663,6 +767,23 @@ bool applySingleDirectCalleeEffects(
         model, callee_outgoing_map, callee_summary.written_stack_cell_ids);
   }
 
+  auto materializeStructuralStackFact =
+      [&](const StackCellKey &key, const VirtualValueExpr &value) {
+        auto mapped_cell_it = stack_cell_ids.find(key);
+        if (mapped_cell_it == stack_cell_ids.end())
+          return;
+        auto existing = caller_outgoing_stack.find(mapped_cell_it->second);
+        if (existing != caller_outgoing_stack.end() &&
+            exprEquals(existing->second, value)) {
+          return;
+        }
+        vmModelImportDebugLog("stack-import after call=" +
+                              callee->getName().str() + " expr=" +
+                              renderVirtualValueExpr(value) + " cell=" +
+                              std::to_string(mapped_cell_it->second));
+        caller_outgoing_stack[mapped_cell_it->second] = value;
+      };
+
   for (const auto &[callee_slot_id, callee_value] : callee_outgoing_map) {
     if (!written_slots.empty() && !written_slots.count(callee_slot_id))
       continue;
@@ -704,6 +825,9 @@ bool applySingleDirectCalleeEffects(
         rebaseOutgoingStackFacts(model, caller_outgoing, caller_outgoing_stack);
     auto effective_slot_facts = slotFactsForMap(caller_outgoing);
     auto effective_stack_facts = stackFactsForMap(effective_caller_outgoing_stack);
+    auto tracked_caller_state = buildTrackedFactState(
+        model, caller_outgoing, effective_caller_outgoing_stack,
+        &caller_structural_outgoing_stack);
     auto specialized =
         localized_outgoing
             ? normalizeLocalizedExprForCaller(
@@ -765,6 +889,12 @@ bool applySingleDirectCalleeEffects(
         specialized = std::move(structural);
       }
     }
+    if (specialized.has_value()) {
+      auto tracked_resolved = resolveTrackedStackExpr(
+          model, tracked_caller_state, *specialized, slot_ids, stack_cell_ids);
+      if (!exprEquals(tracked_resolved, *specialized))
+        specialized = std::move(tracked_resolved);
+    }
     if (localized_outgoing &&
         (!specialized.has_value() || isUnknownLikeExpr(*specialized) ||
          !isBoundedLocalizedTransferExpr(*specialized)) &&
@@ -772,6 +902,18 @@ bool applySingleDirectCalleeEffects(
       specialized = remapped;
     }
     if (specialized.has_value() && containsStackCellExpr(*specialized)) {
+      if (specialized->kind == VirtualExprKind::kStackCell) {
+        if (auto structural = resolveStructuralStackFallback(
+                *specialized, caller_structural_outgoing_stack, slot_ids,
+                caller_outgoing)) {
+          vmModelImportDebugLog("slot-import structural-fallback call=" +
+                                callee->getName().str() + " expr=" +
+                                renderVirtualValueExpr(*specialized) +
+                                " resolved=" +
+                                renderVirtualValueExpr(*structural));
+          specialized = std::move(structural);
+        }
+      }
       auto mapped_slot_info_it = slot_info.find(*mapped_slot_id);
       if (mapped_slot_info_it != slot_info.end() &&
           (exprContainsStackCellBasedOnSlot(*specialized,
@@ -807,6 +949,21 @@ bool applySingleDirectCalleeEffects(
         !exprEquals(existing->second, *specialized) &&
         isIdentitySlotExpr(*specialized, *mapped_slot_id)) {
       continue;
+    }
+    if (existing != caller_outgoing.end() &&
+        !exprEquals(existing->second, *specialized) &&
+        containsStackCellExpr(*specialized)) {
+      if (auto existing_delta =
+              stackBaseDeltaForExpr(existing->second, *mapped_slot_id);
+          existing_delta) {
+        vmModelImportDebugLog("slot-import keep-existing call=" +
+                              callee->getName().str() + " slot=" +
+                              std::to_string(*mapped_slot_id) + " existing=" +
+                              renderVirtualValueExpr(existing->second) +
+                              " specialized=" +
+                              renderVirtualValueExpr(*specialized));
+        continue;
+      }
     }
     vmModelImportDebugLog("slot-import after call=" + callee->getName().str() +
                           " expr=" + renderVirtualValueExpr(*specialized) +
@@ -962,6 +1119,9 @@ bool applySingleDirectCalleeEffects(
         rebaseOutgoingStackFacts(model, caller_outgoing, caller_outgoing_stack);
     auto effective_slot_facts = slotFactsForMap(caller_outgoing);
     auto effective_stack_facts = stackFactsForMap(effective_caller_outgoing_stack);
+    auto tracked_caller_state = buildTrackedFactState(
+        model, caller_outgoing, effective_caller_outgoing_stack,
+        &caller_structural_outgoing_stack);
     auto specialized =
         localized_outgoing
             ? normalizeLocalizedExprForCaller(
@@ -1023,6 +1183,12 @@ bool applySingleDirectCalleeEffects(
         specialized = std::move(structural);
       }
     }
+    if (specialized.has_value()) {
+      auto tracked_resolved = resolveTrackedStackExpr(
+          model, tracked_caller_state, *specialized, slot_ids, stack_cell_ids);
+      if (!exprEquals(tracked_resolved, *specialized))
+        specialized = std::move(tracked_resolved);
+    }
     if (localized_outgoing &&
         (!specialized.has_value() || isUnknownLikeExpr(*specialized) ||
          !isBoundedLocalizedTransferExpr(*specialized)) &&
@@ -1052,6 +1218,7 @@ bool applySingleDirectCalleeEffects(
         vmModelImportDebugLog("structural-stack-import after call=" +
                               callee->getName().str() + " expr=" +
                               renderVirtualValueExpr(*specialized));
+        materializeStructuralStackFact(*mapped_structural_key, *specialized);
         caller_structural_outgoing_stack[*mapped_structural_key] =
             std::move(*specialized);
       }
@@ -1092,6 +1259,16 @@ bool applySingleDirectCalleeEffects(
           stack_cell_ids, dl);
       if (!mapped_key)
         continue;
+      vmModelImportDebugLog("structural-stack-key call=" +
+                            callee->getName().str() + " key=" +
+                            mapped_key->base_slot.base_name + ":" +
+                            std::to_string(mapped_key->base_slot.offset) + ":" +
+                            std::to_string(mapped_key->base_slot.width) + ":" +
+                            std::to_string(mapped_key->base_slot.from_argument) +
+                            ":" +
+                            std::to_string(mapped_key->base_slot.from_alloca) +
+                            ":" + std::to_string(mapped_key->cell_offset) + ":" +
+                            std::to_string(mapped_key->width));
       auto specialized = normalizeLocalizedExprForCaller(
           callee_value, caller_fn, slot_ids, stack_cell_ids, caller_outgoing,
           rebaseOutgoingStackFacts(model, caller_outgoing, caller_outgoing_stack),
@@ -1108,6 +1285,17 @@ bool applySingleDirectCalleeEffects(
                 slot_info, stack_cell_info)) {
           specialized = std::move(structural);
         }
+      }
+      if (specialized.has_value()) {
+        auto tracked_caller_state = buildTrackedFactState(
+            model, caller_outgoing,
+            rebaseOutgoingStackFacts(model, caller_outgoing, caller_outgoing_stack),
+            &caller_structural_outgoing_stack);
+        auto tracked_resolved = resolveTrackedStackExpr(
+            model, tracked_caller_state, *specialized, slot_ids,
+            stack_cell_ids);
+        if (!exprEquals(tracked_resolved, *specialized))
+          specialized = std::move(tracked_resolved);
       }
       if (!specialized.has_value() ||
           (specialized.has_value() && containsArgumentExpr(*specialized))) {
@@ -1130,6 +1318,7 @@ bool applySingleDirectCalleeEffects(
       vmModelImportDebugLog("structural-stack-import after call=" +
                             callee->getName().str() + " expr=" +
                             renderVirtualValueExpr(*specialized));
+      materializeStructuralStackFact(*mapped_key, *specialized);
       caller_structural_outgoing_stack[*mapped_key] = std::move(*specialized);
     }
   }
@@ -1322,6 +1511,19 @@ void applyDirectCalleeEffectsImpl(
             !isBoundedLocalizedTransferExpr(*specialized)) {
           continue;
         }
+        if (auto mapped_cell_it = stack_cell_ids.find(key);
+            mapped_cell_it != stack_cell_ids.end()) {
+          auto existing = caller_outgoing_stack.find(mapped_cell_it->second);
+          if (existing == caller_outgoing_stack.end() ||
+              !exprEquals(existing->second, *specialized)) {
+            vmModelImportDebugLog("call-root stack-import after call=" +
+                                  callee->getName().str() + " expr=" +
+                                  renderVirtualValueExpr(*specialized) +
+                                  " cell=" +
+                                  std::to_string(mapped_cell_it->second));
+            caller_outgoing_stack[mapped_cell_it->second] = *specialized;
+          }
+        }
         caller_structural_outgoing_stack[key] = std::move(*specialized);
       }
     }
@@ -1355,6 +1557,35 @@ void applyDirectCalleeEffects(
       stack_cell_info, dl, binary_memory, /*depth=*/0, visiting,
       localized_replay_cache, relevant_caller_slot_ids,
       relevant_caller_stack_cell_ids);
+
+  for (unsigned round = 0; round < 2; ++round) {
+    bool changed = false;
+
+    for (auto &[slot_id, value] : caller_outgoing) {
+      auto normalized = normalizeLocalizedExprForCaller(
+          value, caller_fn, slot_ids, stack_cell_ids, caller_outgoing,
+          caller_outgoing_stack, &caller_structural_outgoing_stack,
+          caller_argument_map);
+      if (!normalized.has_value() || exprEquals(value, *normalized))
+        continue;
+      value = std::move(*normalized);
+      changed = true;
+    }
+
+    for (auto &[cell_id, value] : caller_outgoing_stack) {
+      auto normalized = normalizeLocalizedExprForCaller(
+          value, caller_fn, slot_ids, stack_cell_ids, caller_outgoing,
+          caller_outgoing_stack, &caller_structural_outgoing_stack,
+          caller_argument_map);
+      if (!normalized.has_value() || exprEquals(value, *normalized))
+        continue;
+      value = std::move(*normalized);
+      changed = true;
+    }
+
+    if (!changed)
+      break;
+  }
 }
 
 }  // namespace omill::virtual_model::detail

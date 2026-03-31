@@ -11,6 +11,7 @@
 #include <llvm/IR/Operator.h>
 #include <llvm/Support/Debug.h>
 
+#include "omill/Utils/LiftedNames.h"
 #include "omill/Utils/StateFieldMap.h"
 
 #define DEBUG_TYPE "optimize-state"
@@ -299,9 +300,8 @@ static bool hasRemillControlTransfer(const llvm::Function &F) {
       if (!callee)
         continue;
       auto name = callee->getName();
-      if (name == "__remill_jump" || name == "__remill_function_call" ||
-          name == "__remill_function_return" ||
-          name == "__omill_dispatch_jump" || name == "__omill_dispatch_call") {
+      if (isDispatchIntrinsicName(name) ||
+          name == "__remill_function_return") {
         return true;
       }
       // Before full control-flow lowering, lifted traces can still contain

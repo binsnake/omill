@@ -14,8 +14,8 @@ namespace omill {
 ///   2. Handler functions that are small (< threshold instruction count)
 ///   3. Multiple call sites to the same set of handlers
 ///
-/// This pass identifies functions called from __omill_dispatch_call /
-/// __omill_dispatch_jump sites or indirect calls within loops, and marks
+/// This pass identifies functions called from unresolved dispatch call/jump
+/// sites or indirect calls within loops, and marks
 /// small handler functions with alwaysinline.  It then runs LLVM's
 /// AlwaysInliner to perform the actual inlining.
 ///

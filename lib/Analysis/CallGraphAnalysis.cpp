@@ -152,9 +152,8 @@ LiftedCallGraph CallGraphAnalysis::run(llvm::Module &M,
           }
         }
 
-        // __omill_dispatch_call or __omill_dispatch_jump
-        if (name == "__omill_dispatch_call" ||
-            name == "__omill_dispatch_jump") {
+        // Unresolved dispatch via either the raw Remill or legacy omill name.
+        if (isDispatchIntrinsicName(name)) {
           CallSite cs;
           cs.inst = CI;
           cs.caller = F;

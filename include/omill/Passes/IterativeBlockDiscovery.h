@@ -12,7 +12,7 @@ namespace omill {
 ///
 /// This pass is the core of the blocks-as-functions architecture: after
 /// BlockLifter produces one function per basic block (with indirect
-/// jumps represented as __omill_dispatch_jump / __omill_dispatch_call),
+/// jumps represented as unresolved dispatch jump/call intrinsics),
 /// IterativeBlockDiscovery runs lightweight per-function optimization
 /// (InstCombine + ConstantMemoryFolding) and then scans all dispatch
 /// call sites for constant PC arguments.  Newly discovered PCs are

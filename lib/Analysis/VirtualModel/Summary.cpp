@@ -86,7 +86,6 @@ llvm::stable_hash summaryRelevantFunctionFingerprint(
       "omill.newly_lifted",
       "omill.vm_demerged_clone",
       "omill.vm_outlined_virtual_call",
-      "omill.trace_native_target",
   };
   for (llvm::StringLiteral attr_name : kRelevantAttrs)
     hash = llvm::stable_hash_combine(hash, stableHashAttribute(F, attr_name));
@@ -217,8 +216,7 @@ static bool isLiftedOrHelperSeedFunction(const llvm::Function &F) {
 static bool isVirtualModelNamedCodeFunction(const llvm::Function &F) {
   auto name = F.getName();
   return name.starts_with("sub_") || name.starts_with("blk_") ||
-         name.starts_with("block_") || name.starts_with("__lifted_") ||
-         name.ends_with("_native");
+         name.starts_with("block_") || name.starts_with("__lifted_");
 }
 
 static bool hasVirtualModelCodeBearingAttr(const llvm::Function &F) {
@@ -229,8 +227,7 @@ static bool hasVirtualModelCodeBearingAttr(const llvm::Function &F) {
          F.hasFnAttribute("omill.vm_newly_lifted") ||
          F.hasFnAttribute("omill.newly_lifted") ||
          F.getFnAttribute("omill.vm_demerged_clone").isValid() ||
-         F.getFnAttribute("omill.vm_outlined_virtual_call").isValid() ||
-         F.getFnAttribute("omill.trace_native_target").isValid();
+         F.getFnAttribute("omill.vm_outlined_virtual_call").isValid();
 }
 
 bool isVirtualModelInitialSeedFunction(
@@ -252,8 +249,7 @@ bool isVirtualModelCodeBearingFunction(
 }
 
 static bool isDispatchIntrinsic(const llvm::Function &F) {
-  return F.getName() == "__omill_dispatch_call" ||
-         F.getName() == "__omill_dispatch_jump";
+  return isDispatchIntrinsicName(F.getName());
 }
 
 static void collectExprReferencedStackCells(
@@ -327,7 +323,12 @@ VirtualHandlerSummary summarizeFunction(
   if (entry_va != 0)
     summary.entry_va = entry_va;
   summary.is_output_root = F.hasFnAttribute("omill.output_root");
+  summary.is_closed_root_slice_root =
+      F.hasFnAttribute("omill.closed_root_slice_root");
   summary.is_specialized = F.hasFnAttribute("omill.virtual_specialized");
+  summary.is_dirty_seed = F.hasFnAttribute("omill.vm_newly_lifted") ||
+                          F.hasFnAttribute("omill.newly_lifted") ||
+                          F.hasFnAttribute("omill.terminal_boundary_recovery_seed");
   summary.specialization_root_va =
       extractHexAttr(F, "omill.virtual_specialization.root_va");
   summary.specialization_facts = parseSpecializationFacts(F);

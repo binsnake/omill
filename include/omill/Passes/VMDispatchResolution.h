@@ -12,9 +12,9 @@ namespace omill {
 /// therefore trusts only the concrete trace map produced by VMTraceEmulator.
 ///
 /// For each function tagged with `omill.vm_handler`, the pass looks up the
-/// traced successor VA for that handler and replaces opaque
-/// `__omill_dispatch_jump` targets with a constant VA. `__omill_dispatch_call`
-/// sites are intentionally ignored here because they represent native calls
+/// traced successor VA for that handler and replaces opaque unresolved
+/// dispatch-jump targets with a constant VA. Dispatch-call sites are
+/// intentionally ignored here because they represent native calls
 /// through the vmexit trampoline, not handler-to-handler dispatch.
 class VMDispatchResolutionPass
     : public llvm::PassInfoMixin<VMDispatchResolutionPass> {

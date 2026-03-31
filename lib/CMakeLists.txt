@@ -2,6 +2,11 @@ add_library(omill STATIC
   # Arch
   Arch/ArchABI.cpp
 
+  # Devirtualization
+  Devirtualization/Orchestrator.cpp
+  Devirtualization/OutputRootClosure.cpp
+  Remill/Normalization.cpp
+
   # Utils
   Utils/IntrinsicTable.cpp
   Utils/LiftedNames.cpp
@@ -33,12 +38,14 @@ add_library(omill STATIC
   Analysis/VirtualModel/Regions.cpp
   Analysis/VirtualModel/Render.cpp
       Analysis/VirtualModel/RootSlices.cpp
+      Analysis/VirtualModel/StackFactTracker.cpp
       Analysis/VirtualModel/StateFacts.cpp
       Analysis/VirtualModel/Specialization.cpp
       Analysis/VirtualModel/Summary.cpp
       Analysis/VirtualModel/Targets.cpp
   Analysis/VirtualModel/Transfers.cpp
   Analysis/VirtualModel/ValueExprs.cpp
+  Analysis/VirtualModel/VIP.cpp
   Analysis/ExceptionInfo.cpp
   Analysis/SegmentsAA.cpp
   Analysis/VirtualCalleeRegistry.cpp
@@ -64,16 +71,13 @@ add_library(omill STATIC
   # Analysis & Passes - Stage 5: ABI Recovery
   Analysis/CallingConventionAnalysis.cpp
   Passes/RecoverStackFrame.cpp
-  Passes/RecoverFunctionSignatures.cpp
   Passes/RecoverStackFrameTypes.cpp
-  Passes/RefineFunctionSignatures.cpp
-  Passes/RewriteLiftedCallsToNative.cpp
-  Passes/EliminateStateStruct.cpp
 
   # Analysis & Passes - Stage 6: Deobfuscation
   Analysis/BinaryMemoryMap.cpp
   Utils/ImportHashDB.cpp
   Passes/ConstantMemoryFolding.cpp
+  Passes/CombinedFixedPointDevirt.cpp
   Passes/HashImportAnnotation.cpp
   Passes/ResolveLazyImports.cpp
   Passes/RecoverGlobalTypes.cpp

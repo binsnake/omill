@@ -93,6 +93,32 @@ enum class VirtualDispatchResolutionSource {
   kPreludeLocalization,
 };
 
+enum class VirtualInstructionPointerSourceKind {
+  kUnknown,
+  kNamedSlot,
+  kStackCell,
+  kBytecodeRead,
+  kDispatchOperand,
+};
+
+enum class VirtualExitDisposition {
+  kUnknown,
+  kStayInVm,
+  kVmExitTerminal,
+  kVmExitNativeCallReenter,
+  kVmExitNativeExecUnknownReturn,
+  kVmEnter,
+  kNestedVmEnter,
+};
+
+enum class VirtualExitStackDeltaKind {
+  kUnknown,
+  kUnchanged,
+  kPlusPointer,
+  kPlusDoublePointer,
+  kOther,
+};
+
 struct VirtualValueExpr {
   VirtualExprKind kind = VirtualExprKind::kUnknown;
   unsigned bit_width = 0;
@@ -105,6 +131,31 @@ struct VirtualValueExpr {
   std::optional<unsigned> stack_cell_id;
   std::optional<int64_t> stack_offset;
   std::vector<VirtualValueExpr> operands;
+};
+
+struct VirtualInstructionPointerSummary {
+  std::optional<unsigned> slot_id;
+  std::optional<unsigned> stack_cell_id;
+  VirtualValueExpr expr_before_dispatch;
+  VirtualValueExpr expr_after_dispatch;
+  std::optional<uint64_t> resolved_pc;
+  VirtualInstructionPointerSourceKind source_kind =
+      VirtualInstructionPointerSourceKind::kUnknown;
+  bool symbolic = false;
+};
+
+struct VirtualExitSummary {
+  VirtualExitDisposition disposition = VirtualExitDisposition::kUnknown;
+  std::optional<uint64_t> native_target_pc;
+  VirtualInstructionPointerSummary continuation_vip;
+  std::optional<uint64_t> continuation_pc;
+  VirtualExitStackDeltaKind stack_delta_kind =
+      VirtualExitStackDeltaKind::kUnknown;
+  std::optional<int64_t> stack_delta_bytes;
+  bool is_full_exit = false;
+  bool is_partial_exit = false;
+  bool reenters_vm = false;
+  bool corroborated_by_trace = false;
 };
 
 struct VirtualDispatchSuccessorSummary {
@@ -123,6 +174,8 @@ struct VirtualDispatchSummary {
   VirtualValueExpr specialized_target;
   VirtualDispatchResolutionSource specialized_target_source =
       VirtualDispatchResolutionSource::kUnknown;
+  VirtualInstructionPointerSummary vip;
+  VirtualExitSummary exit;
   std::vector<VirtualDispatchSuccessorSummary> successors;
   std::string unresolved_reason;
 };
@@ -188,6 +241,8 @@ struct VirtualCallSiteSummary {
   std::optional<uint64_t> resolved_target_pc;
   std::optional<uint64_t> recovered_entry_pc;
   std::optional<uint64_t> continuation_pc;
+  VirtualInstructionPointerSummary vip;
+  VirtualExitSummary exit;
   bool is_executable_in_image = false;
   bool is_decodable_entry = false;
   std::optional<std::string> target_function_name;
@@ -201,12 +256,15 @@ struct VirtualHandlerSummary {
   std::string function_name;
   std::optional<uint64_t> entry_va;
   bool is_output_root = false;
+  bool is_closed_root_slice_root = false;
   bool is_specialized = false;
+  bool is_dirty_seed = false;
   std::optional<uint64_t> specialization_root_va;
   unsigned dispatch_call_count = 0;
   unsigned dispatch_jump_count = 0;
   unsigned protected_boundary_call_count = 0;
   bool is_candidate = false;
+  VirtualInstructionPointerSummary canonical_vip;
   std::vector<std::string> called_boundaries;
   std::vector<std::string> direct_callees;
   std::vector<VirtualStateSlotSummary> state_slots;
@@ -267,6 +325,9 @@ struct VirtualRootSliceSummary {
     std::optional<uint64_t> target_pc;
     std::optional<uint64_t> canonical_target_va;
     std::optional<std::string> boundary_name;
+    std::optional<uint64_t> vip_pc;
+    VirtualExitDisposition exit_disposition =
+        VirtualExitDisposition::kUnknown;
   };
 
   uint64_t root_va = 0;

@@ -64,13 +64,45 @@ struct StackCellKey {
   }
 };
 
+struct CanonicalStackFactKey {
+  unsigned base_slot_id = 0;
+  int64_t cell_offset = 0;
+  unsigned width = 0;
+
+  auto tie() const { return std::tie(base_slot_id, cell_offset, width); }
+
+  bool operator<(const CanonicalStackFactKey &other) const {
+    return tie() < other.tie();
+  }
+};
+
+struct TrackedStackQuery {
+  CanonicalStackFactKey key;
+  llvm::SmallVector<CanonicalStackFactKey, 8> variants;
+};
+
+struct TrackedStackLookupResult {
+  CanonicalStackFactKey key;
+  VirtualValueExpr value;
+  bool matched_variant = false;
+};
+
+struct TrackedFactState {
+  std::map<unsigned, VirtualValueExpr> slot_facts;
+  std::map<CanonicalStackFactKey, VirtualValueExpr> stack_facts;
+  std::map<unsigned, int64_t> stack_base_deltas;
+  std::map<unsigned, VirtualValueExpr> materialized_stack_facts;
+};
+
 struct CallsiteLocalizedOutgoingFacts {
   std::map<unsigned, VirtualValueExpr> outgoing_slots;
   std::map<unsigned, VirtualValueExpr> outgoing_stack;
   std::map<StackCellKey, VirtualValueExpr> structural_outgoing_stack;
+  TrackedFactState tracked_state;
   std::set<unsigned> written_slot_ids;
   std::set<unsigned> written_stack_cell_ids;
   std::set<StackCellKey> written_structural_stack_keys;
+  std::set<CanonicalStackFactKey> written_stack_keys;
 };
 
 struct CachedOutgoingFactsKey {
@@ -123,6 +155,11 @@ struct CachedPropagationEntry {
   bool stack_memory_budget_exceeded = false;
 };
 
+struct CachedRootSlicesEntry {
+  llvm::stable_hash fingerprint = 0;
+  std::vector<VirtualRootSliceSummary> root_slices;
+};
+
 struct CachedDirectCalleeEntry {
   llvm::stable_hash fingerprint = 0;
   llvm::SmallVector<std::string, 8> callees;
@@ -152,7 +189,9 @@ struct LocalCallSiteState {
 };
 
 struct CachedModuleHandlerSummaryState {
+  llvm::stable_hash module_fingerprint = 0;
   std::map<std::string, CachedHandlerSummaryEntry> summaries;
+  CachedRootSlicesEntry root_slices;
   std::map<std::string, CachedDirectCalleeEntry> direct_callees;
   std::map<CachedOutgoingFactsKey, std::optional<CallsiteLocalizedOutgoingFacts>>
       localized_top_level_replays;

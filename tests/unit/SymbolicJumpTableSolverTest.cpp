@@ -12,6 +12,7 @@
 
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
+#include "omill/BC/BlockLifterAnalysis.h"
 
 #include <gtest/gtest.h>
 
@@ -50,6 +51,7 @@ class SymbolicJumpTableSolverTest : public ::testing::Test {
     MAM.registerPass(
         [&]() { return omill::BinaryMemoryAnalysis(std::move(map)); });
     MAM.registerPass([] { return omill::LiftedFunctionAnalysis(); });
+    MAM.registerPass([] { return omill::BlockLiftAnalysis(); });
 
     PB.registerModuleAnalyses(MAM);
     PB.registerCGSCCAnalyses(CGAM);
@@ -59,6 +61,7 @@ class SymbolicJumpTableSolverTest : public ::testing::Test {
 
     (void)MAM.getResult<omill::BinaryMemoryAnalysis>(*M);
     (void)MAM.getResult<omill::LiftedFunctionAnalysis>(*M);
+    (void)MAM.getResult<omill::BlockLiftAnalysis>(*M);
 
     llvm::ModulePassManager MPM;
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(

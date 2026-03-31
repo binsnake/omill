@@ -4,6 +4,7 @@
 #include <llvm/IR/PassManager.h>
 
 #include <cstdint>
+#include <llvm/ADT/Twine.h>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -25,9 +26,17 @@ class LiftedFunctionMap {
     if (!module_)
       return nullptr;
     auto it = pc_to_name_.find(pc);
-    if (it == pc_to_name_.end())
-      return nullptr;
-    return module_->getFunction(it->second);
+    if (it != pc_to_name_.end()) {
+      if (auto *fn = module_->getFunction(it->second))
+        return fn;
+    }
+
+    for (llvm::StringRef prefix : {"sub_", "blk_", "block_"}) {
+      std::string name = (prefix + llvm::Twine::utohexstr(pc)).str();
+      if (auto *fn = module_->getFunction(name); fn && !fn->isDeclaration())
+        return fn;
+    }
+    return nullptr;
   }
 
   /// Check if a function is a known lifted function.

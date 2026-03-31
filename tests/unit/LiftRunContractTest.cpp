@@ -18,6 +18,7 @@ TEST(LiftRunContractTest, RequestRoundTripJSON) {
   req.base = 0x140000000;
   req.output_filename = "out.ll";
   req.deobfuscate = true;
+  req.devirtualize = true;
   req.resolve_targets = true;
   req.max_iterations = 42;
   req.event_jsonl = "events.jsonl";
@@ -32,6 +33,7 @@ TEST(LiftRunContractTest, RequestRoundTripJSON) {
   EXPECT_EQ(parsed->base, req.base);
   EXPECT_EQ(parsed->output_filename, req.output_filename);
   EXPECT_EQ(parsed->deobfuscate, req.deobfuscate);
+  EXPECT_EQ(parsed->devirtualize, req.devirtualize);
   EXPECT_EQ(parsed->resolve_targets, req.resolve_targets);
   EXPECT_EQ(parsed->max_iterations, req.max_iterations);
   EXPECT_EQ(parsed->event_jsonl, req.event_jsonl);
@@ -59,6 +61,7 @@ TEST(LiftRunContractTest, BuildArgsIncludesRequestedOptions) {
   req.va = "0x1234";
   req.output_filename = "lifted.ll";
   req.deobfuscate = true;
+  req.devirtualize = true;
   req.resolve_targets = true;
   req.max_iterations = 7;
   req.raw = true;
@@ -79,6 +82,7 @@ TEST(LiftRunContractTest, BuildArgsIncludesRequestedOptions) {
   EXPECT_TRUE(contains("-o"));
   EXPECT_TRUE(contains("lifted.ll"));
   EXPECT_TRUE(contains("--deobfuscate"));
+  EXPECT_TRUE(contains("--devirtualize"));
   EXPECT_TRUE(contains("--resolve-targets"));
   EXPECT_TRUE(contains("--max-iterations"));
   EXPECT_TRUE(contains("7"));

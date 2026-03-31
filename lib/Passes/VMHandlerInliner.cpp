@@ -129,7 +129,7 @@ bool hasUnresolvedDispatch(const llvm::Function &F) {
         continue;
 
       auto name = callee->getName();
-      if (name != "__omill_dispatch_call" && name != "__omill_dispatch_jump")
+      if (!isDispatchIntrinsicName(name))
         continue;
 
       auto *target = CB->getArgOperand(1);

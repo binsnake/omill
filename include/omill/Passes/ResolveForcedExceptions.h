@@ -15,7 +15,7 @@ namespace omill {
 ///   3. Store handler args (EXCEPTION_RECORD*, 0, CONTEXT*, 0) into State
 ///   4. Call the lifted handler
 ///   5. Unmarshal CONTEXT back into State
-///   6. Load new RIP from CONTEXT and dispatch via __omill_dispatch_jump
+///   6. Load new RIP from CONTEXT and dispatch via the unresolved jump helper
 ///
 /// Runs in Phase 3 before LowerErrorAndMissingPass. Unresolved error
 /// sites (no handler or handler not lifted) are left for LowerErrorAndMissing.

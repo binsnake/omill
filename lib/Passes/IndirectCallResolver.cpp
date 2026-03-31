@@ -1613,8 +1613,8 @@ llvm::PreservedAnalyses IndirectCallResolverPass::run(
       if (call->arg_size() < 3)
         continue;
 
-      bool is_call = (callee->getName() == "__omill_dispatch_call");
-      bool is_jump = (callee->getName() == "__omill_dispatch_jump");
+      bool is_call = isDispatchCallName(callee->getName());
+      bool is_jump = isDispatchJumpName(callee->getName());
       if (!is_call && !is_jump)
         continue;
 

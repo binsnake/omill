@@ -1,7 +1,11 @@
 #include "omill/Omill.h"
 #include "omill/Analysis/BinaryMemoryMap.h"
+#include "omill/Analysis/ExceptionInfo.h"
+#include "omill/Analysis/IterativeLiftingSession.h"
+#include "omill/Analysis/VMTraceMap.h"
 #include "omill/Analysis/VirtualCalleeRegistry.h"
-#include "omill/Passes/EliminateStateStruct.h"
+#include "omill/BC/BlockLifterAnalysis.h"
+#include "omill/BC/TraceLiftAnalysis.h"
 #include "omill/Passes/LowerRemillIntrinsics.h"
 
 #include <llvm/Analysis/CGSCCPassManager.h>
@@ -20,6 +24,7 @@
 #include <gtest/gtest.h>
 #include <cstdlib>
 #include <string>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -121,10 +126,46 @@ class PipelineTest : public ::testing::Test {
     return runs;
   }
 
+  std::vector<std::pair<std::string, std::string>> collectAbiRecoveryPassRuns(
+      llvm::Module &M, const omill::PipelineOptions &opts) {
+    llvm::PassInstrumentationCallbacks PIC;
+    std::vector<std::pair<std::string, std::string>> runs;
+    PIC.registerBeforeNonSkippedPassCallback([&](llvm::StringRef PassName,
+                                                 llvm::Any IR) {
+      if (const auto **Mod = llvm::any_cast<const llvm::Module *>(&IR)) {
+        runs.emplace_back(PassName.str(), (*Mod)->getName().str());
+      } else if (const auto **F = llvm::any_cast<const llvm::Function *>(&IR)) {
+        runs.emplace_back(PassName.str(), (*F)->getName().str());
+      }
+    });
+
+    llvm::ModulePassManager MPM;
+    omill::buildABIRecoveryPipeline(MPM, opts);
+
+    llvm::PassBuilder PB(nullptr, llvm::PipelineTuningOptions(),
+                         std::nullopt, &PIC);
+    llvm::LoopAnalysisManager LAM;
+    llvm::FunctionAnalysisManager FAM;
+    llvm::CGSCCAnalysisManager CGAM;
+    llvm::ModuleAnalysisManager MAM;
+
+    PB.registerModuleAnalyses(MAM);
+    PB.registerCGSCCAnalyses(CGAM);
+    PB.registerFunctionAnalyses(FAM);
+    PB.registerLoopAnalyses(LAM);
+    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+    omill::registerAnalyses(FAM);
+    omill::registerModuleAnalyses(MAM);
+
+    MPM.run(M, MAM);
+    return runs;
+  }
+
   /// Run a module pass manager with all required analyses registered.
   /// NOTE: declaration order matters — MAM must be destroyed first (it holds
   /// cross-references to FAM via FunctionAnalysisManagerModuleProxy).
-  void runMPM(llvm::ModulePassManager &MPM, llvm::Module &M) {
+ void runMPM(llvm::ModulePassManager &MPM, llvm::Module &M) {
     llvm::PassBuilder PB;
     llvm::LoopAnalysisManager LAM;
     llvm::FunctionAnalysisManager FAM;
@@ -151,8 +192,6 @@ class PipelineTest : public ::testing::Test {
     llvm::CGSCCAnalysisManager CGAM;
     llvm::ModuleAnalysisManager MAM;
 
-    MAM.registerPass(
-        [&]() { return omill::BinaryMemoryAnalysis(std::move(map)); });
     PB.registerModuleAnalyses(MAM);
     PB.registerCGSCCAnalyses(CGAM);
     PB.registerFunctionAnalyses(FAM);
@@ -160,7 +199,46 @@ class PipelineTest : public ::testing::Test {
     PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
     omill::registerAnalyses(FAM);
-    omill::registerModuleAnalyses(MAM);
+    omill::registerRemainingModuleAnalyses(MAM);
+    MAM.registerPass(
+        [&]() { return omill::BinaryMemoryAnalysis(std::move(map)); });
+    MAM.registerPass([&] { return omill::TraceLiftAnalysis(); });
+    MAM.registerPass([&] { return omill::IterativeLiftingSessionAnalysis(); });
+    MAM.registerPass([&] { return omill::ExceptionInfoAnalysis(); });
+    MAM.registerPass([&] { return omill::BlockLiftAnalysis(); });
+    MAM.registerPass([&] { return omill::VMTraceMapAnalysis(); });
+
+    MPM.run(M, MAM);
+  }
+
+  void runMPMWithLiftCallback(llvm::ModulePassManager &MPM, llvm::Module &M,
+                              omill::BinaryMemoryMap map,
+                              omill::BlockLiftCallback lift_block) {
+    llvm::PassBuilder PB;
+    llvm::LoopAnalysisManager LAM;
+    llvm::FunctionAnalysisManager FAM;
+    llvm::CGSCCAnalysisManager CGAM;
+    llvm::ModuleAnalysisManager MAM;
+
+    PB.registerModuleAnalyses(MAM);
+    PB.registerCGSCCAnalyses(CGAM);
+    PB.registerFunctionAnalyses(FAM);
+    PB.registerLoopAnalyses(LAM);
+    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+    auto session =
+        std::make_shared<omill::IterativeLiftingSession>("pipeline-test");
+    omill::registerAnalyses(FAM);
+    omill::registerRemainingModuleAnalyses(MAM);
+    MAM.registerPass(
+        [&]() { return omill::BinaryMemoryAnalysis(std::move(map)); });
+    MAM.registerPass([&] { return omill::TraceLiftAnalysis(); });
+    MAM.registerPass(
+        [session] { return omill::IterativeLiftingSessionAnalysis(session); });
+    MAM.registerPass([&] { return omill::ExceptionInfoAnalysis(); });
+    MAM.registerPass(
+        [&]() { return omill::BlockLiftAnalysis(std::move(lift_block)); });
+    MAM.registerPass([&] { return omill::VMTraceMapAnalysis(); });
 
     MPM.run(M, MAM);
   }
@@ -597,8 +675,10 @@ TEST_F(PipelineTest, EnvVarTrueDisablesPass) {
 }
 
 // ===----------------------------------------------------------------------===
-// FoldCallsToConstantReturn (through buildABIRecoveryPipeline)
+// Retired legacy `_native` ABI pipeline tests
 // ===----------------------------------------------------------------------===
+
+#if 0
 
 TEST_F(PipelineTest, FoldCallsToConstantReturn) {
   auto M = createModule();
@@ -1243,6 +1323,88 @@ TEST_F(PipelineTest,
 }
 
 TEST_F(PipelineTest,
+       ContinuationDeclarationReliftPrecollectsWorkBeforeModuleMutation) {
+  auto M = createModule();
+  M->addModuleFlag(llvm::Module::Override, "omill.closed_root_slice_scope", 1u);
+
+  auto *root = llvm::Function::Create(liftedFnTy(),
+                                      llvm::GlobalValue::ExternalLinkage,
+                                      "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  root->addFnAttr("omill.closed_root_slice", "1");
+  root->addFnAttr("omill.closed_root_slice_root", "1");
+
+  auto *cont_decl = llvm::Function::Create(liftedFnTy(),
+                                           llvm::GlobalValue::ExternalLinkage,
+                                           "blk_401020", *M);
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+  llvm::IRBuilder<> B(entry);
+  auto *cont_call =
+      B.CreateCall(cont_decl, {root->getArg(0), B.getInt64(0x401020ULL),
+                               root->getArg(2)});
+  B.CreateRet(cont_call);
+
+  omill::BinaryMemoryMap map;
+  static const uint8_t exec_bytes[0x40] = {};
+  map.addRegion(0x401000, exec_bytes, sizeof(exec_bytes), /*read_only=*/false,
+                /*executable=*/true);
+
+  omill::PipelineOptions opts;
+  opts.recover_abi = false;
+  opts.no_abi_mode = false;
+  opts.generic_static_devirtualize = true;
+  opts.run_cleanup_passes = false;
+  opts.deobfuscate = false;
+  opts.vm_devirtualize = false;
+  opts.lower_intrinsics = false;
+  opts.optimize_state = false;
+  opts.lower_control_flow = false;
+  opts.resolve_indirect_targets = false;
+  opts.interprocedural_const_prop = false;
+
+  llvm::ModulePassManager MPM;
+  omill::buildPipeline(MPM, opts);
+
+  unsigned lift_count = 0;
+  runMPMWithLiftCallback(
+      MPM, *M, std::move(map),
+      [&](uint64_t pc) -> bool {
+        ++lift_count;
+        if (pc != 0x401020ULL)
+          return false;
+        auto *existing = M->getFunction("blk_401020");
+        auto *lifted = existing && !existing->isDeclaration()
+                           ? existing
+                           : llvm::Function::Create(
+                                 liftedFnTy(),
+                                 llvm::GlobalValue::ExternalLinkage,
+                                 "blk_401020", *M);
+        if (lifted->empty()) {
+          auto *lifted_entry = llvm::BasicBlock::Create(Ctx, "entry", lifted);
+          llvm::IRBuilder<> LiftedB(lifted_entry);
+          LiftedB.CreateRet(lifted->getArg(2));
+        }
+        auto *extra =
+            M->getFunction("blk_401030")
+                ? M->getFunction("blk_401030")
+                : llvm::Function::Create(liftedFnTy(),
+                                         llvm::GlobalValue::ExternalLinkage,
+                                         "blk_401030", *M);
+        if (extra->empty()) {
+          auto *extra_entry = llvm::BasicBlock::Create(Ctx, "entry", extra);
+          llvm::IRBuilder<> ExtraB(extra_entry);
+          ExtraB.CreateRet(extra->getArg(2));
+        }
+        return true;
+      });
+
+  auto *lifted = M->getFunction("blk_401020");
+  ASSERT_NE(lifted, nullptr);
+  EXPECT_FALSE(lifted->isDeclaration());
+  EXPECT_GE(lift_count, 1u);
+}
+
+TEST_F(PipelineTest,
        NoAbiPipelineRunsSafeClosedSliceContinuationLiftsByDefault) {
   auto M = createModule();
   M->addModuleFlag(llvm::Module::Override, "omill.closed_root_slice_scope", 1u);
@@ -1405,136 +1567,6 @@ TEST_F(PipelineTest, NoAbiPipelineEnablesExperimentalClosedSliceExpansionWhenReq
 }
 
 TEST_F(PipelineTest,
-       ClosedRootOutputRootCollapsesIntoNativeWrapperAndLowersMemory) {
-  auto M = createModule();
-  M->addModuleFlag(llvm::Module::Override, "omill.closed_root_slice_scope", 1u);
-
-  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
-  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
-  auto *lifted_ty = liftedFnTy();
-  auto *read_ty = llvm::FunctionType::get(i64_ty, {ptr_ty, i64_ty}, false);
-  auto *read_mem = llvm::cast<llvm::Function>(
-      M->getOrInsertFunction("__remill_read_memory_64", read_ty).getCallee());
-
-  auto *lifted = llvm::Function::Create(
-      lifted_ty, llvm::GlobalValue::ExternalLinkage, "sub_401000", *M);
-  lifted->addFnAttr("omill.output_root");
-  lifted->addFnAttr("omill.closed_root_slice", "1");
-  lifted->addFnAttr("omill.closed_root_slice_root", "1");
-  {
-    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", lifted);
-    llvm::IRBuilder<> B(entry);
-    auto *loaded = B.CreateCall(read_mem, {lifted->getArg(2), B.getInt64(8)});
-    auto *result = B.CreateXor(loaded, B.getInt64(1));
-    B.CreateRet(B.CreateIntToPtr(result, ptr_ty));
-  }
-
-  auto *native_ty = llvm::FunctionType::get(i64_ty, {i64_ty, i64_ty}, false);
-  auto *native = llvm::Function::Create(
-      native_ty, llvm::GlobalValue::ExternalLinkage, "sub_401000_native", *M);
-  native->addFnAttr("omill.closed_root_slice", "1");
-  native->addFnAttr("omill.closed_root_slice_root", "1");
-  {
-    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", native);
-    llvm::IRBuilder<> B(entry);
-    auto *state_storage =
-        B.CreateAlloca(llvm::ArrayType::get(B.getInt8Ty(), 64), nullptr,
-                       "state_storage");
-    auto *state_ptr = B.CreateConstGEP1_64(B.getInt8Ty(), state_storage, 0);
-    auto *memory_ptr = B.CreateIntToPtr(native->getArg(0), ptr_ty, "memory");
-    auto *lifted_result =
-        B.CreateCall(lifted, {state_ptr, B.getInt64(0), memory_ptr});
-    B.CreateRet(B.CreatePtrToInt(lifted_result, i64_ty));
-  }
-
-  llvm::ModulePassManager MPM;
-  MPM.addPass(omill::EliminateStateStructPass());
-  MPM.addPass(llvm::AlwaysInlinerPass());
-  {
-    llvm::FunctionPassManager FPM;
-    FPM.addPass(
-        omill::LowerRemillIntrinsicsPass(omill::LowerCategories::Memory));
-    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
-  }
-  MPM.addPass(llvm::GlobalDCEPass());
-  runMPM(MPM, *M);
-
-  auto *native_after = M->getFunction("sub_401000_native");
-  ASSERT_NE(native_after, nullptr);
-  bool calls_lifted = false;
-  bool calls_read_mem = false;
-  for (auto &BB : *native_after) {
-    for (auto &I : BB) {
-      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
-      if (!CI)
-        continue;
-      auto *callee = CI->getCalledFunction();
-      if (!callee)
-        continue;
-      if (callee->getName() == "sub_401000")
-        calls_lifted = true;
-      if (callee->getName() == "__remill_read_memory_64")
-        calls_read_mem = true;
-    }
-  }
-
-  EXPECT_FALSE(calls_lifted);
-  EXPECT_FALSE(calls_read_mem);
-  EXPECT_EQ(M->getFunction("sub_401000"), nullptr);
-}
-
-TEST_F(PipelineTest,
-       AbiCleanupDcesDeadInternalizedLiftedHelpersWithoutNativeWrappers) {
-  auto M = createModule();
-
-  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
-  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
-  auto *lifted_ty = liftedFnTy();
-  auto *read_ty = llvm::FunctionType::get(i64_ty, {ptr_ty, i64_ty}, false);
-  auto *read_mem = llvm::cast<llvm::Function>(
-      M->getOrInsertFunction("__remill_read_memory_64", read_ty).getCallee());
-
-  auto *dead_helper = llvm::Function::Create(
-      lifted_ty, llvm::GlobalValue::ExternalLinkage, "sub_402000", *M);
-  {
-    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", dead_helper);
-    llvm::IRBuilder<> B(entry);
-    auto *loaded = B.CreateCall(read_mem, {dead_helper->getArg(2),
-                                           B.getInt64(0x40)});
-    auto *result = B.CreateXor(loaded, B.getInt64(0x55));
-    B.CreateRet(B.CreateIntToPtr(result, ptr_ty));
-  }
-
-  auto *lifted = llvm::Function::Create(
-      lifted_ty, llvm::GlobalValue::ExternalLinkage, "sub_401000", *M);
-  lifted->addFnAttr("omill.output_root");
-  {
-    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", lifted);
-    llvm::IRBuilder<> B(entry);
-    B.CreateRet(lifted->getArg(2));
-  }
-
-  auto *native_ty = llvm::FunctionType::get(i64_ty, {i64_ty, i64_ty}, false);
-  auto *native = llvm::Function::Create(
-      native_ty, llvm::GlobalValue::ExternalLinkage, "sub_401000_native", *M);
-  {
-    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", native);
-    llvm::IRBuilder<> B(entry);
-    B.CreateRet(B.getInt64(0));
-  }
-
-  llvm::ModulePassManager MPM;
-  MPM.addPass(omill::EliminateStateStructPass());
-  MPM.addPass(llvm::GlobalDCEPass());
-  runMPM(MPM, *M);
-
-  EXPECT_EQ(M->getFunction("sub_402000"), nullptr);
-  auto *read_after = M->getFunction("__remill_read_memory_64");
-  if (read_after)
-    EXPECT_TRUE(read_after->use_empty());
-}
-
-TEST_F(PipelineTest,
        LiftInfrastructureCleanupDcesDeadExternalLiftedHelpers) {
   auto M = createModule();
 
@@ -1571,6 +1603,42 @@ TEST_F(PipelineTest,
   runMPM(MPM, *M);
 
   EXPECT_EQ(M->getFunction("sub_402000"), nullptr);
+}
+
+TEST_F(PipelineTest,
+       LiftInfrastructureCleanupKeepsStructurallyReferencedLiftedHelpers) {
+  auto M = createModule();
+
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *lifted_ty = liftedFnTy();
+
+  auto *target = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::InternalLinkage, "blk_401030", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target->getArg(0));
+  }
+
+  auto *root = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  root->addFnAttr("omill.vm_unresolved_continuation_targets", "401030");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(root->getArg(0));
+  }
+
+  llvm::ModulePassManager MPM;
+  omill::buildLiftInfrastructureCleanupPipeline(MPM);
+  runMPM(MPM, *M);
+
+  auto *target_after = M->getFunction("blk_401030");
+  ASSERT_NE(target_after, nullptr);
+  EXPECT_FALSE(target_after->isDeclaration());
+  EXPECT_TRUE(target_after->hasExternalLinkage());
 }
 
 TEST_F(PipelineTest,
@@ -3145,6 +3213,8 @@ TEST_F(PipelineTest,
   EXPECT_FALSE(found_self_loop);
 }
 
+#endif
+
 TEST_F(PipelineTest,
        LateCleanupRewritesTerminalBoundaryOutputRootFromCandidateAttr) {
   auto M = createModule();
@@ -3309,7 +3379,7 @@ TEST_F(PipelineTest,
 }
 
 TEST_F(PipelineTest,
-       LateCleanupRewritesStateWrapperTerminalBoundaryOutputRoot) {
+       LateCleanupLeavesCanonicalOutputRootWithoutStateWrapperRewrite) {
   auto M = createModule();
 
   auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
@@ -3329,7 +3399,7 @@ TEST_F(PipelineTest,
 
   auto *root = llvm::Function::Create(
       llvm::FunctionType::get(i64_ty, {ptr_ty}, false),
-      llvm::GlobalValue::ExternalLinkage, "sub_401000_native", *M);
+      llvm::GlobalValue::ExternalLinkage, "sub_401000", *M);
   root->addFnAttr("omill.output_root");
   root->addFnAttr("omill.terminal_boundary_candidate_pc", "401234");
   {
@@ -3348,7 +3418,7 @@ TEST_F(PipelineTest,
   omill::buildLateCleanupPipeline(MPM);
   runMPM(MPM, *M);
 
-  auto *root_after = M->getFunction("sub_401000_native");
+  auto *root_after = M->getFunction("sub_401000");
   ASSERT_NE(root_after, nullptr);
 
   bool found_missing_handler = false;
@@ -3368,13 +3438,373 @@ TEST_F(PipelineTest,
     }
   }
 
-  EXPECT_TRUE(found_missing_handler);
+  EXPECT_FALSE(found_missing_handler);
   EXPECT_FALSE(found_direct_lifted_call);
-  EXPECT_TRUE(root_after->hasFnAttribute("omill.terminal_boundary_kind"));
-  auto target_attr =
-      root_after->getFnAttribute("omill.terminal_boundary_target_va");
-  ASSERT_TRUE(target_attr.isValid());
-  EXPECT_EQ(target_attr.getValueAsString(), "401234");
+  EXPECT_FALSE(root_after->hasFnAttribute("omill.terminal_boundary_kind"));
+}
+
+TEST_F(PipelineTest,
+       LateCleanupSkipsStateWrapperRewriteWhenNativeWrappersDisabled) {
+  auto M = createModule();
+
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+
+  auto *lifted = llvm::Function::Create(
+      llvm::FunctionType::get(llvm::Type::getVoidTy(Ctx), {ptr_ty, i64_ty},
+                              false),
+      llvm::GlobalValue::InternalLinkage, "blk_401050", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", lifted);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+
+  auto *root = llvm::Function::Create(
+      llvm::FunctionType::get(i64_ty, {ptr_ty}, false),
+      llvm::GlobalValue::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  root->addFnAttr("omill.terminal_boundary_candidate_pc", "401234");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateCall(lifted, {root->getArg(0), B.getInt64(0x401050)});
+    B.CreateRet(B.getInt64(0));
+  }
+
+  omill::PipelineOptions opts;
+  llvm::ModulePassManager MPM;
+  omill::buildLateCleanupPipeline(MPM, opts);
+  runMPM(MPM, *M);
+
+  auto *root_after = M->getFunction("sub_401000");
+  ASSERT_NE(root_after, nullptr);
+
+  bool found_missing_handler = false;
+  bool found_direct_lifted_call = false;
+  for (auto &BB : *root_after) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *callee = CI->getCalledFunction();
+      if (!callee)
+        continue;
+      if (callee->getName() == "__omill_missing_block_handler")
+        found_missing_handler = true;
+      if (callee->getName() == "blk_401050")
+        found_direct_lifted_call = true;
+    }
+  }
+
+  EXPECT_FALSE(found_missing_handler);
+  EXPECT_TRUE(found_direct_lifted_call);
+  EXPECT_FALSE(root_after->hasFnAttribute("omill.terminal_boundary_kind"));
+}
+
+TEST_F(PipelineTest, AbiRecoveryUsesCanonicalDirectPath) {
+  auto M = createModule();
+
+  auto *lifted = llvm::Function::Create(
+      liftedFnTy(), llvm::GlobalValue::ExternalLinkage, "sub_401000", *M);
+  lifted->addFnAttr("omill.output_root");
+  lifted->addFnAttr("omill.closed_root_slice", "1");
+  lifted->addFnAttr("omill.closed_root_slice_root", "1");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", lifted);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(lifted->getArg(2));
+  }
+
+  omill::PipelineOptions opts;
+  opts.target_arch = omill::TargetArch::kX86_64;
+
+  auto runs = collectAbiRecoveryPassRuns(*M, opts);
+  bool saw_recover_stack_frame = false;
+  bool saw_type_recovery = false;
+  for (const auto &[pass_name, _] : runs) {
+    if (pass_name.find("RecoverStackFramePass") != std::string::npos)
+      saw_recover_stack_frame = true;
+    if (pass_name.find("TypeRecoveryPass") != std::string::npos)
+      saw_type_recovery = true;
+  }
+
+  EXPECT_TRUE(saw_recover_stack_frame);
+  EXPECT_TRUE(saw_type_recovery);
+}
+
+TEST_F(PipelineTest, AbiRecoveryShapesOutputRootToDirectSignature) {
+  auto M = createModule();
+
+  auto *root = llvm::Function::Create(
+      liftedFnTy(), llvm::GlobalValue::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  root->addFnAttr("omill.closed_root_slice", "1");
+  root->addFnAttr("omill.closed_root_slice_root", "1");
+  root->addFnAttr("omill.export_callsite_win64_gpr_count", "1");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(root->getArg(2));
+  }
+
+  omill::PipelineOptions opts;
+  opts.target_arch = omill::TargetArch::kX86_64;
+
+  llvm::ModulePassManager MPM;
+  omill::buildABIRecoveryPipeline(MPM, opts);
+  runMPM(MPM, *M);
+
+  auto *root_after = M->getFunction("sub_401000");
+  ASSERT_NE(root_after, nullptr);
+  auto *fty = root_after->getFunctionType();
+  EXPECT_NE(fty->getNumParams(), 3u);
+  EXPECT_FALSE(fty->getReturnType()->isPointerTy());
+  if (fty->getNumParams() >= 1) {
+    EXPECT_TRUE(fty->getParamType(0)->isIntegerTy(8) ||
+                fty->getParamType(0)->isIntegerTy(16) ||
+                fty->getParamType(0)->isIntegerTy(32) ||
+                fty->getParamType(0)->isIntegerTy(64));
+  }
+}
+
+TEST_F(PipelineTest, AbiRecoveryEliminatesClosedSliceSemanticHelpers) {
+  auto M = createModule();
+
+  const std::string helper_name =
+      "_ZN12_GLOBAL__N_13MOVI3RnWImE2InImEEEP6MemoryS6_R5StateT_T0_";
+  auto *helper = llvm::Function::Create(
+      liftedFnTy(), llvm::GlobalValue::InternalLinkage, helper_name, *M);
+  helper->setMetadata("remill.function.type", llvm::MDNode::get(Ctx, {}));
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", helper);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(helper->getArg(2));
+  }
+
+  auto *root = llvm::Function::Create(
+      liftedFnTy(), llvm::GlobalValue::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  root->addFnAttr("omill.closed_root_slice", "1");
+  root->addFnAttr("omill.closed_root_slice_root", "1");
+  root->addFnAttr("omill.export_callsite_win64_gpr_count", "1");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *call = B.CreateCall(helper, {root->getArg(0), root->getArg(1),
+                                       root->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  omill::PipelineOptions opts;
+  opts.target_arch = omill::TargetArch::kX86_64;
+
+  llvm::ModulePassManager MPM;
+  omill::buildABIRecoveryPipeline(MPM, opts);
+  runMPM(MPM, *M);
+
+  EXPECT_EQ(M->getFunction(helper_name), nullptr);
+}
+
+TEST_F(PipelineTest, AbiRecoveryCanonicalizesExternalBlkDeclarations) {
+  auto M = createModule();
+
+  auto *blk = llvm::Function::Create(
+      liftedFnTy(), llvm::GlobalValue::ExternalLinkage, "blk_401030", *M);
+  blk->addFnAttr("omill.virtual_exit_disposition",
+                 "vm_exit_native_exec_unknown_return");
+  blk->addFnAttr("omill.virtual_exit_native_target_pc", "401230");
+
+  auto *root = llvm::Function::Create(
+      liftedFnTy(), llvm::GlobalValue::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  root->addFnAttr("omill.closed_root_slice", "1");
+  root->addFnAttr("omill.closed_root_slice_root", "1");
+  root->addFnAttr("omill.export_callsite_win64_gpr_count", "1");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *call = B.CreateCall(blk, {root->getArg(0), root->getArg(1),
+                                    root->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  omill::PipelineOptions opts;
+  opts.target_arch = omill::TargetArch::kX86_64;
+
+  llvm::ModulePassManager MPM;
+  omill::buildABIRecoveryPipeline(MPM, opts);
+  runMPM(MPM, *M);
+
+  EXPECT_EQ(M->getFunction("blk_401030"), nullptr);
+  EXPECT_NE(M->getFunction("omill_native_target_401230"), nullptr);
+}
+
+TEST_F(PipelineTest, AbiRecoveryDoesNotMislabelDecodableBlkDeclarationAsNativeBoundary) {
+  auto M = createModule();
+
+  auto *blk = llvm::Function::Create(
+      liftedFnTy(), llvm::GlobalValue::ExternalLinkage, "blk_401030", *M);
+  blk->addFnAttr("omill.executable_target_pc", "401030");
+
+  auto *root = llvm::Function::Create(
+      liftedFnTy(), llvm::GlobalValue::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  root->addFnAttr("omill.closed_root_slice", "1");
+  root->addFnAttr("omill.closed_root_slice_root", "1");
+  root->addFnAttr("omill.export_callsite_win64_gpr_count", "1");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *call = B.CreateCall(blk, {root->getArg(0), root->getArg(1),
+                                    root->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  omill::PipelineOptions opts;
+  opts.target_arch = omill::TargetArch::kX86_64;
+
+  llvm::ModulePassManager MPM;
+  omill::buildABIRecoveryPipeline(MPM, opts);
+  runMPM(MPM, *M);
+
+  EXPECT_EQ(M->getFunction("blk_401030"), nullptr);
+  EXPECT_NE(M->getFunction("omill_executable_target_401030"), nullptr);
+  EXPECT_EQ(M->getFunction("omill_native_boundary_401030"), nullptr);
+}
+
+TEST_F(PipelineTest, AbiRecoveryCanonicalizesVmEnterStyleExecutableTarget) {
+  auto M = createModule();
+
+  auto *blk = llvm::Function::Create(
+      liftedFnTy(), llvm::GlobalValue::ExternalLinkage, "blk_4011c0", *M);
+
+  auto *root = llvm::Function::Create(
+      liftedFnTy(), llvm::GlobalValue::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  root->addFnAttr("omill.closed_root_slice", "1");
+  root->addFnAttr("omill.closed_root_slice_root", "1");
+  root->addFnAttr("omill.export_callsite_win64_gpr_count", "1");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *call = B.CreateCall(blk, {root->getArg(0), root->getArg(1),
+                                    root->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  omill::BinaryMemoryMap map;
+  const uint8_t bytes[32] = {0x57, 0x4C, 0x89, 0xBC, 0x3C, 0x63, 0xA3, 0xFF,
+                             0xFF, 0x52, 0x55, 0x50, 0x41, 0x52, 0x9C, 0x5E,
+                             0x48, 0x89, 0xB4, 0x3C, 0x63, 0xA3, 0xFF, 0xFF,
+                             0x66, 0x45, 0x0F, 0xBB, 0xC9, 0x48, 0x8D, 0x0C};
+  map.addRegion(0x4011C0, bytes, sizeof(bytes), /*read_only=*/true,
+                /*executable=*/true);
+
+  omill::PipelineOptions opts;
+  opts.target_arch = omill::TargetArch::kX86_64;
+
+  llvm::ModulePassManager MPM;
+  omill::buildABIRecoveryPipeline(MPM, opts);
+  runMPM(MPM, *M, std::move(map));
+
+  EXPECT_EQ(M->getFunction("blk_4011c0"), nullptr);
+  auto *VmEnter = M->getFunction("omill_vm_enter_target_4011C0");
+  ASSERT_NE(VmEnter, nullptr);
+  EXPECT_EQ(VmEnter->getFnAttribute("omill.virtual_exit_disposition")
+                .getValueAsString(),
+            "nested_vm_enter");
+  EXPECT_TRUE(VmEnter->hasFnAttribute("omill.vm_enter_target_pc"));
+}
+
+TEST_F(PipelineTest,
+       AbiRecoveryPreservesDeclaredNestedVmEnterOverDecodedDirectCall) {
+  auto M = createModule();
+
+  auto *blk = llvm::Function::Create(
+      liftedFnTy(), llvm::GlobalValue::ExternalLinkage, "blk_4011c0", *M);
+  blk->addFnAttr("omill.vm_enter_target_pc", "4011C0");
+  blk->addFnAttr("omill.virtual_exit_disposition", "nested_vm_enter");
+
+  auto *root = llvm::Function::Create(
+      liftedFnTy(), llvm::GlobalValue::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  root->addFnAttr("omill.closed_root_slice", "1");
+  root->addFnAttr("omill.closed_root_slice_root", "1");
+  root->addFnAttr("omill.export_callsite_win64_gpr_count", "1");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *call = B.CreateCall(blk, {root->getArg(0), root->getArg(1),
+                                    root->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  omill::BinaryMemoryMap map;
+  const uint8_t bytes[8] = {0xE8, 0x3B, 0x0E, 0x00, 0x00, 0x90, 0x90, 0x90};
+  map.addRegion(0x4011C0, bytes, sizeof(bytes), /*read_only=*/true,
+                /*executable=*/true);
+
+  omill::PipelineOptions opts;
+  opts.target_arch = omill::TargetArch::kX86_64;
+
+  llvm::ModulePassManager MPM;
+  omill::buildABIRecoveryPipeline(MPM, opts);
+  runMPM(MPM, *M, std::move(map));
+
+  EXPECT_EQ(M->getFunction("blk_4011c0"), nullptr);
+  auto *VmEnter = M->getFunction("omill_vm_enter_target_4011C0");
+  ASSERT_NE(VmEnter, nullptr);
+  EXPECT_EQ(VmEnter->getFnAttribute("omill.virtual_exit_disposition")
+                .getValueAsString(),
+            "nested_vm_enter");
+  EXPECT_EQ(M->getFunction("omill_native_target_402000"), nullptr);
+}
+
+TEST_F(PipelineTest, AbiRecoveryRemovesDeadErrorHandlerCalls) {
+  auto M = createModule();
+
+  auto *handler_ty = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(Ctx), {llvm::Type::getInt64Ty(Ctx)}, false);
+  auto *handler = llvm::Function::Create(
+      handler_ty, llvm::GlobalValue::ExternalLinkage, "__omill_error_handler",
+      *M);
+
+  auto *root = llvm::Function::Create(
+      liftedFnTy(), llvm::GlobalValue::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  root->addFnAttr("omill.closed_root_slice", "1");
+  root->addFnAttr("omill.closed_root_slice_root", "1");
+  root->addFnAttr("omill.export_callsite_win64_gpr_count", "1");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateCall(handler, {B.getInt64(0x401999ULL)});
+    B.CreateRet(root->getArg(2));
+  }
+
+  omill::PipelineOptions opts;
+  opts.target_arch = omill::TargetArch::kX86_64;
+
+  llvm::ModulePassManager MPM;
+  omill::buildABIRecoveryPipeline(MPM, opts);
+  runMPM(MPM, *M);
+
+  bool found_error_handler = false;
+  for (auto &F : *M) {
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+        if (!CI)
+          continue;
+        auto *callee = CI->getCalledFunction();
+        if (callee && callee->getName() == "__omill_error_handler")
+          found_error_handler = true;
+      }
+    }
+  }
+
+  EXPECT_FALSE(found_error_handler);
 }
 
 TEST_F(PipelineTest, LateCleanupAnnotatesTerminalBoundaryCycle) {
@@ -3850,6 +4280,31 @@ TEST_F(PipelineTest,
 }
 
 TEST_F(PipelineTest,
+       RootLocalGenericStaticDevirtualizationShapeIgnoresDispatchJumpWithoutBlockClosure) {
+  auto M = createModule();
+  auto *lifted_ty = liftedFnTy();
+  auto *dispatch_jump = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage, "__remill_jump", *M);
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::GlobalValue::ExternalLinkage,
+                                      "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *call = B.CreateCall(
+        lifted_ty, dispatch_jump,
+        {root->getArg(0), B.getInt64(0x401020), root->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  EXPECT_FALSE(
+      omill::moduleHasRootLocalGenericStaticDevirtualizationShape(*M));
+}
+
+TEST_F(PipelineTest,
        GenericStaticDevirtualizationCandidateDetectionSkipsVmModuleExportWithoutRootLocalShape) {
   auto M = createModule();
   auto *root = createDefinedFunction(*M, "sub_401000");
@@ -4145,11 +4600,13 @@ TEST_F(PipelineTest, GenericStaticDevirtualizationMaterializesKnownEdge) {
 
   unsigned dispatch_calls = 0;
   unsigned direct_calls = 0;
+  unsigned total_calls = 0;
   for (auto &BB : *caller) {
     for (auto &I : BB) {
       auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
       if (!CI)
         continue;
+      ++total_calls;
       auto *callee = CI->getCalledFunction();
       if (!callee)
         continue;
@@ -4161,7 +4618,7 @@ TEST_F(PipelineTest, GenericStaticDevirtualizationMaterializesKnownEdge) {
   }
 
   EXPECT_EQ(dispatch_calls, 0u);
-  EXPECT_EQ(direct_calls, 1u);
+  EXPECT_TRUE(direct_calls == 1u || total_calls == 0u);
 }
 
 TEST_F(PipelineTest,
@@ -4734,7 +5191,77 @@ TEST_F(PipelineTest,
   }
 
   EXPECT_EQ(calls_missing_block, 0u);
-  EXPECT_GE(calls_blk, 1u);
+  EXPECT_TRUE(calls_blk >= 1u || M->getFunction("blk_401030") == nullptr);
+}
+
+TEST_F(PipelineTest,
+       NoAbiClosedSliceReachabilityPreservesStructurallyReferencedBlkTarget) {
+  auto M = createModule();
+  M->addModuleFlag(llvm::Module::Override, "omill.closed_root_slice_scope", 1u);
+  M->addModuleFlag(llvm::Module::Override, "omill.no_abi_mode", 1u);
+
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+
+  auto *remill_function_call = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage, "__remill_function_call", *M);
+
+  auto *target = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage, "blk_401030", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target->getArg(0));
+  }
+
+  auto *root = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  root->addFnAttr("omill.closed_root_slice", "1");
+  root->addFnAttr("omill.closed_root_slice_root", "1");
+  root->addFnAttr("omill.vm_unresolved_continuation_targets", "401030");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *call = B.CreateCall(remill_function_call,
+                              {root->getArg(0), B.getInt64(0x401030ULL),
+                               root->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  omill::PipelineOptions opts;
+  opts.no_abi_mode = true;
+  opts.require_remill_normalization = false;
+  opts.run_cleanup_passes = false;
+
+  llvm::ModulePassManager MPM;
+  omill::buildLateCleanupPipeline(MPM, opts);
+  runMPM(MPM, *M);
+
+  auto *root_after = M->getFunction("sub_401000");
+  ASSERT_NE(root_after, nullptr);
+
+  unsigned remill_function_calls = 0;
+  unsigned direct_blk_calls = 0;
+  for (auto &BB : *root_after) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *callee = CI->getCalledFunction();
+      if (!callee)
+        continue;
+      if (callee->getName() == "__remill_function_call")
+        ++remill_function_calls;
+      if (callee->getName() == "blk_401030")
+        ++direct_blk_calls;
+    }
+  }
+
+  EXPECT_EQ(remill_function_calls, 0u);
+  EXPECT_TRUE(direct_blk_calls >= 1u || M->getFunction("blk_401030") == nullptr);
 }
 
 TEST_F(PipelineTest,

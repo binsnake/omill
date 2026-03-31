@@ -80,6 +80,30 @@ TEST_F(LiftedNamesTest, DemergedHandlerCloneName_IsCanonical) {
             "sub_180001000__vm_abcdef");
 }
 
+TEST_F(LiftedNamesTest, ExtractStructuralCodeTargetPC_ParsesKnownPrefixes) {
+  EXPECT_EQ(omill::extractStructuralCodeTargetPC("sub_401230"), 0x401230ULL);
+  EXPECT_EQ(omill::extractStructuralCodeTargetPC("blk_401030"), 0x401030ULL);
+  EXPECT_EQ(omill::extractStructuralCodeTargetPC("block_401145"), 0x401145ULL);
+  EXPECT_EQ(omill::extractStructuralCodeTargetPC("omill_native_target_401250"),
+            0x401250ULL);
+  EXPECT_EQ(
+      omill::extractStructuralCodeTargetPC("omill_native_boundary_401260"),
+      0x401260ULL);
+  EXPECT_EQ(
+      omill::extractStructuralCodeTargetPC("omill_executable_target_401270"),
+      0x401270ULL);
+  EXPECT_EQ(omill::extractStructuralCodeTargetPC("omill_vm_enter_target_401280"),
+            0x401280ULL);
+}
+
+TEST_F(LiftedNamesTest, ExtractStructuralCodeTargetPC_PrefersAttrsOverName) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  auto *F = createLiftedDecl(*M, "blk_401030");
+  F->addFnAttr("omill.vm_enter_target_pc", "401155");
+  F->addFnAttr("omill.executable_target_pc", "401145");
+  EXPECT_EQ(omill::extractStructuralCodeTargetPC(*F), 0x401145ULL);
+}
+
 
 // ===----------------------------------------------------------------------===
 // extractBlockPC
@@ -274,6 +298,42 @@ TEST_F(LiftedNamesTest, CollectBlockPCMap_BlockWithLLVMSuffix) {
   auto map = omill::collectBlockPCMap(*F);
   EXPECT_EQ(map.size(), 1u);
   EXPECT_EQ(map[0x180001010ULL], b);
+}
+
+TEST_F(LiftedNamesTest, FindLiftedOrCoveredFunctionByPC_FindsCoveredBlockPc) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  auto *F = createLiftedFunction(*M, "sub_180001000");
+
+  auto *b = llvm::BasicBlock::Create(Ctx, "block_180001239", F);
+  llvm::IRBuilder<> B(b);
+  B.CreateRet(F->getArg(2));
+
+  auto *found = omill::findLiftedOrCoveredFunctionByPC(*M, 0x180001239ULL);
+  ASSERT_NE(found, nullptr);
+  EXPECT_EQ(found, F);
+}
+
+TEST_F(LiftedNamesTest, FindNearestCoveredLiftedOrBlockPC_FindsNearbyEntry) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  auto *F = createLiftedFunction(*M, "blk_180001220");
+  auto *b = llvm::BasicBlock::Create(Ctx, "block_180001240", F);
+  llvm::IRBuilder<> B(b);
+  B.CreateRet(F->getArg(2));
+
+  auto found = omill::findNearestCoveredLiftedOrBlockPC(*M, 0x180001249ULL);
+  ASSERT_TRUE(found.has_value());
+  EXPECT_EQ(*found, 0x180001240ULL);
+}
+
+TEST_F(LiftedNamesTest, FindStructuralCodeTargetFunctionByPC_FindsPlaceholderDecl) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  auto *F = createLiftedDecl(*M, "omill_executable_target_1801F7733");
+  F->addFnAttr("omill.executable_target_pc", "1801F7733");
+
+  auto *found =
+      omill::findStructuralCodeTargetFunctionByPC(*M, 0x1801F7733ULL);
+  ASSERT_NE(found, nullptr);
+  EXPECT_EQ(found, F);
 }
 
 }  // namespace

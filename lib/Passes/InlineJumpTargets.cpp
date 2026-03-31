@@ -12,11 +12,74 @@
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/Transforms/Utils/Cloning.h>
 
+#include "omill/Analysis/VirtualModel/Types.h"
 #include "omill/Utils/LiftedNames.h"
 
 namespace omill {
 
 namespace {
+
+void copyVirtualExitAttrs(const llvm::CallBase &from, llvm::CallBase &to) {
+  static constexpr llvm::StringLiteral kVirtualExitAttrs[] = {
+      "omill.virtual_exit_disposition",
+      "omill.virtual_exit_continuation_pc",
+      "omill.virtual_exit_continuation_vip",
+      "omill.virtual_exit_native_target_pc",
+      "omill.virtual_exit_partial",
+      "omill.virtual_exit_full",
+      "omill.virtual_exit_reenters_vm",
+  };
+  for (auto name : kVirtualExitAttrs) {
+    auto attr = from.getFnAttr(name);
+    if (!attr.isValid())
+      continue;
+    to.addFnAttr(llvm::Attribute::get(to.getContext(), name,
+                                      attr.getValueAsString()));
+  }
+}
+
+std::optional<VirtualExitDisposition> getVirtualExitDisposition(
+    const llvm::CallBase &call) {
+  auto attr = call.getFnAttr("omill.virtual_exit_disposition");
+  if (!attr.isValid() || !attr.isStringAttribute())
+    return std::nullopt;
+
+  auto text = attr.getValueAsString();
+  if (text == "unknown")
+    return VirtualExitDisposition::kUnknown;
+  if (text == "stay_in_vm")
+    return VirtualExitDisposition::kStayInVm;
+  if (text == "vm_exit_terminal")
+    return VirtualExitDisposition::kVmExitTerminal;
+  if (text == "vm_exit_native_call_reenter")
+    return VirtualExitDisposition::kVmExitNativeCallReenter;
+  if (text == "vm_exit_native_exec_unknown_return")
+    return VirtualExitDisposition::kVmExitNativeExecUnknownReturn;
+  if (text == "vm_enter")
+    return VirtualExitDisposition::kVmEnter;
+  if (text == "nested_vm_enter")
+    return VirtualExitDisposition::kNestedVmEnter;
+  return std::nullopt;
+}
+
+bool shouldLowerJumpEarly(const llvm::CallBase &call) {
+  auto disposition = getVirtualExitDisposition(call);
+  if (!disposition.has_value())
+    return true;
+
+  switch (*disposition) {
+    case VirtualExitDisposition::kUnknown:
+    case VirtualExitDisposition::kStayInVm:
+      return true;
+    case VirtualExitDisposition::kVmExitTerminal:
+    case VirtualExitDisposition::kVmExitNativeCallReenter:
+    case VirtualExitDisposition::kVmExitNativeExecUnknownReturn:
+    case VirtualExitDisposition::kVmEnter:
+    case VirtualExitDisposition::kNestedVmEnter:
+      return false;
+  }
+  return true;
+}
 
 /// Connect disconnected jump table target blocks to the function's CFG by
 /// replacing non-constant __remill_jump calls with switches over the known
@@ -61,7 +124,8 @@ unsigned lowerJumpsEarly(llvm::Function &F) {
       if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
         if (auto *callee = CI->getCalledFunction())
           if (callee->getName() == "__remill_jump" &&
-              !llvm::isa<llvm::ConstantInt>(CI->getArgOperand(1)))
+              !llvm::isa<llvm::ConstantInt>(CI->getArgOperand(1)) &&
+              shouldLowerJumpEarly(*CI))
             jump_calls.push_back(CI);
 
   if (jump_calls.empty())
@@ -91,10 +155,12 @@ unsigned lowerJumpsEarly(llvm::Function &F) {
         Ctx, "jump_dispatch_fallback", &F);
     {
       llvm::IRBuilder<> FBBuilder(fallback_bb);
-      auto dispatcher =
-          M.getOrInsertFunction("__omill_dispatch_jump", lifted_fn_ty);
+      auto dispatcher = M.getOrInsertFunction(
+          canonicalDispatchIntrinsicName(DispatchIntrinsicKind::kJump, M),
+          lifted_fn_ty);
       auto *result =
           FBBuilder.CreateCall(dispatcher, {state, target_pc, mem});
+      copyVirtualExitAttrs(*CI, *result);
       FBBuilder.CreateRet(result);
     }
 

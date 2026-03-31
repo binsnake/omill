@@ -215,6 +215,41 @@ TEST_F(IterativeBlockDiscoveryTest, NoBlockFunctionsIsNoOp) {
   EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
 }
 
+TEST_F(IterativeBlockDiscoveryTest, OptimizationStepStaysScopedToDiscoveryFunctions) {
+  auto M = createModule();
+
+  auto *blk = declareBlockFn(*M, 0x6100);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", blk);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(blk->getArg(2));
+  }
+
+  auto *i64Ty = llvm::Type::getInt64Ty(Ctx);
+  auto *regularTy = llvm::FunctionType::get(i64Ty, {}, false);
+  auto *regular = llvm::Function::Create(regularTy,
+                                         llvm::GlobalValue::ExternalLinkage,
+                                         "regular_helper", *M);
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", regular);
+  auto *thenBB = llvm::BasicBlock::Create(Ctx, "then", regular);
+  auto *mergeBB = llvm::BasicBlock::Create(Ctx, "merge", regular);
+  llvm::IRBuilder<> B(entry);
+  B.CreateCondBr(llvm::ConstantInt::getTrue(Ctx), thenBB, mergeBB);
+  llvm::IRBuilder<> ThenB(thenBB);
+  ThenB.CreateBr(mergeBB);
+  llvm::IRBuilder<> MergeB(mergeBB);
+  auto *phi = MergeB.CreatePHI(i64Ty, 2);
+  phi->addIncoming(llvm::ConstantInt::get(i64Ty, 1), entry);
+  phi->addIncoming(llvm::ConstantInt::get(i64Ty, 2), thenBB);
+  MergeB.CreateRet(phi);
+
+  ASSERT_EQ(regular->size(), 3u);
+  runPass(*M);
+
+  EXPECT_EQ(regular->size(), 3u);
+  EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+}
+
 // Test: Constant dispatch to non-existent block-function left unresolved.
 TEST_F(IterativeBlockDiscoveryTest, ConstantDispatchToMissingBlock) {
   auto M = createModule();

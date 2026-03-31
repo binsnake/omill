@@ -7,27 +7,36 @@
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
+#include <llvm/Support/Format.h>
 
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
+#include "omill/Utils/LiftedNames.h"
 #include "JumpTableUtils.h"
 
 namespace omill {
 
 namespace {
 
+bool debugJumpTables() {
+  static const bool enabled =
+      (std::getenv("OMILL_DEBUG_JUMP_TABLES") != nullptr);
+  return enabled;
+}
+
 struct JumpTableCandidate {
   llvm::CallInst *dispatch_call;
   llvm::ReturnInst *ret;
+  llvm::BranchInst *branch;
   llvm::LoadInst *table_load;
   jt::LinearAddress addr;
   uint64_t image_base;
   uint64_t num_entries;
 };
 
-/// Scan a function for dispatch_jump sites with jump table patterns.
+/// Scan a function for unresolved jump-dispatch sites with jump table patterns.
 llvm::SmallVector<JumpTableCandidate, 4>
-findJumpTableCandidates(llvm::Function &F) {
+findJumpTableCandidates(llvm::Function &F, const BinaryMemoryMap *map) {
   llvm::SmallVector<JumpTableCandidate, 4> candidates;
 
   for (auto &BB : F) {
@@ -36,7 +45,7 @@ findJumpTableCandidates(llvm::Function &F) {
       if (!call)
         continue;
       auto *callee = call->getCalledFunction();
-      if (!callee || callee->getName() != "__omill_dispatch_jump")
+      if (!callee || !isDispatchJumpName(callee->getName()))
         continue;
       if (call->arg_size() < 3)
         continue;
@@ -50,35 +59,72 @@ findJumpTableCandidates(llvm::Function &F) {
 
       // Unwrap RVA conversion: target = add(zext/sext(load), image_base).
       auto [image_base, load_val] = jt::unwrapRVAConversion(target, &F);
+      llvm::Value *dynamic_rva_base = nullptr;
+      if (image_base == 0)
+        jt::trySplitDynamicRVAConversion(target, dynamic_rva_base, load_val);
+      if (debugJumpTables()) {
+        llvm::errs() << "[jt-concretizer] inspect " << F.getName()
+                     << " bb=" << BB.getName()
+                     << " image_base=0x" << llvm::format_hex(image_base, 10)
+                     << " dynamic_base=" << (dynamic_rva_base ? "yes" : "no")
+                     << "\n";
+      }
 
-      // Strip zext/sext from load value.
-      if (auto *zext = llvm::dyn_cast<llvm::ZExtInst>(load_val))
-        load_val = zext->getOperand(0);
-      else if (auto *sext = llvm::dyn_cast<llvm::SExtInst>(load_val))
-        load_val = sext->getOperand(0);
-
-      auto *table_load = llvm::dyn_cast<llvm::LoadInst>(load_val);
-      if (!table_load)
+      auto *table_load = jt::extractUnderlyingLoad(load_val);
+      if (!table_load) {
+        if (debugJumpTables())
+          llvm::errs() << "[jt-concretizer] reject:no-table-load\n";
         continue;
+      }
 
       // Decompose load pointer into base + idx * stride.
       auto addr_info =
           jt::decomposeTableAddress(table_load->getPointerOperand(), &F);
-      if (!addr_info)
+      if (!addr_info && dynamic_rva_base && map && map->imageBase() != 0) {
+        addr_info = jt::decomposeTableAddressWithDynamicBase(
+            table_load->getPointerOperand(), dynamic_rva_base,
+            map->imageBase());
+        if (addr_info && image_base == 0)
+          image_base = map->imageBase();
+      }
+      if (!addr_info) {
+        if (debugJumpTables())
+          llvm::errs() << "[jt-concretizer] reject:no-addr-decompose\n";
         continue;
+      }
 
       // Find bounds from dominating branch conditions.
       auto bound = jt::computeIndexRange(addr_info->index, call->getParent());
-      if (!bound || *bound == 0 || *bound > 1024)
+      if (!bound || *bound == 0 || *bound > 1024) {
+        if (debugJumpTables())
+          llvm::errs() << "[jt-concretizer] reject:bad-bound\n";
         continue;
+      }
 
-      // Dispatch call must be followed immediately by ret.
+      // Dispatch call must be followed by either a direct ret or an
+      // unconditional branch into a shared return/join block.
       auto *ret = llvm::dyn_cast<llvm::ReturnInst>(call->getNextNode());
-      if (!ret)
-        continue;
+      auto *branch =
+          ret ? nullptr : llvm::dyn_cast<llvm::BranchInst>(call->getNextNode());
+      if (!ret) {
+        if (!branch || branch->isConditional() || branch->getNumSuccessors() != 1) {
+          if (debugJumpTables())
+            llvm::errs() << "[jt-concretizer] reject:no-ret-or-join\n";
+          continue;
+        }
+      }
+
+      if (debugJumpTables()) {
+        llvm::errs() << "[jt-concretizer] candidate base=0x"
+                     << llvm::format_hex(addr_info->base, 10)
+                     << " stride=" << addr_info->stride
+                     << " bound=" << *bound
+                     << " image_base=0x" << llvm::format_hex(image_base, 10)
+                     << "\n";
+      }
 
       candidates.push_back(
-          {call, ret, table_load, *addr_info, image_base, *bound});
+          {call, ret, branch, table_load, *addr_info, image_base, *bound});
     }
   }
 
@@ -89,6 +135,8 @@ findJumpTableCandidates(llvm::Function &F) {
 
 llvm::PreservedAnalyses JumpTableConcretizerPass::run(
     llvm::Function &F, llvm::FunctionAnalysisManager &AM) {
+  if (debugJumpTables())
+    llvm::errs() << "[jt-concretizer] run " << F.getName() << "\n";
 
   auto &MAMProxy = AM.getResult<llvm::ModuleAnalysisManagerFunctionProxy>(F);
   auto *map = MAMProxy.getCachedResult<BinaryMemoryAnalysis>(*F.getParent());
@@ -98,7 +146,7 @@ llvm::PreservedAnalyses JumpTableConcretizerPass::run(
   auto *lifted =
       MAMProxy.getCachedResult<LiftedFunctionAnalysis>(*F.getParent());
 
-  auto candidates = findJumpTableCandidates(F);
+  auto candidates = findJumpTableCandidates(F, map);
   if (candidates.empty())
     return llvm::PreservedAnalyses::all();
 
@@ -116,6 +164,9 @@ llvm::PreservedAnalyses JumpTableConcretizerPass::run(
     // Apply RVA→VA conversion if the target expression included an
     // image_base addend.
     jt::applyRVAConversion(*raw_entries, cand.image_base, addr.stride);
+    jt::trimTrailingInvalidEntries(*raw_entries, *map);
+    if (raw_entries->empty())
+      continue;
 
     // Validate: all entries should look like plausible code addresses.
     // If image_base is set and the map has executable regions, check that
@@ -141,7 +192,7 @@ llvm::PreservedAnalyses JumpTableConcretizerPass::run(
     // Build the switch instruction.
     auto result = jt::buildSwitchFromEntries(
         *raw_entries, addr.index, cand.image_base, cand.dispatch_call,
-        cand.ret, F, *map, lifted);
+        cand.ret, cand.branch, F, *map, lifted);
 
     if (result.changed)
       changed = true;

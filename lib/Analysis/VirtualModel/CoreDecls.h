@@ -133,6 +133,50 @@ std::map<unsigned, VirtualValueExpr> restoreStableStackFactMap(
     const std::vector<CachedStableStackFactEntry> &facts,
     const std::map<SlotKey, unsigned> &slot_ids,
     const std::map<StackCellKey, unsigned> &stack_cell_ids);
+std::optional<int64_t> inferTrackedStackBaseDeltaForSlot(
+    const std::map<unsigned, VirtualValueExpr> &slot_facts, unsigned slot_id);
+void refreshTrackedFactState(
+    const VirtualMachineModel &model, TrackedFactState &state);
+TrackedFactState buildTrackedFactState(
+    const VirtualMachineModel &model,
+    const std::map<unsigned, VirtualValueExpr> &slot_facts,
+    const std::map<unsigned, VirtualValueExpr> &stack_facts,
+    const std::map<StackCellKey, VirtualValueExpr> *structural_stack_facts =
+        nullptr);
+std::optional<CanonicalStackFactKey> canonicalStackFactKeyForCellId(
+    const VirtualMachineModel &model, const TrackedFactState &state,
+    unsigned cell_id);
+std::optional<CanonicalStackFactKey> canonicalStackFactKeyForSummary(
+    const VirtualMachineModel &model, const TrackedFactState &state,
+    const VirtualStackCellSummary &summary);
+bool mergeTrackedStackFact(TrackedFactState &state,
+                           const CanonicalStackFactKey &key,
+                           const VirtualValueExpr &value);
+bool assignTrackedStackFactForCellId(const VirtualMachineModel &model,
+                                     TrackedFactState &state, unsigned cell_id,
+                                     const VirtualValueExpr &value);
+bool assignTrackedStackFactForSummary(const VirtualMachineModel &model,
+                                      TrackedFactState &state,
+                                      const VirtualStackCellSummary &summary,
+                                      const VirtualValueExpr &value);
+std::map<unsigned, VirtualValueExpr> materializeTrackedStackFacts(
+    const VirtualMachineModel &model, const TrackedFactState &state);
+std::map<StackCellKey, VirtualValueExpr> materializeTrackedStructuralStackFacts(
+    const VirtualMachineModel &model, const TrackedFactState &state);
+llvm::SmallDenseSet<unsigned, 16> materializeTrackedWrittenStackCellIds(
+    const VirtualMachineModel &model, const TrackedFactState &state,
+    const std::set<CanonicalStackFactKey> &written_stack_keys);
+void normalizeLocalizedOutgoingFacts(const VirtualMachineModel &model,
+                                     CallsiteLocalizedOutgoingFacts &localized);
+std::optional<TrackedStackLookupResult> lookupTrackedStackFact(
+    const VirtualMachineModel &model, const TrackedFactState &state,
+    const VirtualStackCellSummary &summary);
+VirtualValueExpr resolveTrackedStackExpr(
+    const VirtualMachineModel &model, const TrackedFactState &state,
+    const VirtualValueExpr &expr,
+    const std::map<SlotKey, unsigned> &slot_ids,
+    const std::map<StackCellKey, unsigned> &stack_cell_ids,
+    unsigned depth = 0);
 llvm::DenseSet<unsigned> buildBooleanFlagSlotIds(
     llvm::Module &M, const VirtualMachineModel &model);
 std::set<BooleanSlotExprKey> buildBooleanFlagExprKeys(

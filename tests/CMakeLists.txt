@@ -47,10 +47,8 @@ add_executable(omill-unit-tests
   unit/LowerJumpTest.cpp
   unit/DeadStateFlagEliminationTest.cpp
   unit/MemoryPointerEliminationTest.cpp
-  unit/RecoverFunctionSignaturesTest.cpp
-  unit/RefineFunctionSignaturesTest.cpp
-  unit/EliminateStateStructTest.cpp
   unit/ConstantMemoryFoldingTest.cpp
+  unit/CombinedFixedPointDevirtTest.cpp
   unit/ImportHashDBTest.cpp
   unit/HashImportAnnotationTest.cpp
   unit/FoldProgramCounterTest.cpp
@@ -67,7 +65,6 @@ add_executable(omill-unit-tests
   unit/IterativeTargetResolutionTest.cpp
   unit/PassRegistryTest.cpp
   unit/LiftRunContractTest.cpp
-  unit/RewriteLiftedCallsToNativeTest.cpp
   unit/ResolveForcedExceptionsTest.cpp
   unit/SimplifyVectorFlagComputationTest.cpp
   unit/CollapsePartialXMMWritesTest.cpp
@@ -84,6 +81,7 @@ add_executable(omill-unit-tests
   unit/MergeBlockFunctionsTest.cpp
   unit/JumpTableConcretizerTest.cpp
   unit/IndirectCallResolverTest.cpp
+  unit/DevirtualizationOrchestratorTest.cpp
   unit/ControlFlowUnflattenerTest.cpp
   unit/SynthesizeFlagsTest.cpp
   unit/SegmentsAATest.cpp
@@ -97,6 +95,7 @@ add_executable(omill-unit-tests
   unit/ResolveAndLowerControlFlowTest.cpp
   unit/InlineJumpTargetsTest.cpp
   unit/LiftedNamesTest.cpp
+  unit/RemillNormalizationOrchestratorTest.cpp
   unit/ProtectedBoundaryUtilsTest.cpp
   unit/LiftedFunctionMapTest.cpp
   unit/VirtualMachineModelTest.cpp
@@ -105,22 +104,13 @@ add_executable(omill-unit-tests
   unit/VMDispatchResolutionTest.cpp
   unit/VMTraceMapTest.cpp
   unit/VirtualCalleeRegistryTest.cpp
+  unit/OutputRootClosureTest.cpp
   unit/VMDeadMergedHandlerEliminationTest.cpp
   unit/ExceptionInfoTest.cpp
   unit/StateFieldAccessAnalysisTest.cpp
   unit/RemillIntrinsicAnalysisTest.cpp
   unit/PipelineTest.cpp
 )
-
-if(OMILL_ENABLE_REMILL AND OMILL_ENABLE_TOOLS)
-  target_sources(omill-unit-tests PRIVATE
-    unit/OmillLiftEventIntegrationTest.cpp
-  )
-  add_dependencies(omill-unit-tests omill-lift)
-  target_compile_definitions(omill-unit-tests PRIVATE
-    OMILL_LIFT_EXE_PATH="$<TARGET_FILE:omill-lift>"
-  )
-endif()
 
 target_link_libraries(omill-unit-tests
   PRIVATE
@@ -138,6 +128,32 @@ target_include_directories(omill-unit-tests
 
 if(NOT MSVC)
   target_compile_options(omill-unit-tests PRIVATE -fno-rtti)
+endif()
+
+if(OMILL_ENABLE_REMILL AND OMILL_ENABLE_TOOLS)
+  add_executable(omill-cli-tests
+    unit/OmillLiftEventIntegrationTest.cpp
+    e2e/CorpusDevirtualizationRegressionTest.cpp
+  )
+  add_dependencies(omill-cli-tests omill-lift)
+  target_compile_definitions(omill-cli-tests PRIVATE
+    OMILL_LIFT_EXE_PATH="$<TARGET_FILE:omill-lift>"
+  )
+  target_link_libraries(omill-cli-tests
+    PRIVATE
+      omill
+      Zydis
+      GTest::gtest_main
+      ${OMILL_LLVM_LIBS}
+      ${_llvm_object_lib}
+  )
+  target_include_directories(omill-cli-tests
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/utils
+  )
+  if(NOT MSVC)
+    target_compile_options(omill-cli-tests PRIVATE -fno-rtti)
+  endif()
 endif()
 
 if(OMILL_ENABLE_Z3)
@@ -158,13 +174,38 @@ if(OMILL_ENABLE_Z3)
 endif()
 
 if(OMILL_ENABLE_SIMPLIFIER)
-  target_sources(omill-unit-tests PRIVATE unit/SimplifyMBATest.cpp)
-  eqsat_copy_dll(omill-unit-tests)
+  add_executable(omill-simplifier-tests
+    unit/SimplifyMBATest.cpp
+  )
+  target_link_libraries(omill-simplifier-tests
+    PRIVATE
+      omill
+      Zydis
+      GTest::gtest_main
+      ${OMILL_LLVM_LIBS}
+      ${_llvm_object_lib}
+  )
+  target_include_directories(omill-simplifier-tests
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/utils
+  )
+  if(NOT MSVC)
+    target_compile_options(omill-simplifier-tests PRIVATE -fno-rtti)
+  endif()
+  eqsat_copy_dll(omill-simplifier-tests)
   # Use PRE_TEST discovery so the exe isn't run at build time (requires
   # Mba.FFI.dll which may not be available during the build step).
   gtest_discover_tests(omill-unit-tests DISCOVERY_MODE PRE_TEST)
+  gtest_discover_tests(omill-simplifier-tests DISCOVERY_MODE PRE_TEST)
+  if(TARGET omill-cli-tests)
+    eqsat_copy_dll(omill-cli-tests)
+    gtest_discover_tests(omill-cli-tests DISCOVERY_MODE PRE_TEST)
+  endif()
 else()
   gtest_discover_tests(omill-unit-tests)
+  if(TARGET omill-cli-tests)
+    gtest_discover_tests(omill-cli-tests)
+  endif()
 endif()
 
 # --------------------------------------------------------------------------

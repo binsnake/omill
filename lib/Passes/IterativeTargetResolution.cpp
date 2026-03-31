@@ -26,6 +26,7 @@
 #include "omill/BC/BlockLifterAnalysis.h"
 #include "omill/BC/TraceLiftAnalysis.h"
 #include "omill/Passes/ConstantMemoryFolding.h"
+#include "omill/Passes/CombinedFixedPointDevirt.h"
 #include "omill/Passes/EliminateDeadPaths.h"
 #include "omill/Passes/IndirectCallResolver.h"
 #include "omill/Passes/InterProceduralConstProp.h"
@@ -48,6 +49,49 @@
 namespace omill {
 
 namespace {
+
+template <typename Pred>
+struct ScopedFunctionPassAdaptor
+    : llvm::PassInfoMixin<ScopedFunctionPassAdaptor<Pred>> {
+  llvm::FunctionPassManager FPM;
+  Pred predicate;
+
+  ScopedFunctionPassAdaptor(llvm::FunctionPassManager FPM, Pred pred)
+      : FPM(std::move(FPM)), predicate(std::move(pred)) {}
+
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &MAM) {
+    auto &FAM =
+        MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M).getManager();
+
+    llvm::SmallVector<llvm::Function *, 32> worklist;
+    for (auto &F : M) {
+      if (F.isDeclaration() || !predicate(F))
+        continue;
+      worklist.push_back(&F);
+    }
+
+    bool changed = false;
+    for (auto *F : worklist) {
+      if (!F || F->isDeclaration())
+        continue;
+      auto PA = FPM.run(*F, FAM);
+      if (!PA.areAllPreserved()) {
+        changed = true;
+        FAM.invalidate(*F, PA);
+      }
+    }
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+};
+
+template <typename Pred>
+ScopedFunctionPassAdaptor<Pred> createScopedFPM(llvm::FunctionPassManager FPM,
+                                                Pred pred) {
+  return ScopedFunctionPassAdaptor<Pred>(std::move(FPM), std::move(pred));
+}
 
 struct UnresolvedEdgeStats {
   unsigned dynamic = 0;
@@ -106,8 +150,7 @@ unsigned countUnresolvedDispatches(llvm::Module &M) {
         if (auto *call = llvm::dyn_cast<llvm::CallInst>(&I))
           if (auto *callee = call->getCalledFunction()) {
             auto name = callee->getName();
-            if (name == "__omill_dispatch_call" ||
-                name == "__omill_dispatch_jump")
+            if (isDispatchIntrinsicName(name))
               ++count;
           }
   return count;
@@ -161,7 +204,7 @@ bool functionHasDispatches(const llvm::Function &F) {
       if (!callee)
         continue;
       auto name = callee->getName();
-      if (name == "__omill_dispatch_call" || name == "__omill_dispatch_jump")
+      if (isDispatchIntrinsicName(name))
         return true;
     }
   }
@@ -247,9 +290,8 @@ void recordResolutionState(llvm::Module &M, IterativeLiftingSession &session) {
         edge.source_pc = *source_pc;
 
         auto callee_name = callee->getName();
-        if (callee_name == "__omill_dispatch_call" ||
-            callee_name == "__omill_dispatch_jump") {
-          edge.kind = (callee_name == "__omill_dispatch_call")
+        if (isDispatchIntrinsicName(callee_name)) {
+          edge.kind = isDispatchCallName(callee_name)
                           ? LiftEdgeKind::kIndirectCall
                           : LiftEdgeKind::kIndirectBranch;
           if (call->arg_size() >= 2) {
@@ -292,7 +334,7 @@ bool runInterproceduralResolutionRound(
 
   llvm::FunctionPassManager FPM;
   buildCleanupPipeline(FPM, CleanupProfile::kLightScalar);
-  FPM.addPass(ConstantMemoryFoldingPass());
+  FPM.addPass(CombinedFixedPointDevirtPass());
   FPM.addPass(llvm::GVNPass());
   FPM.addPass(llvm::InstCombinePass());
   FPM.addPass(IndirectCallResolverPass());
@@ -302,17 +344,15 @@ bool runInterproceduralResolutionRound(
   FPM.addPass(
       ResolveAndLowerControlFlowPass(ResolvePhases::ResolveTargets));
 
-  auto &FAM =
-      MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M).getManager();
-  for (auto *F : affected) {
-    if (!F || F->isDeclaration())
-      continue;
-    auto fpa = FPM.run(*F, FAM);
-    if (!fpa.areAllPreserved()) {
-      changed = true;
-      FAM.invalidate(*F, fpa);
-    }
-  }
+  llvm::DenseSet<llvm::Function *> affected_set(affected.begin(),
+                                                affected.end());
+  llvm::ModulePassManager MPM;
+  MPM.addPass(createScopedFPM(std::move(FPM), [&](llvm::Function &F) {
+    return affected_set.contains(&F);
+  }));
+  auto PA = MPM.run(M, MAM);
+  if (!PA.areAllPreserved())
+    changed = true;
 
   return changed;
 }
@@ -322,13 +362,12 @@ void runFPMOnFunctions(llvm::FunctionPassManager &FPM,
                        llvm::ArrayRef<llvm::Function *> Funcs,
                        llvm::ModuleAnalysisManager &MAM,
                        llvm::Module &M) {
-  llvm::FunctionAnalysisManager &FAM =
-      MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M).getManager();
-  for (auto *F : Funcs) {
-    if (F->isDeclaration())
-      continue;
-    FPM.run(*F, FAM);
-  }
+  llvm::DenseSet<llvm::Function *> func_set(Funcs.begin(), Funcs.end());
+  llvm::ModulePassManager MPM;
+  MPM.addPass(createScopedFPM(std::move(FPM), [&](llvm::Function &F) {
+    return func_set.contains(&F);
+  }));
+  MPM.run(M, MAM);
 }
 
 /// Collect constant dispatch targets that don't have a corresponding lifted
@@ -382,7 +421,7 @@ llvm::DenseSet<uint64_t> collectNewTargetPCs(
         if (!callee)
           continue;
         auto name = callee->getName();
-        if (name != "__omill_dispatch_call" && name != "__omill_dispatch_jump")
+        if (!isDispatchIntrinsicName(name))
           continue;
         if (call->arg_size() < 2)
           continue;
@@ -458,8 +497,7 @@ bool inlineCalleesForDispatchResolution(
         auto *callee = call->getCalledFunction();
         if (!callee)
           continue;
-        if (callee->getName() == "__omill_dispatch_call" ||
-            callee->getName() == "__omill_dispatch_jump") {
+        if (isDispatchIntrinsicName(callee->getName())) {
           targets.push_back(&F);
           goto next_func;
         }
@@ -540,8 +578,7 @@ bool inlineCalleesForDispatchResolution(
                   if (!DefCallee)
                     continue;
                   auto name = DefCallee->getName();
-                  if (name == "__omill_dispatch_call" ||
-                      name == "__omill_dispatch_jump") {
+                  if (isDispatchIntrinsicName(name)) {
                     is_vm_handler = true;
                     break;
                   }
@@ -611,8 +648,7 @@ bool inlineDispatchFunctionsIntoCallers(
         auto *callee = CI->getCalledFunction();
         if (!callee)
           continue;
-        if (callee->getName() == "__omill_dispatch_call" ||
-            callee->getName() == "__omill_dispatch_jump") {
+        if (isDispatchIntrinsicName(callee->getName())) {
           has_dispatch = true;
           break;
         }
@@ -942,8 +978,7 @@ void processDeferredFunctions(llvm::ArrayRef<llvm::Function *> deferred,
   llvm::errs() << "ITR: deferred Step 1: optimizing...\n";
   {
     llvm::FunctionPassManager FPM;
-    FPM.addPass(llvm::InstCombinePass());
-    FPM.addPass(ConstantMemoryFoldingPass());
+    FPM.addPass(CombinedFixedPointDevirtPass());
     FPM.addPass(llvm::GVNPass());
     FPM.addPass(llvm::SimplifyCFGPass());
     FPM.addPass(llvm::InstCombinePass());
@@ -1119,11 +1154,10 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
       FPM.addPass(llvm::FixIrreduciblePass());
       FPM.addPass(llvm::LoopSimplifyPass());
       FPM.addPass(llvm::LCSSAPass());
-      FPM.addPass(llvm::InstCombinePass());
-      FPM.addPass(ConstantMemoryFoldingPass());
+      FPM.addPass(CombinedFixedPointDevirtPass());
       FPM.addPass(llvm::GVNPass());
       FPM.addPass(llvm::SimplifyCFGPass());
-      FPM.addPass(ConstantMemoryFoldingPass());
+      FPM.addPass(CombinedFixedPointDevirtPass());
       FPM.addPass(EliminateDeadPathsPass());
       FPM.addPass(llvm::InstCombinePass());
       runFPMOnFunctions(FPM, needs_opt, MAM, M);
@@ -1153,22 +1187,17 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
 #if OMILL_ENABLE_Z3
         FPM.addPass(Z3DispatchSolverPass());
 #endif
-        // Per-function resolution with progress logging.
-        {
-          auto &FAM = MAM.getResult<
-              llvm::FunctionAnalysisManagerModuleProxy>(M).getManager();
-          for (unsigned i = 0; i < needs_resolve.size(); ++i) {
-            auto *RF = needs_resolve[i];
-            if (RF->isDeclaration())
-              continue;
-            unsigned ic = 0;
-            for (auto &BB : *RF)
-              ic += BB.size();
-            llvm::errs() << "  resolving [" << i << "] "
-                         << RF->getName() << " (" << ic << " insts)\n";
-            FPM.run(*RF, FAM);
-          }
+        for (unsigned i = 0; i < needs_resolve.size(); ++i) {
+          auto *RF = needs_resolve[i];
+          if (!RF || RF->isDeclaration())
+            continue;
+          unsigned ic = 0;
+          for (auto &BB : *RF)
+            ic += BB.size();
+          llvm::errs() << "  resolving [" << i << "] "
+                       << RF->getName() << " (" << ic << " insts)\n";
         }
+        runFPMOnFunctions(FPM, needs_resolve, MAM, M);
         for (auto *F : needs_resolve)
           already_resolved.insert(F);
         resolve_ms = elapsedMillis(step_start);
@@ -1423,9 +1452,8 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
                          << post_inline.size() << " modified functions\n";
             llvm::FunctionPassManager FPM;
             FPM.addPass(RecoverAllocaPointersPass());
+            FPM.addPass(CombinedFixedPointDevirtPass());
             FPM.addPass(llvm::GVNPass());
-            FPM.addPass(ConstantMemoryFoldingPass());
-            FPM.addPass(llvm::InstCombinePass());
             FPM.addPass(llvm::SimplifyCFGPass());
             FPM.addPass(llvm::ADCEPass());
             FPM.addPass(llvm::InstCombinePass());
@@ -1544,9 +1572,8 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
           {
             llvm::FunctionPassManager FPM;
             FPM.addPass(RecoverAllocaPointersPass());
+            FPM.addPass(CombinedFixedPointDevirtPass());
             FPM.addPass(llvm::GVNPass());
-            FPM.addPass(ConstantMemoryFoldingPass());
-            FPM.addPass(llvm::InstCombinePass());
             FPM.addPass(llvm::SimplifyCFGPass());
             FPM.addPass(llvm::ADCEPass());
             FPM.addPass(llvm::InstCombinePass());

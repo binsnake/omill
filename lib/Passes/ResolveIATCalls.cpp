@@ -168,7 +168,7 @@ llvm::PreservedAnalyses ResolveIATCallsPass::run(
       if (!call)
         continue;
       auto *callee = call->getCalledFunction();
-      if (!callee || callee->getName() != "__omill_dispatch_call")
+      if (!callee || !isDispatchCallName(callee->getName()))
         continue;
       if (call->arg_size() < 3)
         continue;

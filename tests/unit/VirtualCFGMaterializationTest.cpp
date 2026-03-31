@@ -471,6 +471,13 @@ TEST_F(VirtualCFGMaterializationTest,
     auto *call = B.CreateCall(missing, {caller->getArg(0),
                                         B.getInt64(0x18000E240ULL),
                                         caller->getArg(2)});
+    call->addFnAttr(llvm::Attribute::get(
+        Ctx, "omill.virtual_exit_disposition",
+        "vm_exit_native_exec_unknown_return"));
+    call->addFnAttr(llvm::Attribute::get(
+        Ctx, "omill.virtual_exit_native_target_pc", "180020200"));
+    call->addFnAttr(
+        llvm::Attribute::get(Ctx, "omill.virtual_exit_partial", "1"));
     B.CreateRet(call);
   }
 
@@ -478,6 +485,7 @@ TEST_F(VirtualCFGMaterializationTest,
 
   unsigned missing_calls = 0;
   unsigned direct_calls = 0;
+  llvm::CallInst *direct_call = nullptr;
   for (auto &BB : *caller) {
     for (auto &I : BB) {
       auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
@@ -488,13 +496,25 @@ TEST_F(VirtualCFGMaterializationTest,
         continue;
       if (callee->getName() == "__remill_missing_block")
         ++missing_calls;
-      if (callee == target)
+      if (callee == target) {
         ++direct_calls;
+        direct_call = CI;
+      }
     }
   }
 
   EXPECT_EQ(missing_calls, 0u);
   EXPECT_EQ(direct_calls, 1u);
+  ASSERT_NE(direct_call, nullptr);
+  ASSERT_TRUE(direct_call->hasFnAttr("omill.virtual_exit_disposition"));
+  EXPECT_EQ(direct_call->getFnAttr("omill.virtual_exit_disposition")
+                .getValueAsString(),
+            "vm_exit_native_exec_unknown_return");
+  ASSERT_TRUE(direct_call->hasFnAttr("omill.virtual_exit_native_target_pc"));
+  EXPECT_EQ(direct_call->getFnAttr("omill.virtual_exit_native_target_pc")
+                .getValueAsString(),
+            "180020200");
+  EXPECT_TRUE(direct_call->hasFnAttr("omill.virtual_exit_partial"));
 }
 
 TEST_F(VirtualCFGMaterializationTest, LeavesDynamicDispatchUnchanged) {
@@ -567,6 +587,7 @@ TEST_F(VirtualCFGMaterializationTest, MaterializesKnownProtectedBoundaryCall) {
 
   unsigned dispatch_calls = 0;
   llvm::Function *boundary = nullptr;
+  llvm::CallInst *boundary_call = nullptr;
   for (auto &BB : *caller) {
     for (auto &I : BB) {
       auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
@@ -577,16 +598,23 @@ TEST_F(VirtualCFGMaterializationTest, MaterializesKnownProtectedBoundaryCall) {
         continue;
       if (callee->getName() == "__omill_dispatch_call")
         ++dispatch_calls;
-      if (callee->getName() == "vm_entry_1800042ba4")
+      if (callee->getName() == "vm_entry_1800042ba4") {
         boundary = callee;
+        boundary_call = CI;
+      }
     }
   }
 
   EXPECT_EQ(dispatch_calls, 0u);
   ASSERT_NE(boundary, nullptr);
+  ASSERT_NE(boundary_call, nullptr);
   EXPECT_TRUE(boundary->hasFnAttribute("omill.protection_boundary"));
   EXPECT_EQ(boundary->getFnAttribute("omill.boundary_kind").getValueAsString(),
             "vm_entry_stub");
+  ASSERT_TRUE(boundary_call->hasFnAttr("omill.virtual_exit_disposition"));
+  EXPECT_EQ(boundary_call->getFnAttr("omill.virtual_exit_disposition")
+                .getValueAsString(),
+            "vm_exit_terminal");
 }
 
 TEST_F(VirtualCFGMaterializationTest, MaterializesSelectDispatchFromCompareFacts) {
@@ -2808,6 +2836,7 @@ TEST_F(VirtualCFGMaterializationTest,
 
   unsigned dispatch_calls = 0;
   unsigned direct_calls = 0;
+  llvm::CallInst *direct_call = nullptr;
   for (auto &BB : *trampoline) {
     for (auto &I : BB) {
       auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
@@ -2818,13 +2847,20 @@ TEST_F(VirtualCFGMaterializationTest,
         continue;
       if (callee->getName() == "__omill_dispatch_jump")
         ++dispatch_calls;
-      if (callee == target)
+      if (callee == target) {
         ++direct_calls;
+        direct_call = CI;
+      }
     }
   }
 
   EXPECT_EQ(dispatch_calls, 0u);
   EXPECT_EQ(direct_calls, 1u);
+  ASSERT_NE(direct_call, nullptr);
+  ASSERT_TRUE(direct_call->hasFnAttr("omill.virtual_exit_disposition"));
+  EXPECT_EQ(direct_call->getFnAttr("omill.virtual_exit_disposition")
+                .getValueAsString(),
+            "stay_in_vm");
 }
 
 TEST_F(VirtualCFGMaterializationTest,
@@ -3514,6 +3550,20 @@ TEST_F(VirtualCFGMaterializationTest,
             llvm::GlobalValue::InternalLinkage);
   EXPECT_TRUE(continuation_after->hasFnAttribute("omill.localized_continuation_shim"));
   EXPECT_TRUE(continuation_after->hasFnAttribute(llvm::Attribute::AlwaysInline));
+  ASSERT_TRUE(
+      continuation_after->hasFnAttribute("omill.virtual_exit_disposition"));
+  EXPECT_EQ(continuation_after
+                ->getFnAttribute("omill.virtual_exit_disposition")
+                .getValueAsString(),
+            "vm_exit_native_call_reenter");
+  EXPECT_TRUE(
+      continuation_after->hasFnAttribute("omill.virtual_exit_continuation_pc"));
+  EXPECT_EQ(continuation_after
+                ->getFnAttribute("omill.virtual_exit_continuation_pc")
+                .getValueAsString(),
+            "18000F013");
+  EXPECT_TRUE(
+      continuation_after->hasFnAttribute("omill.virtual_exit_reenters_vm"));
 
   auto &entry = continuation_after->getEntryBlock();
   auto *ret = llvm::dyn_cast<llvm::ReturnInst>(entry.getTerminator());
@@ -3592,6 +3642,81 @@ TEST_F(VirtualCFGMaterializationTest,
 }
 
 TEST_F(VirtualCFGMaterializationTest,
+       RewritesDeclaredContinuationCallAndPreservesExitAttrs) {
+  auto M = createModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+
+  auto *target = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "sub_180030080", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target->getArg(0));
+  }
+
+  auto *continuation = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "blk_180030013", *M);
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::Function::ExternalLinkage,
+                                      "sub_180030000", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *tail = B.CreateCall(
+        continuation,
+        {root->getArg(0), B.getInt64(0x180030080ULL), root->getArg(2)});
+    tail->addFnAttr(llvm::Attribute::get(
+        Ctx, "omill.virtual_exit_disposition",
+        "vm_exit_native_call_reenter"));
+    tail->addFnAttr(llvm::Attribute::get(
+        Ctx, "omill.virtual_exit_continuation_pc", "180030013"));
+    tail->addFnAttr(llvm::Attribute::get(
+        Ctx, "omill.virtual_exit_continuation_vip", "180030013"));
+    tail->addFnAttr(llvm::Attribute::get(
+        Ctx, "omill.virtual_exit_native_target_pc", "180040000"));
+    tail->addFnAttr(
+        llvm::Attribute::get(Ctx, "omill.virtual_exit_reenters_vm", "1"));
+    B.CreateRet(tail);
+  }
+
+  runPass(*M);
+
+  llvm::CallInst *direct_call = nullptr;
+  for (auto &BB : *root) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI || CI->getCalledFunction() != target)
+        continue;
+      direct_call = CI;
+    }
+  }
+
+  ASSERT_NE(direct_call, nullptr);
+  EXPECT_EQ(M->getFunction("blk_180030013"), continuation);
+  ASSERT_TRUE(direct_call->hasFnAttr("omill.virtual_exit_disposition"));
+  EXPECT_EQ(direct_call->getFnAttr("omill.virtual_exit_disposition")
+                .getValueAsString(),
+            "vm_exit_native_call_reenter");
+  ASSERT_TRUE(direct_call->hasFnAttr("omill.virtual_exit_continuation_pc"));
+  EXPECT_EQ(direct_call->getFnAttr("omill.virtual_exit_continuation_pc")
+                .getValueAsString(),
+            "180030013");
+  ASSERT_TRUE(direct_call->hasFnAttr("omill.virtual_exit_continuation_vip"));
+  EXPECT_EQ(direct_call->getFnAttr("omill.virtual_exit_continuation_vip")
+                .getValueAsString(),
+            "180030013");
+  ASSERT_TRUE(direct_call->hasFnAttr("omill.virtual_exit_native_target_pc"));
+  EXPECT_EQ(direct_call->getFnAttr("omill.virtual_exit_native_target_pc")
+                .getValueAsString(),
+            "180040000");
+  EXPECT_TRUE(direct_call->hasFnAttr("omill.virtual_exit_reenters_vm"));
+}
+
+TEST_F(VirtualCFGMaterializationTest,
        SynthesizesContinuationShimForNullMemoryContinuationCall) {
   auto M = createModule();
   auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
@@ -3613,6 +3738,13 @@ TEST_F(VirtualCFGMaterializationTest,
         continuation,
         {root->getArg(0), B.getInt64(0x18000F005ULL),
          llvm::ConstantPointerNull::get(ptr_ty)});
+    tail->addFnAttr(llvm::Attribute::get(
+        Ctx, "omill.virtual_exit_disposition",
+        "vm_exit_native_exec_unknown_return"));
+    tail->addFnAttr(llvm::Attribute::get(
+        Ctx, "omill.virtual_exit_native_target_pc", "180020100"));
+    tail->addFnAttr(
+        llvm::Attribute::get(Ctx, "omill.virtual_exit_partial", "1"));
     B.CreateRet(tail);
   }
 
@@ -3627,6 +3759,95 @@ TEST_F(VirtualCFGMaterializationTest,
       continuation_after->hasFnAttribute("omill.localized_continuation_shim"));
   EXPECT_TRUE(
       continuation_after->hasFnAttribute(llvm::Attribute::AlwaysInline));
+  ASSERT_TRUE(
+      continuation_after->hasFnAttribute("omill.virtual_exit_disposition"));
+  EXPECT_EQ(continuation_after
+                ->getFnAttribute("omill.virtual_exit_disposition")
+                .getValueAsString(),
+            "vm_exit_native_exec_unknown_return");
+  EXPECT_TRUE(
+      continuation_after->hasFnAttribute("omill.virtual_exit_continuation_pc"));
+  EXPECT_EQ(continuation_after
+                ->getFnAttribute("omill.virtual_exit_continuation_pc")
+                .getValueAsString(),
+            "18000F005");
+  EXPECT_TRUE(
+      continuation_after->hasFnAttribute("omill.virtual_exit_native_target_pc"));
+  EXPECT_EQ(continuation_after
+                ->getFnAttribute("omill.virtual_exit_native_target_pc")
+                .getValueAsString(),
+            "180020100");
+  EXPECT_TRUE(
+      continuation_after->hasFnAttribute("omill.virtual_exit_partial"));
+}
+
+TEST_F(VirtualCFGMaterializationTest,
+       RewritesDeclaredContinuationCallUsingCalleeExitAttrsWhenCallsiteIsBare) {
+  auto M = createModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+
+  auto *target = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "sub_180031080", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target->getArg(0));
+  }
+
+  auto *continuation = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "blk_180031013", *M);
+  continuation->addFnAttr("omill.virtual_exit_disposition",
+                          "vm_exit_native_call_reenter");
+  continuation->addFnAttr("omill.virtual_exit_continuation_pc", "180031013");
+  continuation->addFnAttr("omill.virtual_exit_continuation_vip", "180031013");
+  continuation->addFnAttr("omill.virtual_exit_native_target_pc", "180041000");
+  continuation->addFnAttr("omill.virtual_exit_reenters_vm", "1");
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::Function::ExternalLinkage,
+                                      "sub_180031000", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *tail = B.CreateCall(
+        continuation,
+        {root->getArg(0), B.getInt64(0x180031080ULL), root->getArg(2)});
+    B.CreateRet(tail);
+  }
+
+  runPass(*M);
+
+  llvm::CallInst *direct_call = nullptr;
+  for (auto &BB : *root) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI || CI->getCalledFunction() != target)
+        continue;
+      direct_call = CI;
+    }
+  }
+
+  ASSERT_NE(direct_call, nullptr);
+  ASSERT_TRUE(direct_call->hasFnAttr("omill.virtual_exit_disposition"));
+  EXPECT_EQ(direct_call->getFnAttr("omill.virtual_exit_disposition")
+                .getValueAsString(),
+            "vm_exit_native_call_reenter");
+  ASSERT_TRUE(direct_call->hasFnAttr("omill.virtual_exit_continuation_pc"));
+  EXPECT_EQ(direct_call->getFnAttr("omill.virtual_exit_continuation_pc")
+                .getValueAsString(),
+            "180031013");
+  ASSERT_TRUE(direct_call->hasFnAttr("omill.virtual_exit_continuation_vip"));
+  EXPECT_EQ(direct_call->getFnAttr("omill.virtual_exit_continuation_vip")
+                .getValueAsString(),
+            "180031013");
+  ASSERT_TRUE(direct_call->hasFnAttr("omill.virtual_exit_native_target_pc"));
+  EXPECT_EQ(direct_call->getFnAttr("omill.virtual_exit_native_target_pc")
+                .getValueAsString(),
+            "180041000");
+  EXPECT_TRUE(direct_call->hasFnAttr("omill.virtual_exit_reenters_vm"));
 }
 
 TEST_F(VirtualCFGMaterializationTest,

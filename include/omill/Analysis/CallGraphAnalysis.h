@@ -36,7 +36,8 @@ struct CallGraphNode {
 ///
 /// Edges are derived from:
 /// - Direct calls to sub_* functions
-/// - __omill_dispatch_call with constant target resolved via LiftedFunctionMap
+/// - unresolved dispatch-call intrinsics with constant targets resolved via
+///   LiftedFunctionMap
 /// - musttail calls (tail-call edges)
 /// - Dynamic/unresolved dispatch targets
 ///

@@ -101,6 +101,16 @@ TEST_F(LiftedFunctionMapTest, MultipleLiftedFunctions) {
   EXPECT_EQ(map.lookup(0xABCD), F3);
 }
 
+TEST_F(LiftedFunctionMapTest, IncludesBlockNamedLiftedFunctions) {
+  llvm::Module M("blocks", Ctx);
+  auto *Blk = addDefinedFunc(M, "blk_18006542b", liftedTy());
+  auto *Block = addDefinedFunc(M, "block_18005536a", liftedTy());
+
+  auto map = runAnalysis(M);
+  EXPECT_EQ(map.lookup(0x18006542B), Blk);
+  EXPECT_EQ(map.lookup(0x18005536A), Block);
+}
+
 // ===----------------------------------------------------------------------===
 // Test 4: __remill_ prefixed functions are skipped
 // ===----------------------------------------------------------------------===

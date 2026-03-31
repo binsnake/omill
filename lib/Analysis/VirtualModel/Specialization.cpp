@@ -278,11 +278,12 @@ static bool collectEvaluatedValueChoicesImpl(
   if (depth > 4 || expr.kind == VirtualExprKind::kUnknown)
     return false;
 
-  llvm::SmallDenseSet<uint64_t, 8> unique_values;
+  llvm::SmallVector<uint64_t, 8> unique_values;
   auto append_value = [&](uint64_t value) {
     value &= bitMask(expr.bit_width);
-    if (!unique_values.insert(value).second)
+    if (llvm::is_contained(unique_values, value))
       return true;
+    unique_values.push_back(value);
     values.push_back(value);
     return values.size() <= 4;
   };

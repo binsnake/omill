@@ -134,7 +134,7 @@ static void collectDispatchJumps(
       auto *callee = call->getCalledFunction();
       if (!callee || call->arg_size() < 3)
         continue;
-      if (callee->getName() == "__omill_dispatch_jump")
+      if (isDispatchJumpName(callee->getName()))
         dispatch_jumps.push_back(call);
     }
   }

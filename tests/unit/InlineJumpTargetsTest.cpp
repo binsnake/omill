@@ -125,6 +125,8 @@ TEST_F(InlineJumpTargetsTest, JumpLoweredToSwitch) {
   llvm::IRBuilder<> B(entry);
   auto *target = B.CreateLoad(i64_ty, F->getArg(0));  // non-constant
   auto *result = B.CreateCall(jump_fn, {F->getArg(0), target, F->getArg(2)});
+  result->addFnAttr(llvm::Attribute::get(
+      Ctx, "omill.virtual_exit_disposition", "stay_in_vm"));
   B.CreateRet(result);
 
   // Disconnected blocks: just return.
@@ -149,6 +151,74 @@ TEST_F(InlineJumpTargetsTest, JumpLoweredToSwitch) {
     EXPECT_GE(SW->getNumCases(), 2u)
         << "Expected at least 2 switch cases for the disconnected blocks";
   }
+
+  llvm::BasicBlock *FallbackBB = nullptr;
+  for (auto &BB : *F) {
+    if (BB.getName() == "jump_dispatch_fallback") {
+      FallbackBB = &BB;
+      break;
+    }
+  }
+  ASSERT_NE(FallbackBB, nullptr);
+  auto *FallbackCall = llvm::dyn_cast<llvm::CallInst>(&FallbackBB->front());
+  ASSERT_NE(FallbackCall, nullptr);
+  ASSERT_TRUE(FallbackCall->hasFnAttr("omill.virtual_exit_disposition"));
+  EXPECT_EQ(FallbackCall->getFnAttr("omill.virtual_exit_disposition")
+                .getValueAsString(),
+            "stay_in_vm");
+}
+
+TEST_F(InlineJumpTargetsTest, VmExitJumpIsPreservedAsExplicitJump) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+
+  auto *jump_fn = createRemillJump(*M);
+
+  auto *F = llvm::Function::Create(
+      liftedFnTy(), llvm::Function::ExternalLinkage, "sub_180001000", *M);
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  auto *block_a = llvm::BasicBlock::Create(Ctx, "block_180001010", F);
+  auto *block_b = llvm::BasicBlock::Create(Ctx, "block_180001020", F);
+
+  llvm::IRBuilder<> B(entry);
+  auto *target = B.CreateLoad(i64_ty, F->getArg(0));
+  auto *result = B.CreateCall(jump_fn, {F->getArg(0), target, F->getArg(2)});
+  result->addFnAttr(llvm::Attribute::get(
+      Ctx, "omill.virtual_exit_disposition",
+      "vm_exit_native_exec_unknown_return"));
+  result->addFnAttr(
+      llvm::Attribute::get(Ctx, "omill.virtual_exit_partial", "1"));
+  B.CreateRet(result);
+
+  llvm::IRBuilder<> BA(block_a);
+  BA.CreateRet(F->getArg(2));
+  llvm::IRBuilder<> BB2(block_b);
+  BB2.CreateRet(F->getArg(2));
+
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+
+  runPass(*M);
+
+  ASSERT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+
+  EXPECT_TRUE(llvm::isa<llvm::ReturnInst>(F->getEntryBlock().getTerminator()));
+  llvm::CallInst *entry_call = nullptr;
+  for (auto &I : F->getEntryBlock()) {
+    auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+    if (!CI)
+      continue;
+    if (CI->getCalledFunction() == jump_fn) {
+      entry_call = CI;
+      break;
+    }
+  }
+  ASSERT_NE(entry_call, nullptr);
+  ASSERT_EQ(entry_call->getCalledFunction(), jump_fn);
+  ASSERT_TRUE(entry_call->hasFnAttr("omill.virtual_exit_disposition"));
+  EXPECT_EQ(entry_call->getFnAttr("omill.virtual_exit_disposition")
+                .getValueAsString(),
+            "vm_exit_native_exec_unknown_return");
 }
 
 // ===----------------------------------------------------------------------===

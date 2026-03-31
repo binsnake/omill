@@ -797,8 +797,7 @@ CallsiteInfo analyzeCallsite(llvm::CallInst *CI, const llvm::DataLayout &DL,
     return info;
 
   uint64_t callee_va = 0;
-  if (callee->getName() == "__omill_dispatch_call" ||
-      callee->getName() == "__omill_dispatch_jump") {
+  if (isDispatchIntrinsicName(callee->getName())) {
     // Target PC is the second arg.
     if (CI->arg_size() >= 2) {
       if (auto *pc_ci = llvm::dyn_cast<llvm::ConstantInt>(CI->getArgOperand(1)))

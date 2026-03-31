@@ -57,7 +57,7 @@ struct BoundaryTargetSummary {
 };
 
 static bool isDispatchIntrinsicName(llvm::StringRef name) {
-  return name == "__omill_dispatch_call" || name == "__omill_dispatch_jump";
+  return omill::isDispatchIntrinsicName(name);
 }
 
 static bool genericDebugEnabled() {
@@ -94,6 +94,265 @@ static bool isBoundaryFunctionName(llvm::StringRef name) {
   return name.starts_with("vm_entry_");
 }
 
+static llvm::StringRef renderVirtualExitDisposition(
+    VirtualExitDisposition disposition) {
+  switch (disposition) {
+    case VirtualExitDisposition::kUnknown:
+      return "unknown";
+    case VirtualExitDisposition::kStayInVm:
+      return "stay_in_vm";
+    case VirtualExitDisposition::kVmExitTerminal:
+      return "vm_exit_terminal";
+    case VirtualExitDisposition::kVmExitNativeCallReenter:
+      return "vm_exit_native_call_reenter";
+    case VirtualExitDisposition::kVmExitNativeExecUnknownReturn:
+      return "vm_exit_native_exec_unknown_return";
+    case VirtualExitDisposition::kVmEnter:
+      return "vm_enter";
+    case VirtualExitDisposition::kNestedVmEnter:
+      return "nested_vm_enter";
+  }
+  return "unknown";
+}
+
+static std::optional<uint64_t> parseOptionalHexExitAttr(
+    const llvm::CallBase &call, llvm::StringRef attr_name) {
+  auto attr = call.getFnAttr(attr_name);
+  if (!attr.isValid() || !attr.isStringAttribute())
+    return std::nullopt;
+  uint64_t value = 0;
+  if (attr.getValueAsString().getAsInteger(16, value))
+    return std::nullopt;
+  return value;
+}
+
+static std::optional<uint64_t> parseOptionalHexExitAttr(
+    const llvm::Function &function, llvm::StringRef attr_name) {
+  auto attr = function.getFnAttribute(attr_name);
+  if (!attr.isValid() || !attr.isStringAttribute())
+    return std::nullopt;
+  uint64_t value = 0;
+  if (attr.getValueAsString().getAsInteger(16, value))
+    return std::nullopt;
+  return value;
+}
+
+static std::optional<VirtualExitDisposition> parseVirtualExitDispositionAttr(
+    const llvm::CallBase &call) {
+  auto attr = call.getFnAttr("omill.virtual_exit_disposition");
+  if (!attr.isValid() || !attr.isStringAttribute())
+    return std::nullopt;
+
+  auto text = attr.getValueAsString();
+  if (text == "unknown")
+    return VirtualExitDisposition::kUnknown;
+  if (text == "stay_in_vm")
+    return VirtualExitDisposition::kStayInVm;
+  if (text == "vm_exit_terminal")
+    return VirtualExitDisposition::kVmExitTerminal;
+  if (text == "vm_exit_native_call_reenter")
+    return VirtualExitDisposition::kVmExitNativeCallReenter;
+  if (text == "vm_exit_native_exec_unknown_return")
+    return VirtualExitDisposition::kVmExitNativeExecUnknownReturn;
+  if (text == "vm_enter")
+    return VirtualExitDisposition::kVmEnter;
+  if (text == "nested_vm_enter")
+    return VirtualExitDisposition::kNestedVmEnter;
+  return std::nullopt;
+}
+
+static std::optional<VirtualExitDisposition> parseVirtualExitDispositionAttr(
+    const llvm::Function &function) {
+  auto attr = function.getFnAttribute("omill.virtual_exit_disposition");
+  if (!attr.isValid() || !attr.isStringAttribute())
+    return std::nullopt;
+
+  auto text = attr.getValueAsString();
+  if (text == "unknown")
+    return VirtualExitDisposition::kUnknown;
+  if (text == "stay_in_vm")
+    return VirtualExitDisposition::kStayInVm;
+  if (text == "vm_exit_terminal")
+    return VirtualExitDisposition::kVmExitTerminal;
+  if (text == "vm_exit_native_call_reenter")
+    return VirtualExitDisposition::kVmExitNativeCallReenter;
+  if (text == "vm_exit_native_exec_unknown_return")
+    return VirtualExitDisposition::kVmExitNativeExecUnknownReturn;
+  if (text == "vm_enter")
+    return VirtualExitDisposition::kVmEnter;
+  if (text == "nested_vm_enter")
+    return VirtualExitDisposition::kNestedVmEnter;
+  return std::nullopt;
+}
+
+static std::optional<VirtualExitSummary> parseVirtualExitSummaryAttr(
+    const llvm::CallBase &call) {
+  auto disposition = parseVirtualExitDispositionAttr(call);
+  if (!disposition.has_value())
+    return std::nullopt;
+
+  VirtualExitSummary exit;
+  exit.disposition = *disposition;
+  exit.continuation_pc =
+      parseOptionalHexExitAttr(call, "omill.virtual_exit_continuation_pc");
+  auto continuation_vip =
+      parseOptionalHexExitAttr(call, "omill.virtual_exit_continuation_vip");
+  if (!continuation_vip)
+    continuation_vip = exit.continuation_pc;
+  if (continuation_vip) {
+    exit.continuation_vip.resolved_pc = *continuation_vip;
+    exit.continuation_vip.expr_before_dispatch.kind = VirtualExprKind::kConstant;
+    exit.continuation_vip.expr_before_dispatch.bit_width = 64;
+    exit.continuation_vip.expr_before_dispatch.complete = true;
+    exit.continuation_vip.expr_before_dispatch.constant = *continuation_vip;
+    exit.continuation_vip.expr_after_dispatch =
+        exit.continuation_vip.expr_before_dispatch;
+    exit.continuation_vip.symbolic = false;
+  }
+  exit.native_target_pc =
+      parseOptionalHexExitAttr(call, "omill.virtual_exit_native_target_pc");
+  exit.is_partial_exit = call.hasFnAttr("omill.virtual_exit_partial");
+  exit.is_full_exit = call.hasFnAttr("omill.virtual_exit_full");
+  exit.reenters_vm = call.hasFnAttr("omill.virtual_exit_reenters_vm");
+  return exit;
+}
+
+static std::optional<VirtualExitSummary> parseVirtualExitSummaryAttr(
+    const llvm::Function &function) {
+  auto disposition = parseVirtualExitDispositionAttr(function);
+  if (!disposition.has_value())
+    return std::nullopt;
+
+  VirtualExitSummary exit;
+  exit.disposition = *disposition;
+  exit.continuation_pc =
+      parseOptionalHexExitAttr(function, "omill.virtual_exit_continuation_pc");
+  auto continuation_vip =
+      parseOptionalHexExitAttr(function, "omill.virtual_exit_continuation_vip");
+  if (!continuation_vip)
+    continuation_vip = exit.continuation_pc;
+  if (continuation_vip) {
+    exit.continuation_vip.resolved_pc = *continuation_vip;
+    exit.continuation_vip.expr_before_dispatch.kind = VirtualExprKind::kConstant;
+    exit.continuation_vip.expr_before_dispatch.bit_width = 64;
+    exit.continuation_vip.expr_before_dispatch.complete = true;
+    exit.continuation_vip.expr_before_dispatch.constant = *continuation_vip;
+    exit.continuation_vip.expr_after_dispatch =
+        exit.continuation_vip.expr_before_dispatch;
+    exit.continuation_vip.symbolic = false;
+  }
+  exit.native_target_pc =
+      parseOptionalHexExitAttr(function, "omill.virtual_exit_native_target_pc");
+  exit.is_partial_exit = function.hasFnAttribute("omill.virtual_exit_partial");
+  exit.is_full_exit = function.hasFnAttribute("omill.virtual_exit_full");
+  exit.reenters_vm = function.hasFnAttribute("omill.virtual_exit_reenters_vm");
+  return exit;
+}
+
+static std::optional<VirtualExitSummary> parseVirtualExitSummaryAttrWithFallback(
+    const llvm::CallBase &call, const llvm::Function *fallback_callee = nullptr) {
+  if (auto exit = parseVirtualExitSummaryAttr(call))
+    return exit;
+  if (fallback_callee)
+    return parseVirtualExitSummaryAttr(*fallback_callee);
+  return std::nullopt;
+}
+
+static bool shouldMaterializeContinuationShimForExit(
+    const VirtualExitSummary &exit) {
+  switch (exit.disposition) {
+    case VirtualExitDisposition::kVmExitTerminal:
+    case VirtualExitDisposition::kVmEnter:
+    case VirtualExitDisposition::kNestedVmEnter:
+      return false;
+    case VirtualExitDisposition::kUnknown:
+    case VirtualExitDisposition::kStayInVm:
+    case VirtualExitDisposition::kVmExitNativeCallReenter:
+    case VirtualExitDisposition::kVmExitNativeExecUnknownReturn:
+      return true;
+  }
+  return true;
+}
+
+static bool shouldPreserveFrontierAsExit(
+    VirtualExitDisposition disposition) {
+  switch (disposition) {
+    case VirtualExitDisposition::kVmExitTerminal:
+    case VirtualExitDisposition::kVmExitNativeCallReenter:
+    case VirtualExitDisposition::kVmExitNativeExecUnknownReturn:
+    case VirtualExitDisposition::kVmEnter:
+    case VirtualExitDisposition::kNestedVmEnter:
+      return true;
+    case VirtualExitDisposition::kUnknown:
+    case VirtualExitDisposition::kStayInVm:
+      return false;
+  }
+  return false;
+}
+
+static void annotateContinuationShimExit(llvm::Function &continuation,
+                                         const VirtualExitSummary &exit) {
+  continuation.addFnAttr("omill.virtual_exit_disposition",
+                         renderVirtualExitDisposition(exit.disposition));
+  if (exit.continuation_pc.has_value()) {
+    continuation.addFnAttr("omill.virtual_exit_continuation_pc",
+                           llvm::utohexstr(*exit.continuation_pc));
+  }
+  if (exit.continuation_vip.resolved_pc.has_value()) {
+    continuation.addFnAttr("omill.virtual_exit_continuation_vip",
+                           llvm::utohexstr(*exit.continuation_vip.resolved_pc));
+  }
+  if (exit.native_target_pc.has_value()) {
+    continuation.addFnAttr("omill.virtual_exit_native_target_pc",
+                           llvm::utohexstr(*exit.native_target_pc));
+  }
+  if (exit.is_partial_exit)
+    continuation.addFnAttr("omill.virtual_exit_partial", "1");
+  if (exit.is_full_exit)
+    continuation.addFnAttr("omill.virtual_exit_full", "1");
+  if (exit.reenters_vm)
+    continuation.addFnAttr("omill.virtual_exit_reenters_vm", "1");
+}
+
+static void annotateExitOnCallSite(llvm::CallBase &call,
+                                   const VirtualExitSummary *exit) {
+  if (!exit)
+    return;
+  call.addFnAttr(llvm::Attribute::get(call.getContext(),
+                                      "omill.virtual_exit_disposition",
+                                      renderVirtualExitDisposition(
+                                          exit->disposition)));
+  if (exit->continuation_pc.has_value()) {
+    call.addFnAttr(llvm::Attribute::get(call.getContext(),
+                                        "omill.virtual_exit_continuation_pc",
+                                        llvm::utohexstr(
+                                            *exit->continuation_pc)));
+  }
+  if (exit->continuation_vip.resolved_pc.has_value()) {
+    call.addFnAttr(llvm::Attribute::get(
+        call.getContext(), "omill.virtual_exit_continuation_vip",
+        llvm::utohexstr(*exit->continuation_vip.resolved_pc)));
+  }
+  if (exit->native_target_pc.has_value()) {
+    call.addFnAttr(llvm::Attribute::get(call.getContext(),
+                                        "omill.virtual_exit_native_target_pc",
+                                        llvm::utohexstr(
+                                            *exit->native_target_pc)));
+  }
+  if (exit->is_partial_exit)
+    call.addFnAttr(
+        llvm::Attribute::get(call.getContext(), "omill.virtual_exit_partial",
+                             "1"));
+  if (exit->is_full_exit)
+    call.addFnAttr(
+        llvm::Attribute::get(call.getContext(), "omill.virtual_exit_full",
+                             "1"));
+  if (exit->reenters_vm)
+    call.addFnAttr(llvm::Attribute::get(call.getContext(),
+                                        "omill.virtual_exit_reenters_vm",
+                                        "1"));
+}
+
 static bool exprReferencesNamedSlot(const VirtualMachineModel &model,
                                     const VirtualValueExpr &expr,
                                     llvm::StringRef slot_name) {
@@ -122,6 +381,8 @@ static bool isSemanticallyLocalizedCallsite(
     const VirtualCallSiteSummary &callsite,
     const std::map<std::string, const VirtualHandlerSummary *> &handler_by_name) {
   if (!callsite.continuation_pc.has_value())
+    return false;
+  if (!shouldMaterializeContinuationShimForExit(callsite.exit))
     return false;
 
   bool has_lifted_direct_callee = llvm::any_of(
@@ -343,8 +604,7 @@ static void annotateUnresolvedVmContinuations(llvm::Module &M) {
         if (!callee)
           continue;
         auto callee_name = callee->getName();
-        if (callee_name != "__omill_dispatch_call" &&
-            callee_name != "__omill_dispatch_jump") {
+        if (!isDispatchIntrinsicName(callee_name)) {
           continue;
         }
 
@@ -353,8 +613,8 @@ static void annotateUnresolvedVmContinuations(llvm::Module &M) {
           continue;
 
         std::string reason =
-            callee_name == "__omill_dispatch_jump" ? "dispatch_jump"
-                                                    : "dispatch_call";
+            isDispatchJumpName(callee_name) ? "dispatch_jump"
+                                            : "dispatch_call";
         if (auto *prev =
                 llvm::dyn_cast_or_null<llvm::CallInst>(call->getPrevNonDebugInstruction())) {
           if (auto *prev_callee = prev->getCalledFunction()) {
@@ -783,15 +1043,15 @@ static ResolvedTarget resolveTarget(llvm::Module &M,
 
 static bool lowerToDirectCall(llvm::CallInst *dispatch_call, llvm::Function *target_fn,
                               uint64_t target_pc, bool is_jump,
-                              bool store_pc_to_state = false) {
+                              bool store_pc_to_state = false,
+                              const VirtualExitSummary *exit = nullptr) {
   if (dispatch_call->arg_size() < 3 || !target_fn)
     return false;
 
   if (auto *helper_call = llvm::dyn_cast<llvm::CallInst>(dispatch_call->getArgOperand(2))) {
     if (auto *helper_callee = helper_call->getCalledFunction();
         helper_callee &&
-        (helper_callee->getName() == "__omill_dispatch_jump" ||
-         helper_callee->getName() == "__omill_dispatch_call") &&
+        isDispatchIntrinsicName(helper_callee->getName()) &&
         helper_call->arg_size() >= 3) {
       dispatch_call->setArgOperand(2, helper_call->getArgOperand(2));
       if (helper_call->use_empty())
@@ -809,6 +1069,7 @@ static bool lowerToDirectCall(llvm::CallInst *dispatch_call, llvm::Function *tar
   }
   dispatch_call->setCalledFunction(target_fn);
   dispatch_call->setArgOperand(1, pc_val);
+  annotateExitOnCallSite(*dispatch_call, exit);
   if (is_jump) {
     if (auto *ret = llvm::dyn_cast_or_null<llvm::ReturnInst>(
             dispatch_call->getNextNonDebugInstruction())) {
@@ -821,7 +1082,8 @@ static bool lowerToDirectCall(llvm::CallInst *dispatch_call, llvm::Function *tar
 }
 
 static bool lowerTerminalContinuationCallToDirectTarget(
-    llvm::CallInst *continuation_call, const ResolvedTarget &target) {
+    llvm::CallInst *continuation_call, const ResolvedTarget &target,
+    const VirtualExitSummary *exit = nullptr) {
   if (!continuation_call || !continuation_call->getParent() ||
       !target.function)
     return false;
@@ -846,6 +1108,7 @@ static bool lowerTerminalContinuationCallToDirectTarget(
   continuation_call->setArgOperand(
       1, llvm::ConstantInt::get(llvm::Type::getInt64Ty(builder.getContext()),
                                 target.pc));
+  annotateExitOnCallSite(*continuation_call, exit);
   return true;
 }
 
@@ -886,7 +1149,8 @@ static bool hasSyntheticPathTo(llvm::Function *from, llvm::Function *goal) {
 static bool lowerSelectDispatchToBranches(llvm::CallInst *dispatch_call,
                                           llvm::Value *condition,
                                           const ResolvedTarget &true_target,
-                                          const ResolvedTarget &false_target) {
+                                          const ResolvedTarget &false_target,
+                                          const VirtualExitSummary *exit = nullptr) {
   if (!dispatch_call || !dispatch_call->getParent() || !condition ||
       !condition->getType()->isIntegerTy(1) || !true_target.function ||
       !false_target.function || true_target.function == false_target.function) {
@@ -919,6 +1183,7 @@ static bool lowerSelectDispatchToBranches(llvm::CallInst *dispatch_call,
     args[1] = llvm::ConstantInt::get(pc_ty, target.pc);
     maybeStoreProgramCounter(builder, args[0], target);
     out_call = builder.CreateCall(target.function, args);
+    annotateExitOnCallSite(*out_call, exit);
     builder.CreateBr(cont_bb);
   };
 
@@ -939,7 +1204,8 @@ static bool lowerSelectDispatchToBranches(llvm::CallInst *dispatch_call,
 
 static bool lowerChoiceDispatchToSwitch(
     llvm::CallInst *dispatch_call, llvm::Value *dispatch_value,
-    llvm::ArrayRef<ResolvedTarget> targets) {
+    llvm::ArrayRef<ResolvedTarget> targets,
+    const VirtualExitSummary *exit = nullptr) {
   if (!dispatch_call || !dispatch_call->getParent() || !dispatch_value ||
       !dispatch_value->getType()->isIntegerTy() || targets.size() < 2)
     return false;
@@ -959,11 +1225,10 @@ static bool lowerChoiceDispatchToSwitch(
   }
   if (unique_targets.size() < 2) {
     auto *callee = dispatch_call->getCalledFunction();
-    bool is_jump =
-        callee && callee->getName() == "__omill_dispatch_jump";
+    bool is_jump = callee && isDispatchJumpName(callee->getName());
     const auto &target = unique_targets.front();
     return lowerToDirectCall(dispatch_call, target.function, target.pc, is_jump,
-                             target.store_pc_to_state);
+                             target.store_pc_to_state, exit);
   }
 
   auto *orig_bb = dispatch_call->getParent();
@@ -993,6 +1258,7 @@ static bool lowerChoiceDispatchToSwitch(
     args[1] = llvm::ConstantInt::get(pc_ty, target.pc);
     maybeStoreProgramCounter(builder, args[0], target);
     auto *direct_call = builder.CreateCall(target.function, args);
+    annotateExitOnCallSite(*direct_call, exit);
     builder.CreateBr(after_bb);
     auto *case_value = llvm::ConstantInt::get(
         llvm::cast<llvm::IntegerType>(dispatch_value->getType()), target.pc);
@@ -1022,31 +1288,66 @@ static std::optional<uint64_t> resolveDispatchFromFacts(
     const VirtualMachineModel &model, const VirtualHandlerSummary &summary,
     const VirtualDispatchSummary &dispatch,
     llvm::SmallVectorImpl<std::string> *diagnostics) {
-  if (auto resolved = evaluateVirtualExpr(dispatch.target, summary.outgoing_facts,
-                                          summary.outgoing_stack_facts))
+  struct FactStateRef {
+    llvm::ArrayRef<VirtualSlotFact> slots;
+    llvm::ArrayRef<VirtualStackFact> stack;
+    llvm::StringRef name;
+  };
+
+  const FactStateRef summary_states[] = {
+      {summary.outgoing_facts, summary.outgoing_stack_facts, "out/out"},
+      {summary.outgoing_facts, summary.incoming_stack_facts, "out/in-stack"},
+      {summary.incoming_facts, summary.outgoing_stack_facts, "in/out-stack"},
+      {summary.incoming_facts, summary.incoming_stack_facts, "in/in"},
+  };
+
+  auto try_expr = [&](const VirtualValueExpr &expr,
+                      llvm::StringRef state_scope,
+                      llvm::ArrayRef<FactStateRef> states) {
+    for (const auto &state : states) {
+      if (auto resolved = evaluateVirtualExpr(expr, state.slots, state.stack)) {
+        if (diagnostics) {
+          diagnostics->push_back("dispatch-fallback " + summary.function_name +
+                                 " state=" + state_scope.str() + "/" +
+                                 state.name.str() + " target=0x" +
+                                 llvm::utohexstr(*resolved));
+        }
+        return resolved;
+      }
+    }
+    return std::optional<uint64_t>{};
+  };
+
+  const bool has_specialized_target =
+      dispatch.specialized_target_source !=
+      VirtualDispatchResolutionSource::kUnknown;
+
+  if (has_specialized_target) {
+    if (auto resolved =
+            try_expr(dispatch.specialized_target, "summary", summary_states)) {
+      return resolved;
+    }
+  }
+  if (auto resolved = try_expr(dispatch.target, "summary", summary_states))
     return resolved;
 
   if (const auto *region = model.lookupRegionForHandler(summary.function_name)) {
-    if (auto resolved =
-            evaluateVirtualExpr(dispatch.target, region->outgoing_facts,
-                                region->outgoing_stack_facts)) {
-      if (diagnostics) {
-        diagnostics->push_back("region-fallback " + summary.function_name +
-                               " region=" + std::to_string(region->id) +
-                               " target=0x" + llvm::utohexstr(*resolved));
+    const FactStateRef region_states[] = {
+        {region->outgoing_facts, region->outgoing_stack_facts, "out/out"},
+        {region->outgoing_facts, region->incoming_stack_facts, "out/in-stack"},
+        {region->incoming_facts, region->outgoing_stack_facts, "in/out-stack"},
+        {region->incoming_facts, region->incoming_stack_facts, "in/in"},
+    };
+    auto region_scope =
+        (llvm::Twine("region#") + llvm::Twine(region->id)).str();
+    if (has_specialized_target) {
+      if (auto resolved = try_expr(dispatch.specialized_target, region_scope,
+                                   region_states)) {
+        return resolved;
       }
-      return resolved;
     }
-    if (auto resolved =
-            evaluateVirtualExpr(dispatch.target, region->incoming_facts,
-                                region->incoming_stack_facts)) {
-      if (diagnostics) {
-        diagnostics->push_back("region-in-fallback " + summary.function_name +
-                               " region=" + std::to_string(region->id) +
-                               " target=0x" + llvm::utohexstr(*resolved));
-      }
+    if (auto resolved = try_expr(dispatch.target, region_scope, region_states))
       return resolved;
-    }
   }
 
   return std::nullopt;
@@ -1808,6 +2109,8 @@ static void markLiftedTargetForRecoverySeed(
 
 static bool shouldAttemptLiftFrontier(
     const VirtualRootSliceSummary::FrontierEdge &frontier) {
+  if (shouldPreserveFrontierAsExit(frontier.exit_disposition))
+    return false;
   switch (frontier.kind) {
     case VirtualRootFrontierKind::kDispatch:
       return frontier.reason == "missing_lifted_target" ||
@@ -1850,8 +2153,7 @@ static bool liftConstantDispatchTargetsInReachableHandlers(
           continue;
 
         auto callee_name = callee->getName();
-        if (callee_name != "__omill_dispatch_call" &&
-            callee_name != "__omill_dispatch_jump") {
+        if (!isDispatchIntrinsicName(callee_name)) {
           continue;
         }
 
@@ -2006,7 +2308,8 @@ static bool synthesizeLocalizedContinuationShims(
   bool changed = false;
 
   auto materialize_shim_body = [&](llvm::Function &continuation,
-                                   llvm::StringRef reason) {
+                                   llvm::StringRef reason,
+                                   const VirtualExitSummary *exit_summary) {
     if (continuation.hasFnAttribute("omill.localized_continuation_shim"))
       return;
 
@@ -2016,6 +2319,8 @@ static bool synthesizeLocalizedContinuationShims(
     continuation.setLinkage(llvm::GlobalValue::InternalLinkage);
     continuation.addFnAttr(llvm::Attribute::AlwaysInline);
     continuation.addFnAttr("omill.localized_continuation_shim", "1");
+    if (exit_summary)
+      annotateContinuationShimExit(continuation, *exit_summary);
 
     auto *entry =
         llvm::BasicBlock::Create(M.getContext(), "entry", &continuation);
@@ -2053,10 +2358,14 @@ static bool synthesizeLocalizedContinuationShims(
     for (const auto &callsite : handler.callsites) {
       if (!callsite.continuation_pc.has_value())
         continue;
+      if (!shouldMaterializeContinuationShimForExit(callsite.exit))
+        continue;
 
       auto *continuation =
           lookupLiftedTargetByPC(M, *callsite.continuation_pc);
       if (!continuation)
+        continue;
+      if (!continuation->isDeclaration())
         continue;
 
       bool should_synthesize =
@@ -2070,7 +2379,7 @@ static bool synthesizeLocalizedContinuationShims(
       if (!should_synthesize)
         continue;
 
-      materialize_shim_body(*continuation, "callsite");
+      materialize_shim_body(*continuation, "callsite", &callsite.exit);
     }
   }
 
@@ -2099,8 +2408,14 @@ static bool synthesizeLocalizedContinuationShims(
           if (!hasLiftedSignature(*callee))
             continue;
 
+          auto exit = parseVirtualExitSummaryAttrWithFallback(*call, callee).value_or([&] {
+            VirtualExitSummary fallback;
+            fallback.disposition = VirtualExitDisposition::kStayInVm;
+            return fallback;
+          }());
           materialize_shim_body(*callee,
-                                "closed-slice-defined-continuation-call");
+                                "closed-slice-defined-continuation-call",
+                                &exit);
         }
       }
     }
@@ -2147,7 +2462,25 @@ static bool synthesizeLocalizedContinuationShims(
         if (!isNullMemoryContinuationCall(*call, continuation_pc))
           continue;
 
-        materialize_shim_body(*callee, "null-memory-continuation-call");
+        auto exit = parseVirtualExitSummaryAttrWithFallback(*call, callee).value_or([&] {
+          VirtualExitSummary fallback;
+          fallback.disposition = VirtualExitDisposition::kStayInVm;
+          return fallback;
+        }());
+        if (!exit.continuation_pc)
+          exit.continuation_pc = continuation_pc;
+        if (!exit.continuation_vip.resolved_pc) {
+          exit.continuation_vip.resolved_pc = continuation_pc;
+          exit.continuation_vip.expr_before_dispatch.kind =
+              VirtualExprKind::kConstant;
+          exit.continuation_vip.expr_before_dispatch.bit_width = 64;
+          exit.continuation_vip.expr_before_dispatch.complete = true;
+          exit.continuation_vip.expr_before_dispatch.constant = continuation_pc;
+          exit.continuation_vip.expr_after_dispatch =
+              exit.continuation_vip.expr_before_dispatch;
+          exit.continuation_vip.symbolic = false;
+        }
+        materialize_shim_body(*callee, "null-memory-continuation-call", &exit);
       }
     }
   }
@@ -2345,6 +2678,32 @@ static void annotateClosedRootSlices(llvm::Module &M,
                                      const VirtualMachineModel &model) {
   const bool terminal_boundary_recovery_mode =
       envFlagEnabled("OMILL_TERMINAL_BOUNDARY_RECOVERY");
+  const bool preserve_existing_closed_scope =
+      isClosedRootSliceScopedModule(M);
+  bool model_has_closed_slice = false;
+  for (const auto &slice : model.rootSlices()) {
+    if (slice.is_closed) {
+      model_has_closed_slice = true;
+      break;
+    }
+  }
+
+  if (!terminal_boundary_recovery_mode && preserve_existing_closed_scope &&
+      !model_has_closed_slice) {
+    return;
+  }
+
+  llvm::SmallVector<llvm::Function *, 16> prior_closed_functions;
+  llvm::SmallVector<llvm::Function *, 8> prior_root_functions;
+  if (preserve_existing_closed_scope) {
+    for (auto &F : M) {
+      if (F.hasFnAttribute("omill.closed_root_slice"))
+        prior_closed_functions.push_back(&F);
+      if (F.hasFnAttribute("omill.closed_root_slice_root"))
+        prior_root_functions.push_back(&F);
+    }
+  }
+
   for (auto &F : M) {
     F.removeFnAttr("omill.closed_root_slice");
     F.removeFnAttr("omill.closed_root_slice_root");
@@ -2371,6 +2730,19 @@ static void annotateClosedRootSlices(llvm::Module &M,
       root_fn->addFnAttr("omill.closed_root_slice", "1");
       root_fn->addFnAttr("omill.closed_root_slice_root", "1");
     }
+  }
+
+  if (!has_closed_slice && preserve_existing_closed_scope &&
+      !prior_root_functions.empty()) {
+    for (auto *F : prior_closed_functions)
+      if (F && F->getParent() == &M)
+        F->addFnAttr("omill.closed_root_slice", "1");
+    for (auto *F : prior_root_functions)
+      if (F && F->getParent() == &M) {
+        F->addFnAttr("omill.closed_root_slice", "1");
+        F->addFnAttr("omill.closed_root_slice_root", "1");
+      }
+    has_closed_slice = true;
   }
 
   M.setModuleFlag(llvm::Module::Override, "omill.closed_root_slice_scope",
@@ -2438,6 +2810,11 @@ static MaterializationResult runMaterialization(llvm::Module &M,
         [&](const VirtualHandlerSummary &summary) {
           if (summary.is_candidate || summary.is_output_root)
             return true;
+          if (!summary.dispatches.empty() || !summary.callsites.empty() ||
+              !summary.outgoing_facts.empty() ||
+              !summary.outgoing_stack_facts.empty()) {
+            return true;
+          }
           if (!terminal_boundary_recovery_mode)
             return false;
           return closed_slice_handlers.find(summary.function_name) !=
@@ -2688,6 +3065,7 @@ static MaterializationResult runMaterialization(llvm::Module &M,
       uint64_t target_pc = 0;
       bool is_jump = false;
       bool store_pc_to_state = false;
+      VirtualExitSummary exit;
     };
     struct BranchCandidate {
       llvm::CallInst *call = nullptr;
@@ -2695,12 +3073,14 @@ static MaterializationResult runMaterialization(llvm::Module &M,
       llvm::Value *condition = nullptr;
       ResolvedTarget true_target;
       ResolvedTarget false_target;
+      VirtualExitSummary exit;
     };
     struct ChoiceCandidate {
       llvm::CallInst *call = nullptr;
       llvm::Function *source_fn = nullptr;
       llvm::Value *dispatch_value = nullptr;
       llvm::SmallVector<ResolvedTarget, 4> targets;
+      VirtualExitSummary exit;
     };
     struct MissingCandidate {
       llvm::CallInst *call = nullptr;
@@ -2708,6 +3088,7 @@ static MaterializationResult runMaterialization(llvm::Module &M,
       llvm::Function *target_fn = nullptr;
       uint64_t target_pc = 0;
       bool store_pc_to_state = false;
+      std::optional<VirtualExitSummary> exit;
     };
     struct DeclContinuationCandidate {
       llvm::CallInst *call = nullptr;
@@ -2719,6 +3100,7 @@ static MaterializationResult runMaterialization(llvm::Module &M,
       llvm::CallInst *continuation_call = nullptr;
       llvm::Function *source_fn = nullptr;
       ResolvedTarget target;
+      VirtualExitSummary exit;
     };
 
     llvm::SmallVector<Candidate, 16> candidates;
@@ -2772,7 +3154,9 @@ static MaterializationResult runMaterialization(llvm::Module &M,
         return;
       missing_candidates.push_back(MissingCandidate{
           call, source_fn, resolved.function, resolved.pc,
-          resolved.store_pc_to_state});
+          resolved.store_pc_to_state,
+          parseVirtualExitSummaryAttrWithFallback(
+              *call, call->getCalledFunction())});
     };
 
     for (auto &F : M) {
@@ -2899,8 +3283,16 @@ static MaterializationResult runMaterialization(llvm::Module &M,
             }
             if (ret->getReturnValue() != call)
               continue;
+            auto exit = parseVirtualExitSummaryAttrWithFallback(*call, callee).value_or([&] {
+              VirtualExitSummary fallback;
+              fallback.disposition = VirtualExitDisposition::kStayInVm;
+              return fallback;
+            }());
             terminal_jump_candidates.push_back(
-                TerminalJumpCandidate{call, &F, resolved});
+                TerminalJumpCandidate{call,
+                                      &F,
+                                      resolved,
+                                      std::move(exit)});
           }
         }
       }
@@ -2915,7 +3307,7 @@ static MaterializationResult runMaterialization(llvm::Module &M,
           if (!callee)
             continue;
           auto name = callee->getName();
-          if (name != "__omill_dispatch_call" && name != "__omill_dispatch_jump")
+          if (!isDispatchIntrinsicName(name))
             continue;
           if (dispatch_index >= summary->dispatches.size())
             continue;
@@ -2943,7 +3335,8 @@ static MaterializationResult runMaterialization(llvm::Module &M,
                                 false_pc->getZExtValue(), &result.diagnostics);
               if (true_target.function && false_target.function) {
                 branch_candidates.push_back(BranchCandidate{
-                    call, &F, select->getCondition(), true_target, false_target});
+                    call, &F, select->getCondition(), true_target, false_target,
+                    dispatch.exit});
                 continue;
               }
             }
@@ -2959,8 +3352,7 @@ static MaterializationResult runMaterialization(llvm::Module &M,
                                 call->getFunctionType(), successor.target_pc,
                                 &result.diagnostics);
               const bool self_jump_target =
-                  resolved.function == &F &&
-                  name == "__omill_dispatch_jump";
+                  resolved.function == &F && isDispatchJumpName(name);
               if (!resolved.function ||
                   (resolved.function == &F && !self_jump_target)) {
                 all_resolved = false;
@@ -2975,6 +3367,7 @@ static MaterializationResult runMaterialization(llvm::Module &M,
               candidate.dispatch_value = call->getArgOperand(1);
               candidate.targets.assign(resolved_choices.begin(),
                                        resolved_choices.end());
+              candidate.exit = dispatch.exit;
               switch_candidates.push_back(candidate);
               continue;
             }
@@ -3020,15 +3413,16 @@ static MaterializationResult runMaterialization(llvm::Module &M,
                                      &result.diagnostics);
           }
           const bool self_jump_target =
-              resolved.function == &F && name == "__omill_dispatch_jump";
+              resolved.function == &F && isDispatchJumpName(name);
           if (!resolved.function ||
               (resolved.function == &F && !self_jump_target))
             continue;
 
           candidates.push_back(Candidate{call, &F, resolved.function,
                                          resolved.pc,
-                                         name == "__omill_dispatch_jump",
-                                         resolved.store_pc_to_state});
+                                         isDispatchJumpName(name),
+                                         resolved.store_pc_to_state,
+                                         dispatch.exit});
         }
       }
     }
@@ -3051,7 +3445,8 @@ static MaterializationResult runMaterialization(llvm::Module &M,
       if (lowerSelectDispatchToBranches(branch_candidate.call,
                                         branch_candidate.condition,
                                         branch_candidate.true_target,
-                                        branch_candidate.false_target)) {
+                                        branch_candidate.false_target,
+                                        &branch_candidate.exit)) {
         result.changed = true;
         iteration_changed = true;
         final_model_current = false;
@@ -3064,7 +3459,8 @@ static MaterializationResult runMaterialization(llvm::Module &M,
         continue;
       if (lowerChoiceDispatchToSwitch(switch_candidate.call,
                                       switch_candidate.dispatch_value,
-                                      switch_candidate.targets)) {
+                                      switch_candidate.targets,
+                                      &switch_candidate.exit)) {
         result.changed = true;
         iteration_changed = true;
         final_model_current = false;
@@ -3075,7 +3471,7 @@ static MaterializationResult runMaterialization(llvm::Module &M,
     for (const auto &candidate : candidates) {
       if (!candidate.call || !candidate.call->getParent())
         continue;
-      if (candidate.is_jump &&
+      if (candidate.is_jump && candidate.target_fn != candidate.source_fn &&
           hasSyntheticPathTo(candidate.target_fn, candidate.source_fn)) {
         genericDebugLog("iteration " + llvm::Twine(iteration).str() +
                         " skip-jump-cycle source=" +
@@ -3086,7 +3482,7 @@ static MaterializationResult runMaterialization(llvm::Module &M,
       }
       if (lowerToDirectCall(candidate.call, candidate.target_fn,
                             candidate.target_pc, candidate.is_jump,
-                            candidate.store_pc_to_state)) {
+                            candidate.store_pc_to_state, &candidate.exit)) {
         genericDebugLog("iteration " + llvm::Twine(iteration).str() +
                         " dispatch-rewrite source=" +
                         candidate.source_fn->getName().str() + " target=" +
@@ -3106,7 +3502,8 @@ static MaterializationResult runMaterialization(llvm::Module &M,
         continue;
       if (lowerToDirectCall(candidate.call, candidate.target_fn,
                             candidate.target_pc, /*is_jump=*/false,
-                            candidate.store_pc_to_state)) {
+                            candidate.store_pc_to_state,
+                            candidate.exit ? &*candidate.exit : nullptr)) {
         genericDebugLog("iteration " + llvm::Twine(iteration).str() +
                         " missing-rewrite source=" +
                         candidate.source_fn->getName().str() + " target=" +
@@ -3123,9 +3520,12 @@ static MaterializationResult runMaterialization(llvm::Module &M,
     for (const auto &candidate : decl_continuation_candidates) {
       if (!candidate.call || !candidate.call->getParent())
         continue;
+      auto exit = parseVirtualExitSummaryAttrWithFallback(
+          *candidate.call, candidate.call->getCalledFunction());
       if (lowerToDirectCall(candidate.call, candidate.target_fn,
                             candidate.target_pc, /*is_jump=*/false,
-                            /*store_pc_to_state=*/false)) {
+                            /*store_pc_to_state=*/false,
+                            exit ? &*exit : nullptr)) {
         genericDebugLog("iteration " + llvm::Twine(iteration).str() +
                         " decl-cont-rewrite source=" +
                         candidate.source_fn->getName().str() + " target=" +
@@ -3143,7 +3543,8 @@ static MaterializationResult runMaterialization(llvm::Module &M,
       if (!candidate.continuation_call || !candidate.continuation_call->getParent())
         continue;
       if (lowerTerminalContinuationCallToDirectTarget(
-              candidate.continuation_call, candidate.target)) {
+              candidate.continuation_call, candidate.target,
+              &candidate.exit)) {
         genericDebugLog(
             "iteration " + llvm::Twine(iteration).str() +
             " terminal-rewrite source=" +
@@ -3269,6 +3670,10 @@ static MaterializationResult runMaterialization(llvm::Module &M,
           }
           if (frontier.boundary_name.has_value())
             os << " boundary=" << *frontier.boundary_name;
+          if (frontier.vip_pc.has_value())
+            os << " vip=0x" << llvm::utohexstr(*frontier.vip_pc);
+          os << " exit="
+             << renderVirtualExitDisposition(frontier.exit_disposition);
           os << "\n";
         }
       }
@@ -3443,6 +3848,8 @@ static MaterializationResult runMaterialization(llvm::Module &M,
           }
           if (!dispatch.unresolved_reason.empty())
             os << "    unresolved " << dispatch.unresolved_reason << "\n";
+          os << "    exit="
+             << renderVirtualExitDisposition(dispatch.exit.disposition) << "\n";
         }
         for (const auto &callsite : handler.callsites) {
           os << "  callsite target=" << renderVirtualValueExpr(callsite.target)
@@ -3488,6 +3895,12 @@ static MaterializationResult runMaterialization(llvm::Module &M,
             os << "    continuation_pc=0x"
                << llvm::utohexstr(*callsite.continuation_pc) << "\n";
           }
+          if (callsite.vip.resolved_pc.has_value()) {
+            os << "    vip=0x" << llvm::utohexstr(*callsite.vip.resolved_pc)
+               << "\n";
+          }
+          os << "    exit="
+             << renderVirtualExitDisposition(callsite.exit.disposition) << "\n";
           os << "    executable_in_image="
              << (callsite.is_executable_in_image ? "true" : "false") << "\n";
           os << "    decodable_entry="

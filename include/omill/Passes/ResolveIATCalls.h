@@ -4,14 +4,14 @@
 
 namespace omill {
 
-/// Resolves __omill_dispatch_call invocations whose target address comes
+/// Resolves unresolved dispatch-call invocations whose target address comes
 /// from an IAT (Import Address Table) slot via RIP-relative addressing.
 ///
 /// Pattern matched:
 ///   %addr = add i64 %program_counter, <const_offset>
 ///   %ptr  = inttoptr i64 %addr to ptr
 ///   %tgt  = load i64, ptr %ptr
-///   call @__omill_dispatch_call(%state, %tgt, %mem)
+///   call @dispatcher(%state, %tgt, %mem)
 ///
 /// The pass computes the actual IAT VA (function_entry_va + offset),
 /// looks it up in the BinaryMemoryMap's import table, and replaces

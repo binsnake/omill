@@ -352,7 +352,6 @@ class MainWindow final : public QMainWindow {
     no_abi_cb_ = new QCheckBox("--no-abi", flag_group);
     deobf_cb_ = new QCheckBox("--deobfuscate", flag_group);
     resolve_targets_cb_ = new QCheckBox("--resolve-targets", flag_group);
-    refine_signatures_cb_ = new QCheckBox("--refine-signatures", flag_group);
     ipcp_cb_ = new QCheckBox("--ipcp", flag_group);
     resolve_exceptions_cb_ = new QCheckBox("--resolve-exceptions", flag_group);
     block_lift_cb_ = new QCheckBox("--block-lift", flag_group);
@@ -366,7 +365,6 @@ class MainWindow final : public QMainWindow {
     flag_layout->addWidget(no_abi_cb_, 0, 1);
     flag_layout->addWidget(deobf_cb_, 1, 0);
     flag_layout->addWidget(resolve_targets_cb_, 1, 1);
-    flag_layout->addWidget(refine_signatures_cb_, 2, 0);
     flag_layout->addWidget(ipcp_cb_, 2, 1);
     flag_layout->addWidget(resolve_exceptions_cb_, 3, 0);
     flag_layout->addWidget(block_lift_cb_, 3, 1);
@@ -618,7 +616,6 @@ class MainWindow final : public QMainWindow {
     no_abi_cb_->setToolTip("Disable ABI recovery stage.");
     deobf_cb_->setToolTip("Enable deobfuscation pipeline passes.");
     resolve_targets_cb_->setToolTip("Enable iterative target resolution.");
-    refine_signatures_cb_->setToolTip("Run signature refinement after initial recovery.");
     ipcp_cb_->setToolTip("Enable interprocedural constant propagation.");
     resolve_exceptions_cb_->setToolTip("Resolve forced exception dispatch constructs.");
     block_lift_cb_->setToolTip("Prefer block-level lifting mode.");
@@ -760,7 +757,6 @@ class MainWindow final : public QMainWindow {
     request.resolve_targets = resolve_targets_cb_->isChecked();
     if (auto mi = parseUInt(max_iterations_edit_->text()); mi)
       request.max_iterations = *mi;
-    request.refine_signatures = refine_signatures_cb_->isChecked();
     request.ipcp = ipcp_cb_->isChecked();
     request.resolve_exceptions = resolve_exceptions_cb_->isChecked();
     request.block_lift = block_lift_cb_->isChecked();
@@ -1635,7 +1631,6 @@ class MainWindow final : public QMainWindow {
   QCheckBox *no_abi_cb_ = nullptr;
   QCheckBox *deobf_cb_ = nullptr;
   QCheckBox *resolve_targets_cb_ = nullptr;
-  QCheckBox *refine_signatures_cb_ = nullptr;
   QCheckBox *ipcp_cb_ = nullptr;
   QCheckBox *resolve_exceptions_cb_ = nullptr;
   QCheckBox *block_lift_cb_ = nullptr;

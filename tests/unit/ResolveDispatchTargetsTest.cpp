@@ -14,6 +14,7 @@
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/CallGraphAnalysis.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
+#include "omill/BC/BlockLifterAnalysis.h"
 #include "omill/BC/TraceLiftAnalysis.h"
 #include "omill/Passes/ConstantMemoryFolding.h"
 #include "omill/Passes/IterativeTargetResolution.h"
@@ -65,6 +66,7 @@ class ResolveDispatchTargetsTest : public ::testing::Test {
         [&]() { return omill::BinaryMemoryAnalysis(std::move(map)); });
     MAM.registerPass([] { return omill::CallGraphAnalysis(); });
     MAM.registerPass([] { return omill::LiftedFunctionAnalysis(); });
+    MAM.registerPass([] { return omill::BlockLiftAnalysis(); });
     MAM.registerPass([] { return omill::TraceLiftAnalysis(); });
 
     PB.registerModuleAnalyses(MAM);
@@ -75,6 +77,7 @@ class ResolveDispatchTargetsTest : public ::testing::Test {
 
     (void)MAM.getResult<omill::BinaryMemoryAnalysis>(*M);
     (void)MAM.getResult<omill::LiftedFunctionAnalysis>(*M);
+    (void)MAM.getResult<omill::BlockLiftAnalysis>(*M);
 
     llvm::ModulePassManager MPM;
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(
@@ -94,6 +97,7 @@ class ResolveDispatchTargetsTest : public ::testing::Test {
         [&]() { return omill::BinaryMemoryAnalysis(std::move(map)); });
     MAM.registerPass([] { return omill::CallGraphAnalysis(); });
     MAM.registerPass([] { return omill::LiftedFunctionAnalysis(); });
+    MAM.registerPass([] { return omill::BlockLiftAnalysis(); });
     MAM.registerPass([] { return omill::TraceLiftAnalysis(); });
 
     PB.registerModuleAnalyses(MAM);
@@ -104,6 +108,7 @@ class ResolveDispatchTargetsTest : public ::testing::Test {
 
     (void)MAM.getResult<omill::BinaryMemoryAnalysis>(*M);
     (void)MAM.getResult<omill::LiftedFunctionAnalysis>(*M);
+    (void)MAM.getResult<omill::BlockLiftAnalysis>(*M);
 
     llvm::ModulePassManager MPM;
     MPM.addPass(omill::IterativeTargetResolutionPass(

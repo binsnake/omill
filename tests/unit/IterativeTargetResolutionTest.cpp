@@ -13,6 +13,7 @@
 #include "omill/Analysis/CallGraphAnalysis.h"
 #include "omill/Analysis/IterativeLiftingSession.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
+#include "omill/BC/BlockLifterAnalysis.h"
 #include "omill/BC/TraceLiftAnalysis.h"
 
 #include <gtest/gtest.h>
@@ -65,6 +66,7 @@ class IterativeTargetResolutionTest : public ::testing::Test {
         [&]() { return omill::BinaryMemoryAnalysis(std::move(map)); });
     MAM.registerPass([] { return omill::CallGraphAnalysis(); });
     MAM.registerPass([] { return omill::LiftedFunctionAnalysis(); });
+    MAM.registerPass([] { return omill::BlockLiftAnalysis(); });
     MAM.registerPass([] { return omill::TraceLiftAnalysis(); });
     Session = std::make_shared<omill::IterativeLiftingSession>("itr-test");
     MAM.registerPass([this] {

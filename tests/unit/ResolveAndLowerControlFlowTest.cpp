@@ -9,6 +9,7 @@
 
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
+#include "omill/BC/BlockLifterAnalysis.h"
 
 #include <gtest/gtest.h>
 
@@ -53,6 +54,7 @@ class ResolveAndLowerControlFlowTest : public ::testing::Test {
 
     MAM.registerPass([] { return omill::BinaryMemoryAnalysis(); });
     MAM.registerPass([] { return omill::LiftedFunctionAnalysis(); });
+    MAM.registerPass([] { return omill::BlockLiftAnalysis(); });
 
     PB.registerModuleAnalyses(MAM);
     PB.registerCGSCCAnalyses(CGAM);
@@ -62,6 +64,7 @@ class ResolveAndLowerControlFlowTest : public ::testing::Test {
 
     (void)MAM.getResult<omill::BinaryMemoryAnalysis>(*M);
     (void)MAM.getResult<omill::LiftedFunctionAnalysis>(*M);
+    (void)MAM.getResult<omill::BlockLiftAnalysis>(*M);
 
     llvm::ModulePassManager MPM;
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(
@@ -153,6 +156,10 @@ TEST_F(ResolveAndLowerControlFlowTest, ConstantDispatchCall_Resolved) {
   auto *dispatch = M->getFunction("__omill_dispatch_call");
   auto *result =
       B.CreateCall(dispatch, {F->getArg(0), B.getInt64(0x402000), F->getArg(2)});
+  result->addFnAttr(llvm::Attribute::get(
+      Ctx, "omill.virtual_exit_disposition", "stay_in_vm"));
+  result->addFnAttr(llvm::Attribute::get(
+      Ctx, "omill.virtual_exit_continuation_pc", "402123"));
   B.CreateRet(result);
 
   EXPECT_EQ(1u, countDispatchCalls(F));
@@ -161,6 +168,92 @@ TEST_F(ResolveAndLowerControlFlowTest, ConstantDispatchCall_Resolved) {
 
   EXPECT_EQ(0u, countDispatchCalls(F));
   EXPECT_TRUE(hasDirectCallTo(F, "sub_402000"));
+  bool preserved_exit_attrs = false;
+  for (auto &BB : *F) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI || !CI->getCalledFunction() ||
+          CI->getCalledFunction()->getName() != "sub_402000") {
+        continue;
+      }
+      preserved_exit_attrs =
+          CI->hasFnAttr("omill.virtual_exit_disposition") &&
+          CI->getFnAttr("omill.virtual_exit_disposition").getValueAsString() ==
+              "stay_in_vm" &&
+          CI->hasFnAttr("omill.virtual_exit_continuation_pc") &&
+          CI->getFnAttr("omill.virtual_exit_continuation_pc")
+                  .getValueAsString() == "402123";
+    }
+  }
+  EXPECT_TRUE(preserved_exit_attrs);
+  EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+}
+
+TEST_F(ResolveAndLowerControlFlowTest,
+       ConstantDispatchCallWithVmEnterDispositionIsPreserved) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(kDataLayout);
+
+  createDispatchCallDecl(*M);
+
+  auto *target_fn =
+      llvm::Function::Create(liftedFnType(), llvm::Function::ExternalLinkage,
+                             "sub_402000", *M);
+  auto *target_entry = llvm::BasicBlock::Create(Ctx, "entry", target_fn);
+  llvm::IRBuilder<>(target_entry).CreateRet(target_fn->getArg(2));
+
+  auto *F = llvm::Function::Create(liftedFnType(),
+                                   llvm::Function::ExternalLinkage,
+                                   "sub_401000", *M);
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  llvm::IRBuilder<> B(entry);
+  auto *dispatch = M->getFunction("__omill_dispatch_call");
+  auto *result =
+      B.CreateCall(dispatch, {F->getArg(0), B.getInt64(0x402000), F->getArg(2)});
+  result->addFnAttr(
+      llvm::Attribute::get(Ctx, "omill.virtual_exit_disposition", "vm_enter"));
+  B.CreateRet(result);
+
+  EXPECT_EQ(1u, countDispatchCalls(F));
+
+  runResolvePass(M.get());
+
+  EXPECT_EQ(1u, countDispatchCalls(F));
+  EXPECT_FALSE(hasDirectCallTo(F, "sub_402000"));
+  EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+}
+
+TEST_F(ResolveAndLowerControlFlowTest,
+       ConstantDispatchCallWithVmExitDispositionIsPreserved) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(kDataLayout);
+
+  createDispatchCallDecl(*M);
+
+  auto *target_fn =
+      llvm::Function::Create(liftedFnType(), llvm::Function::ExternalLinkage,
+                             "sub_402000", *M);
+  auto *target_entry = llvm::BasicBlock::Create(Ctx, "entry", target_fn);
+  llvm::IRBuilder<>(target_entry).CreateRet(target_fn->getArg(2));
+
+  auto *F = llvm::Function::Create(liftedFnType(),
+                                   llvm::Function::ExternalLinkage,
+                                   "sub_401000", *M);
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  llvm::IRBuilder<> B(entry);
+  auto *dispatch = M->getFunction("__omill_dispatch_call");
+  auto *result =
+      B.CreateCall(dispatch, {F->getArg(0), B.getInt64(0x402000), F->getArg(2)});
+  result->addFnAttr(llvm::Attribute::get(
+      Ctx, "omill.virtual_exit_disposition", "vm_exit_native_call_reenter"));
+  B.CreateRet(result);
+
+  EXPECT_EQ(1u, countDispatchCalls(F));
+
+  runResolvePass(M.get());
+
+  EXPECT_EQ(1u, countDispatchCalls(F));
+  EXPECT_FALSE(hasDirectCallTo(F, "sub_402000"));
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
 }
 
@@ -216,6 +309,8 @@ TEST_F(ResolveAndLowerControlFlowTest, PtrToIntDispatchJump_BecomesDirectCall) {
   auto *dispatch = M->getFunction("__omill_dispatch_jump");
   auto *target_ptr = B.CreatePtrToInt(target_fn, B.getInt64Ty());
   auto *result = B.CreateCall(dispatch, {F->getArg(0), target_ptr, F->getArg(2)});
+  result->addFnAttr(
+      llvm::Attribute::get(Ctx, "omill.virtual_exit_disposition", "stay_in_vm"));
   B.CreateRet(result);
 
   EXPECT_EQ(1u, countDispatchJumps(F));
@@ -224,6 +319,53 @@ TEST_F(ResolveAndLowerControlFlowTest, PtrToIntDispatchJump_BecomesDirectCall) {
 
   EXPECT_EQ(0u, countDispatchJumps(F));
   EXPECT_TRUE(hasDirectCallTo(F, "sub_402000__vm_1111"));
+  bool preserved_exit_attrs = false;
+  for (auto &BB : *F) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI || !CI->getCalledFunction() ||
+          CI->getCalledFunction()->getName() != "sub_402000__vm_1111") {
+        continue;
+      }
+      preserved_exit_attrs =
+          CI->hasFnAttr("omill.virtual_exit_disposition") &&
+          CI->getFnAttr("omill.virtual_exit_disposition").getValueAsString() ==
+              "stay_in_vm";
+    }
+  }
+  EXPECT_TRUE(preserved_exit_attrs);
+  EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+}
+
+TEST_F(ResolveAndLowerControlFlowTest,
+       ConstantDispatchJumpWithVmExitDispositionIsPreserved) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(kDataLayout);
+
+  createDispatchJumpDecl(*M);
+
+  auto *F = llvm::Function::Create(liftedFnType(),
+                                   llvm::Function::ExternalLinkage,
+                                   "sub_401000", *M);
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  auto *target_bb = llvm::BasicBlock::Create(Ctx, "block_401020", F);
+
+  llvm::IRBuilder<>(target_bb).CreateRet(F->getArg(2));
+
+  llvm::IRBuilder<> B(entry);
+  auto *dispatch = M->getFunction("__omill_dispatch_jump");
+  auto *result = B.CreateCall(
+      dispatch, {F->getArg(0), B.getInt64(0x401020), F->getArg(2)});
+  result->addFnAttr(llvm::Attribute::get(
+      Ctx, "omill.virtual_exit_disposition", "vm_exit_terminal"));
+  B.CreateRet(result);
+
+  EXPECT_EQ(1u, countDispatchJumps(F));
+
+  runResolvePass(M.get());
+
+  EXPECT_EQ(1u, countDispatchJumps(F));
+  EXPECT_FALSE(hasBranchTo(F, "block_401020"));
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
 }
 

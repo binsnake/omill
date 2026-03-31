@@ -12,6 +12,24 @@ class Module;
 
 namespace omill {
 
+struct VirtualModelRunTelemetry {
+  bool dirty_scope_requested = false;
+  bool session_graph_projection_used = false;
+  bool session_graph_handler_scope_used = false;
+  bool session_graph_boundary_projection_used = false;
+  unsigned seed_handler_count = 0;
+  unsigned summarized_handlers = 0;
+  unsigned cached_summary_hits = 0;
+  unsigned cached_summary_misses = 0;
+  unsigned root_slice_cache_hits = 0;
+  unsigned root_slice_cache_misses = 0;
+  unsigned dispatch_handler_count = 0;
+  unsigned callsite_handler_count = 0;
+  unsigned exit_handler_count = 0;
+  unsigned root_slice_count = 0;
+  std::string scope_reason;
+};
+
 class VirtualMachineModel {
  public:
   llvm::ArrayRef<VirtualBoundaryInfo> boundaries() const { return boundaries_; }
@@ -22,6 +40,7 @@ class VirtualMachineModel {
   llvm::ArrayRef<VirtualRootSliceSummary> rootSlices() const {
     return root_slices_;
   }
+  const VirtualModelRunTelemetry &telemetry() const { return telemetry_; }
 
   const VirtualBoundaryInfo *lookupBoundary(llvm::StringRef name) const;
   const VirtualHandlerSummary *lookupHandler(llvm::StringRef name) const;
@@ -33,6 +52,7 @@ class VirtualMachineModel {
 
   std::vector<const VirtualHandlerSummary *> candidateHandlers() const;
 
+  std::vector<VirtualBoundaryInfo> &mutableBoundaries() { return boundaries_; }
   std::vector<VirtualStateSlotInfo> &mutableSlots() { return slots_; }
   std::vector<VirtualStackCellInfo> &mutableStackCells() { return stack_cells_; }
   std::vector<VirtualHandlerSummary> &mutableHandlers() { return handlers_; }
@@ -40,6 +60,7 @@ class VirtualMachineModel {
   std::vector<VirtualRootSliceSummary> &mutableRootSlices() {
     return root_slices_;
   }
+  VirtualModelRunTelemetry &mutableTelemetry() { return telemetry_; }
 
   bool empty() const {
     return boundaries_.empty() && slots_.empty() && stack_cells_.empty() &&
@@ -59,6 +80,7 @@ class VirtualMachineModel {
   std::vector<VirtualHandlerSummary> handlers_;
   std::vector<VirtualRegionSummary> regions_;
   std::vector<VirtualRootSliceSummary> root_slices_;
+  VirtualModelRunTelemetry telemetry_;
 };
 
 class VirtualMachineModelAnalysis

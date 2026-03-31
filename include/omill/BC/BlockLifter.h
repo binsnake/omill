@@ -5,7 +5,9 @@
 /// BlockLifter produces one LLVM Function per basic block using remill's
 /// standard lifted signature (State*, i64 pc, Memory*) -> Memory*.  Block
 /// functions terminate with musttail calls to successor block functions
-/// (direct jumps, conditional branches) or __omill_dispatch_jump/call
+/// (direct jumps, conditional branches) or the module's canonical unresolved
+/// control-flow intrinsics (raw `__remill_*` when requested, otherwise the
+/// legacy `__omill_dispatch_*` compatibility names)
 /// (unresolved indirect targets).
 ///
 /// This enables an iterative optimize-discover-lift loop: per-block
@@ -86,9 +88,9 @@ class BlockManager {
 ///
 /// Direct jumps and conditional branches produce musttail calls to
 /// the successor block-function.  Indirect jumps produce calls to
-/// __omill_dispatch_jump.  Function calls produce calls to
-/// __omill_dispatch_call followed by a musttail call to the fall-through
-/// block-function.
+/// the module's canonical unresolved jump intrinsic. Function calls produce
+/// calls to the module's canonical unresolved call intrinsic followed by a
+/// musttail call to the fall-through block-function.
 class BlockLifter {
  public:
   BlockLifter(const remill::Arch *arch, BlockManager &manager);

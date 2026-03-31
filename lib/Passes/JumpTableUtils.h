@@ -11,11 +11,13 @@
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/PatternMatch.h>
 #include <llvm/Support/KnownBits.h>
+#include <llvm/Support/Format.h>
 
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
 #include "omill/Utils/LiftedNames.h"
 
+#include <cstdlib>
 #include <optional>
 
 namespace omill {
@@ -29,6 +31,126 @@ struct LinearAddress {
   uint64_t base;
   unsigned stride;
 };
+
+inline llvm::Value *stripSimpleValueCasts(llvm::Value *V) {
+  while (true) {
+    if (auto *cast = llvm::dyn_cast<llvm::CastInst>(V)) {
+      V = cast->getOperand(0);
+      continue;
+    }
+    if (auto *freeze = llvm::dyn_cast<llvm::FreezeInst>(V)) {
+      V = freeze->getOperand(0);
+      continue;
+    }
+    if (auto *ce = llvm::dyn_cast<llvm::ConstantExpr>(V)) {
+      switch (ce->getOpcode()) {
+        case llvm::Instruction::IntToPtr:
+        case llvm::Instruction::PtrToInt:
+        case llvm::Instruction::BitCast:
+        case llvm::Instruction::Trunc:
+        case llvm::Instruction::ZExt:
+        case llvm::Instruction::SExt:
+          V = ce->getOperand(0);
+          continue;
+        default:
+          break;
+      }
+    }
+    break;
+  }
+  return V;
+}
+
+inline bool containsLoadLikeValue(llvm::Value *V, unsigned depth = 0) {
+  if (!V || depth > 8)
+    return false;
+
+  V = stripSimpleValueCasts(V);
+  if (llvm::isa<llvm::LoadInst>(V))
+    return true;
+
+  auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(V);
+  if (!BO)
+    return false;
+
+  switch (BO->getOpcode()) {
+    case llvm::Instruction::Add:
+    case llvm::Instruction::Sub:
+    case llvm::Instruction::And:
+    case llvm::Instruction::Or:
+    case llvm::Instruction::Xor:
+      return containsLoadLikeValue(BO->getOperand(0), depth + 1) ||
+             containsLoadLikeValue(BO->getOperand(1), depth + 1);
+    default:
+      return false;
+  }
+}
+
+inline llvm::LoadInst *extractUnderlyingLoad(llvm::Value *V,
+                                             unsigned depth = 0) {
+  if (!V || depth > 8)
+    return nullptr;
+
+  V = stripSimpleValueCasts(V);
+  if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(V))
+    return LI;
+
+  auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(V);
+  if (!BO)
+    return nullptr;
+
+  llvm::LoadInst *lhs_load = extractUnderlyingLoad(BO->getOperand(0), depth + 1);
+  llvm::LoadInst *rhs_load = extractUnderlyingLoad(BO->getOperand(1), depth + 1);
+  if (lhs_load && !rhs_load)
+    return lhs_load;
+  if (rhs_load && !lhs_load)
+    return rhs_load;
+  return nullptr;
+}
+
+inline bool trySplitDynamicRVAConversion(llvm::Value *target,
+                                         llvm::Value *&image_base_value,
+                                         llvm::Value *&load_value) {
+  auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(target);
+  if (!BO || BO->getOpcode() != llvm::Instruction::Add)
+    return false;
+  llvm::Value *lhs = BO->getOperand(0);
+  llvm::Value *rhs = BO->getOperand(1);
+
+  auto *lhs_load = extractUnderlyingLoad(lhs);
+  auto *rhs_load = extractUnderlyingLoad(rhs);
+  bool lhs_load_like = (lhs_load != nullptr);
+  bool rhs_load_like = (rhs_load != nullptr);
+
+  if (lhs_load_like && !rhs_load_like) {
+    load_value = lhs;
+    image_base_value = rhs;
+    return true;
+  }
+  if (rhs_load_like && !lhs_load_like) {
+    load_value = rhs;
+    image_base_value = lhs;
+    return true;
+  }
+
+  if (lhs_load_like && rhs_load_like) {
+    auto lhs_bits =
+        lhs_load->getType()->getScalarSizeInBits();
+    auto rhs_bits =
+        rhs_load->getType()->getScalarSizeInBits();
+    if (lhs_bits != rhs_bits) {
+      if (lhs_bits < rhs_bits) {
+        load_value = lhs;
+        image_base_value = rhs;
+      } else {
+        load_value = rhs;
+        image_base_value = lhs;
+      }
+      return true;
+    }
+  }
+  return false;
+}
 
 inline std::optional<uint64_t> foldConstAtEntryPC(
     llvm::Value *V, const llvm::Function &F,
@@ -473,9 +595,140 @@ inline std::optional<LinearAddress> decomposeTableAddress(
   }
 }
 
+inline std::optional<LinearAddress> decomposeTableAddressWithDynamicBase(
+    llvm::Value *ptr, llvm::Value *dynamic_base, uint64_t concrete_base) {
+  auto *addr = llvm::dyn_cast<llvm::IntToPtrInst>(ptr);
+  if (!addr)
+    return std::nullopt;
+
+  llvm::Value *expr = addr->getOperand(0);
+  uint64_t accum_base = 0;
+
+  while (true) {
+    llvm::Value *lhs = nullptr;
+    llvm::Value *rhs = nullptr;
+    if (!match(expr, m_Add(m_Value(lhs), m_Value(rhs))))
+      break;
+
+    if (auto *ci = llvm::dyn_cast<llvm::ConstantInt>(rhs)) {
+      accum_base += ci->getZExtValue();
+      expr = lhs;
+      continue;
+    }
+    if (auto *ci = llvm::dyn_cast<llvm::ConstantInt>(lhs)) {
+      accum_base += ci->getZExtValue();
+      expr = rhs;
+      continue;
+    }
+    break;
+  }
+
+  llvm::Value *lhs = nullptr;
+  llvm::Value *rhs = nullptr;
+  if (!match(expr, m_Add(m_Value(lhs), m_Value(rhs))))
+    return std::nullopt;
+
+  llvm::Value *scaled = nullptr;
+  if (stripSimpleValueCasts(lhs) == stripSimpleValueCasts(dynamic_base)) {
+    scaled = rhs;
+  } else if (stripSimpleValueCasts(rhs) == stripSimpleValueCasts(dynamic_base)) {
+    scaled = lhs;
+  } else {
+    return std::nullopt;
+  }
+
+  llvm::Value *idx = nullptr;
+  llvm::ConstantInt *shift_ci = nullptr;
+  if (match(scaled, m_Shl(m_Value(idx), m_ConstantInt(shift_ci)))) {
+    unsigned shift = shift_ci->getZExtValue();
+    if (shift >= 1 && shift <= 3)
+      return LinearAddress{idx, concrete_base + accum_base, 1u << shift};
+    return std::nullopt;
+  }
+
+  llvm::ConstantInt *stride_ci = nullptr;
+  if (match(scaled, m_Mul(m_Value(idx), m_ConstantInt(stride_ci)))) {
+    uint64_t stride = stride_ci->getZExtValue();
+    if (stride >= 1 && stride <= 8)
+      return LinearAddress{idx, concrete_base + accum_base,
+                           static_cast<unsigned>(stride)};
+  }
+
+  return std::nullopt;
+}
+
 // ---------------------------------------------------------------------------
 // Index range computation
 // ---------------------------------------------------------------------------
+
+inline bool matchIndexEqConst(llvm::Value *V, llvm::Value *idx,
+                              uint64_t &N) {
+  V = stripSimpleValueCasts(V);
+  auto *ICI = llvm::dyn_cast<llvm::ICmpInst>(V);
+  if (!ICI || ICI->getPredicate() != llvm::ICmpInst::ICMP_EQ)
+    return false;
+
+  auto *lhs = stripSimpleValueCasts(ICI->getOperand(0));
+  auto *rhs = stripSimpleValueCasts(ICI->getOperand(1));
+  if (lhs == idx) {
+    if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(rhs)) {
+      N = CI->getZExtValue();
+      return true;
+    }
+  }
+  if (rhs == idx) {
+    if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(lhs)) {
+      N = CI->getZExtValue();
+      return true;
+    }
+  }
+  return false;
+}
+
+inline bool matchIndexUpperBoundTruth(llvm::Value *V, llvm::Value *idx,
+                                      uint64_t &bound) {
+  V = stripSimpleValueCasts(V);
+  auto *ICI = llvm::dyn_cast<llvm::ICmpInst>(V);
+  if (ICI) {
+    auto *lhs = stripSimpleValueCasts(ICI->getOperand(0));
+    auto *rhs = stripSimpleValueCasts(ICI->getOperand(1));
+    auto *CI = llvm::dyn_cast<llvm::ConstantInt>(rhs);
+    if (lhs == idx && CI) {
+      switch (ICI->getPredicate()) {
+        case llvm::ICmpInst::ICMP_ULT:
+        case llvm::ICmpInst::ICMP_SLT:
+          bound = CI->getZExtValue();
+          return true;
+        case llvm::ICmpInst::ICMP_ULE:
+        case llvm::ICmpInst::ICMP_SLE:
+          bound = CI->getZExtValue() + 1;
+          return true;
+        default:
+          break;
+      }
+    }
+  }
+
+  auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(V);
+  if (!BO || BO->getOpcode() != llvm::Instruction::Or)
+    return false;
+
+  uint64_t eq_N = 0;
+  uint64_t ult_bound = 0;
+  if (matchIndexEqConst(BO->getOperand(0), idx, eq_N) &&
+      matchIndexUpperBoundTruth(BO->getOperand(1), idx, ult_bound) &&
+      ult_bound == eq_N) {
+    bound = eq_N + 1;
+    return true;
+  }
+  if (matchIndexEqConst(BO->getOperand(1), idx, eq_N) &&
+      matchIndexUpperBoundTruth(BO->getOperand(0), idx, ult_bound) &&
+      ult_bound == eq_N) {
+    bound = eq_N + 1;
+    return true;
+  }
+  return false;
+}
 
 /// Collect a ConstantRange for `idx` by walking predecessors of `bb`.
 /// Returns the upper bound (exclusive) if a valid range can be determined.
@@ -483,6 +736,7 @@ inline std::optional<uint64_t> computeIndexRange(llvm::Value *idx,
                                                   llvm::BasicBlock *bb,
                                                   unsigned depth = 0) {
   const unsigned kMaxDepth = 3;
+  std::optional<uint64_t> syntactic_bound;
 
   // Fast path: AND mask.
   llvm::Value *orig;
@@ -490,7 +744,7 @@ inline std::optional<uint64_t> computeIndexRange(llvm::Value *idx,
   if (match(idx, m_And(m_Value(orig), m_ConstantInt(mask_ci)))) {
     uint64_t mask = mask_ci->getZExtValue();
     if ((mask & (mask + 1)) == 0)
-      return mask + 1;
+      syntactic_bound = mask + 1;
   }
 
   // ZExt/SExt: narrow to source width.
@@ -503,7 +757,8 @@ inline std::optional<uint64_t> computeIndexRange(llvm::Value *idx,
       return *inner;
     // The zext itself limits to [0, 2^src_bits).
     if (max_val <= 1024)
-      return max_val;
+      syntactic_bound = syntactic_bound ? std::min(*syntactic_bound, max_val)
+                                        : std::optional<uint64_t>(max_val);
   }
 
   // PHI: union of ranges from each incoming block.
@@ -579,6 +834,30 @@ inline std::optional<uint64_t> computeIndexRange(llvm::Value *idx,
         bool on_true = (BI->getSuccessor(0) == cur);
         bool on_false = (BI->getSuccessor(1) == cur);
 
+        // Recognize branch conditions that materialize "idx <= N" as a
+        // non-zero byte/bit and then compare that against zero.
+        llvm::Value *truthy = nullptr;
+        if (pred_type == llvm::ICmpInst::ICMP_EQ ||
+            pred_type == llvm::ICmpInst::ICMP_NE) {
+          auto *lhs_stripped = stripSimpleValueCasts(lhs);
+          auto *rhs_stripped = stripSimpleValueCasts(rhs);
+          if (match(rhs_stripped, m_ZeroInt())) {
+            truthy = lhs_stripped;
+          } else if (match(lhs_stripped, m_ZeroInt())) {
+            truthy = rhs_stripped;
+          }
+        }
+        if (truthy) {
+          uint64_t guarded_bound = 0;
+          if (matchIndexUpperBoundTruth(truthy, idx, guarded_bound)) {
+            if ((pred_type == llvm::ICmpInst::ICMP_EQ && on_false) ||
+                (pred_type == llvm::ICmpInst::ICMP_NE && on_true)) {
+              tryBound(guarded_bound);
+              continue;
+            }
+          }
+        }
+
         // Match idx on the LHS.
         if (lhs != idx) {
           next.push_back(pred);
@@ -618,7 +897,11 @@ inline std::optional<uint64_t> computeIndexRange(llvm::Value *idx,
     ++walk_depth;
   }
 
-  return best_bound;
+  if (best_bound && syntactic_bound)
+    return std::min(*best_bound, *syntactic_bound);
+  if (best_bound)
+    return best_bound;
+  return syntactic_bound;
 }
 
 // ---------------------------------------------------------------------------
@@ -685,6 +968,25 @@ inline void applyRVAConversion(llvm::MutableArrayRef<uint64_t> entries,
   }
 }
 
+inline unsigned trimTrailingInvalidEntries(
+    llvm::SmallVectorImpl<uint64_t> &entries, const BinaryMemoryMap &map) {
+  unsigned trimmed = 0;
+  const bool has_image_bounds = map.imageBase() != 0 && map.imageSize() != 0;
+  while (!entries.empty()) {
+    uint64_t target = entries.back();
+    bool plausible = (target != 0);
+    if (plausible && has_image_bounds) {
+      plausible = target >= map.imageBase() &&
+                  target < (map.imageBase() + map.imageSize());
+    }
+    if (plausible)
+      break;
+    entries.pop_back();
+    ++trimmed;
+  }
+  return trimmed;
+}
+
 // ---------------------------------------------------------------------------
 // Switch building
 // ---------------------------------------------------------------------------
@@ -698,7 +1000,7 @@ struct SwitchResult {
 inline SwitchResult buildSwitchFromEntries(
     llvm::ArrayRef<uint64_t> entry_targets, llvm::Value *index,
     uint64_t image_base, llvm::CallInst *dispatch_call,
-    llvm::ReturnInst *ret, llvm::Function &F,
+    llvm::ReturnInst *ret, llvm::BranchInst *branch, llvm::Function &F,
     const BinaryMemoryMap &map,
     const LiftedFunctionMap *lifted) {
 
@@ -712,19 +1014,50 @@ inline SwitchResult buildSwitchFromEntries(
   };
   llvm::SmallVector<CaseTarget, 16> cases;
   bool all_resolved = true;
+  const bool debug_jump_tables =
+      (std::getenv("OMILL_DEBUG_JUMP_TABLES") != nullptr);
 
   for (uint64_t i = 0; i < entry_targets.size(); ++i) {
     uint64_t target_va = entry_targets[i];
-
-    // Try intra-function block.
-    if (auto *target_bb = findBlockForPC(F, target_va)) {
-      cases.push_back({i, target_bb});
+    llvm::BasicBlock *local_bb = nullptr;
+    auto local_block_name =
+        (llvm::Twine("block_") + llvm::Twine::utohexstr(target_va)).str();
+    for (auto &candidate_bb : F) {
+      if (candidate_bb.getName() == local_block_name) {
+        local_bb = &candidate_bb;
+        break;
+      }
+    }
+    if (local_bb) {
+      if (debug_jump_tables) {
+        llvm::errs() << "[jt-build] " << F.getName()
+                     << " entry[" << i << "]=0x"
+                     << llvm::format_hex(target_va, 10)
+                     << " -> local-bb " << local_bb->getName() << "\n";
+      }
+      cases.push_back({i, local_bb});
       continue;
     }
 
-    // Try inter-function tail call.
+    // Prefer lifted block/function targets over direct intra-function edges.
+    // This avoids introducing new CFG predecessors into trace-lifted blocks
+    // whose PHIs were built for a different predecessor set.
     auto *target_fn = lifted ? lifted->lookup(target_va) : nullptr;
+    if (!target_fn) {
+      auto block_name = (llvm::Twine("blk_") + llvm::Twine::utohexstr(target_va)).str();
+      target_fn = F.getParent()->getFunction(block_name);
+    }
+    if (!target_fn) {
+      auto lifted_name = (llvm::Twine("sub_") + llvm::Twine::utohexstr(target_va)).str();
+      target_fn = F.getParent()->getFunction(lifted_name);
+    }
     if (target_fn) {
+      if (debug_jump_tables) {
+        llvm::errs() << "[jt-build] " << F.getName()
+                     << " entry[" << i << "]=0x"
+                     << llvm::format_hex(target_va, 10)
+                     << " -> fn " << target_fn->getName() << "\n";
+      }
       char name[64];
       snprintf(name, sizeof(name), "jt_case_%llu",
                (unsigned long long)i);
@@ -743,11 +1076,19 @@ inline SwitchResult buildSwitchFromEntries(
       continue;
     }
 
+    if (debug_jump_tables) {
+      llvm::errs() << "[jt-build] " << F.getName()
+                   << " entry[" << i << "]=0x"
+                   << llvm::format_hex(target_va, 10)
+                   << " unresolved\n";
+    }
     all_resolved = false;
   }
 
   if (cases.empty())
     return {false};
+
+  auto *join_bb = branch ? branch->getSuccessor(0) : nullptr;
 
   // Create default block.
   llvm::BasicBlock *default_bb = nullptr;
@@ -760,7 +1101,29 @@ inline SwitchResult buildSwitchFromEntries(
         {dispatch_call->getArgOperand(0),
          dispatch_call->getArgOperand(1),
          dispatch_call->getArgOperand(2)});
-    DBuilder.CreateRet(new_call);
+    if (ret) {
+      DBuilder.CreateRet(new_call);
+    } else {
+      for (auto &I : *join_bb) {
+        auto *phi = llvm::dyn_cast<llvm::PHINode>(&I);
+        if (!phi)
+          break;
+        int incoming_idx = phi->getBasicBlockIndex(BB);
+        if (incoming_idx < 0)
+          continue;
+        auto *old_incoming = phi->getIncomingValue(incoming_idx);
+        llvm::Value *new_incoming = old_incoming;
+        if (old_incoming == dispatch_call) {
+          new_incoming = new_call;
+        } else if (auto *incoming_inst =
+                       llvm::dyn_cast<llvm::Instruction>(old_incoming)) {
+          if (incoming_inst->getParent() == BB)
+            new_incoming = llvm::PoisonValue::get(phi->getType());
+        }
+        phi->addIncoming(new_incoming, default_bb);
+      }
+      DBuilder.CreateBr(join_bb);
+    }
   } else {
     default_bb = llvm::BasicBlock::Create(Ctx, "jt_default", &F);
     new llvm::UnreachableInst(Ctx, default_bb);
@@ -781,7 +1144,10 @@ inline SwitchResult buildSwitchFromEntries(
   // Erase original dispatch_jump + ret.
   dispatch_call->replaceAllUsesWith(
       llvm::PoisonValue::get(dispatch_call->getType()));
-  ret->eraseFromParent();
+  if (ret)
+    ret->eraseFromParent();
+  else
+    branch->eraseFromParent();
   dispatch_call->eraseFromParent();
 
   // Clean up dead instructions after switch.

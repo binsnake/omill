@@ -1,5 +1,13 @@
 # Iterative Lifting Todo
 
+## Active Backlog
+
+The active iteration backlog has moved to `docs/ITERATION_REWORK_WORKLIST.md`.
+
+Use that file as the canonical source of truth for current iteration work.
+Keep this document as the historical checklist for the original iterative
+lifting rollout and items that have already landed.
+
 - [x] Introduce a shared iterative lifting session and lift graph.
 - [x] Move iterative target/block discovery onto the shared session.
 - [x] Remove the late fresh-module relift path and keep one long-lived lifting world.

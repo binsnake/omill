@@ -4,9 +4,9 @@
 
 namespace omill {
 
-/// Resolves __omill_dispatch_call and __omill_dispatch_jump targets that are
-/// not yet constant by recursively evaluating the target expression using
-/// binary memory as a constant oracle.
+/// Resolves unresolved dispatch call/jump targets that are not yet constant
+/// by recursively evaluating the target expression using binary memory as a
+/// constant oracle.
 ///
 /// Unlike ResolveAndLowerControlFlow (which only handles already-constant PCs)
 /// and ResolveIATCalls (which matches a specific IAT load pattern), this pass

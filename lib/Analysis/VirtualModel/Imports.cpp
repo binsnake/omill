@@ -6,6 +6,14 @@ namespace omill::virtual_model::detail {
 
 namespace {
 
+static std::string renderStructuralStackKey(const StackCellKey &key) {
+  return key.base_slot.base_name + ":" + std::to_string(key.base_slot.offset) +
+         ":" + std::to_string(key.base_slot.width) + ":" +
+         std::to_string(key.base_slot.from_argument) + ":" +
+         std::to_string(key.base_slot.from_alloca) + ":" +
+         std::to_string(key.cell_offset) + ":" + std::to_string(key.width);
+}
+
 static bool functionHasAllocaNamed(const llvm::Function &F,
                                    llvm::StringRef base_name) {
   for (const auto &BB : F) {
@@ -281,6 +289,11 @@ static std::optional<int64_t> stackBaseDeltaForExpr(const VirtualValueExpr &expr
   if (expr.kind == VirtualExprKind::kStateSlot && expr.slot_id == slot_id)
     return 0;
 
+  if (expr.kind == VirtualExprKind::kStackCell && expr.slot_id == slot_id &&
+      expr.stack_offset.has_value()) {
+    return *expr.stack_offset;
+  }
+
   if ((expr.kind == VirtualExprKind::kAdd || expr.kind == VirtualExprKind::kSub) &&
       expr.operands.size() == 2) {
     if (auto nested = stackBaseDeltaForExpr(expr.operands[0], slot_id);
@@ -337,13 +350,18 @@ static VirtualValueExpr rebaseStackCellExprThroughCallerSlots(
   if (!summary)
     return expr;
 
-  auto slot_it = slot_ids.find(
-      SlotKey{summary->base_name, summary->base_offset, summary->base_width,
-              summary->base_from_argument, summary->base_from_alloca});
-  if (slot_it == slot_ids.end())
+  std::optional<unsigned> base_slot_id = expr.slot_id;
+  if (!base_slot_id) {
+    auto slot_it = slot_ids.find(
+        SlotKey{summary->base_name, summary->base_offset, summary->base_width,
+                summary->base_from_argument, summary->base_from_alloca});
+    if (slot_it != slot_ids.end())
+      base_slot_id = slot_it->second;
+  }
+  if (!base_slot_id)
     return expr;
 
-  auto delta = findStackBaseDeltaForSlot(caller_outgoing, slot_it->second);
+  auto delta = findStackBaseDeltaForSlot(caller_outgoing, *base_slot_id);
   if (!delta || *delta == 0)
     return expr;
 
@@ -354,6 +372,62 @@ static VirtualValueExpr rebaseStackCellExprThroughCallerSlots(
   annotateExprSlots(rewritten, slot_ids);
   annotateExprStackCells(rewritten, stack_cell_ids, slot_ids);
   return rewritten;
+}
+
+static std::optional<StackCellKey> rebaseStructuralStackKeyThroughCallerSlots(
+    const StackCellKey &key, const std::map<SlotKey, unsigned> &slot_ids,
+    const std::map<unsigned, VirtualValueExpr> &caller_outgoing) {
+  auto slot_it = slot_ids.find(key.base_slot);
+  if (slot_it == slot_ids.end())
+    return std::nullopt;
+
+  auto delta = findStackBaseDeltaForSlot(caller_outgoing, slot_it->second);
+  if (!delta || *delta == 0)
+    return key;
+
+  StackCellKey rebased = key;
+  rebased.cell_offset -= *delta;
+  return rebased;
+}
+
+static std::map<StackCellKey, VirtualValueExpr>
+rebaseStructuralStackFactsThroughCallerSlots(
+    const std::map<StackCellKey, VirtualValueExpr> *structural_stack_facts,
+    const std::map<SlotKey, unsigned> &slot_ids,
+    const std::map<unsigned, VirtualValueExpr> &caller_outgoing) {
+  std::map<StackCellKey, VirtualValueExpr> rebased;
+  if (!structural_stack_facts)
+    return rebased;
+
+  auto merge_fact = [&](const StackCellKey &key, const VirtualValueExpr &value) {
+    auto existing = rebased.find(key);
+    if (existing == rebased.end()) {
+      rebased.emplace(key, value);
+      return;
+    }
+    if (exprEquals(existing->second, value))
+      return;
+    if (auto merged = mergeIncomingExpr(existing->second, value)) {
+      existing->second = std::move(*merged);
+      return;
+    }
+    existing->second = unknownExpr(existing->second.bit_width
+                                       ? existing->second.bit_width
+                                       : value.bit_width);
+  };
+
+  for (const auto &[key, value] : *structural_stack_facts) {
+    merge_fact(key, value);
+    if (auto rebased_key = rebaseStructuralStackKeyThroughCallerSlots(
+            key, slot_ids, caller_outgoing)) {
+      vmModelImportDebugLog("structural-stack-rebase key=" +
+                            renderStructuralStackKey(key) + " rebased=" +
+                            renderStructuralStackKey(*rebased_key));
+      merge_fact(*rebased_key, value);
+    }
+  }
+
+  return rebased;
 }
 
 static std::optional<StackCellKey> extractStackCellKeyFromExpr(
@@ -393,6 +467,58 @@ static VirtualValueExpr substituteStructuralStackFacts(
         substituteStructuralStackFacts(operand, structural_stack_facts,
                                        depth + 1));
   }
+  return substituted;
+}
+
+static VirtualValueExpr substituteStructuralStackFactsWithSlotDeltaFallback(
+    const VirtualValueExpr &expr,
+    const std::map<StackCellKey, VirtualValueExpr> *structural_stack_facts,
+    const std::map<SlotKey, unsigned> &slot_ids,
+    const std::map<unsigned, VirtualValueExpr> &caller_outgoing) {
+  auto substituted = substituteStructuralStackFacts(expr, structural_stack_facts);
+  if (substituted.kind != VirtualExprKind::kStackCell || !structural_stack_facts)
+    return substituted;
+
+  auto summary = extractStackCellSummaryFromExpr(substituted,
+                                                 exprByteWidth(substituted));
+  if (!summary)
+    return substituted;
+
+  std::optional<unsigned> base_slot_id = substituted.slot_id;
+  if (!base_slot_id) {
+    auto slot_it = slot_ids.find(
+        SlotKey{summary->base_name, summary->base_offset, summary->base_width,
+                summary->base_from_argument, summary->base_from_alloca});
+    if (slot_it != slot_ids.end())
+      base_slot_id = slot_it->second;
+  }
+  if (!base_slot_id)
+    return substituted;
+
+  auto delta = findStackBaseDeltaForSlot(caller_outgoing, *base_slot_id);
+  if (!delta || *delta == 0)
+    return substituted;
+
+  llvm::SmallVector<int64_t, 4> candidate_offsets;
+  candidate_offsets.push_back(summary->offset - *delta);
+  candidate_offsets.push_back(summary->offset + *delta);
+  candidate_offsets.push_back(summary->offset - (2 * *delta));
+  candidate_offsets.push_back(summary->offset + (2 * *delta));
+
+  for (int64_t candidate_offset : candidate_offsets) {
+    StackCellKey candidate_key{
+        SlotKey{summary->base_name, summary->base_offset, summary->base_width,
+                summary->base_from_argument, summary->base_from_alloca},
+        candidate_offset, summary->width};
+    auto it = structural_stack_facts->find(candidate_key);
+    if (it == structural_stack_facts->end() || exprEquals(it->second, substituted))
+      continue;
+    vmModelImportDebugLog("structural-stack-delta-hit expr=" +
+                          renderVirtualValueExpr(substituted) + " key=" +
+                          renderStructuralStackKey(candidate_key));
+    return substituteStructuralStackFacts(it->second, structural_stack_facts);
+  }
+
   return substituted;
 }
 
@@ -667,25 +793,38 @@ std::optional<VirtualValueExpr> normalizeImportedExprForCaller(
     const std::map<StackCellKey, VirtualValueExpr>
         *caller_structural_outgoing_stack,
     const std::map<unsigned, VirtualValueExpr> &caller_argument_map) {
+  auto effective_structural_stack_facts =
+      rebaseStructuralStackFactsThroughCallerSlots(
+          caller_structural_outgoing_stack, slot_ids, caller_outgoing);
+  const auto *effective_structural_stack_facts_ptr =
+      caller_structural_outgoing_stack ? &effective_structural_stack_facts
+                                       : nullptr;
+
   auto remapped = remapCalleeExprToCaller(expr, call, slot_info, stack_cell_info,
                                           slot_ids, stack_cell_ids, dl);
   annotateExprSlots(remapped, slot_ids);
   annotateExprStackCells(remapped, stack_cell_ids, slot_ids);
-  remapped = substituteStructuralStackFacts(remapped,
-                                            caller_structural_outgoing_stack);
+  remapped = substituteStructuralStackFactsWithSlotDeltaFallback(
+      remapped, effective_structural_stack_facts_ptr, slot_ids, caller_outgoing);
   annotateExprSlots(remapped, slot_ids);
   annotateExprStackCells(remapped, stack_cell_ids, slot_ids);
 
   auto specialized = specializeExpr(remapped, caller_outgoing,
                                     &caller_outgoing_stack,
                                     &caller_argument_map);
-  specialized = substituteStructuralStackFacts(
-      specialized, caller_structural_outgoing_stack);
+  specialized = substituteStructuralStackFactsWithSlotDeltaFallback(
+      specialized, effective_structural_stack_facts_ptr, slot_ids,
+      caller_outgoing);
   annotateExprSlots(specialized, slot_ids);
   annotateExprStackCells(specialized, stack_cell_ids, slot_ids);
   specialized = rebaseStackCellExprThroughCallerSlots(specialized, slot_ids,
                                                       stack_cell_ids,
                                                       caller_outgoing);
+  annotateExprSlots(specialized, slot_ids);
+  annotateExprStackCells(specialized, stack_cell_ids, slot_ids);
+  specialized = substituteStructuralStackFactsWithSlotDeltaFallback(
+      specialized, effective_structural_stack_facts_ptr, slot_ids,
+      caller_outgoing);
   annotateExprSlots(specialized, slot_ids);
   annotateExprStackCells(specialized, stack_cell_ids, slot_ids);
   specialized = specializeExpr(specialized, caller_outgoing,
@@ -723,23 +862,37 @@ std::optional<VirtualValueExpr> normalizeLocalizedExprForCaller(
     const std::map<StackCellKey, VirtualValueExpr>
         *caller_structural_outgoing_stack,
     const std::map<unsigned, VirtualValueExpr> &caller_argument_map) {
+  auto effective_structural_stack_facts =
+      rebaseStructuralStackFactsThroughCallerSlots(
+          caller_structural_outgoing_stack, slot_ids, caller_outgoing);
+  const auto *effective_structural_stack_facts_ptr =
+      caller_structural_outgoing_stack ? &effective_structural_stack_facts
+                                       : nullptr;
+
   VirtualValueExpr normalized = expr;
   annotateExprSlots(normalized, slot_ids);
   annotateExprStackCells(normalized, stack_cell_ids, slot_ids);
-  normalized = substituteStructuralStackFacts(normalized,
-                                              caller_structural_outgoing_stack);
+  normalized = substituteStructuralStackFactsWithSlotDeltaFallback(
+      normalized, effective_structural_stack_facts_ptr, slot_ids,
+      caller_outgoing);
   annotateExprSlots(normalized, slot_ids);
   annotateExprStackCells(normalized, stack_cell_ids, slot_ids);
   VirtualValueExpr base_normalized = normalized;
   normalized = specializeExpr(normalized, caller_outgoing,
                               &caller_outgoing_stack, &caller_argument_map);
-  normalized = substituteStructuralStackFacts(normalized,
-                                              caller_structural_outgoing_stack);
+  normalized = substituteStructuralStackFactsWithSlotDeltaFallback(
+      normalized, effective_structural_stack_facts_ptr, slot_ids,
+      caller_outgoing);
   annotateExprSlots(normalized, slot_ids);
   annotateExprStackCells(normalized, stack_cell_ids, slot_ids);
   normalized = rebaseStackCellExprThroughCallerSlots(normalized, slot_ids,
                                                      stack_cell_ids,
                                                      caller_outgoing);
+  annotateExprSlots(normalized, slot_ids);
+  annotateExprStackCells(normalized, stack_cell_ids, slot_ids);
+  normalized = substituteStructuralStackFactsWithSlotDeltaFallback(
+      normalized, effective_structural_stack_facts_ptr, slot_ids,
+      caller_outgoing);
   annotateExprSlots(normalized, slot_ids);
   annotateExprStackCells(normalized, stack_cell_ids, slot_ids);
   if ((isUnknownLikeExpr(normalized) ||

@@ -12,6 +12,8 @@
 #include <llvm/IR/ValueHandle.h>
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
 
+#include "omill/Utils/LiftedNames.h"
+
 namespace omill {
 
 namespace {
@@ -26,12 +28,12 @@ llvm::Loop *getOutermostLoop(llvm::Loop *L) {
   return L;
 }
 
-/// Find an __omill_dispatch_call in the given block.
+/// Find a canonical unresolved call-dispatch intrinsic in the given block.
 llvm::CallInst *findDispatchCall(llvm::BasicBlock *BB) {
   for (auto &I : *BB) {
     if (auto *call = llvm::dyn_cast<llvm::CallInst>(&I)) {
       auto *callee = call->getCalledFunction();
-      if (callee && callee->getName() == "__omill_dispatch_call")
+      if (callee && isDispatchCallName(callee->getName()))
         return call;
     }
   }
@@ -136,7 +138,7 @@ llvm::PreservedAnalyses ResolveLazyImportsPass::run(
     // import is actually CALLED (not just its address returned).
     //
     // Two forms are supported:
-    // 1) lifted: __omill_dispatch_call(...)
+    // 1) lifted: unresolved dispatch call intrinsic
     // 2) post-ABI native: indirect call through computed function pointer
     llvm::BasicBlock *icmp_bb = icmp->getParent();
     auto *br = llvm::dyn_cast<llvm::BranchInst>(icmp_bb->getTerminator());
@@ -164,7 +166,7 @@ llvm::PreservedAnalyses ResolveLazyImportsPass::run(
     fn->setDLLStorageClass(llvm::GlobalValue::DLLImportStorageClass);
 
     if (dispatch) {
-      // === Import is called via __omill_dispatch_call ===
+      // === Import is called via the unresolved dispatch-call intrinsic ===
       //
       // Replace the dispatch_call's target address with the resolved import
       // and fold the hash comparison to true.  The PEB-walking loop becomes

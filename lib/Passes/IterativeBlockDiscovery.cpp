@@ -13,6 +13,7 @@
 
 #include "omill/Analysis/IterativeLiftingSession.h"
 #include "omill/Passes/ConstantMemoryFolding.h"
+#include "omill/Passes/CombinedFixedPointDevirt.h"
 #include "omill/BC/BlockLifterAnalysis.h"
 #include "omill/Utils/LiftedNames.h"
 
@@ -76,9 +77,8 @@ void recordBlockGraphState(llvm::Module &M, IterativeLiftingSession &session) {
         LiftEdge edge;
         edge.source_pc = *source_pc;
 
-        if (callee->getName() == "__omill_dispatch_jump" ||
-            callee->getName() == "__omill_dispatch_call") {
-          edge.kind = (callee->getName() == "__omill_dispatch_call")
+        if (isDispatchIntrinsicName(callee->getName())) {
+          edge.kind = isDispatchCallName(callee->getName())
                           ? LiftEdgeKind::kIndirectCall
                           : LiftEdgeKind::kIndirectBranch;
           if (call->arg_size() >= 2) {
@@ -125,7 +125,7 @@ llvm::DenseSet<uint64_t> collectNewTargetPCs(llvm::Module &M) {
         if (!callee)
           continue;
         auto name = callee->getName();
-        if (name != "__omill_dispatch_jump" && name != "__omill_dispatch_call")
+        if (!isDispatchIntrinsicName(name))
           continue;
         if (call->arg_size() < 2)
           continue;
@@ -163,7 +163,7 @@ unsigned countUnresolvedBlockDispatches(llvm::Module &M) {
         if (!callee)
           continue;
         auto name = callee->getName();
-        if (name == "__omill_dispatch_call" || name == "__omill_dispatch_jump")
+        if (isDispatchIntrinsicName(name))
           ++count;
       }
     }
@@ -191,7 +191,7 @@ bool resolveConstantDispatches(llvm::Module &M) {
         if (!callee)
           continue;
         auto name = callee->getName();
-        if (name != "__omill_dispatch_jump" && name != "__omill_dispatch_call")
+        if (!isDispatchIntrinsicName(name))
           continue;
 
         // Check if PC argument is constant.
@@ -220,7 +220,7 @@ bool resolveConstantDispatches(llvm::Module &M) {
 
   for (auto &[call, target_fn] : to_replace) {
     // The dispatch call pattern is:
-    //   %r = call @__omill_dispatch_jump(state, pc, mem)
+    //   %r = call @dispatcher(state, pc, mem)
     //   ret %r
     // Replace with:
     //   %r = musttail call @blk_xxx(state, pc, mem)
@@ -300,6 +300,25 @@ void canonicalizePhiIncomingEdges(llvm::Function &F) {
   }
 }
 
+void runDiscoveryFPM(llvm::Module &M, llvm::ModuleAnalysisManager &MAM,
+                     llvm::FunctionPassManager &&FPM) {
+  auto &FAM =
+      MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M).getManager();
+  llvm::SmallVector<llvm::Function *, 32> worklist;
+  for (auto &F : M) {
+    if (!isDiscoveryFunction(F))
+      continue;
+    worklist.push_back(&F);
+  }
+
+  for (auto *F : worklist) {
+    if (!F || F->isDeclaration())
+      continue;
+    auto PA = FPM.run(*F, FAM);
+    FAM.invalidate(*F, PA);
+  }
+}
+
 }  // namespace
 
 llvm::PreservedAnalyses IterativeBlockDiscoveryPass::run(
@@ -340,13 +359,10 @@ llvm::PreservedAnalyses IterativeBlockDiscoveryPass::run(
     {
       llvm::FunctionPassManager FPM;
       FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
-      FPM.addPass(llvm::InstCombinePass());
-      FPM.addPass(ConstantMemoryFoldingPass());
-      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(CombinedFixedPointDevirtPass());
       FPM.addPass(llvm::ADCEPass());
       FPM.addPass(llvm::SimplifyCFGPass());
-      auto adaptor = llvm::createModuleToFunctionPassAdaptor(std::move(FPM));
-      adaptor.run(M, MAM);
+      runDiscoveryFPM(M, MAM, std::move(FPM));
     }
 
     // Step 2: If we have a lift callback, discover new target PCs and

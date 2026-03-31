@@ -5,6 +5,8 @@
 
 #include "omill/BC/BlockLifter.h"
 
+#include "omill/Utils/LiftedNames.h"
+
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
@@ -24,6 +26,8 @@
 #include <queue>
 #include <set>
 #include <sstream>
+
+#include "omill/Utils/LiftedNames.h"
 
 namespace omill {
 
@@ -88,10 +92,11 @@ class BlockLifter::Impl {
                            llvm::Function *target_fn,
                            uint64_t target_pc);
 
-  /// Emit a call to __omill_dispatch_jump for unresolved indirect jumps.
+  /// Emit a call to the configured unresolved jump dispatcher.
   void EmitDispatchJump(llvm::BasicBlock *bb);
 
-  /// Emit a call to __omill_dispatch_call + musttail to fall-through block.
+  /// Emit a call to the configured unresolved call dispatcher + musttail to
+  /// the fall-through block.
   void EmitDispatchCallAndFallthrough(llvm::BasicBlock *bb,
                                       uint64_t fallthrough_pc,
                                       llvm::SmallVectorImpl<uint64_t> &targets);
@@ -189,10 +194,11 @@ void BlockLifter::Impl::EmitDispatchJump(llvm::BasicBlock *bb) {
   // Load the computed target PC from NEXT_PC (set by instruction semantics).
   auto *next_pc = remill::LoadNextProgramCounter(bb, *intrinsics);
 
-  // Get or create __omill_dispatch_jump.
+  // Get or create the configured unresolved jump dispatcher.
   auto *lifted_fn_ty = func->getFunctionType();
-  auto dispatch = module->getOrInsertFunction("__omill_dispatch_jump",
-                                              lifted_fn_ty);
+  auto dispatch = module->getOrInsertFunction(
+      canonicalDispatchIntrinsicName(DispatchIntrinsicKind::kJump, *module),
+      lifted_fn_ty);
 
   llvm::IRBuilder<> ir(bb);
   auto *result = ir.CreateCall(dispatch, {state_ptr, next_pc, mem_ptr});
@@ -210,10 +216,11 @@ void BlockLifter::Impl::EmitDispatchCallAndFallthrough(
   // Load the target PC for the call.
   auto *call_pc = remill::LoadNextProgramCounter(bb, *intrinsics);
 
-  // Get or create __omill_dispatch_call.
+  // Get or create the configured unresolved call dispatcher.
   auto *lifted_fn_ty = func->getFunctionType();
-  auto dispatch = module->getOrInsertFunction("__omill_dispatch_call",
-                                              lifted_fn_ty);
+  auto dispatch = module->getOrInsertFunction(
+      canonicalDispatchIntrinsicName(DispatchIntrinsicKind::kCall, *module),
+      lifted_fn_ty);
 
   llvm::IRBuilder<> ir(bb);
   auto *call_result = ir.CreateCall(dispatch, {state_ptr, call_pc, mem_ptr});
@@ -274,8 +281,9 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
   // Decode instructions within this basic block.
   auto *current_block = body;
   uint64_t current_pc = addr;
-
-  while (true) {
+  bool lift_crashed = false;
+  __try {
+    while (true) {
     // No executable bytes?
     if (!ReadInstructionBytes(current_pc)) {
       remill::AddTerminatingTailCall(current_block, intrinsics->missing_block,
@@ -425,7 +433,9 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
           auto *pc_val = llvm::ConstantInt::get(word_type, call_target);
           auto *lifted_fn_ty = func->getFunctionType();
           auto dispatch = module->getOrInsertFunction(
-              "__omill_dispatch_call", lifted_fn_ty);
+              canonicalDispatchIntrinsicName(DispatchIntrinsicKind::kCall,
+                                             *module),
+              lifted_fn_ty);
 
           auto *sp = remill::NthArgument(func, remill::kStatePointerArgNum);
           auto *mp = remill::NthArgument(func, remill::kMemoryPointerArgNum);
@@ -460,7 +470,9 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
 
         auto *lifted_fn_ty = func->getFunctionType();
         auto dispatch = module->getOrInsertFunction(
-            "__omill_dispatch_call", lifted_fn_ty);
+            canonicalDispatchIntrinsicName(DispatchIntrinsicKind::kCall,
+                                           *module),
+            lifted_fn_ty);
 
         auto *sp = remill::NthArgument(func, remill::kStatePointerArgNum);
         auto *mp = remill::NthArgument(func, remill::kMemoryPointerArgNum);
@@ -563,7 +575,9 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
           auto *pc_val = llvm::ConstantInt::get(word_type, call_target);
           auto *lifted_fn_ty = func->getFunctionType();
           auto dispatch = module->getOrInsertFunction(
-              "__omill_dispatch_call", lifted_fn_ty);
+              canonicalDispatchIntrinsicName(DispatchIntrinsicKind::kCall,
+                                             *module),
+              lifted_fn_ty);
 
           auto *sp = remill::NthArgument(func, remill::kStatePointerArgNum);
           auto *mp = remill::NthArgument(func, remill::kMemoryPointerArgNum);
@@ -626,7 +640,9 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
               remill::LoadNextProgramCounter(do_call_bb, *intrinsics);
           auto *lifted_fn_ty = func->getFunctionType();
           auto dispatch = module->getOrInsertFunction(
-              "__omill_dispatch_call", lifted_fn_ty);
+              canonicalDispatchIntrinsicName(DispatchIntrinsicKind::kCall,
+                                             *module),
+              lifted_fn_ty);
 
           auto *sp = remill::NthArgument(func, remill::kStatePointerArgNum);
           auto *mp = remill::NthArgument(func, remill::kMemoryPointerArgNum);
@@ -723,6 +739,16 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
     remill::AddTerminatingTailCall(current_block, intrinsics->error,
                                    *intrinsics);
     break;
+    }
+  } __except (1) {
+    lift_crashed = true;
+  }
+
+  if (lift_crashed) {
+    llvm::errs() << "omill: BlockLifter: crashed while lifting block at 0x"
+                 << llvm::Twine::utohexstr(addr) << "\n";
+    func->deleteBody();
+    return nullptr;
   }
 
 done:

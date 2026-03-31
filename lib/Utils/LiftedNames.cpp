@@ -193,6 +193,36 @@ llvm::DenseMap<uint64_t, llvm::BasicBlock *> collectBlockPCMap(
       maybeAddPC(candidate, BB);
   };
 
+  auto *pc_slot = [&]() -> llvm::Value * {
+    for (auto &I : F.getEntryBlock()) {
+      if (I.getName() == "PC")
+        return &I;
+    }
+    return nullptr;
+  }();
+
+  auto sameStateOffset = [&](llvm::Value *A, llvm::Value *B) -> bool {
+    if (A == B)
+      return true;
+    auto *arg0 = F.arg_empty() ? nullptr : F.getArg(0);
+    if (!arg0)
+      return false;
+
+    auto *GA = llvm::dyn_cast<llvm::GetElementPtrInst>(A);
+    auto *GB = llvm::dyn_cast<llvm::GetElementPtrInst>(B);
+    if (!GA || !GB || GA->getPointerOperand() != arg0 ||
+        GB->getPointerOperand() != arg0 || !GA->hasAllConstantIndices() ||
+        !GB->hasAllConstantIndices())
+      return false;
+
+    llvm::APInt off_a(64, 0);
+    llvm::APInt off_b(64, 0);
+    if (!GA->accumulateConstantOffset(F.getDataLayout(), off_a) ||
+        !GB->accumulateConstantOffset(F.getDataLayout(), off_b))
+      return false;
+    return off_a == off_b;
+  };
+
   for (auto &BB : F) {
     llvm::SmallVector<llvm::PHINode *, 8> phis;
     for (auto &I : BB) {
@@ -216,6 +246,31 @@ llvm::DenseMap<uint64_t, llvm::BasicBlock *> collectBlockPCMap(
     if (!added_named) {
       for (auto *PN : phis)
         addFromPhi(PN, &BB);
+    }
+
+    if (pc_slot) {
+      for (auto &I : BB) {
+        auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I);
+        if (!SI || !SI->getValueOperand()->getType()->isIntegerTy(64))
+          continue;
+        if (!sameStateOffset(SI->getPointerOperand(), pc_slot))
+          continue;
+
+        auto values = collectPossiblePCValues(SI->getValueOperand(), F, 32);
+        for (uint64_t candidate : values)
+          maybeAddPC(candidate, &BB);
+      }
+    }
+
+    // Broad fallback: collect any concrete PC-derived i64 SSA values in the
+    // block. This recovers internal trace block entry PCs after LLVM has
+    // stripped block names and folded NEXT_PC values through ordinary adds.
+    for (auto &I : BB) {
+      if (!I.getType()->isIntegerTy(64))
+        continue;
+      auto values = collectPossiblePCValues(&I, F, 32);
+      for (uint64_t candidate : values)
+        maybeAddPC(candidate, &BB);
     }
   }
 
@@ -257,6 +312,75 @@ llvm::BasicBlock *findBlockForPC(llvm::Function &F, uint64_t pc) {
   return nullptr;
 }
 
+llvm::Function *findLiftedOrBlockFunctionByPC(llvm::Module &M, uint64_t pc) {
+  for (llvm::StringRef prefix : {"sub_", "blk_", "block_"}) {
+    std::string name = (prefix + llvm::Twine::utohexstr(pc)).str();
+    if (auto *fn = M.getFunction(name); fn && !fn->isDeclaration())
+      return fn;
+  }
+  return nullptr;
+}
+
+llvm::Function *findLiftedOrCoveredFunctionByPC(llvm::Module &M, uint64_t pc) {
+  if (auto *exact = findLiftedOrBlockFunctionByPC(M, pc))
+    return exact;
+
+  for (auto &F : M) {
+    if (F.isDeclaration() || !hasLiftedSignature(F))
+      continue;
+    if (extractEntryVA(F.getName()) == pc || extractBlockPC(F.getName()) == pc)
+      return &F;
+    auto pc_to_bb = collectBlockPCMap(F);
+    if (pc_to_bb.find(pc) != pc_to_bb.end())
+      return &F;
+  }
+
+  return nullptr;
+}
+
+llvm::Function *findStructuralCodeTargetFunctionByPC(llvm::Module &M,
+                                                     uint64_t pc) {
+  for (auto &F : M) {
+    if (extractStructuralCodeTargetPC(F) == pc)
+      return &F;
+  }
+  return nullptr;
+}
+
+std::optional<uint64_t> findNearestCoveredLiftedOrBlockPC(llvm::Module &M,
+                                                          uint64_t pc,
+                                                          uint64_t max_distance) {
+  std::optional<uint64_t> best_pc;
+  uint64_t best_distance = std::numeric_limits<uint64_t>::max();
+
+  auto consider = [&](uint64_t candidate) {
+    const uint64_t distance =
+        candidate > pc ? candidate - pc : pc - candidate;
+    if (distance > max_distance)
+      return;
+    if (!best_pc || distance < best_distance ||
+        (distance == best_distance && candidate < *best_pc)) {
+      best_pc = candidate;
+      best_distance = distance;
+    }
+  };
+
+  for (auto &F : M) {
+    if (F.isDeclaration() || !hasLiftedSignature(F))
+      continue;
+    if (uint64_t entry_pc = extractEntryVA(F.getName()); entry_pc != 0)
+      consider(entry_pc);
+    if (uint64_t block_pc = extractBlockPC(F.getName()); block_pc != 0)
+      consider(block_pc);
+    for (const auto &[block_pc, BB] : collectBlockPCMap(F)) {
+      (void)BB;
+      consider(block_pc);
+    }
+  }
+
+  return best_pc;
+}
+
 uint64_t extractEntryVA(llvm::StringRef name) {
   if (!name.starts_with("sub_"))
     return 0;
@@ -274,6 +398,65 @@ uint64_t extractEntryVA(llvm::StringRef name) {
   return va;
 }
 
+uint64_t extractStructuralCodeTargetPC(llvm::StringRef name) {
+  auto parseWithPrefix = [&](llvm::StringRef prefix) -> uint64_t {
+    if (!name.starts_with(prefix))
+      return 0;
+    llvm::StringRef rest = name.drop_front(prefix.size());
+    size_t hex_len = 0;
+    while (hex_len < rest.size() && llvm::isHexDigit(rest[hex_len]))
+      ++hex_len;
+    if (hex_len == 0)
+      return 0;
+    llvm::StringRef hex = rest.substr(0, hex_len);
+    uint64_t pc = 0;
+    if (hex.getAsInteger(16, pc))
+      return 0;
+    return pc;
+  };
+
+  if (uint64_t pc = extractEntryVA(name))
+    return pc;
+  if (uint64_t pc = extractBlockPC(name))
+    return pc;
+  if (uint64_t pc = parseWithPrefix("omill_native_target_"))
+    return pc;
+  if (uint64_t pc = parseWithPrefix("omill_native_boundary_"))
+    return pc;
+  if (uint64_t pc = parseWithPrefix("omill_executable_target_"))
+    return pc;
+  if (uint64_t pc = parseWithPrefix("omill_vm_enter_target_"))
+    return pc;
+  return 0;
+}
+
+uint64_t extractStructuralCodeTargetPC(const llvm::Function &F) {
+  auto parseHexAttr = [&](llvm::StringRef key) -> uint64_t {
+    auto attr = F.getFnAttribute(key);
+    if (!attr.isValid())
+      return 0;
+    auto text = attr.getValueAsString();
+    if (text.consume_front("0x") || text.consume_front("0X")) {
+    }
+    uint64_t value = 0;
+    if (text.getAsInteger(16, value))
+      return 0;
+    return value;
+  };
+
+  if (uint64_t pc = parseHexAttr("omill.native_direct_target_pc"))
+    return pc;
+  if (uint64_t pc = parseHexAttr("omill.virtual_exit_native_target_pc"))
+    return pc;
+  if (uint64_t pc = parseHexAttr("omill.executable_target_pc"))
+    return pc;
+  if (uint64_t pc = parseHexAttr("omill.vm_enter_target_pc"))
+    return pc;
+  if (uint64_t pc = parseHexAttr("omill.native_boundary_pc"))
+    return pc;
+  return extractStructuralCodeTargetPC(F.getName());
+}
+
 std::string liftedFunctionName(uint64_t va) {
   return "sub_" + llvm::utohexstr(va, true);
 }
@@ -283,8 +466,50 @@ std::string demergedHandlerCloneName(uint64_t va, uint64_t incoming_hash) {
          llvm::utohexstr(incoming_hash, true);
 }
 
-std::string nativeFunctionName(uint64_t va) {
-  return liftedFunctionName(va) + "_native";
+llvm::StringRef canonicalDispatchIntrinsicName(
+    DispatchIntrinsicKind kind, const llvm::Module &M) {
+  if (prefersRawRemillDispatch(M)) {
+    switch (kind) {
+      case DispatchIntrinsicKind::kCall:
+        return "__remill_function_call";
+      case DispatchIntrinsicKind::kJump:
+        return "__remill_jump";
+    }
+  }
+
+  switch (kind) {
+    case DispatchIntrinsicKind::kCall:
+      return "__omill_dispatch_call";
+    case DispatchIntrinsicKind::kJump:
+      return "__omill_dispatch_jump";
+  }
+  return "__omill_dispatch_call";
+}
+
+bool prefersRawRemillDispatch(const llvm::Module &M) {
+  auto *flag = M.getModuleFlag("omill.raw_remill_dispatch");
+  if (!flag)
+    return false;
+  if (auto *ci = llvm::mdconst::dyn_extract<llvm::ConstantInt>(flag))
+    return ci->getZExtValue() != 0;
+  return false;
+}
+
+bool isDispatchCallName(llvm::StringRef name) {
+  return name == "__remill_function_call" ||
+         name == "__omill_dispatch_call";
+}
+
+bool isDispatchJumpName(llvm::StringRef name) {
+  return name == "__remill_jump" || name == "__omill_dispatch_jump";
+}
+
+bool isDispatchIntrinsicName(llvm::StringRef name) {
+  return isDispatchCallName(name) || isDispatchJumpName(name);
+}
+
+bool isLegacyOmillDispatchName(llvm::StringRef name) {
+  return name == "__omill_dispatch_call" || name == "__omill_dispatch_jump";
 }
 
 bool isLiftedFunction(const llvm::Function &F) {
@@ -329,10 +554,14 @@ bool hasLiftedSignature(const llvm::Function &F) {
 }
 
 uint64_t extractBlockPC(llvm::StringRef name) {
-  if (!name.starts_with("block_"))
+  llvm::StringRef rest;
+  if (name.starts_with("block_")) {
+    rest = name.drop_front(6);
+  } else if (name.starts_with("blk_")) {
+    rest = name.drop_front(4);
+  } else {
     return 0;
-
-  llvm::StringRef rest = name.drop_front(6);
+  }
   size_t hex_len = 0;
   while (hex_len < rest.size() && llvm::isHexDigit(rest[hex_len]))
     ++hex_len;

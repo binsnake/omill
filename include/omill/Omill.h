@@ -83,10 +83,6 @@ struct PipelineOptions {
   /// so this needs to be high enough to handle long handler chains.
   unsigned max_resolution_iterations = 32;
 
-  /// Refine _native function parameter types (ptr vs i64 vs double).
-  /// Opt-in; runs late in Phase 4 after ABI recovery.
-  bool refine_signatures = false;
-
   /// Legacy VM devirtualization path: resolve dispatch targets from
   /// emulator-derived flat traces for a specific trace-driven VM pipeline.
   /// Generic static devirtualization should use separate VM-agnostic analyses.
@@ -95,6 +91,13 @@ struct PipelineOptions {
   /// Generic static devirtualization path: use the VM-agnostic symbolic
   /// virtual-state model to materialize proven virtual CFG edges.
   bool generic_static_devirtualize = false;
+
+  /// The devirtualization-owned pipeline emits raw __remill_* unresolved
+  /// control-flow intrinsics instead of the legacy __omill_dispatch_* names.
+  bool prefer_raw_remill_dispatch = false;
+
+  /// Centralize Remill lowering/cleanup in explicit normalization epochs.
+  bool require_remill_normalization = false;
 
   /// When generic_static_devirtualize is enabled, validate rewritten
   /// functions with the TranslationValidator when Z3 is available.
@@ -173,6 +176,8 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM,
 /// Build the late cleanup pipeline (sentinel data elimination + DCE).
 /// Run after ABI recovery and post-ABI deobfuscation, before output.
 void buildLateCleanupPipeline(llvm::ModulePassManager &MPM);
+void buildLateCleanupPipeline(llvm::ModulePassManager &MPM,
+                              const PipelineOptions &opts);
 
 /// Build a shared cleanup bundle using one of the canonical cleanup profiles.
 void buildCleanupPipeline(llvm::FunctionPassManager &FPM,
@@ -184,16 +189,19 @@ void buildCleanupPipeline(llvm::ModulePassManager &MPM,
 /// further iterative lifting rounds will run.
 void buildLiftInfrastructureCleanupPipeline(llvm::ModulePassManager &MPM);
 
-/// Resolve constant inttoptr call targets to direct _native calls and run
-/// bounded post-rewrite inline/cleanup rounds until convergence.
-///
-/// Emits per-round progress metadata in:
-///   !omill.inttoptr_closure_rounds = {round, resolved_calls, remaining_calls}
-void buildIntToPtrClosurePipeline(llvm::ModulePassManager &MPM);
-
 /// Build the post-patch cleanup pipeline used after call-target rewrites.
 /// Includes module inlining and core scalar cleanup passes.
 void buildPostPatchCleanupPipeline(llvm::ModulePassManager &MPM,
+                                   unsigned inline_threshold = 80);
+
+/// Build a conservative late-closure canonicalization pipeline that exposes
+/// constant edges without running the full late cleanup stack.
+void buildLateClosureCanonicalizationPipeline(llvm::ModulePassManager &MPM);
+
+/// Build a narrow late-closure patch pipeline that canonicalizes newly
+/// surfaced lifted targets, rewrites direct constant control-flow edges to
+/// defined lifted/block functions, and performs bounded cleanup afterwards.
+void buildLateClosurePatchPipeline(llvm::ModulePassManager &MPM,
                                    unsigned inline_threshold = 80);
 
 /// Return true when the lifted module contains VM-like signals that justify
@@ -256,6 +264,10 @@ void registerAnalyses(llvm::FunctionAnalysisManager &FAM);
 
 /// Register all omill module-level analyses.
 void registerModuleAnalyses(llvm::ModuleAnalysisManager &MAM);
+
+/// Register the default module analyses that do not override caller-supplied
+/// BinaryMemory/trace/lifting/session analyses.
+void registerRemainingModuleAnalyses(llvm::ModuleAnalysisManager &MAM);
 
 /// Register omill's custom alias analysis with an AAManager.
 /// Call before PB.registerFunctionAnalyses() so the custom AA is included.

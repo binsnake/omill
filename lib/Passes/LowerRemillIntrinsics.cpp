@@ -1289,13 +1289,17 @@ bool lowerFunctionCall(llvm::Function &F, IntrinsicTable &table,
     if (auto *const_pc = llvm::dyn_cast<llvm::ConstantInt>(target_pc)) {
       auto *target_fn = lifted ? lifted->lookup(const_pc->getZExtValue())
                                : nullptr;
+      if (!target_fn)
+        target_fn = findLiftedOrBlockFunctionByPC(
+            M, const_pc->getZExtValue());
       if (target_fn)
         result = Builder.CreateCall(target_fn, {state, target_pc, mem});
     }
 
     if (!result) {
-      auto dispatcher =
-          M.getOrInsertFunction("__omill_dispatch_call", lifted_fn_ty);
+      auto dispatcher = M.getOrInsertFunction(
+          canonicalDispatchIntrinsicName(DispatchIntrinsicKind::kCall, M),
+          lifted_fn_ty);
       result = Builder.CreateCall(dispatcher, {state, target_pc, mem});
     }
 
@@ -1358,6 +1362,8 @@ bool lowerJump(llvm::Function &F, IntrinsicTable &table,
 
       if (!new_term) {
         auto *target_fn = lifted ? lifted->lookup(pc_val) : nullptr;
+        if (!target_fn)
+          target_fn = findLiftedOrBlockFunctionByPC(M, pc_val);
         if (target_fn) {
           auto *tail_call =
               Builder.CreateCall(target_fn, {state, target_pc, mem});
@@ -1368,7 +1374,8 @@ bool lowerJump(llvm::Function &F, IntrinsicTable &table,
     }
 
     if (!new_term) {
-      // Fallback br selector: dispatch via __omill_dispatch_jump.
+      // Fallback br selector: dispatch via the configured unresolved jump
+      // intrinsic.
       // Note: InlineJumpTargetsPass lowers most __remill_jump calls early
       // (before state optimization) with proper PC→block switches.
       // This path handles any remaining jumps that weren't lowered early.
@@ -1410,8 +1417,9 @@ bool lowerJump(llvm::Function &F, IntrinsicTable &table,
           Ctx, "jump_dispatch_fallback", &F);
       {
         llvm::IRBuilder<> FBBuilder(fallback_bb);
-        auto dispatcher =
-            M.getOrInsertFunction("__omill_dispatch_jump", lifted_fn_ty);
+        auto dispatcher = M.getOrInsertFunction(
+            canonicalDispatchIntrinsicName(DispatchIntrinsicKind::kJump, M),
+            lifted_fn_ty);
         auto *result =
             FBBuilder.CreateCall(dispatcher, {state, target_pc, mem});
         FBBuilder.CreateRet(result);
@@ -1508,7 +1516,7 @@ bool lowerResolvedDispatchCalls(llvm::Function &F) {
       if (!call)
         continue;
       auto *callee = call->getCalledFunction();
-      if (!callee || callee->getName() != "__omill_dispatch_call")
+      if (!callee || !isDispatchCallName(callee->getName()))
         continue;
       if (call->arg_size() < 3)
         continue;

@@ -100,11 +100,6 @@ static cl::opt<unsigned> MaxIterations(
     cl::desc("Max iterations for target resolution (default 10)"),
     cl::init(10));
 
-static cl::opt<bool> RefineSignatures(
-    "refine-signatures",
-    cl::desc("Refine function signatures after ABI recovery"),
-    cl::init(false));
-
 static cl::opt<bool> IPCP(
     "ipcp",
     cl::desc("Enable interprocedural constant propagation"),
@@ -180,7 +175,6 @@ int main(int argc, char **argv) {
     opts.deobfuscate = false;
     opts.recover_abi = true;
     opts.resolve_indirect_targets = false;
-    opts.refine_signatures = RefineSignatures;
     opts.interprocedural_const_prop = false;
   } else {
     opts.lower_intrinsics = !NoLowerIntrinsics;
@@ -191,7 +185,6 @@ int main(int argc, char **argv) {
     opts.recover_abi = RecoverABI;
     opts.resolve_indirect_targets = ResolveTargets;
     opts.max_resolution_iterations = MaxIterations;
-    opts.refine_signatures = RefineSignatures;
     opts.interprocedural_const_prop = IPCP;
   }
 

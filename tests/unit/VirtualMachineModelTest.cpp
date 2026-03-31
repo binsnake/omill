@@ -7,11 +7,15 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <cstdint>
 #include <stdlib.h>
 
 #include <algorithm>
 
 #include "omill/Analysis/BinaryMemoryMap.h"
+#include "omill/Analysis/VMTraceMap.h"
+#include "omill/Devirtualization/Orchestrator.h"
 #include "omill/Omill.h"
 #include "omill/Support/JumpTableDiscovery.h"
 #include "omill/Utils/StateFieldMap.h"
@@ -20,6 +24,12 @@ namespace omill::virtual_model::detail {
 void summarizeDispatchSuccessors(llvm::Module &M,
                                  ::omill::VirtualMachineModel &model,
                                  const ::omill::BinaryMemoryMap &binary_memory);
+VirtualValueExpr constantExpr(uint64_t value, unsigned bits);
+bool collectEvaluatedValueChoices(
+    const VirtualValueExpr &expr, const std::vector<VirtualSlotFact> &facts,
+    const std::vector<VirtualStackFact> &stack_facts,
+    llvm::SmallVectorImpl<uint64_t> &values,
+    const BinaryMemoryMap *binary_memory = nullptr);
 }
 
 namespace {
@@ -38,6 +48,11 @@ class VirtualMachineModelTest : public ::testing::Test {
 
   omill::VirtualMachineModel runAnalysis(
       llvm::Module &M, omill::BinaryMemoryMap map = {}) {
+    return runAnalysis(M, std::move(map), omill::VMTraceMap());
+  }
+
+  omill::VirtualMachineModel runAnalysis(
+      llvm::Module &M, omill::BinaryMemoryMap map, omill::VMTraceMap trace_map) {
     llvm::PassBuilder PB;
     llvm::LoopAnalysisManager LAM;
     llvm::FunctionAnalysisManager FAM;
@@ -46,6 +61,11 @@ class VirtualMachineModelTest : public ::testing::Test {
 
     MAM.registerPass(
         [&]() { return omill::BinaryMemoryAnalysis(std::move(map)); });
+    auto trace_holder =
+        std::make_shared<omill::VMTraceMap>(std::move(trace_map));
+    MAM.registerPass([trace_holder] {
+      return omill::VMTraceMapAnalysis(*trace_holder);
+    });
     MAM.registerPass([] { return omill::VirtualMachineModelAnalysis(); });
     PB.registerModuleAnalyses(MAM);
     PB.registerCGSCCAnalyses(CGAM);
@@ -205,6 +225,563 @@ TEST_F(VirtualMachineModelTest, InvalidatesCachedHandlerSummaryAfterBodyChange) 
   auto *second_summary = second_model.lookupHandler("sub_1800018f0");
   ASSERT_NE(second_summary, nullptr);
   EXPECT_EQ(second_summary->dispatch_jump_count, 1u);
+}
+
+TEST_F(VirtualMachineModelTest,
+       ExplicitDirtySeedScopeSkipsUnrelatedBoundaryTargetSeeding) {
+  auto M = createModule();
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *dispatch_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *dispatch = llvm::Function::Create(dispatch_ty,
+                                          llvm::Function::ExternalLinkage,
+                                          "__omill_dispatch_jump", *M);
+  auto *handler_ty = llvm::FunctionType::get(void_ty, {ptr_ty, i64_ty, ptr_ty},
+                                             false);
+
+  auto *root = llvm::Function::Create(handler_ty, llvm::Function::ExternalLinkage,
+                                      "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  root->addFnAttr("omill.vm_newly_lifted");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+
+  auto *unrelated = llvm::Function::Create(handler_ty,
+                                           llvm::Function::ExternalLinkage,
+                                           "blk_401300", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", unrelated);
+    llvm::IRBuilder<> B(entry);
+    B.CreateCall(dispatch_ty, dispatch,
+                 {unrelated->getArg(0), B.getInt64(0x401360),
+                  unrelated->getArg(2)});
+    B.CreateRetVoid();
+  }
+
+  auto *boundary_ty =
+      llvm::FunctionType::get(i64_ty, std::vector<llvm::Type *>(12, i64_ty),
+                              false);
+  auto *boundary = llvm::Function::Create(boundary_ty,
+                                          llvm::Function::ExternalLinkage,
+                                          "vm_entry_401200", *M);
+  boundary->addFnAttr("omill.protection_boundary");
+  boundary->addFnAttr("omill.boundary_kind", "vm_entry_stub");
+  boundary->addFnAttr("omill.boundary_target_va", "401300");
+
+  auto model = runAnalysis(*M);
+  EXPECT_TRUE(model.telemetry().dirty_scope_requested);
+  EXPECT_EQ(model.telemetry().scope_reason, "explicit_dirty_seed_attr");
+  EXPECT_NE(model.lookupHandler("sub_401000"), nullptr);
+  EXPECT_EQ(model.lookupHandler("blk_401300"), nullptr);
+  EXPECT_EQ(model.telemetry().seed_handler_count, 1u);
+  EXPECT_EQ(model.telemetry().summarized_handlers, 1u);
+}
+
+TEST_F(VirtualMachineModelTest,
+       ExplicitDirtySeedScopeSkipsPreferredSeedFallbackExpansion) {
+  auto M = createModule();
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+  auto *handler_ty = llvm::FunctionType::get(
+      void_ty,
+      {llvm::PointerType::get(Ctx, 0), llvm::Type::getInt64Ty(Ctx),
+       llvm::PointerType::get(Ctx, 0)},
+      false);
+
+  auto *root = llvm::Function::Create(handler_ty, llvm::Function::ExternalLinkage,
+                                      "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  root->addFnAttr("omill.vm_newly_lifted");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+
+  auto *wrapper = llvm::Function::Create(handler_ty,
+                                         llvm::Function::ExternalLinkage,
+                                         "sub_401200", *M);
+  wrapper->addFnAttr("omill.vm_wrapper");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", wrapper);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+
+  auto model = runAnalysis(*M);
+  EXPECT_TRUE(model.telemetry().dirty_scope_requested);
+  EXPECT_NE(model.lookupHandler("sub_401000"), nullptr);
+  EXPECT_EQ(model.lookupHandler("sub_401200"), nullptr);
+  EXPECT_EQ(model.telemetry().summarized_handlers, 1u);
+  EXPECT_EQ(model.telemetry().seed_handler_count, 1u);
+}
+
+TEST_F(VirtualMachineModelTest,
+       ExplicitDirtySeedScopeLimitsRootSlicesToDirtyOutputRoots) {
+  auto M = createModule();
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *dispatch_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *dispatch = llvm::Function::Create(dispatch_ty,
+                                          llvm::Function::ExternalLinkage,
+                                          "__omill_dispatch_jump", *M);
+  auto *handler_ty = llvm::FunctionType::get(void_ty, {ptr_ty, i64_ty, ptr_ty},
+                                             false);
+
+  auto *dirty_root = llvm::Function::Create(
+      handler_ty, llvm::Function::ExternalLinkage, "sub_401000", *M);
+  dirty_root->addFnAttr("omill.output_root");
+  dirty_root->addFnAttr("omill.vm_newly_lifted");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", dirty_root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateCall(dispatch_ty, dispatch,
+                 {dirty_root->getArg(0), B.getInt64(0x401040),
+                  dirty_root->getArg(2)});
+    B.CreateRetVoid();
+  }
+
+  auto *dirty_target = llvm::Function::Create(
+      handler_ty, llvm::Function::ExternalLinkage, "blk_401040", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", dirty_target);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+
+  auto *other_root = llvm::Function::Create(
+      handler_ty, llvm::Function::ExternalLinkage, "sub_402000", *M);
+  other_root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", other_root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateCall(dispatch_ty, dispatch,
+                 {other_root->getArg(0), B.getInt64(0x402040),
+                  other_root->getArg(2)});
+    B.CreateRetVoid();
+  }
+
+  auto *other_target = llvm::Function::Create(
+      handler_ty, llvm::Function::ExternalLinkage, "blk_402040", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", other_target);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+
+  auto model = runAnalysis(*M);
+  EXPECT_TRUE(model.telemetry().dirty_scope_requested);
+  EXPECT_NE(model.lookupRootSlice(0x401000ULL), nullptr);
+  EXPECT_EQ(model.lookupRootSlice(0x402000ULL), nullptr);
+  EXPECT_EQ(model.rootSlices().size(), 1u);
+  EXPECT_EQ(model.telemetry().root_slice_count, 1u);
+  EXPECT_EQ(model.telemetry().dispatch_handler_count, 2u);
+  EXPECT_EQ(model.telemetry().exit_handler_count, 2u);
+}
+
+TEST_F(VirtualMachineModelTest, TelemetryReportsCachedSummaryReuseOnRerun) {
+  auto M = createModule();
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+  auto *handler_ty =
+      llvm::FunctionType::get(void_ty,
+                              {llvm::PointerType::get(Ctx, 0),
+                               llvm::Type::getInt64Ty(Ctx),
+                               llvm::PointerType::get(Ctx, 0)},
+                              false);
+  auto *root = llvm::Function::Create(handler_ty, llvm::Function::ExternalLinkage,
+                                      "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+
+  auto first_model = runAnalysis(*M);
+  EXPECT_EQ(first_model.telemetry().cached_summary_hits, 0u);
+  EXPECT_GE(first_model.telemetry().cached_summary_misses, 1u);
+  EXPECT_EQ(first_model.telemetry().root_slice_cache_hits, 0u);
+  EXPECT_EQ(first_model.telemetry().root_slice_cache_misses, 1u);
+
+  auto second_model = runAnalysis(*M);
+  EXPECT_GE(second_model.telemetry().cached_summary_hits, 1u);
+  EXPECT_EQ(second_model.telemetry().cached_summary_misses, 0u);
+  EXPECT_EQ(second_model.telemetry().root_slice_cache_hits, 1u);
+  EXPECT_EQ(second_model.telemetry().root_slice_cache_misses, 0u);
+}
+
+TEST_F(VirtualMachineModelTest, TelemetryReportsRootSliceCacheInvalidation) {
+  auto M = createModule();
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *handler_ty =
+      llvm::FunctionType::get(void_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *dispatch_ty =
+      llvm::FunctionType::get(void_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+
+  auto *dispatch = llvm::Function::Create(dispatch_ty,
+                                          llvm::Function::ExternalLinkage,
+                                          "__omill_dispatch_jump", *M);
+  auto *root = llvm::Function::Create(handler_ty, llvm::Function::ExternalLinkage,
+                                      "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateCall(dispatch, {root->getArg(0), B.getInt64(0x401040),
+                            root->getArg(2)});
+    B.CreateRetVoid();
+  }
+
+  auto *target = llvm::Function::Create(handler_ty,
+                                        llvm::Function::ExternalLinkage,
+                                        "blk_401040", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+
+  auto first_model = runAnalysis(*M);
+  EXPECT_EQ(first_model.telemetry().root_slice_cache_hits, 0u);
+  EXPECT_EQ(first_model.telemetry().root_slice_cache_misses, 1u);
+
+  auto second_model = runAnalysis(*M);
+  EXPECT_EQ(second_model.telemetry().root_slice_cache_hits, 1u);
+  EXPECT_EQ(second_model.telemetry().root_slice_cache_misses, 0u);
+
+  root->addFnAttr("omill.vm_newly_lifted");
+  auto third_model = runAnalysis(*M);
+  EXPECT_EQ(third_model.telemetry().root_slice_cache_hits, 0u);
+  EXPECT_EQ(third_model.telemetry().root_slice_cache_misses, 1u);
+}
+
+TEST_F(VirtualMachineModelTest,
+       ProjectsRootSlicesFromPublishedSessionGraphWhenAvailable) {
+  auto M = createModule();
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *handler_ty = llvm::FunctionType::get(void_ty, {ptr_ty, i64_ty, ptr_ty},
+                                             false);
+  auto *jump_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+
+  auto *jump = llvm::Function::Create(jump_ty, llvm::Function::ExternalLinkage,
+                                      "__remill_jump", *M);
+  auto *root = llvm::Function::Create(handler_ty, llvm::Function::ExternalLinkage,
+                                      "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateCall(jump, {root->getArg(0), B.getInt64(0x401120),
+                        root->getArg(2)});
+    B.CreateRetVoid();
+  }
+
+  omill::DevirtualizationOrchestrator orchestrator;
+  omill::DevirtualizationRequest request;
+  request.root_vas.push_back(0x401000);
+  (void)orchestrator.buildExecutionPlan(*M, request);
+
+  omill::FrontierCallbacks callbacks;
+  callbacks.is_code_address = [](uint64_t pc) {
+    return pc >= 0x401000 && pc < 0x500000;
+  };
+  callbacks.has_defined_target = [](uint64_t) { return false; };
+  callbacks.normalize_target_pc = [](uint64_t pc) { return pc; };
+  callbacks.is_executable_target = [](uint64_t) { return true; };
+  callbacks.is_protected_boundary = [](uint64_t) { return false; };
+  callbacks.can_decode_target = [](uint64_t) { return true; };
+  callbacks.read_target_bytes = [](uint64_t, uint8_t *out, size_t size) {
+    if (size == 0)
+      return false;
+    out[0] = 0x90;
+    for (size_t i = 1; i < size; ++i)
+      out[i] = 0x90;
+    return true;
+  };
+  (void)orchestrator.discoverFrontierWork(
+      *M, callbacks, omill::FrontierDiscoveryPhase::kOutputRootClosure);
+
+  auto model = runAnalysis(*M);
+  EXPECT_TRUE(model.telemetry().session_graph_projection_used);
+  auto *slice = model.lookupRootSlice(0x401000ULL);
+  ASSERT_NE(slice, nullptr);
+  EXPECT_FALSE(slice->frontier_edges.empty());
+  EXPECT_TRUE(llvm::any_of(
+      slice->frontier_edges,
+      [](const omill::VirtualRootSliceSummary::FrontierEdge &edge) {
+        return edge.target_pc.has_value() && *edge.target_pc == 0x401120ULL;
+      }));
+}
+
+TEST_F(VirtualMachineModelTest,
+       ExplicitDirtySeedScopeUsesSessionGraphDirtyHandlerProjection) {
+  auto M = createModule();
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *handler_ty = llvm::FunctionType::get(void_ty, {ptr_ty, i64_ty, ptr_ty},
+                                             false);
+
+  auto *dirty_root = llvm::Function::Create(handler_ty,
+                                            llvm::Function::ExternalLinkage,
+                                            "sub_401000", *M);
+  dirty_root->addFnAttr("omill.output_root");
+  dirty_root->addFnAttr("omill.vm_newly_lifted");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", dirty_root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+
+  auto *unrelated_root = llvm::Function::Create(
+      handler_ty, llvm::Function::ExternalLinkage, "sub_401100", *M);
+  unrelated_root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", unrelated_root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+
+  omill::SessionGraphState graph;
+  {
+    omill::SessionHandlerNode dirty_node;
+    dirty_node.function_name = "sub_401000";
+    dirty_node.entry_va = 0x401000ULL;
+    dirty_node.is_defined = true;
+    dirty_node.is_output_root = true;
+    dirty_node.is_dirty = true;
+    graph.handler_nodes.emplace(dirty_node.function_name, std::move(dirty_node));
+  }
+  {
+    omill::SessionHandlerNode unrelated_node;
+    unrelated_node.function_name = "sub_401100";
+    unrelated_node.entry_va = 0x401100ULL;
+    unrelated_node.is_defined = true;
+    unrelated_node.is_output_root = true;
+    graph.handler_nodes.emplace(unrelated_node.function_name,
+                                std::move(unrelated_node));
+  }
+  graph.dirty_function_names.insert("sub_401000");
+  publishSessionGraphProjection(*M, graph);
+
+  auto model = runAnalysis(*M);
+  EXPECT_TRUE(model.telemetry().dirty_scope_requested);
+  EXPECT_TRUE(model.telemetry().session_graph_handler_scope_used);
+  EXPECT_NE(model.lookupHandler("sub_401000"), nullptr);
+  EXPECT_EQ(model.lookupHandler("sub_401100"), nullptr);
+}
+
+TEST_F(VirtualMachineModelTest,
+       ProjectsBoundaryAndFlowFactsFromSessionGraphWhenAvailable) {
+  auto M = createModule();
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *handler_ty = llvm::FunctionType::get(void_ty, {ptr_ty, i64_ty, ptr_ty},
+                                             false);
+
+  auto *root = llvm::Function::Create(handler_ty, llvm::Function::ExternalLinkage,
+                                      "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+
+  omill::SessionGraphState graph;
+  {
+    omill::SessionHandlerNode root_node;
+    root_node.function_name = "sub_401000";
+    root_node.entry_va = 0x401000ULL;
+    root_node.is_defined = true;
+    root_node.is_output_root = true;
+    graph.handler_nodes.emplace(root_node.function_name, std::move(root_node));
+  }
+  {
+    omill::SessionEdgeFact edge;
+    edge.identity = "sub_401000:0:call::401220";
+    edge.owner_function = "sub_401000";
+    edge.site_index = 0;
+    edge.target_pc = 0x401220ULL;
+    edge.root_frontier_kind = omill::VirtualRootFrontierKind::kCall;
+    edge.kind = omill::FrontierWorkKind::kVmEnterBoundary;
+    edge.status = omill::FrontierWorkStatus::kClassifiedVmEnter;
+    edge.exit_disposition = omill::VirtualExitDisposition::kNestedVmEnter;
+    graph.edge_facts_by_identity.emplace(edge.identity, std::move(edge));
+  }
+  {
+    omill::SessionBoundaryFact boundary;
+    boundary.target_pc = 0x401220ULL;
+    boundary.kind = omill::FrontierWorkKind::kVmEnterBoundary;
+    boundary.exit_disposition = omill::VirtualExitDisposition::kNestedVmEnter;
+    boundary.declaration_name = "omill_vm_enter_target_401220";
+    graph.boundary_facts_by_target.emplace(boundary.target_pc, std::move(boundary));
+  }
+  publishSessionGraphProjection(*M, graph);
+
+  auto model = runAnalysis(*M);
+  EXPECT_TRUE(model.telemetry().session_graph_boundary_projection_used);
+  auto *boundary = model.lookupBoundary("omill_vm_enter_target_401220");
+  ASSERT_NE(boundary, nullptr);
+  EXPECT_EQ(boundary->kind, omill::VirtualBoundaryKind::kProtectedEntryStub);
+  EXPECT_EQ(boundary->target_va, 0x401220ULL);
+
+  auto *handler = model.lookupHandler("sub_401000");
+  ASSERT_NE(handler, nullptr);
+  ASSERT_EQ(handler->callsites.size(), 1u);
+  EXPECT_EQ(handler->callsites[0].resolved_target_pc, 0x401220ULL);
+  ASSERT_TRUE(handler->callsites[0].target_function_name.has_value());
+  EXPECT_EQ(*handler->callsites[0].target_function_name,
+            "omill_vm_enter_target_401220");
+  EXPECT_EQ(handler->callsites[0].exit.disposition,
+            omill::VirtualExitDisposition::kNestedVmEnter);
+}
+
+TEST_F(VirtualMachineModelTest,
+       ProjectsRegionsFromSessionGraphWhenAvailable) {
+  auto M = createModule();
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *handler_ty = llvm::FunctionType::get(void_ty, {ptr_ty, i64_ty, ptr_ty},
+                                             false);
+
+  auto *root = llvm::Function::Create(handler_ty, llvm::Function::ExternalLinkage,
+                                      "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+
+  omill::SessionGraphState graph;
+  {
+    omill::SessionHandlerNode root_node;
+    root_node.function_name = "sub_401000";
+    root_node.entry_va = 0x401000ULL;
+    root_node.is_defined = true;
+    root_node.is_output_root = true;
+    graph.handler_nodes.emplace(root_node.function_name, std::move(root_node));
+  }
+  {
+    omill::SessionRegionNode region;
+    region.entry_pc = 0x401330ULL;
+    region.kind = omill::SessionRegionKind::kNestedVmEnter;
+    region.status = omill::SessionRegionStatus::kImported;
+    region.parent_entry_pc = 0x401000ULL;
+    region.imported_root_function = "tbrec_sub_401330";
+    graph.region_nodes_by_entry_pc.emplace(region.entry_pc, std::move(region));
+  }
+  publishSessionGraphProjection(*M, graph);
+
+  auto model = runAnalysis(*M);
+  ASSERT_EQ(model.regions().size(), 1u);
+  EXPECT_EQ(model.regions()[0].handler_names.size(), 1u);
+  EXPECT_EQ(model.regions()[0].handler_names[0], "tbrec_sub_401330");
+  EXPECT_EQ(model.regions()[0].entry_handler_names.size(), 1u);
+  EXPECT_EQ(model.regions()[0].entry_handler_names[0], "tbrec_sub_401330");
+  EXPECT_EQ(model.regions()[0].exit_handler_names.size(), 1u);
+  EXPECT_EQ(model.regions()[0].exit_handler_names[0], "sub_401000");
+}
+
+TEST_F(VirtualMachineModelTest,
+       CollectEvaluatedValueChoicesHandlesDenseSetSentinelConstants) {
+  llvm::SmallVector<uint64_t, 4> values;
+  EXPECT_TRUE(omill::virtual_model::detail::collectEvaluatedValueChoices(
+      omill::virtual_model::detail::constantExpr(UINT64_MAX, 64), {}, {}, values,
+      nullptr));
+  ASSERT_EQ(values.size(), 1u);
+  EXPECT_EQ(values.front(), UINT64_MAX);
+
+  values.clear();
+  EXPECT_TRUE(omill::virtual_model::detail::collectEvaluatedValueChoices(
+      omill::virtual_model::detail::constantExpr(UINT64_MAX - 1, 64), {}, {},
+      values, nullptr));
+  ASSERT_EQ(values.size(), 1u);
+  EXPECT_EQ(values.front(), UINT64_MAX - 1);
+}
+
+TEST_F(VirtualMachineModelTest,
+       PrefersAttrSeededOutputRootsOverAllNamedCodeFallback) {
+  auto M = createModule();
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *handler_ty =
+      llvm::FunctionType::get(void_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+
+  auto *root = llvm::Function::Create(handler_ty,
+                                      llvm::Function::ExternalLinkage,
+                                      "sub_180001000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+
+  auto *unrelated = llvm::Function::Create(handler_ty,
+                                           llvm::Function::ExternalLinkage,
+                                           "blk_180002000", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", unrelated);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+
+  auto model = runAnalysis(*M);
+  EXPECT_NE(model.lookupHandler("sub_180001000"), nullptr);
+  EXPECT_EQ(model.lookupHandler("blk_180002000"), nullptr);
+}
+
+TEST_F(VirtualMachineModelTest,
+       AttrSeededRootDoesNotPullOrdinarySemanticHelpersIntoHandlerSet) {
+  auto M = createModule();
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *handler_ty =
+      llvm::FunctionType::get(void_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+
+  auto *helper = llvm::Function::Create(handler_ty,
+                                        llvm::Function::ExternalLinkage,
+                                        "_ZN12_GLOBAL__N_13HelperEP6MemoryS0_R5State",
+                                        *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", helper);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+
+  auto *root = llvm::Function::Create(handler_ty,
+                                      llvm::Function::ExternalLinkage,
+                                      "sub_180003000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateCall(handler_ty, helper,
+                 {root->getArg(0), root->getArg(1), root->getArg(2)});
+    B.CreateRetVoid();
+  }
+
+  auto model = runAnalysis(*M);
+  EXPECT_NE(model.lookupHandler("sub_180003000"), nullptr);
+  EXPECT_EQ(model.lookupHandler("_ZN12_GLOBAL__N_13HelperEP6MemoryS0_R5State"),
+            nullptr);
 }
 
 TEST_F(VirtualMachineModelTest, InvalidatesCachedOutgoingFactsAfterCalleeBodyChange) {
@@ -3807,6 +4384,8 @@ TEST_F(VirtualMachineModelTest,
   ASSERT_TRUE(slice->frontier_edges.front().boundary_name.has_value());
   EXPECT_EQ(*slice->frontier_edges.front().boundary_name,
             "KERNEL32.dll!CreateFileW");
+  EXPECT_EQ(slice->frontier_edges.front().exit_disposition,
+            omill::VirtualExitDisposition::kVmExitNativeCallReenter);
 }
 
 TEST_F(VirtualMachineModelTest,
@@ -5523,6 +6102,301 @@ TEST_F(VirtualMachineModelTest,
   ASSERT_TRUE(dispatch_summary.successors.front().target_function_name.has_value());
   EXPECT_EQ(*dispatch_summary.successors.front().target_function_name,
             "blk_18000e340");
+}
+
+TEST_F(VirtualMachineModelTest,
+       TracksCanonicalVipFromNextPcAndClassifiesDispatchAsStayInVm) {
+  auto M = createModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+
+  auto *dispatch = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "__omill_dispatch_jump", *M);
+  auto *target = llvm::Function::Create(lifted_ty,
+                                        llvm::Function::ExternalLinkage,
+                                        "blk_180020140", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target->getArg(0));
+  }
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::Function::ExternalLinkage,
+                                      "sub_180020100", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *next_pc = B.CreateAlloca(i64_ty, nullptr, "NEXT_PC");
+    B.CreateStore(B.getInt64(0x180020140ULL), next_pc);
+    auto *loaded_next_pc = B.CreateLoad(i64_ty, next_pc);
+    auto *call = B.CreateCall(dispatch,
+                              {root->getArg(0), loaded_next_pc, root->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  auto model = runAnalysis(*M);
+  auto *summary = model.lookupHandler("sub_180020100");
+  ASSERT_NE(summary, nullptr);
+  EXPECT_EQ(summary->canonical_vip.source_kind,
+            omill::VirtualInstructionPointerSourceKind::kNamedSlot);
+  ASSERT_TRUE(summary->canonical_vip.resolved_pc.has_value());
+  EXPECT_EQ(*summary->canonical_vip.resolved_pc, 0x180020140ULL);
+  ASSERT_EQ(summary->dispatches.size(), 1u);
+  EXPECT_EQ(summary->dispatches.front().exit.disposition,
+            omill::VirtualExitDisposition::kStayInVm);
+  ASSERT_TRUE(summary->dispatches.front().vip.resolved_pc.has_value());
+  EXPECT_EQ(*summary->dispatches.front().vip.resolved_pc, 0x180020140ULL);
+}
+
+TEST_F(VirtualMachineModelTest,
+       ClassifiesNativeCallWithContinuationAsVmExitNativeCallReenter) {
+  auto M = createModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+  auto *calli_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, i64_ty, ptr_ty, i64_ty},
+                              false);
+  auto *calli = llvm::Function::Create(calli_ty, llvm::Function::ExternalLinkage,
+                                       "HELPER_CALLI_NATIVE", *M);
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::Function::ExternalLinkage,
+                                      "sub_180021000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *next_pc = B.CreateAlloca(i64_ty, nullptr, "NEXT_PC");
+    auto *return_pc = B.CreateAlloca(i64_ty, nullptr, "RETURN_PC");
+    B.CreateStore(B.getInt64(0x180021200ULL), next_pc);
+    B.CreateStore(B.getInt64(0x180021080ULL), return_pc);
+    auto *call = B.CreateCall(calli, {root->getArg(0), root->getArg(1),
+                                      B.getInt64(0x180030000ULL),
+                                      root->getArg(2), B.getInt64(0x180021080ULL)});
+    B.CreateRet(call);
+  }
+
+  omill::BinaryMemoryMap map;
+  map.setImageBase(0x180020000ULL);
+  std::array<uint8_t, 16> native_code = {0x48, 0x89, 0xC8, 0xC3};
+  map.addRegion(0x180030000ULL, native_code.data(), native_code.size(),
+                /*read_only=*/false, /*executable=*/true);
+
+  auto model = runAnalysis(*M, std::move(map));
+  auto *summary = model.lookupHandler("sub_180021000");
+  ASSERT_NE(summary, nullptr);
+  ASSERT_EQ(summary->callsites.size(), 1u);
+  const auto &callsite = summary->callsites.front();
+  EXPECT_EQ(callsite.exit.disposition,
+            omill::VirtualExitDisposition::kVmExitNativeCallReenter);
+  ASSERT_TRUE(callsite.exit.continuation_pc.has_value());
+  EXPECT_EQ(*callsite.exit.continuation_pc, 0x180021080ULL);
+  ASSERT_TRUE(callsite.exit.continuation_vip.resolved_pc.has_value());
+  EXPECT_EQ(*callsite.exit.continuation_vip.resolved_pc, 0x180021080ULL);
+
+  auto *slice = model.lookupRootSlice(0x180021000ULL);
+  ASSERT_NE(slice, nullptr);
+  EXPECT_FALSE(slice->frontier_edges.empty());
+  EXPECT_TRUE(llvm::any_of(
+      slice->frontier_edges,
+      [](const omill::VirtualRootSliceSummary::FrontierEdge &frontier) {
+        return frontier.kind == omill::VirtualRootFrontierKind::kCall &&
+               frontier.reason == "call_target_unlifted" &&
+               frontier.exit_disposition ==
+                   omill::VirtualExitDisposition::kVmExitNativeCallReenter &&
+               frontier.target_pc.has_value() &&
+               *frontier.target_pc == 0x180030000ULL;
+      }));
+}
+
+TEST_F(VirtualMachineModelTest,
+       CarriesVipAndExitDispositionIntoBoundaryFrontierEdges) {
+  auto M = createModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+  auto *dispatch = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "__omill_dispatch_jump", *M);
+
+  auto *boundary_ty =
+      llvm::FunctionType::get(i64_ty, std::vector<llvm::Type *>(12, i64_ty),
+                              false);
+  auto *boundary = llvm::Function::Create(boundary_ty,
+                                          llvm::Function::ExternalLinkage,
+                                          "vm_entry_180022000", *M);
+  boundary->addFnAttr("omill.protection_boundary");
+  boundary->addFnAttr("omill.boundary_kind", "vm_entry_stub");
+  boundary->addFnAttr("omill.boundary_entry_va", "180022000");
+  boundary->addFnAttr("omill.boundary_target_va", "180040000");
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::Function::ExternalLinkage,
+                                      "sub_180021f00", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *next_pc = B.CreateAlloca(i64_ty, nullptr, "NEXT_PC");
+    B.CreateStore(B.getInt64(0x180022000ULL), next_pc);
+    auto *loaded_next_pc = B.CreateLoad(i64_ty, next_pc);
+    auto *call = B.CreateCall(dispatch,
+                              {root->getArg(0), loaded_next_pc, root->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  auto model = runAnalysis(*M);
+  auto *slice = model.lookupRootSlice(0x180021F00ULL);
+  ASSERT_NE(slice, nullptr);
+  ASSERT_EQ(slice->frontier_edges.size(), 1u);
+  EXPECT_EQ(slice->frontier_edges.front().exit_disposition,
+            omill::VirtualExitDisposition::kVmExitTerminal);
+  ASSERT_TRUE(slice->frontier_edges.front().vip_pc.has_value());
+  EXPECT_EQ(*slice->frontier_edges.front().vip_pc, 0x180022000ULL);
+}
+
+TEST_F(VirtualMachineModelTest,
+       ClassifiesBoundaryCallsiteTargetAsVmEnterAndNestedVmEnter) {
+  auto M = createModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+  auto *calli_ty = llvm::FunctionType::get(
+      ptr_ty, {ptr_ty, ptr_ty, i64_ty, ptr_ty, i64_ty, ptr_ty}, false);
+  auto *boundary_ty =
+      llvm::FunctionType::get(i64_ty, std::vector<llvm::Type *>(12, i64_ty),
+                              false);
+
+  auto *calli = llvm::Function::Create(
+      calli_ty, llvm::Function::ExternalLinkage,
+      "_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_", *M);
+  auto *boundary = llvm::Function::Create(boundary_ty,
+                                          llvm::Function::ExternalLinkage,
+                                          "vm_entry_180024000", *M);
+  boundary->addFnAttr("omill.protection_boundary");
+  boundary->addFnAttr("omill.boundary_kind", "vm_entry_stub");
+  boundary->addFnAttr("omill.boundary_entry_va", "180024000");
+  boundary->addFnAttr("omill.boundary_target_va", "180040000");
+
+  auto *vm_enter_root = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "sub_180023000", *M);
+  vm_enter_root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", vm_enter_root);
+    llvm::IRBuilder<> B(entry);
+    auto *next_pc = B.CreateAlloca(i64_ty, nullptr, "NEXT_PC");
+    auto *return_pc = B.CreateAlloca(i64_ty, nullptr, "RETURN_PC");
+    B.CreateCall(calli, {vm_enter_root->getArg(2), vm_enter_root->getArg(0),
+                         B.getInt64(0x180024000ULL), next_pc,
+                         B.getInt64(0x180023013ULL), return_pc});
+    B.CreateRet(vm_enter_root->getArg(0));
+  }
+
+  auto *nested_root = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "sub_180023100", *M);
+  nested_root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", nested_root);
+    llvm::IRBuilder<> B(entry);
+    llvm::SmallVector<llvm::Value *, 12> boundary_args(12, B.getInt64(0));
+    B.CreateCall(boundary_ty, boundary, boundary_args);
+    auto *next_pc = B.CreateAlloca(i64_ty, nullptr, "NEXT_PC");
+    auto *return_pc = B.CreateAlloca(i64_ty, nullptr, "RETURN_PC");
+    B.CreateCall(calli, {nested_root->getArg(2), nested_root->getArg(0),
+                         B.getInt64(0x180024000ULL), next_pc,
+                         B.getInt64(0x180023113ULL), return_pc});
+    B.CreateRet(nested_root->getArg(0));
+  }
+
+  std::vector<uint8_t> code(0x10000, 0x90);
+  omill::BinaryMemoryMap map;
+  map.setImageBase(0x180020000ULL);
+  map.setImageSize(0x10000);
+  map.addRegion(0x180020000ULL, code.data(), code.size(), false,
+                /*executable=*/true);
+
+  auto model = runAnalysis(*M, std::move(map));
+
+  auto *vm_enter_summary = model.lookupHandler("sub_180023000");
+  ASSERT_NE(vm_enter_summary, nullptr);
+  ASSERT_EQ(vm_enter_summary->callsites.size(), 1u);
+  EXPECT_EQ(vm_enter_summary->callsites.front().exit.disposition,
+            omill::VirtualExitDisposition::kVmEnter);
+
+  auto *nested_summary = model.lookupHandler("sub_180023100");
+  ASSERT_NE(nested_summary, nullptr);
+  ASSERT_EQ(nested_summary->callsites.size(), 1u);
+  EXPECT_EQ(nested_summary->callsites.front().exit.disposition,
+            omill::VirtualExitDisposition::kNestedVmEnter);
+}
+
+TEST_F(VirtualMachineModelTest,
+       TraceCorroborationCanRefineBoundaryExitWithoutChangingStaticSourceOfTruth) {
+  auto M = createModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+  auto *dispatch = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "__omill_dispatch_jump", *M);
+  auto *boundary_ty =
+      llvm::FunctionType::get(i64_ty, std::vector<llvm::Type *>(12, i64_ty),
+                              false);
+  auto *boundary = llvm::Function::Create(boundary_ty,
+                                          llvm::Function::ExternalLinkage,
+                                          "vm_entry_180025000", *M);
+  boundary->addFnAttr("omill.protection_boundary");
+  boundary->addFnAttr("omill.boundary_kind", "vm_entry_stub");
+  boundary->addFnAttr("omill.boundary_entry_va", "180025000");
+  boundary->addFnAttr("omill.boundary_target_va", "180045000");
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::Function::ExternalLinkage,
+                                      "sub_180024800", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *next_pc = B.CreateAlloca(i64_ty, nullptr, "NEXT_PC");
+    B.CreateStore(B.getInt64(0x180025000ULL), next_pc);
+    auto *loaded_next_pc = B.CreateLoad(i64_ty, next_pc);
+    auto *call = B.CreateCall(dispatch, {root->getArg(0), loaded_next_pc,
+                                         root->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  std::vector<uint8_t> code(0x10000, 0x90);
+  omill::BinaryMemoryMap map;
+  map.setImageBase(0x180020000ULL);
+  map.setImageSize(0x10000);
+  map.addRegion(0x180020000ULL, code.data(), code.size(), false,
+                /*executable=*/true);
+
+  omill::VMTraceMap trace_map(/*vmenter_va=*/0x180025000ULL,
+                              /*vmexit_va=*/0x180045000ULL);
+  omill::VMTraceRecord record;
+  record.handler_va = 0x180024800ULL;
+  record.native_target_va = 0x180030000ULL;
+  record.successors.push_back(0x180025020ULL);
+  trace_map.recordTrace(std::move(record));
+
+  auto model = runAnalysis(*M, std::move(map), std::move(trace_map));
+  auto *summary = model.lookupHandler("sub_180024800");
+  ASSERT_NE(summary, nullptr);
+  ASSERT_EQ(summary->dispatches.size(), 1u);
+  const auto &dispatch_summary = summary->dispatches.front();
+  EXPECT_EQ(dispatch_summary.exit.disposition,
+            omill::VirtualExitDisposition::kVmExitNativeCallReenter);
+  EXPECT_TRUE(dispatch_summary.exit.corroborated_by_trace);
+  ASSERT_TRUE(dispatch_summary.exit.native_target_pc.has_value());
+  EXPECT_EQ(*dispatch_summary.exit.native_target_pc, 0x180030000ULL);
 }
 
 }  // namespace

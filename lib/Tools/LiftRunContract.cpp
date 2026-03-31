@@ -61,9 +61,9 @@ std::vector<std::string> buildOmillLiftArgs(const LiftRunRequest &request) {
 
   pushFlag(args, request.no_abi, "--no-abi");
   pushFlag(args, request.deobfuscate, "--deobfuscate");
+  pushFlag(args, request.devirtualize, "--devirtualize");
   pushFlag(args, request.resolve_targets, "--resolve-targets");
   pushUnsigned(args, "--max-iterations", request.max_iterations, 10);
-  pushFlag(args, request.refine_signatures, "--refine-signatures");
   pushFlag(args, request.ipcp, "--ipcp");
   pushFlag(args, request.resolve_exceptions, "--resolve-exceptions");
   pushFlag(args, request.block_lift, "--block-lift");
@@ -111,9 +111,9 @@ llvm::json::Object toJSON(const LiftRunRequest &request) {
   obj["output_filename"] = request.output_filename;
   obj["no_abi"] = request.no_abi;
   obj["deobfuscate"] = request.deobfuscate;
+  obj["devirtualize"] = request.devirtualize;
   obj["resolve_targets"] = request.resolve_targets;
   obj["max_iterations"] = static_cast<int64_t>(request.max_iterations);
-  obj["refine_signatures"] = request.refine_signatures;
   obj["ipcp"] = request.ipcp;
   obj["resolve_exceptions"] = request.resolve_exceptions;
   obj["block_lift"] = request.block_lift;
@@ -156,12 +156,12 @@ std::optional<LiftRunRequest> parseLiftRunRequest(const llvm::json::Value &v) {
     request.no_abi = *b;
   if (auto b = obj->getBoolean("deobfuscate"))
     request.deobfuscate = *b;
+  if (auto b = obj->getBoolean("devirtualize"))
+    request.devirtualize = *b;
   if (auto b = obj->getBoolean("resolve_targets"))
     request.resolve_targets = *b;
   if (auto n = obj->getInteger("max_iterations"))
     request.max_iterations = static_cast<unsigned>(*n);
-  if (auto b = obj->getBoolean("refine_signatures"))
-    request.refine_signatures = *b;
   if (auto b = obj->getBoolean("ipcp"))
     request.ipcp = *b;
   if (auto b = obj->getBoolean("resolve_exceptions"))

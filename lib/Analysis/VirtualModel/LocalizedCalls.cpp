@@ -575,6 +575,7 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeCallsiteLocalizedOutgoingFa
     }
     if (leaf_localized) {
       log_localization_step("leaf-replay-done");
+      normalizeLocalizedOutgoingFacts(model, *leaf_localized);
       visiting.erase(callee_fn);
       return leaf_localized;
     }
@@ -632,6 +633,7 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeCallsiteLocalizedOutgoingFa
       rebaseOutgoingStackFacts(model, localized.outgoing_slots,
                                localized.outgoing_stack);
   log_localization_step("rebase-stack-done");
+  normalizeLocalizedOutgoingFacts(model, localized);
   visiting.erase(callee_fn);
   log_localization_step("done");
   return localized;
@@ -725,6 +727,7 @@ computeResolvedCallTargetOutgoingFacts(
             handler_index, outgoing_maps, outgoing_stack_maps, binary_memory,
             depth + 1, visiting, nullptr, nullptr, &caller_outgoing, nullptr,
             nullptr, nullptr, nullptr)) {
+      normalizeLocalizedOutgoingFacts(model, *leaf_localized);
       visiting.erase(target_fn);
       return leaf_localized;
     }
@@ -772,6 +775,7 @@ computeResolvedCallTargetOutgoingFacts(
   localized.outgoing_stack =
       rebaseOutgoingStackFacts(model, localized.outgoing_slots,
                                localized.outgoing_stack);
+  normalizeLocalizedOutgoingFacts(model, localized);
   visiting.erase(target_fn);
   return localized;
 }
@@ -964,6 +968,7 @@ computeEntryPreludeCallOutgoingFacts(
             handler_index, outgoing_maps, outgoing_stack_maps, binary_memory,
             depth + 1, visiting, nullptr, nullptr, &caller_incoming, nullptr,
             nullptr, nullptr, nullptr)) {
+      normalizeLocalizedOutgoingFacts(model, *leaf_localized);
       visiting.erase(target_fn);
       return leaf_localized;
     }
@@ -1012,6 +1017,7 @@ computeEntryPreludeCallOutgoingFacts(
   localized.outgoing_stack =
       rebaseOutgoingStackFacts(model, localized.outgoing_slots,
                                localized.outgoing_stack);
+  normalizeLocalizedOutgoingFacts(model, localized);
   visiting.erase(target_fn);
   return localized;
 }

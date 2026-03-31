@@ -23,9 +23,9 @@ struct LiftRunRequest {
 
   bool no_abi = false;
   bool deobfuscate = false;
+  bool devirtualize = false;
   bool resolve_targets = false;
   unsigned max_iterations = 10;
-  bool refine_signatures = false;
   bool ipcp = false;
   bool resolve_exceptions = false;
   bool block_lift = false;

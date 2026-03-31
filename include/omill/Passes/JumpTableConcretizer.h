@@ -4,7 +4,7 @@
 
 namespace omill {
 
-/// Function pass that proactively scans __omill_dispatch_jump call sites
+/// Function pass that proactively scans unresolved dispatch-jump call sites
 /// for jump table patterns and replaces them with switch instructions.
 ///
 /// For each dispatch_jump(state, target_expr, mem), the pass:

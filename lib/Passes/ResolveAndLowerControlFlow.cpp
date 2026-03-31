@@ -10,9 +10,12 @@
 #include <llvm/IR/Operator.h>
 #include <llvm/IR/PatternMatch.h>
 #include <llvm/Support/KnownBits.h>
+#include <llvm/Support/Format.h>
 
 #include "omill/Analysis/BinaryMemoryMap.h"
+#include "omill/Analysis/VirtualModel/Types.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
+#include "omill/BC/BlockLifterAnalysis.h"
 #include "omill/Utils/LiftedNames.h"
 
 #include "JumpTableUtils.h"
@@ -20,6 +23,80 @@
 namespace omill {
 
 namespace {
+
+bool debugResolveControlFlow() {
+  static const bool enabled =
+      (std::getenv("OMILL_DEBUG_RESOLVE_CONTROL_FLOW") != nullptr);
+  return enabled;
+}
+
+bool debugJumpTables() {
+  static const bool enabled =
+      (std::getenv("OMILL_DEBUG_JUMP_TABLES") != nullptr);
+  return enabled;
+}
+
+void copyVirtualExitAttrs(const llvm::CallBase &from, llvm::CallBase &to) {
+  static constexpr llvm::StringLiteral kVirtualExitAttrs[] = {
+      "omill.virtual_exit_disposition",
+      "omill.virtual_exit_continuation_pc",
+      "omill.virtual_exit_continuation_vip",
+      "omill.virtual_exit_native_target_pc",
+      "omill.virtual_exit_partial",
+      "omill.virtual_exit_full",
+      "omill.virtual_exit_reenters_vm",
+  };
+  for (auto name : kVirtualExitAttrs) {
+    auto attr = from.getFnAttr(name);
+    if (!attr.isValid())
+      continue;
+    to.addFnAttr(llvm::Attribute::get(to.getContext(), name,
+                                      attr.getValueAsString()));
+  }
+}
+
+std::optional<VirtualExitDisposition> getVirtualExitDisposition(
+    const llvm::CallBase &call) {
+  auto attr = call.getFnAttr("omill.virtual_exit_disposition");
+  if (!attr.isValid() || !attr.isStringAttribute())
+    return std::nullopt;
+
+  auto text = attr.getValueAsString();
+  if (text == "unknown")
+    return VirtualExitDisposition::kUnknown;
+  if (text == "stay_in_vm")
+    return VirtualExitDisposition::kStayInVm;
+  if (text == "vm_exit_terminal")
+    return VirtualExitDisposition::kVmExitTerminal;
+  if (text == "vm_exit_native_call_reenter")
+    return VirtualExitDisposition::kVmExitNativeCallReenter;
+  if (text == "vm_exit_native_exec_unknown_return")
+    return VirtualExitDisposition::kVmExitNativeExecUnknownReturn;
+  if (text == "vm_enter")
+    return VirtualExitDisposition::kVmEnter;
+  if (text == "nested_vm_enter")
+    return VirtualExitDisposition::kNestedVmEnter;
+  return std::nullopt;
+}
+
+bool shouldLowerResolvedInternalTarget(const llvm::CallBase &call) {
+  auto disposition = getVirtualExitDisposition(call);
+  if (!disposition.has_value())
+    return true;
+
+  switch (*disposition) {
+    case VirtualExitDisposition::kUnknown:
+    case VirtualExitDisposition::kStayInVm:
+      return true;
+    case VirtualExitDisposition::kVmExitTerminal:
+    case VirtualExitDisposition::kVmExitNativeCallReenter:
+    case VirtualExitDisposition::kVmExitNativeExecUnknownReturn:
+    case VirtualExitDisposition::kVmEnter:
+    case VirtualExitDisposition::kNestedVmEnter:
+      return false;
+  }
+  return true;
+}
 
 // ===----------------------------------------------------------------------===
 // Phase 1: ResolveTargets — resolve constant-PC dispatch calls/jumps
@@ -49,7 +126,7 @@ bool resolveDispatchTargets(llvm::Function &F,
         if (!call)
           continue;
         auto *callee = call->getCalledFunction();
-        if (!callee || callee->getName() != "__omill_dispatch_call")
+        if (!callee || !isDispatchCallName(callee->getName()))
           continue;
         if (call->arg_size() < 3)
           continue;
@@ -67,6 +144,14 @@ bool resolveDispatchTargets(llvm::Function &F,
     }
 
     for (auto *call : candidates) {
+      if (!shouldLowerResolvedInternalTarget(*call)) {
+        if (debugResolveControlFlow())
+          llvm::errs() << "[resolve-cf] skip-call-exit " << F.getName()
+                       << " callee=" << call->getCalledFunction()->getName()
+                       << "\n";
+        continue;
+      }
+
       auto *ci = llvm::cast<llvm::ConstantInt>(call->getArgOperand(1));
       uint64_t target_pc = ci->getZExtValue();
 
@@ -91,10 +176,19 @@ bool resolveDispatchTargets(llvm::Function &F,
 
       // Priority 2: Direct call to lifted function.
       auto *target_fn = lifted ? lifted->lookup(target_pc) : nullptr;
+      if (!target_fn)
+        target_fn = findLiftedOrBlockFunctionByPC(M, target_pc);
+      if (debugResolveControlFlow()) {
+        llvm::errs() << "[resolve-cf] call-target "
+                     << target_pc
+                     << " fn=" << (target_fn ? target_fn->getName() : "<null>")
+                     << " in=" << F.getName() << "\n";
+      }
       if (target_fn) {
         llvm::IRBuilder<> Builder(call);
         auto *direct_call = Builder.CreateCall(
             target_fn, {call->getArgOperand(0), ci, call->getArgOperand(2)});
+        copyVirtualExitAttrs(*call, *direct_call);
         call->replaceAllUsesWith(direct_call);
         call->eraseFromParent();
         changed = true;
@@ -118,7 +212,7 @@ bool resolveDispatchTargets(llvm::Function &F,
         if (!call)
           continue;
         auto *callee = call->getCalledFunction();
-        if (!callee || callee->getName() != "__omill_dispatch_jump")
+        if (!callee || !isDispatchJumpName(callee->getName()))
           continue;
         if (call->arg_size() < 3)
           continue;
@@ -145,6 +239,14 @@ bool resolveDispatchTargets(llvm::Function &F,
     }
 
     for (auto &[call, ret, target_pc, target_fn] : candidates) {
+      if (!shouldLowerResolvedInternalTarget(*call)) {
+        if (debugResolveControlFlow())
+          llvm::errs() << "[resolve-cf] skip-jump-exit " << F.getName()
+                       << " callee=" << call->getCalledFunction()->getName()
+                       << "\n";
+        continue;
+      }
+
       auto *BB = call->getParent();
       llvm::SmallVector<llvm::BasicBlock *, 4> old_succs(successors(BB));
 
@@ -157,6 +259,7 @@ bool resolveDispatchTargets(llvm::Function &F,
         auto *mem = dispatch_call->getArgOperand(2);
 
         auto *tail_call = Builder.CreateCall(direct_target, {state, pc_val, mem});
+        copyVirtualExitAttrs(*dispatch_call, *tail_call);
         tail_call->setTailCallKind(llvm::CallInst::TCK_MustTail);
         auto *new_ret = Builder.CreateRet(tail_call);
 
@@ -213,7 +316,9 @@ bool resolveDispatchTargets(llvm::Function &F,
       }
 
       // Priority 2: Inter-function tail call.
-      target_fn = lifted ? lifted->lookup(target_pc) : nullptr;
+        target_fn = lifted ? lifted->lookup(target_pc) : nullptr;
+        if (!target_fn)
+          target_fn = findLiftedOrBlockFunctionByPC(M, target_pc);
       if (target_fn) {
         lowerDirectJumpToFunction(target_fn, call, ret);
         continue;
@@ -231,6 +336,7 @@ bool resolveDispatchTargets(llvm::Function &F,
 struct JumpTableCandidate {
   llvm::CallInst *dispatch_call;
   llvm::ReturnInst *ret;
+  llvm::BranchInst *branch;
   llvm::LoadInst *table_load;
   jt::LinearAddress addr;
   uint64_t image_base;
@@ -239,7 +345,8 @@ struct JumpTableCandidate {
 
 bool recoverJumpTables(llvm::Function &F,
                        const BinaryMemoryMap *map,
-                       const LiftedFunctionMap *lifted) {
+                       const LiftedFunctionMap *lifted,
+                       BlockLiftCallback lift_block = {}) {
   if (!map || map->empty())
     return false;
 
@@ -251,7 +358,7 @@ bool recoverJumpTables(llvm::Function &F,
       if (!call)
         continue;
       auto *callee = call->getCalledFunction();
-      if (!callee || callee->getName() != "__omill_dispatch_jump")
+      if (!callee || !isDispatchJumpName(callee->getName()))
         continue;
       if (call->arg_size() < 3)
         continue;
@@ -264,34 +371,88 @@ bool recoverJumpTables(llvm::Function &F,
 
       // Unwrap RVA conversion if present.
       auto [image_base, load_val] = jt::unwrapRVAConversion(target, &F);
+      llvm::Value *dynamic_rva_base = nullptr;
+      if (image_base == 0)
+        jt::trySplitDynamicRVAConversion(target, dynamic_rva_base, load_val);
+      if (debugJumpTables()) {
+        llvm::errs() << "[resolve-cf-jt] inspect " << F.getName()
+                     << " bb=" << BB.getName()
+                     << " image_base=0x" << llvm::format_hex(image_base, 10)
+                     << " dynamic_base=" << (dynamic_rva_base ? "yes" : "no")
+                     << " target=";
+        target->print(llvm::errs());
+        llvm::errs() << " load_val=";
+        load_val->print(llvm::errs());
+        llvm::Value *dbg_lhs = nullptr;
+        llvm::Value *dbg_rhs = nullptr;
+        if (llvm::PatternMatch::match(
+                target, llvm::PatternMatch::m_Add(
+                            llvm::PatternMatch::m_Value(dbg_lhs),
+                            llvm::PatternMatch::m_Value(dbg_rhs)))) {
+          llvm::errs() << " lhs=";
+          dbg_lhs->print(llvm::errs());
+          llvm::errs() << " rhs=";
+          dbg_rhs->print(llvm::errs());
+          llvm::errs() << " lhs_stripped=";
+          jt::stripSimpleValueCasts(dbg_lhs)->print(llvm::errs());
+          llvm::errs() << " rhs_stripped=";
+          jt::stripSimpleValueCasts(dbg_rhs)->print(llvm::errs());
+        }
+        llvm::errs() << "\n";
+      }
 
-      // Strip zext/sext from load value.
-      if (auto *zext = llvm::dyn_cast<llvm::ZExtInst>(load_val))
-        load_val = zext->getOperand(0);
-      else if (auto *sext = llvm::dyn_cast<llvm::SExtInst>(load_val))
-        load_val = sext->getOperand(0);
-
-      auto *table_load = llvm::dyn_cast<llvm::LoadInst>(load_val);
-      if (!table_load)
+      auto *table_load = jt::extractUnderlyingLoad(load_val);
+      if (!table_load) {
+        if (debugJumpTables())
+          llvm::errs() << "[resolve-cf-jt] reject:no-table-load\n";
         continue;
+      }
 
       // Decompose load pointer into base + idx * stride.
       auto addr_info =
           jt::decomposeTableAddress(table_load->getPointerOperand(), &F);
-      if (!addr_info)
+      if (!addr_info && dynamic_rva_base && map && map->imageBase() != 0) {
+        addr_info = jt::decomposeTableAddressWithDynamicBase(
+            table_load->getPointerOperand(), dynamic_rva_base,
+            map->imageBase());
+        if (addr_info && image_base == 0)
+          image_base = map->imageBase();
+      }
+      if (!addr_info) {
+        if (debugJumpTables())
+          llvm::errs() << "[resolve-cf-jt] reject:no-addr-decompose\n";
         continue;
+      }
 
       // Find bounds.
       auto bound = jt::computeIndexRange(addr_info->index, call->getParent());
-      if (!bound || *bound == 0 || *bound > 1024)
+      if (!bound || *bound == 0 || *bound > 1024) {
+        if (debugJumpTables())
+          llvm::errs() << "[resolve-cf-jt] reject:bad-bound\n";
         continue;
+      }
 
-      // Must be followed by ret.
       auto *ret = llvm::dyn_cast<llvm::ReturnInst>(call->getNextNode());
-      if (!ret)
-        continue;
+      auto *branch =
+          ret ? nullptr : llvm::dyn_cast<llvm::BranchInst>(call->getNextNode());
+      if (!ret) {
+        if (!branch || branch->isConditional() || branch->getNumSuccessors() != 1) {
+          if (debugJumpTables())
+            llvm::errs() << "[resolve-cf-jt] reject:no-ret-or-join\n";
+          continue;
+        }
+      }
 
-      candidates.push_back({call, ret, table_load, *addr_info,
+      if (debugJumpTables()) {
+        llvm::errs() << "[resolve-cf-jt] candidate base=0x"
+                     << llvm::format_hex(addr_info->base, 10)
+                     << " stride=" << addr_info->stride
+                     << " bound=" << *bound
+                     << " image_base=0x" << llvm::format_hex(image_base, 10)
+                     << "\n";
+      }
+
+      candidates.push_back({call, ret, branch, table_load, *addr_info,
                             image_base, *bound});
     }
   }
@@ -306,17 +467,61 @@ bool recoverJumpTables(llvm::Function &F,
 
     auto raw_entries = jt::readTableEntries(*map, addr.base, addr.stride,
                                             cand.num_entries);
-    if (!raw_entries)
+    if (!raw_entries) {
+      if (debugJumpTables()) {
+        llvm::errs() << "[resolve-cf-jt] reject:unreadable-table base=0x"
+                     << llvm::format_hex(addr.base, 10)
+                     << " stride=" << addr.stride
+                     << " count=" << cand.num_entries << "\n";
+      }
       continue;
+    }
 
     jt::applyRVAConversion(*raw_entries, cand.image_base, addr.stride);
+    unsigned trimmed_invalid = jt::trimTrailingInvalidEntries(*raw_entries, *map);
+    if (raw_entries->empty())
+      continue;
+
+    if (lift_block) {
+      for (uint64_t target_va : *raw_entries) {
+        if ((lifted && lifted->lookup(target_va)) ||
+            F.getParent()->getFunction(
+                (llvm::Twine("blk_") + llvm::Twine::utohexstr(target_va)).str()) ||
+            F.getParent()->getFunction(
+                (llvm::Twine("sub_") + llvm::Twine::utohexstr(target_va)).str())) {
+          continue;
+        }
+        if (!map->isExecutable(target_va, 1))
+          continue;
+        bool lifted_target = lift_block(target_va);
+        if (debugJumpTables()) {
+          llvm::errs() << "[resolve-cf-jt] late-block-lift target=0x"
+                       << llvm::format_hex(target_va, 10)
+                       << " ok=" << lifted_target << "\n";
+        }
+      }
+    }
+
+    if (debugJumpTables()) {
+      llvm::errs() << "[resolve-cf-jt] read-table first=0x"
+                   << llvm::format_hex((*raw_entries)[0], 10)
+                   << " last=0x"
+                   << llvm::format_hex((*raw_entries)[raw_entries->size() - 1], 10)
+                   << " trimmed_tail=" << trimmed_invalid << "\n";
+    }
 
     auto result = jt::buildSwitchFromEntries(
         *raw_entries, addr.index, cand.image_base, cand.dispatch_call,
-        cand.ret, F, *map, lifted);
+        cand.ret, cand.branch, F, *map, lifted);
 
-    if (result.changed)
+    if (result.changed) {
+      if (debugJumpTables())
+        llvm::errs() << "[resolve-cf-jt] changed " << F.getName() << "\n";
       changed = true;
+    } else if (debugJumpTables()) {
+      llvm::errs() << "[resolve-cf-jt] build-switch-nochange " << F.getName()
+                   << "\n";
+    }
   }
 
   return changed;
@@ -360,20 +565,26 @@ struct TableAccess {
 };
 
 std::optional<TableAccess> analyzeTarget(llvm::Value *target,
-                                         llvm::Function &F) {
+                                         llvm::Function &F,
+                                         const BinaryMemoryMap *map) {
   auto [image_base, load_val] = jt::unwrapRVAConversion(target, &F);
+  llvm::Value *dynamic_rva_base = nullptr;
+  if (image_base == 0)
+    jt::trySplitDynamicRVAConversion(target, dynamic_rva_base, load_val);
 
-  if (auto *zext = llvm::dyn_cast<llvm::ZExtInst>(load_val))
-    load_val = zext->getOperand(0);
-  else if (auto *sext = llvm::dyn_cast<llvm::SExtInst>(load_val))
-    load_val = sext->getOperand(0);
-
-  auto *table_load = llvm::dyn_cast<llvm::LoadInst>(load_val);
+  auto *table_load = jt::extractUnderlyingLoad(load_val);
   if (!table_load)
     return std::nullopt;
 
   auto addr_info =
       jt::decomposeTableAddress(table_load->getPointerOperand(), &F);
+  if (!addr_info && dynamic_rva_base && map && map->imageBase() != 0) {
+    addr_info = jt::decomposeTableAddressWithDynamicBase(
+        table_load->getPointerOperand(), dynamic_rva_base,
+        map->imageBase());
+    if (addr_info && image_base == 0)
+      image_base = map->imageBase();
+  }
   if (!addr_info)
     return std::nullopt;
 
@@ -399,6 +610,7 @@ bool symbolicJumpTableSolve(llvm::Function &F,
   struct Candidate {
     llvm::CallInst *dispatch_call;
     llvm::ReturnInst *ret;
+    llvm::BranchInst *branch;
     TableAccess access;
     uint64_t num_entries;
   };
@@ -411,7 +623,7 @@ bool symbolicJumpTableSolve(llvm::Function &F,
       if (!call)
         continue;
       auto *callee = call->getCalledFunction();
-      if (!callee || callee->getName() != "__omill_dispatch_jump")
+      if (!callee || !isDispatchJumpName(callee->getName()))
         continue;
       if (call->arg_size() < 3)
         continue;
@@ -420,7 +632,7 @@ bool symbolicJumpTableSolve(llvm::Function &F,
       if (llvm::isa<llvm::ConstantInt>(target))
         continue;
 
-      auto access = analyzeTarget(target, F);
+      auto access = analyzeTarget(target, F, map);
       if (!access)
         continue;
 
@@ -450,10 +662,14 @@ bool symbolicJumpTableSolve(llvm::Function &F,
         continue;
 
       auto *ret = llvm::dyn_cast<llvm::ReturnInst>(call->getNextNode());
-      if (!ret)
-        continue;
+      auto *branch =
+          ret ? nullptr : llvm::dyn_cast<llvm::BranchInst>(call->getNextNode());
+      if (!ret) {
+        if (!branch || branch->isConditional() || branch->getNumSuccessors() != 1)
+          continue;
+      }
 
-      candidates.push_back({call, ret, *access, *bound});
+      candidates.push_back({call, ret, branch, *access, *bound});
     }
   }
 
@@ -474,7 +690,7 @@ bool symbolicJumpTableSolve(llvm::Function &F,
 
     auto result = jt::buildSwitchFromEntries(
         *raw_entries, addr.index, cand.access.image_base,
-        cand.dispatch_call, cand.ret, F, *map, lifted);
+        cand.dispatch_call, cand.ret, cand.branch, F, *map, lifted);
 
     if (result.changed)
       changed = true;
@@ -491,10 +707,16 @@ bool symbolicJumpTableSolve(llvm::Function &F,
 
 llvm::PreservedAnalyses ResolveAndLowerControlFlowPass::run(
     llvm::Function &F, llvm::FunctionAnalysisManager &AM) {
+  if (debugJumpTables())
+    llvm::errs() << "[resolve-cf-jt] run " << F.getName() << "\n";
   auto &MAMProxy = AM.getResult<llvm::ModuleAnalysisManagerFunctionProxy>(F);
   auto *map = MAMProxy.getCachedResult<BinaryMemoryAnalysis>(*F.getParent());
   auto *lifted =
       MAMProxy.getCachedResult<LiftedFunctionAnalysis>(*F.getParent());
+  auto *block_lift_result =
+      MAMProxy.getCachedResult<BlockLiftAnalysis>(*F.getParent());
+  auto lift_block =
+      block_lift_result ? block_lift_result->lift_block : BlockLiftCallback{};
 
   bool changed = false;
 
@@ -504,7 +726,7 @@ llvm::PreservedAnalyses ResolveAndLowerControlFlowPass::run(
 
   // Phase 2: Recover jump tables via pattern matching.
   if (phases_ & ResolvePhases::RecoverTables)
-    changed |= recoverJumpTables(F, map, lifted);
+    changed |= recoverJumpTables(F, map, lifted, lift_block);
 
   // Phase 3: Symbolic fallback for table index bounds.
   if (phases_ & ResolvePhases::SymbolicSolve)

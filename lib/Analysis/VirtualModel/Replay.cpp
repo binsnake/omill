@@ -92,6 +92,7 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
   const auto &slot_info = *slot_info_ptr;
   const auto &stack_cell_info = *stack_cell_info_ptr;
   const auto &equivalent_stack_cell_groups = *equivalent_stack_cell_groups_ptr;
+  (void)equivalent_stack_cell_groups;
   struct LocalLeafReplayState {
     std::map<unsigned, VirtualValueExpr> slot_facts;
     std::map<unsigned, VirtualValueExpr> stack_facts;
@@ -381,213 +382,56 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
         !fallback_caller_structural_stack_facts)
       return std::nullopt;
 
-    auto lookup_equivalent_caller_fact =
-        [&](const std::map<unsigned, VirtualValueExpr> *stack_facts,
+    auto lookup_from_tracked_state =
+        [&](const std::map<unsigned, VirtualValueExpr> &tracked_slots,
+            const std::map<unsigned, VirtualValueExpr> *tracked_stack_facts,
+            const std::map<StackCellKey, VirtualValueExpr>
+                *tracked_structural_facts,
             const VirtualStackCellSummary &query)
             -> std::optional<VirtualValueExpr> {
-      if (!stack_facts)
+      if (!tracked_stack_facts && !tracked_structural_facts)
         return std::nullopt;
-      std::optional<VirtualValueExpr> found;
-      auto group_it = equivalent_stack_cell_groups.find(
-          equivalentStackCellGroupKeyForSummary(query));
-      if (group_it == equivalent_stack_cell_groups.end())
+      static const std::map<unsigned, VirtualValueExpr> kEmptyStackFacts;
+      auto tracked = buildTrackedFactState(
+          model, tracked_slots,
+          tracked_stack_facts ? *tracked_stack_facts : kEmptyStackFacts,
+          tracked_structural_facts);
+      auto resolved = lookupTrackedStackFact(model, tracked, query);
+      if (!resolved)
         return std::nullopt;
-      for (unsigned candidate_id : group_it->second) {
-        auto it = stack_facts->find(candidate_id);
-        if (it == stack_facts->end())
-          continue;
-        if (!found) {
-          found = it->second;
-          continue;
-        }
-        if (!exprEquals(*found, it->second))
-          return std::nullopt;
-      }
-      return found;
-    };
-    auto lookup_structural_stack_fact =
-        [&](const std::map<StackCellKey, VirtualValueExpr> *stack_facts,
-            const VirtualStackCellSummary &query)
-            -> std::optional<VirtualValueExpr> {
-      if (!stack_facts)
-        return std::nullopt;
-      auto it = stack_facts->find(stackCellKeyForSummary(query));
-      if (it == stack_facts->end())
-        return std::nullopt;
-      return it->second;
-    };
-    auto stack_cell_summary_for_id =
-        [&](unsigned cell_id) -> std::optional<VirtualStackCellSummary> {
-      auto it = stack_cell_info.find(cell_id);
-      if (it == stack_cell_info.end())
-        return std::nullopt;
-      VirtualStackCellSummary summary;
-      summary.base_name = it->second->base_name;
-      summary.base_offset = it->second->base_offset;
-      summary.base_width = it->second->base_width;
-      summary.base_from_argument = it->second->base_from_argument;
-      summary.base_from_alloca = it->second->base_from_alloca;
-      summary.offset = it->second->cell_offset;
-      summary.width = it->second->width;
-      summary.canonical_id = cell_id;
-      return summary;
-    };
-    auto stack_base_delta_for_expr =
-        [&](const auto &self, const VirtualValueExpr &expr,
-            unsigned slot_id) -> std::optional<int64_t> {
-      if (expr.kind == VirtualExprKind::kStateSlot && expr.slot_id.has_value() &&
-          *expr.slot_id == slot_id) {
-        return 0;
-      }
-      if ((expr.kind == VirtualExprKind::kAdd ||
-           expr.kind == VirtualExprKind::kSub) &&
-          expr.operands.size() == 2) {
-        if (!expr.operands[1].constant.has_value())
-          return std::nullopt;
-        if (auto nested = self(self, expr.operands[0], slot_id)) {
-          int64_t delta = static_cast<int64_t>(*expr.operands[1].constant);
-          if (expr.kind == VirtualExprKind::kSub)
-            delta = -delta;
-          return *nested + delta;
-        }
-        if (expr.kind == VirtualExprKind::kAdd &&
-            expr.operands[0].constant.has_value()) {
-          if (auto nested = self(self, expr.operands[1], slot_id)) {
-            return *nested + static_cast<int64_t>(*expr.operands[0].constant);
-          }
-        }
-      }
-      return std::nullopt;
-    };
-    auto find_stack_base_delta_for_slot =
-        [&](const std::map<unsigned, VirtualValueExpr> &slot_facts,
-            unsigned slot_id) -> std::optional<int64_t> {
-      std::optional<int64_t> found_delta;
-      auto consider_delta = [&](const VirtualValueExpr &value) {
-        auto delta = stack_base_delta_for_expr(stack_base_delta_for_expr, value,
-                                               slot_id);
-        if (!delta)
-          return true;
-        if (!found_delta) {
-          found_delta = *delta;
-          return true;
-        }
-        return *found_delta == *delta;
-      };
-
-      if (auto it = slot_facts.find(slot_id); it != slot_facts.end()) {
-        if (!consider_delta(it->second))
-          return std::nullopt;
-      }
-      for (const auto &[fact_slot_id, value] : slot_facts) {
-        if (fact_slot_id == slot_id)
-          continue;
-        if (!consider_delta(value))
-          return std::nullopt;
-      }
-      return found_delta;
-    };
-    auto rebase_query_through_slot_facts =
-        [&](const VirtualStackCellSummary &query,
-            const std::map<unsigned, VirtualValueExpr> &slot_facts)
-            -> std::optional<VirtualStackCellSummary> {
-      auto slot_it = slot_ids.find(
-          SlotKey{query.base_name, query.base_offset, query.base_width,
-                  query.base_from_argument, query.base_from_alloca});
-      if (slot_it == slot_ids.end())
-        return std::nullopt;
-      auto delta = find_stack_base_delta_for_slot(slot_facts, slot_it->second);
-      if (!delta || *delta == 0)
-        return std::nullopt;
-      VirtualStackCellSummary rebased = query;
-      rebased.offset -= *delta;
-      rebased.canonical_id = lookupStackCellIdForSummary(rebased, stack_cell_ids);
-      return rebased;
-    };
-    auto lookup_canonical_or_equivalent_caller_fact =
-        [&](const std::map<unsigned, VirtualValueExpr> *stack_facts,
-            const VirtualStackCellSummary &query)
-            -> std::optional<VirtualValueExpr> {
-      if (!stack_facts)
-        return std::nullopt;
-      auto canonical_query = canonicalize_cell(query);
-      if (canonical_query.canonical_id.has_value()) {
-        unsigned direct_id = *canonical_query.canonical_id;
-        if (auto it = stack_facts->find(direct_id); it != stack_facts->end()) {
-          return it->second;
-        }
-      }
-      return lookup_equivalent_caller_fact(stack_facts, canonical_query);
-    };
-    auto lookup_rebased_caller_fact =
-        [&](const std::map<unsigned, VirtualValueExpr> *stack_facts,
-            const VirtualStackCellSummary &query,
-            const std::map<unsigned, VirtualValueExpr> &slot_facts)
-            -> std::optional<VirtualValueExpr> {
-      if (!stack_facts)
-        return std::nullopt;
-      auto canonical_query = canonicalize_cell(query);
-      if (!canonical_query.canonical_id.has_value()) {
-        if (auto rebased_query =
-                rebase_query_through_slot_facts(canonical_query, slot_facts)) {
-          return lookup_canonical_or_equivalent_caller_fact(stack_facts,
-                                                            *rebased_query);
-        }
-        return std::nullopt;
-      }
-      unsigned direct_id = *canonical_query.canonical_id;
-      unsigned rebased_id = rebaseSingleStackCellId(model, slot_facts, direct_id);
-      if (rebased_id == direct_id)
-        return lookup_canonical_or_equivalent_caller_fact(stack_facts,
-                                                          canonical_query);
-      if (auto it = stack_facts->find(rebased_id); it != stack_facts->end()) {
-        return it->second;
-      }
-      if (auto rebased_cell = stack_cell_summary_for_id(rebased_id))
-        return lookup_equivalent_caller_fact(stack_facts, *rebased_cell);
-      return std::nullopt;
+      auto value = resolveTrackedStackExpr(model, tracked, resolved->value,
+                                           slot_ids, stack_cell_ids);
+      if (!value.bit_width && query.width)
+        value.bit_width = query.width * 8u;
+      return value;
     };
     auto lookup_from_caller_sources =
         [&](const VirtualStackCellSummary &query)
             -> std::optional<VirtualValueExpr> {
-      if (auto direct =
-              lookup_canonical_or_equivalent_caller_fact(caller_stack_facts,
-                                                         query)) {
-        return direct;
+      if (auto resolved = lookup_from_tracked_state(
+              state.slot_facts, caller_stack_facts,
+              caller_structural_stack_facts, query)) {
+        return resolved;
       }
-      if (auto direct =
-              lookup_structural_stack_fact(caller_structural_stack_facts,
-                                           query)) {
-        return direct;
-      }
-      if (auto rebased = lookup_rebased_caller_fact(caller_stack_facts, query,
-                                                    state.slot_facts)) {
-        return rebased;
-      }
-      if (caller_slot_facts)
-        if (auto rebased = lookup_rebased_caller_fact(caller_stack_facts, query,
-                                                      *caller_slot_facts)) {
-          return rebased;
+      if (caller_slot_facts) {
+        if (auto resolved = lookup_from_tracked_state(
+                *caller_slot_facts, caller_stack_facts,
+                caller_structural_stack_facts, query)) {
+          return resolved;
         }
-      if (auto direct =
-              lookup_canonical_or_equivalent_caller_fact(
-                  fallback_caller_stack_facts, query)) {
-        return direct;
       }
-      if (auto direct = lookup_structural_stack_fact(
+      if (auto resolved = lookup_from_tracked_state(
+              state.slot_facts, fallback_caller_stack_facts,
               fallback_caller_structural_stack_facts, query)) {
-        return direct;
+        return resolved;
       }
-      if (auto rebased = lookup_rebased_caller_fact(
-              fallback_caller_stack_facts, query, state.slot_facts)) {
-        return rebased;
-      }
-      if (fallback_caller_slot_facts)
-        if (auto rebased = lookup_rebased_caller_fact(
-                fallback_caller_stack_facts, query,
-                *fallback_caller_slot_facts)) {
-          return rebased;
+      if (fallback_caller_slot_facts) {
+        if (auto resolved = lookup_from_tracked_state(
+                *fallback_caller_slot_facts, fallback_caller_stack_facts,
+                fallback_caller_structural_stack_facts, query)) {
+          return resolved;
         }
+      }
       return std::nullopt;
     };
 
@@ -1407,6 +1251,7 @@ std::optional<CallsiteLocalizedOutgoingFacts> computeLocalizedSingleBlockOutgoin
   localized.written_stack_cell_ids = std::move(localized_written_stack_cell_ids);
   localized.written_structural_stack_keys =
       std::move(localized_written_structural_stack_keys);
+  normalizeLocalizedOutgoingFacts(model, localized);
   return localized;
 }
 

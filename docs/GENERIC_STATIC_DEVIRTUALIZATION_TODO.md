@@ -1,5 +1,14 @@
 # Generic Static Devirtualization Todo
 
+## Active Backlog
+
+The active architecture-first backlog has moved to
+`docs/ITERATION_REWORK_WORKLIST.md`.
+
+Use that file as the canonical source of truth for current iteration work.
+Keep this document as the historical implementation log for generic
+devirtualization milestones, sample results, and older investigation notes.
+
 ## Goal
 
 Build a generic, static devirtualization pipeline that does not depend on
@@ -72,6 +81,84 @@ concrete traces, VM-specific emulators, or hardcoded handler semantics.
 - [x] Skip terminal `__remill_missing_block` stubs during closed-slice ABI
   wrapper recovery, so verifier-clean ABI output does not try to native-wrap
   synthetic fallback blocks.
+
+## Ordered Remaining Work
+
+These items should be finished before moving on to the full end-to-end
+validation sweep.
+
+1. Repo-wide cleanup and deletion of legacy compatibility paths
+   - [ ] Remove the remaining `_native` wrapper machinery from the production
+     devirtualization pipeline, not just bypass it.
+   - [x] Gate wrapper-derived late discovery and trace-emulator enrichment in
+     `omill-lift` when `disable_native_wrappers` is enabled, so direct mode
+     does not keep running `_native`-shaped helper discovery paths that it
+     will never materialize.
+   - [x] Fix or retire legacy wrapper-era rewrite assumptions that still show
+     up in focused coverage, including
+     `RewriteLiftedCallsToNativeTest.ClosedRootSliceScopeSkipsUnmarkedCallers`.
+   - [x] Remove remaining production-path renaming/mirroring of Remill
+     control-flow/runtime symbols under `__omill_*`; keep raw `__remill_*`
+     naming canonical internally and in final outputs.
+   - [x] Delete or quarantine leftover production-path sample-specific
+     `Corpus*` helpers/fixups so corpus knowledge lives only in regression
+     harnesses, manifests, or debug adapters.
+   - [x] Audit the tree for remaining wrapper-ladder and legacy-dispatch
+     assumptions in passes, tests, and cleanup stages.
+
+2. Finish wiring explicit exit semantics through materialization/final lowering
+   - [ ] Make `VirtualCFGMaterialization` and related final-lowering passes
+     consume `VirtualExitDisposition` directly for:
+     - `kStayInVm`
+     - `kVmExitTerminal`
+     - `kVmExitNativeCallReenter`
+     - `kVmExitNativeExecUnknownReturn`
+     - `kVmEnter`
+     - `kNestedVmEnter`
+   - [x] Preserve partial exits and native-call/re-entry metadata explicitly
+     instead of flattening them back into generic unresolved dispatch.
+   - [x] Preserve virtual-exit attrs through declared-continuation,
+     continuation-shim, and constant missing-block rewrites, including fallback
+     to callee-carried exit metadata when the callsite is still bare.
+   - [x] Ensure terminal exits, native calls, and continuation edges stay
+     distinguishable in finalized ABI and no-ABI output.
+
+3. Strengthen VIP-aware iterative behavior and invalidation rules
+   - [x] Treat the same lifted function reached under different VIP states as
+     distinct frontier/invalidation work where required.
+   - [x] Add stronger loop/re-entry handling across continuation closure so
+     revisiting a handler with the same normalized VIP state converges
+     cleanly, while distinct VIP states remain separable.
+   - [x] Expand unresolved-exit completeness/invalidation bookkeeping to use
+     VIP-aware identities consistently across scheduling, cache reuse, and
+     continuation closure.
+
+4. Broaden VIP/control-state regression coverage
+   - [x] Add stress tests for loops that revisit the same lifted function under
+     different VIP states.
+   - [x] Add regression coverage for native calls from inside the VM that do
+     not represent full `vmexit`.
+   - [x] Add nested re-entry / nested `vmenter` coverage.
+   - [x] Add dispatch/materialization consistency checks proving that if the
+     model resolves VIP/exit state, materialization lowers the same control
+     shape.
+
+5. Wire optional trace corroboration cleanly
+   - [x] Expose `VMTraceMap` corroboration only through explicitly registered
+     analysis users; do not make it a hidden requirement of the static model.
+   - [x] Add tests showing trace evidence can refine or corroborate
+     `VirtualExitSummary` without changing the static pipeline's source of
+     truth.
+   - [x] Keep trace support strictly optional for the generic static
+     devirtualization path.
+
+6. Full end-to-end validation
+   - [ ] Run the full `Corpus.dll`, `CorpusVMP.compact.dll`, and
+     `CorpusVMP.default.dll` matrix after the cleanup/integration items above
+     are complete.
+   - [ ] Extend the acceptance assertions to check VIP-aware lifecycle output,
+     including `vmenter`, `vmexit`, native-call/re-enter, loop handling, and
+     absence of leaked wrapper/legacy-dispatch artifacts.
 
 ## Current Slice
 

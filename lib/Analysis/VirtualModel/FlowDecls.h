@@ -2,17 +2,27 @@
 
 #include "Analysis/VirtualModel/DetailTypes.h"
 
+namespace omill {
+class VMTraceMap;
+}
+
 namespace omill::virtual_model::detail {
 void canonicalizeVirtualState(VirtualMachineModel &model);
 void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
                                 const BinaryMemoryMap &binary_memory,
                                 CachedModuleHandlerSummaryState *module_cache);
+void summarizeVirtualInstructionPointers(llvm::Module &M,
+                                         VirtualMachineModel &model,
+                                         const BinaryMemoryMap &binary_memory);
 void summarizeVirtualRegions(VirtualMachineModel &model,
                              const BinaryMemoryMap &binary_memory);
 void summarizeDispatchSuccessors(llvm::Module &M, VirtualMachineModel &model,
                                  const BinaryMemoryMap &binary_memory);
 void summarizeCallSites(llvm::Module &M, VirtualMachineModel &model,
                         const BinaryMemoryMap &binary_memory);
+void summarizeVirtualExits(llvm::Module &M, VirtualMachineModel &model,
+                           const BinaryMemoryMap &binary_memory,
+                           const VMTraceMap *trace_map = nullptr);
 void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
                          const BinaryMemoryMap &binary_memory);
 std::map<unsigned, VirtualValueExpr> rebaseOutgoingStackFacts(

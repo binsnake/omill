@@ -20,6 +20,8 @@ LiftedFunctionMap LiftedFunctionAnalysis::run(
 
     uint64_t pc = extractEntryVA(F.getName());
     if (pc == 0)
+      pc = extractBlockPC(F.getName());
+    if (pc == 0)
       continue;
 
     auto name = F.getName().str();
