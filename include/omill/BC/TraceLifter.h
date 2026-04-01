@@ -16,8 +16,11 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
+
+#include "omill/BC/LiftTargetPolicy.h"
 
 namespace llvm {
 class Function;
@@ -79,6 +82,18 @@ class TraceManager {
   /// Try to read an executable byte at \p addr.  Returns true on success
   /// and writes the byte to \p *byte.
   virtual bool TryReadExecutableByte(uint64_t addr, uint8_t *byte) = 0;
+
+  /// Resolve a discovered executable control-flow target into a typed
+  /// lift-target decision.
+  virtual LiftTargetDecision ResolveLiftTarget(uint64_t source_pc,
+                                               uint64_t raw_target_pc,
+                                               LiftTargetEdgeKind edge_kind);
+
+  /// Resolve a decode failure while lifting from \p source_addr into a typed
+  /// recovery decision.
+  virtual DecodeFailureDecision ResolveDecodeFailure(
+      uint64_t source_addr, uint64_t failed_pc,
+      const DecodeFailureContext &ctx);
 };
 
 /// Recursive trace lifter.  Decodes and lifts traces of instructions into

@@ -4,6 +4,7 @@
 
 #include <map>
 #include <optional>
+#include <set>
 #include <vector>
 
 namespace omill::virtual_model::detail {
@@ -90,6 +91,118 @@ std::map<unsigned, VirtualValueExpr> argumentFactMapFor(
   for (const auto &fact : facts)
     result.emplace(fact.argument_index, fact.value);
   return result;
+}
+
+VirtualValueExpr mergeIncomingContextArmValues(
+    llvm::ArrayRef<VirtualIncomingContextArm> arms) {
+  if (arms.empty())
+    return unknownExpr();
+
+  VirtualValueExpr merged = arms.front().value;
+  for (size_t i = 1; i < arms.size(); ++i) {
+    auto next = mergeIncomingExpr(merged, arms[i].value);
+    if (!next.has_value()) {
+      merged = unknownExpr(merged.bit_width ? merged.bit_width
+                                            : arms[i].value.bit_width);
+      return merged;
+    }
+    merged = std::move(*next);
+  }
+  return merged;
+}
+
+static std::vector<IncomingContextState> expandIncomingContextStatesImpl(
+    llvm::ArrayRef<VirtualSlotFact> incoming_facts,
+    llvm::ArrayRef<VirtualStackFact> incoming_stack_facts,
+    llvm::ArrayRef<VirtualIncomingSlotPhi> incoming_slot_phis,
+    llvm::ArrayRef<VirtualIncomingStackPhi> incoming_stack_phis) {
+  std::set<std::string> edge_ids;
+  std::set<unsigned> phi_slot_ids;
+  std::set<unsigned> phi_stack_ids;
+  for (const auto &phi : incoming_slot_phis) {
+    phi_slot_ids.insert(phi.slot_id);
+    for (const auto &arm : phi.arms)
+      edge_ids.insert(arm.edge_identity);
+  }
+  for (const auto &phi : incoming_stack_phis) {
+    phi_stack_ids.insert(phi.cell_id);
+    for (const auto &arm : phi.arms)
+      edge_ids.insert(arm.edge_identity);
+  }
+  if (edge_ids.empty())
+    return {};
+
+  auto slot_map = factMapFor(incoming_facts);
+  for (unsigned slot_id : phi_slot_ids)
+    slot_map.erase(slot_id);
+  auto stack_map = stackFactMapFor(incoming_stack_facts);
+  for (unsigned cell_id : phi_stack_ids)
+    stack_map.erase(cell_id);
+
+  std::vector<IncomingContextState> states;
+  states.reserve(edge_ids.size());
+  for (const auto &edge_identity : edge_ids) {
+    auto state_slot_map = slot_map;
+    auto state_stack_map = stack_map;
+    bool has_any_phi_arm = false;
+
+    for (const auto &phi : incoming_slot_phis) {
+      auto arm_it = llvm::find_if(phi.arms, [&](const VirtualIncomingContextArm &arm) {
+        return arm.edge_identity == edge_identity;
+      });
+      if (arm_it == phi.arms.end())
+        continue;
+      state_slot_map[phi.slot_id] = arm_it->value;
+      has_any_phi_arm = true;
+    }
+
+    for (const auto &phi : incoming_stack_phis) {
+      auto arm_it = llvm::find_if(phi.arms, [&](const VirtualIncomingContextArm &arm) {
+        return arm.edge_identity == edge_identity;
+      });
+      if (arm_it == phi.arms.end())
+        continue;
+      state_stack_map[phi.cell_id] = arm_it->value;
+      has_any_phi_arm = true;
+    }
+
+    if (!has_any_phi_arm)
+      continue;
+
+    IncomingContextState state;
+    state.edge_identity = edge_identity;
+    state.slot_facts = slotFactsForMap(state_slot_map);
+    state.stack_facts = stackFactsForMap(state_stack_map);
+    states.push_back(std::move(state));
+  }
+
+  return states;
+}
+
+std::vector<IncomingContextState> expandIncomingContextStates(
+    llvm::ArrayRef<VirtualSlotFact> incoming_facts,
+    llvm::ArrayRef<VirtualStackFact> incoming_stack_facts,
+    llvm::ArrayRef<VirtualIncomingSlotPhi> incoming_slot_phis,
+    llvm::ArrayRef<VirtualIncomingStackPhi> incoming_stack_phis) {
+  return expandIncomingContextStatesImpl(incoming_facts, incoming_stack_facts,
+                                         incoming_slot_phis,
+                                         incoming_stack_phis);
+}
+
+std::vector<IncomingContextState> expandIncomingContextStates(
+    const VirtualHandlerSummary &summary) {
+  return expandIncomingContextStatesImpl(summary.incoming_facts,
+                                         summary.incoming_stack_facts,
+                                         summary.incoming_slot_phis,
+                                         summary.incoming_stack_phis);
+}
+
+std::vector<IncomingContextState> expandIncomingContextStates(
+    const VirtualRegionSummary &summary) {
+  return expandIncomingContextStatesImpl(summary.incoming_facts,
+                                         summary.incoming_stack_facts,
+                                         summary.incoming_slot_phis,
+                                         summary.incoming_stack_phis);
 }
 
 std::vector<VirtualSlotFact> slotFactsForMap(

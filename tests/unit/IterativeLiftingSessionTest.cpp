@@ -56,8 +56,13 @@ TEST_F(IterativeLiftingSessionTest, EdgeUpdatesAreDeduplicatedByShape) {
 TEST_F(IterativeLiftingSessionTest, SyncOutgoingEdgesReplacesStaleEntries) {
   omill::LiftGraph graph;
 
-  graph.addOrUpdateEdge({omill::LiftEdgeKind::kIndirectCall, 0x1000, 0x2000,
-                         false, false});
+  omill::LiftEdge stale;
+  stale.kind = omill::LiftEdgeKind::kIndirectCall;
+  stale.source_pc = 0x1000;
+  stale.target_pc = 0x2000;
+  stale.resolved = false;
+  stale.native_boundary = false;
+  graph.addOrUpdateEdge(stale);
   ASSERT_EQ(graph.unresolvedEdgeCount(), 1u);
 
   omill::LiftEdge direct;
@@ -102,6 +107,37 @@ TEST_F(IterativeLiftingSessionTest, RoundSummariesAreRecordedInOrder) {
   EXPECT_EQ(rounds[0].resolve_ms, 9u);
   EXPECT_EQ(rounds[1].iteration, 1u);
   EXPECT_EQ(rounds[1].unresolved_after, 0u);
+}
+
+TEST_F(IterativeLiftingSessionTest,
+       RecordsBinaryRegionSnapshotsAsLearnedOutgoingEdges) {
+  omill::IterativeLiftingSession session("binary-region");
+
+  omill::BinaryRegionSnapshot snapshot;
+  snapshot.snapshot_key = "region:401230";
+  snapshot.entry_pc = 0x401230;
+  snapshot.closure_kind = omill::BinaryRegionClosureKind::kClosed;
+  omill::BinaryRegionBlockSummary block;
+  block.pc = 0x401230;
+  omill::LearnedOutgoingEdge edge;
+  edge.source_pc = 0x401230;
+  edge.target_pc = 0x401250;
+  edge.restatement_kind = omill::EdgeRestatementKind::kProofSupplied;
+  edge.resolution_status = omill::EdgeResolutionStatus::kResolved;
+  block.outgoing_edges.push_back(edge);
+  snapshot.blocks_by_pc.emplace(block.pc, block);
+
+  session.recordBinaryRegionSnapshot(snapshot);
+
+  auto *recorded = session.lookupBinaryRegionSnapshot("region:401230");
+  ASSERT_NE(recorded, nullptr);
+  auto outgoing = session.graph().outgoingEdges(0x401230);
+  ASSERT_EQ(outgoing.size(), 1u);
+  EXPECT_EQ(outgoing.front()->binary_region_snapshot_key,
+            std::optional<std::string>("region:401230"));
+  ASSERT_EQ(outgoing.front()->learned_outgoing_edges.size(), 1u);
+  EXPECT_EQ(outgoing.front()->learned_outgoing_edges.front().target_pc,
+            0x401250u);
 }
 
 TEST_F(IterativeLiftingSessionTest, PendingTargetCountTracksQueueDepth) {

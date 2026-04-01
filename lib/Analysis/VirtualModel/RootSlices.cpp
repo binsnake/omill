@@ -3,6 +3,7 @@
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/ADT/Twine.h>
+#include <llvm/IR/Module.h>
 
 #include <algorithm>
 #include <cstdlib>
@@ -62,10 +63,12 @@ static bool isOpenExecutableFrontierReason(VirtualRootFrontierKind kind,
     case VirtualRootFrontierKind::kCall:
       return reason == "call_target_unlifted" ||
              reason == "call_target_nearby_unlifted" ||
+             reason == "call_target_desynchronized" ||
              reason == "call_target_undecodable";
     case VirtualRootFrontierKind::kDispatch:
       return reason == "dispatch_target_unlifted" ||
-             reason == "dispatch_target_nearby_unlifted";
+             reason == "dispatch_target_nearby_unlifted" ||
+             reason == "dispatch_target_desynchronized";
   }
   return false;
 }
@@ -85,14 +88,30 @@ static HandlerPtr findNearbyLiftedHandlerEntry(
     const std::map<uint64_t, HandlerPtr> &handler_by_pc, uint64_t target_pc,
     TargetArch arch) {
   const auto window = nearbyEntrySearchWindow(arch);
+  HandlerPtr best = nullptr;
+  uint64_t best_distance = std::numeric_limits<uint64_t>::max();
+
+  auto consider = [&](auto it) {
+    if (it == handler_by_pc.end())
+      return;
+    const uint64_t candidate_pc = it->first;
+    const uint64_t distance =
+        candidate_pc > target_pc ? (candidate_pc - target_pc)
+                                 : (target_pc - candidate_pc);
+    if (distance > window)
+      return;
+    if (!best || distance < best_distance ||
+        (distance == best_distance && candidate_pc < target_pc)) {
+      best = it->second;
+      best_distance = distance;
+    }
+  };
+
   auto it = handler_by_pc.lower_bound(target_pc);
-  while (it != handler_by_pc.begin()) {
-    --it;
-    if ((target_pc - it->first) > window)
-      break;
-    return it->second;
-  }
-  return nullptr;
+  consider(it);
+  if (it != handler_by_pc.begin())
+    consider(std::prev(it));
+  return best;
 }
 
 struct DispatchFrontierClassification {
@@ -115,14 +134,18 @@ static DispatchFrontierClassification classifyUnknownDispatchFrontier(
 
   auto decodable_entry =
       isTargetDecodableEntry(binary_memory, target_pc, target_arch);
-  if (decodable_entry.has_value() && !*decodable_entry) {
-    if (auto nearby_entry =
-            findNearbyExecutableEntry(binary_memory, target_pc, target_arch)) {
-      classification.reason = "dispatch_target_nearby_unlifted";
-      classification.canonical_target_va = nearby_entry;
-    } else {
-      classification.reason = "dispatch_target_undecodable";
-    }
+    if (decodable_entry.has_value() && !*decodable_entry) {
+      if (auto nearby_entry =
+              findNearbyExecutableEntry(binary_memory, target_pc, target_arch)) {
+        classification.reason =
+            isLikelyDisassemblyDesyncTarget(binary_memory, target_pc,
+                                           nearby_entry, target_arch)
+                ? "dispatch_target_desynchronized"
+                : "dispatch_target_nearby_unlifted";
+        classification.canonical_target_va = nearby_entry;
+      } else {
+        classification.reason = "dispatch_target_undecodable";
+      }
     return classification;
   }
 
@@ -150,6 +173,47 @@ static const VirtualSlotFact *lookupSlotFactById(
   return it == facts.end() ? nullptr : &*it;
 }
 
+static bool exprMatchesSlot(const VirtualValueExpr &expr, unsigned slot_id) {
+  return expr.kind == VirtualExprKind::kStateSlot && expr.slot_id.has_value() &&
+         *expr.slot_id == slot_id;
+}
+
+static bool exprMatchesBasePlusOrMinusConst(const VirtualValueExpr &expr,
+                                            unsigned slot_id, int64_t &delta) {
+  if (expr.kind == VirtualExprKind::kAdd && expr.operands.size() == 2) {
+    if (exprMatchesSlot(expr.operands[0], slot_id) &&
+        expr.operands[1].constant.has_value()) {
+      delta = static_cast<int64_t>(*expr.operands[1].constant);
+      return true;
+    }
+    if (expr.operands[0].constant.has_value() &&
+        exprMatchesSlot(expr.operands[1], slot_id)) {
+      delta = static_cast<int64_t>(*expr.operands[0].constant);
+      return true;
+    }
+  }
+  if (expr.kind == VirtualExprKind::kSub && expr.operands.size() == 2 &&
+      exprMatchesSlot(expr.operands[0], slot_id) &&
+      expr.operands[1].constant.has_value()) {
+    delta = -static_cast<int64_t>(*expr.operands[1].constant);
+    return true;
+  }
+  return false;
+}
+
+static std::optional<unsigned> lookupSummarySlotId(
+    const VirtualHandlerSummary &summary, llvm::StringRef base_name,
+    int64_t offset) {
+  for (const auto &slot : summary.state_slots) {
+    if (slot.base_name != base_name || slot.offset != offset ||
+        !slot.canonical_id.has_value()) {
+      continue;
+    }
+    return slot.canonical_id;
+  }
+  return std::nullopt;
+}
+
 static std::optional<uint64_t> resolveTerminalNextPcFromFacts(
     const VirtualHandlerSummary &summary) {
   auto next_pc_slot_id = lookupSummaryNamedSlotId(summary, "NEXT_PC");
@@ -161,28 +225,23 @@ static std::optional<uint64_t> resolveTerminalNextPcFromFacts(
   if (!next_pc_fact)
     return std::nullopt;
 
-  struct FactStateRef {
-    llvm::ArrayRef<VirtualSlotFact> slots;
-    llvm::ArrayRef<VirtualStackFact> stack;
-  };
-
-  const FactStateRef states[] = {
-      {summary.outgoing_facts, summary.outgoing_stack_facts},
-      {summary.outgoing_facts, summary.incoming_stack_facts},
-      {summary.incoming_facts, summary.outgoing_stack_facts},
-      {summary.incoming_facts, summary.incoming_stack_facts},
-  };
-
-  std::optional<uint64_t> first_resolved;
-  for (const auto &state : states) {
-    if (auto resolved =
-            evaluateVirtualExpr(next_pc_fact->value, state.slots, state.stack)) {
-      if (!first_resolved)
-        first_resolved = resolved;
+  if (auto resolved = evaluateVirtualExpr(next_pc_fact->value,
+                                          summary.outgoing_facts,
+                                          summary.outgoing_stack_facts)) {
+    return resolved;
+  }
+  for (const auto &state : expandIncomingContextStates(summary)) {
+    if (auto resolved = evaluateVirtualExpr(next_pc_fact->value,
+                                            state.slot_facts,
+                                            state.stack_facts)) {
+      return resolved;
     }
   }
-
-  return first_resolved;
+  if (summary.incoming_slot_phis.empty() && summary.incoming_stack_phis.empty()) {
+    return evaluateVirtualExpr(next_pc_fact->value, summary.incoming_facts,
+                               summary.incoming_stack_facts);
+  }
+  return std::nullopt;
 }
 
 }  // namespace
@@ -262,6 +321,25 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
         return findNearbyLiftedHandlerEntry(handler_by_pc, pc, target_arch);
       };
 
+  auto lookup_exact_lifted_leaf =
+      [&](std::optional<uint64_t> pc,
+          const std::optional<std::string> &function_name)
+          -> llvm::Function * {
+        if (function_name.has_value()) {
+          if (auto *exact = M.getFunction(*function_name);
+              exact && !exact->isDeclaration()) {
+            return exact;
+          }
+        }
+        if (pc.has_value()) {
+          if (auto *exact = findLiftedOrCoveredFunctionByPC(M, *pc);
+              exact && !exact->isDeclaration()) {
+            return exact;
+          }
+        }
+        return nullptr;
+      };
+
   auto has_lifted_direct_callee =
       [&](const VirtualHandlerSummary &handler) -> bool {
     for (const auto &callee_name : handler.direct_callees) {
@@ -315,22 +393,22 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
 
         auto is_localized_expr = [&](const VirtualValueExpr &expr) {
           return exprReferencesNamedSlot(expr, "RETURN_PC",
-                                         exprReferencesNamedSlot);
+                                         exprReferencesNamedSlot) ||
+                 (expr.kind == VirtualExprKind::kConstant &&
+                  expr.constant.has_value() &&
+                  *expr.constant == continuation_pc);
         };
 
         for (const auto &fact : handler.outgoing_facts) {
-          if (is_return_pc_slot(fact.slot_id) &&
-              fact.value.kind == VirtualExprKind::kConstant &&
-              fact.value.constant.has_value() &&
-              *fact.value.constant == continuation_pc) {
+          if (is_return_pc_slot(fact.slot_id))
+            continue;
+          if (is_localized_expr(fact.value)) {
+            vmModelImportDebugLog("root-same-handler-localized handler=" +
+                                  handler.function_name + " slot=" +
+                                  llvm::Twine(fact.slot_id).str() + " value=" +
+                                  renderVirtualValueExpr(fact.value));
             return true;
           }
-          if (is_localized_expr(fact.value))
-            return true;
-        }
-        for (const auto &fact : handler.outgoing_stack_facts) {
-          if (is_localized_expr(fact.value))
-            return true;
         }
         return false;
       };
@@ -344,12 +422,91 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
                                                   *callsite.continuation_pc);
       };
 
+  auto lookup_stack_cell = [&](unsigned cell_id)
+      -> const VirtualStackCellInfo * {
+    auto it = llvm::find_if(model.stackCells(),
+                            [&](const VirtualStackCellInfo &cell) {
+                              return cell.id == cell_id;
+                            });
+    return it == model.stackCells().end() ? nullptr : &*it;
+  };
+
+  auto has_initial_stack_anchored_continuation =
+      [&](const VirtualHandlerSummary &handler,
+          const VirtualCallSiteSummary &callsite,
+          std::optional<unsigned> &concrete_stack_slot_id) -> bool {
+        if (callsite.continuation_stack_cell_id) {
+          const auto *cell =
+              lookup_stack_cell(*callsite.continuation_stack_cell_id);
+          if (!cell)
+            return false;
+
+          concrete_stack_slot_id =
+              lookupSummarySlotId(handler, cell->base_name, cell->base_offset);
+          return cell->cell_offset == 0;
+        }
+
+        return false;
+      };
+
+  auto has_stack_reentry_to_initial_slot =
+      [&](const VirtualHandlerSummary &handler,
+          const VirtualCallSiteSummary &callsite) -> bool {
+        if (!callsite.continuation_pc.has_value())
+          return false;
+        if (callsite.exit.disposition !=
+            VirtualExitDisposition::kVmExitNativeCallReenter) {
+          return false;
+        }
+        std::optional<unsigned> concrete_stack_slot_id;
+        if (!has_initial_stack_anchored_continuation(handler, callsite,
+                                                     concrete_stack_slot_id)) {
+          return false;
+        }
+
+        if (!concrete_stack_slot_id)
+          return true;
+
+        const auto *stack_fact =
+            lookupSlotFactById(handler.outgoing_facts, *concrete_stack_slot_id);
+        if (!stack_fact)
+          return true;
+
+        int64_t delta = 0;
+        if (!exprMatchesBasePlusOrMinusConst(stack_fact->value,
+                                             *concrete_stack_slot_id, delta)) {
+          return true;
+        }
+        return delta == 8 || delta == 16;
+      };
+
+  auto is_stack_reentry_frontier =
+      [&](const VirtualRootSliceSummary::FrontierEdge &frontier) -> bool {
+        if (frontier.kind != VirtualRootFrontierKind::kCall)
+          return false;
+        if (frontier.callsite_index == 0 &&
+            frontier.source_handler_name.empty()) {
+          return false;
+        }
+        auto handler_it = handler_by_name.find(frontier.source_handler_name);
+        if (handler_it == handler_by_name.end())
+          return false;
+        const auto *handler = handler_it->second;
+        if (frontier.callsite_index >= handler->callsites.size())
+          return false;
+        return has_stack_reentry_to_initial_slot(
+            *handler, handler->callsites[frontier.callsite_index]);
+      };
+
   auto has_lifted_continuation_handler =
       [&](const VirtualCallSiteSummary &callsite) -> bool {
         if (!callsite.continuation_pc.has_value())
           return false;
         auto it = handler_by_pc.find(*callsite.continuation_pc);
-        return it != handler_by_pc.end();
+        if (it != handler_by_pc.end())
+          return true;
+        return lookup_exact_lifted_leaf(callsite.continuation_pc,
+                                        std::nullopt) != nullptr;
       };
 
   auto is_semantically_localized_callsite =
@@ -357,6 +514,11 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
           const VirtualCallSiteSummary &callsite) -> bool {
         if (!callsite.continuation_pc.has_value())
           return false;
+        if (has_stack_reentry_to_initial_slot(handler, callsite)) {
+          return callsite.unresolved_reason.empty() ||
+                 callsite.unresolved_reason == "call_target_unlifted" ||
+                 callsite.unresolved_reason == "call_return_unresolved";
+        }
         if (callsite.exit.disposition == VirtualExitDisposition::kVmEnter ||
             callsite.exit.disposition ==
                 VirtualExitDisposition::kNestedVmEnter) {
@@ -372,6 +534,7 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
                callsite.unresolved_reason ==
                    "call_target_not_executable_in_image" ||
                callsite.unresolved_reason == "call_target_undecodable" ||
+               callsite.unresolved_reason == "call_target_desynchronized" ||
                callsite.unresolved_reason == "call_target_mid_instruction" ||
                (callsite.unresolved_reason == "call_target_unresolved" &&
                 !handler.is_candidate && handler.dispatches.empty() &&
@@ -422,6 +585,8 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
             binary_memory.imageBase() != 0 && binary_memory.imageSize() != 0;
         switch (frontier.kind) {
           case VirtualRootFrontierKind::kCall:
+            if (is_stack_reentry_frontier(frontier))
+              return true;
             if (isOpenExecutableFrontierReason(frontier.kind, frontier.reason))
               return false;
             if (isTerminalExitDisposition(frontier.exit_disposition))
@@ -567,7 +732,11 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
                     recovered_target = recovered_it->second;
                     reason = std::string("call_target_mid_instruction");
                   } else {
-                    reason = std::string("call_target_nearby_unlifted");
+                    reason = isLikelyDisassemblyDesyncTarget(
+                                 binary_memory, prelude->target_pc,
+                                 recovered_entry_pc, target_arch)
+                                 ? std::string("call_target_desynchronized")
+                                 : std::string("call_target_nearby_unlifted");
                   }
                 } else {
                   reason = std::string("call_target_undecodable");
@@ -607,6 +776,14 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
               enqueue_handler(recovered_target, recovered_entry_pc, worklist,
                               queued_names,
                               reachable_names);
+            else if (auto *exact = lookup_exact_lifted_leaf(
+                         recovered_entry_pc
+                             ? recovered_entry_pc
+                             : std::optional<uint64_t>(prelude->target_pc),
+                         std::nullopt)) {
+              reachable_names.insert(exact->getName().str());
+              continue;
+            }
 
             add_frontier(VirtualRootSliceSummary::FrontierEdge{
                 VirtualRootFrontierKind::kCall,
@@ -655,6 +832,10 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
               if (target) {
                 enqueue_handler(target, successor.target_pc, worklist,
                                 queued_names, reachable_names);
+              } else if (auto *exact = lookup_exact_lifted_leaf(
+                             successor.target_pc,
+                             successor.target_function_name)) {
+                reachable_names.insert(exact->getName().str());
               } else {
                 add_frontier(VirtualRootSliceSummary::FrontierEdge{
                         VirtualRootFrontierKind::kDispatch,
@@ -689,6 +870,21 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
             }
             case VirtualSuccessorKind::kUnknown:
               if (successor.target_pc != 0) {
+                if (auto boundary_name = resolveBoundaryNameForTarget(
+                        model, binary_memory, successor.target_pc)) {
+                  const auto *boundary = model.lookupBoundary(*boundary_name);
+                  add_frontier(VirtualRootSliceSummary::FrontierEdge{
+                          VirtualRootFrontierKind::kDispatch,
+                          handler->function_name,
+                          static_cast<unsigned>(dispatch_index),
+                          0,
+                          "boundary_target_unlifted",
+                          successor.target_pc,
+                          boundary ? boundary->target_va : std::nullopt,
+                          boundary_name, dispatch.vip.resolved_pc,
+                          dispatch.exit.disposition});
+                  break;
+                }
                 auto classification = classifyUnknownDispatchFrontier(
                     binary_memory, successor.target_pc, target_arch);
                 add_frontier(VirtualRootSliceSummary::FrontierEdge{
@@ -720,8 +916,6 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
       for (size_t callsite_index = 0; callsite_index < handler->callsites.size();
            ++callsite_index) {
         const auto &callsite = handler->callsites[callsite_index];
-        if (!callsite.continuation_pc.has_value())
-          continue;
 
         const VirtualHandlerSummary *target = nullptr;
         if (callsite.target_function_name.has_value()) {
@@ -744,21 +938,67 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
           if (it != handler_by_pc.end())
             target = it->second;
         }
-        if (target)
+        if (target && callsite.continuation_pc.has_value())
           enqueue_handler(target, callsite.continuation_pc, worklist,
                           queued_names, reachable_names);
+        else if (auto *exact = lookup_exact_lifted_leaf(
+                     callsite.recovered_entry_pc
+                         ? callsite.recovered_entry_pc
+                         : callsite.resolved_target_pc,
+                     callsite.recovered_target_function_name
+                         ? callsite.recovered_target_function_name
+                         : callsite.target_function_name)) {
+          reachable_names.insert(exact->getName().str());
+        }
 
         bool semantically_localized_callsite =
             is_semantically_localized_callsite(*handler, callsite);
         bool semantically_localized_unlifted_target =
             !target &&
             is_semantically_localized_unlifted_callsite(*handler, callsite);
+        const bool has_direct_callee = has_lifted_direct_callee(*handler);
+        const bool has_cont_handler = has_lifted_continuation_handler(callsite);
+        const bool has_same_local =
+            has_same_handler_localized_continuation(*handler, callsite);
+        vmModelImportDebugLog(
+            "root-callsite handler=" + handler->function_name +
+            " unresolved=" + callsite.unresolved_reason +
+            " cont=" +
+            (callsite.continuation_pc
+                 ? ("0x" + llvm::utohexstr(*callsite.continuation_pc))
+                 : std::string("-")) +
+            " target=" +
+            (callsite.resolved_target_pc
+                 ? ("0x" + llvm::utohexstr(*callsite.resolved_target_pc))
+                 : std::string("-")) +
+            " recovered=" +
+            (callsite.recovered_entry_pc
+                 ? ("0x" + llvm::utohexstr(*callsite.recovered_entry_pc))
+                 : std::string("-")) +
+            " target_found=" + (target ? std::string("true") : std::string("false")) +
+            " direct_callee=" +
+            (has_direct_callee ? std::string("true") : std::string("false")) +
+            " cont_handler=" +
+            (has_cont_handler ? std::string("true") : std::string("false")) +
+            " same_local=" +
+            (has_same_local ? std::string("true") : std::string("false")) +
+            " localized=" +
+            (semantically_localized_callsite ? std::string("true")
+                                             : std::string("false")) +
+            " localized_unlifted=" +
+            (semantically_localized_unlifted_target ? std::string("true")
+                                                    : std::string("false")));
         if (semantically_localized_callsite ||
             semantically_localized_unlifted_target) {
           continue;
         }
 
         if (!callsite.unresolved_reason.empty() || !target) {
+          vmModelImportDebugLog("root-callsite-frontier handler=" +
+                                handler->function_name + " reason=" +
+                                (callsite.unresolved_reason.empty()
+                                     ? std::string("call_target_unlifted")
+                                     : callsite.unresolved_reason));
           add_frontier(VirtualRootSliceSummary::FrontierEdge{
               VirtualRootFrontierKind::kCall,
               handler->function_name,
@@ -795,7 +1035,25 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
           if (target) {
             enqueue_handler(target, *terminal_next_pc, worklist, queued_names,
                             reachable_names);
+          } else if (auto *exact =
+                         lookup_exact_lifted_leaf(terminal_next_pc, std::nullopt)) {
+            reachable_names.insert(exact->getName().str());
           } else {
+            if (auto boundary_name = resolveBoundaryNameForTarget(
+                    model, binary_memory, *terminal_next_pc)) {
+              const auto *boundary = model.lookupBoundary(*boundary_name);
+              add_frontier(VirtualRootSliceSummary::FrontierEdge{
+                      VirtualRootFrontierKind::kDispatch,
+                      handler->function_name,
+                      static_cast<unsigned>(handler->dispatches.size()),
+                      0,
+                      "boundary_target_unlifted",
+                      *terminal_next_pc,
+                      boundary ? boundary->target_va : std::nullopt,
+                      boundary_name, handler->canonical_vip.resolved_pc,
+                      VirtualExitDisposition::kUnknown});
+              continue;
+            }
             auto classification = classifyUnknownDispatchFrontier(
                 binary_memory, *terminal_next_pc, target_arch);
             add_frontier(VirtualRootSliceSummary::FrontierEdge{
@@ -820,6 +1078,11 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
         if (target) {
           enqueue_handler(target, boundary->target_va, worklist,
                           queued_names, reachable_names);
+          continue;
+        }
+        if (auto *exact =
+                lookup_exact_lifted_leaf(boundary->target_va, std::nullopt)) {
+          reachable_names.insert(exact->getName().str());
           continue;
         }
         add_frontier(VirtualRootSliceSummary::FrontierEdge{

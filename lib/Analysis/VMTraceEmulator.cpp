@@ -1608,6 +1608,20 @@ bool canDecodeX86InstructionAt(const BinaryMemoryMap &mem, uint64_t pc) {
   return stepInstruction(state, mem) != ExecResult::Unsupported;
 }
 
+std::optional<uint64_t> nextDecodableX86InstructionPC(
+    const BinaryMemoryMap &mem, uint64_t pc) {
+  EmuState state;
+  state.rip = pc;
+  if (stepInstruction(state, mem) == ExecResult::Unsupported)
+    return std::nullopt;
+  if (state.rip <= pc)
+    return std::nullopt;
+  const auto delta = state.rip - pc;
+  if (delta > 15)
+    return std::nullopt;
+  return state.rip;
+}
+
 // ============================================================================
 // VMTraceEmulator Implementation
 // ============================================================================

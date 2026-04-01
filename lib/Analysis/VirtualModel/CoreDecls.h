@@ -70,6 +70,17 @@ std::map<unsigned, VirtualValueExpr> stackFactMapFor(
     llvm::ArrayRef<VirtualStackFact> facts);
 std::map<unsigned, VirtualValueExpr> argumentFactMapFor(
     llvm::ArrayRef<VirtualArgumentFact> facts);
+VirtualValueExpr mergeIncomingContextArmValues(
+    llvm::ArrayRef<VirtualIncomingContextArm> arms);
+std::vector<IncomingContextState> expandIncomingContextStates(
+    llvm::ArrayRef<VirtualSlotFact> incoming_facts,
+    llvm::ArrayRef<VirtualStackFact> incoming_stack_facts,
+    llvm::ArrayRef<VirtualIncomingSlotPhi> incoming_slot_phis,
+    llvm::ArrayRef<VirtualIncomingStackPhi> incoming_stack_phis);
+std::vector<IncomingContextState> expandIncomingContextStates(
+    const VirtualHandlerSummary &summary);
+std::vector<IncomingContextState> expandIncomingContextStates(
+    const VirtualRegionSummary &summary);
 std::vector<VirtualSlotFact> computeOutgoingFacts(
     const VirtualHandlerSummary &summary,
     const std::map<unsigned, VirtualValueExpr> &incoming,
@@ -91,6 +102,7 @@ std::vector<VirtualSlotFact> slotFactsForMap(
     const std::map<unsigned, VirtualValueExpr> &facts);
 std::vector<VirtualStackFact> stackFactsForMap(
     const std::map<unsigned, VirtualValueExpr> &facts);
+StackModelContext buildStackModelContext(const VirtualMachineModel &model);
 std::map<SlotKey, unsigned> buildSlotIdMap(const VirtualMachineModel &model);
 std::map<unsigned, const VirtualStateSlotInfo *> buildSlotInfoMap(
     const VirtualMachineModel &model);
@@ -99,6 +111,8 @@ std::optional<unsigned> lookupSlotIdForSummary(
     const std::map<SlotKey, unsigned> &slot_ids);
 std::map<StackCellKey, unsigned> buildStackCellIdMap(
     const VirtualMachineModel &model);
+std::optional<unsigned> lookupStackCellIdForSummary(
+    const VirtualStackCellSummary &summary, const StackModelContext &context);
 std::map<unsigned, const VirtualStackCellInfo *> buildStackCellInfoMap(
     const VirtualMachineModel &model);
 std::map<EquivalentStackCellGroupKey, llvm::SmallVector<unsigned, 4>>
@@ -106,6 +120,8 @@ buildEquivalentStackCellGroupMap(const VirtualMachineModel &model);
 std::optional<unsigned> lookupStackCellIdForSummary(
     const VirtualStackCellSummary &summary,
     const std::map<StackCellKey, unsigned> &stack_cell_ids);
+std::optional<unsigned> resolveBaseSlotIdForSummary(
+    const VirtualStackCellSummary &summary, const StackModelContext &context);
 std::optional<VirtualStateSlotSummary> extractStateSlotSummaryFromExpr(
     const VirtualValueExpr &expr,
     const std::map<unsigned, const VirtualStateSlotInfo *> &slot_info);
@@ -135,8 +151,16 @@ std::map<unsigned, VirtualValueExpr> restoreStableStackFactMap(
     const std::map<StackCellKey, unsigned> &stack_cell_ids);
 std::optional<int64_t> inferTrackedStackBaseDeltaForSlot(
     const std::map<unsigned, VirtualValueExpr> &slot_facts, unsigned slot_id);
+void refreshTrackedFactState(const StackModelContext &context,
+                             TrackedFactState &state);
 void refreshTrackedFactState(
     const VirtualMachineModel &model, TrackedFactState &state);
+TrackedFactState buildTrackedFactState(
+    const StackModelContext &context,
+    const std::map<unsigned, VirtualValueExpr> &slot_facts,
+    const std::map<unsigned, VirtualValueExpr> &stack_facts,
+    const std::map<StackCellKey, VirtualValueExpr> *structural_stack_facts =
+        nullptr);
 TrackedFactState buildTrackedFactState(
     const VirtualMachineModel &model,
     const std::map<unsigned, VirtualValueExpr> &slot_facts,
@@ -144,30 +168,53 @@ TrackedFactState buildTrackedFactState(
     const std::map<StackCellKey, VirtualValueExpr> *structural_stack_facts =
         nullptr);
 std::optional<CanonicalStackFactKey> canonicalStackFactKeyForCellId(
+    const StackModelContext &context, const TrackedFactState &state,
+    unsigned cell_id);
+std::optional<CanonicalStackFactKey> canonicalStackFactKeyForCellId(
     const VirtualMachineModel &model, const TrackedFactState &state,
     unsigned cell_id);
+std::optional<CanonicalStackFactKey> canonicalStackFactKeyForSummary(
+    const StackModelContext &context, const TrackedFactState &state,
+    const VirtualStackCellSummary &summary);
 std::optional<CanonicalStackFactKey> canonicalStackFactKeyForSummary(
     const VirtualMachineModel &model, const TrackedFactState &state,
     const VirtualStackCellSummary &summary);
 bool mergeTrackedStackFact(TrackedFactState &state,
                            const CanonicalStackFactKey &key,
                            const VirtualValueExpr &value);
+bool assignTrackedStackFactForCellId(const StackModelContext &context,
+                                     TrackedFactState &state, unsigned cell_id,
+                                     const VirtualValueExpr &value);
 bool assignTrackedStackFactForCellId(const VirtualMachineModel &model,
                                      TrackedFactState &state, unsigned cell_id,
                                      const VirtualValueExpr &value);
+bool assignTrackedStackFactForSummary(const StackModelContext &context,
+                                      TrackedFactState &state,
+                                      const VirtualStackCellSummary &summary,
+                                      const VirtualValueExpr &value);
 bool assignTrackedStackFactForSummary(const VirtualMachineModel &model,
                                       TrackedFactState &state,
                                       const VirtualStackCellSummary &summary,
                                       const VirtualValueExpr &value);
 std::map<unsigned, VirtualValueExpr> materializeTrackedStackFacts(
+    const StackModelContext &context, const TrackedFactState &state);
+std::map<unsigned, VirtualValueExpr> materializeTrackedStackFacts(
     const VirtualMachineModel &model, const TrackedFactState &state);
 std::map<StackCellKey, VirtualValueExpr> materializeTrackedStructuralStackFacts(
+    const StackModelContext &context, const TrackedFactState &state);
+std::map<StackCellKey, VirtualValueExpr> materializeTrackedStructuralStackFacts(
     const VirtualMachineModel &model, const TrackedFactState &state);
+llvm::SmallDenseSet<unsigned, 16> materializeTrackedWrittenStackCellIds(
+    const StackModelContext &context, const TrackedFactState &state,
+    const std::set<CanonicalStackFactKey> &written_stack_keys);
 llvm::SmallDenseSet<unsigned, 16> materializeTrackedWrittenStackCellIds(
     const VirtualMachineModel &model, const TrackedFactState &state,
     const std::set<CanonicalStackFactKey> &written_stack_keys);
 void normalizeLocalizedOutgoingFacts(const VirtualMachineModel &model,
                                      CallsiteLocalizedOutgoingFacts &localized);
+std::optional<TrackedStackLookupResult> lookupTrackedStackFact(
+    const StackModelContext &context, const TrackedFactState &state,
+    const VirtualStackCellSummary &summary);
 std::optional<TrackedStackLookupResult> lookupTrackedStackFact(
     const VirtualMachineModel &model, const TrackedFactState &state,
     const VirtualStackCellSummary &summary);
@@ -261,6 +308,7 @@ bool isBoundaryFunction(const llvm::Function &F);
 bool isCallSiteHelper(const llvm::Function &F);
 bool isVirtualModelInitialSeedFunction(const llvm::Function &F);
 bool isVirtualModelCodeBearingFunction(const llvm::Function &F);
+bool isVirtualModelAnalysisHelperFunction(const llvm::Function &F);
 
 llvm::stable_hash summaryRelevantFunctionFingerprint(const llvm::Function &F);
 VirtualHandlerSummary summarizeFunction(llvm::Function &F);

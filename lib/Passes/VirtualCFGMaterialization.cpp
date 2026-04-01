@@ -1,4 +1,5 @@
 #include "omill/Passes/VirtualCFGMaterialization.h"
+#include "Analysis/VirtualModel/Internal.h"
 
 #include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/ADT/DenseSet.h>
@@ -27,6 +28,7 @@
 #include "omill/Analysis/IterativeLiftingSession.h"
 #include "omill/BC/BlockLifterAnalysis.h"
 #include "omill/BC/TraceLiftAnalysis.h"
+#include "omill/Devirtualization/BoundaryFact.h"
 #include "omill/Utils/LiftedNames.h"
 #include "omill/Utils/ProtectedBoundaryUtils.h"
 #include "omill/Utils/StateFieldMap.h"
@@ -115,138 +117,47 @@ static llvm::StringRef renderVirtualExitDisposition(
   return "unknown";
 }
 
-static std::optional<uint64_t> parseOptionalHexExitAttr(
-    const llvm::CallBase &call, llvm::StringRef attr_name) {
-  auto attr = call.getFnAttr(attr_name);
-  if (!attr.isValid() || !attr.isStringAttribute())
-    return std::nullopt;
-  uint64_t value = 0;
-  if (attr.getValueAsString().getAsInteger(16, value))
-    return std::nullopt;
-  return value;
-}
-
-static std::optional<uint64_t> parseOptionalHexExitAttr(
-    const llvm::Function &function, llvm::StringRef attr_name) {
-  auto attr = function.getFnAttribute(attr_name);
-  if (!attr.isValid() || !attr.isStringAttribute())
-    return std::nullopt;
-  uint64_t value = 0;
-  if (attr.getValueAsString().getAsInteger(16, value))
-    return std::nullopt;
-  return value;
-}
-
-static std::optional<VirtualExitDisposition> parseVirtualExitDispositionAttr(
-    const llvm::CallBase &call) {
-  auto attr = call.getFnAttr("omill.virtual_exit_disposition");
-  if (!attr.isValid() || !attr.isStringAttribute())
-    return std::nullopt;
-
-  auto text = attr.getValueAsString();
-  if (text == "unknown")
-    return VirtualExitDisposition::kUnknown;
-  if (text == "stay_in_vm")
-    return VirtualExitDisposition::kStayInVm;
-  if (text == "vm_exit_terminal")
-    return VirtualExitDisposition::kVmExitTerminal;
-  if (text == "vm_exit_native_call_reenter")
-    return VirtualExitDisposition::kVmExitNativeCallReenter;
-  if (text == "vm_exit_native_exec_unknown_return")
-    return VirtualExitDisposition::kVmExitNativeExecUnknownReturn;
-  if (text == "vm_enter")
-    return VirtualExitDisposition::kVmEnter;
-  if (text == "nested_vm_enter")
-    return VirtualExitDisposition::kNestedVmEnter;
-  return std::nullopt;
-}
-
-static std::optional<VirtualExitDisposition> parseVirtualExitDispositionAttr(
-    const llvm::Function &function) {
-  auto attr = function.getFnAttribute("omill.virtual_exit_disposition");
-  if (!attr.isValid() || !attr.isStringAttribute())
-    return std::nullopt;
-
-  auto text = attr.getValueAsString();
-  if (text == "unknown")
-    return VirtualExitDisposition::kUnknown;
-  if (text == "stay_in_vm")
-    return VirtualExitDisposition::kStayInVm;
-  if (text == "vm_exit_terminal")
-    return VirtualExitDisposition::kVmExitTerminal;
-  if (text == "vm_exit_native_call_reenter")
-    return VirtualExitDisposition::kVmExitNativeCallReenter;
-  if (text == "vm_exit_native_exec_unknown_return")
-    return VirtualExitDisposition::kVmExitNativeExecUnknownReturn;
-  if (text == "vm_enter")
-    return VirtualExitDisposition::kVmEnter;
-  if (text == "nested_vm_enter")
-    return VirtualExitDisposition::kNestedVmEnter;
-  return std::nullopt;
+static llvm::StringRef renderVirtualDispatchResolutionSource(
+    VirtualDispatchResolutionSource source) {
+  switch (source) {
+    case VirtualDispatchResolutionSource::kUnknown:
+      return "unknown";
+    case VirtualDispatchResolutionSource::kDirect:
+      return "direct";
+    case VirtualDispatchResolutionSource::kOutgoingFacts:
+      return "outgoing_facts";
+    case VirtualDispatchResolutionSource::kRegionOutgoingFacts:
+      return "region_outgoing_facts";
+    case VirtualDispatchResolutionSource::kIncomingFacts:
+      return "incoming_facts";
+    case VirtualDispatchResolutionSource::kIncomingPhiFacts:
+      return "incoming_phi_facts";
+    case VirtualDispatchResolutionSource::kRegionIncomingFacts:
+      return "region_incoming_facts";
+    case VirtualDispatchResolutionSource::kRegionIncomingPhiFacts:
+      return "region_incoming_phi_facts";
+    case VirtualDispatchResolutionSource::kHelperArgumentSpecialization:
+      return "helper_argument_specialization";
+    case VirtualDispatchResolutionSource::kPreludeLocalization:
+      return "prelude_localization";
+  }
+  return "unknown";
 }
 
 static std::optional<VirtualExitSummary> parseVirtualExitSummaryAttr(
     const llvm::CallBase &call) {
-  auto disposition = parseVirtualExitDispositionAttr(call);
-  if (!disposition.has_value())
+  auto fact = readBoundaryFact(call);
+  if (!fact || fact->exit_disposition == BoundaryDisposition::kUnknown)
     return std::nullopt;
-
-  VirtualExitSummary exit;
-  exit.disposition = *disposition;
-  exit.continuation_pc =
-      parseOptionalHexExitAttr(call, "omill.virtual_exit_continuation_pc");
-  auto continuation_vip =
-      parseOptionalHexExitAttr(call, "omill.virtual_exit_continuation_vip");
-  if (!continuation_vip)
-    continuation_vip = exit.continuation_pc;
-  if (continuation_vip) {
-    exit.continuation_vip.resolved_pc = *continuation_vip;
-    exit.continuation_vip.expr_before_dispatch.kind = VirtualExprKind::kConstant;
-    exit.continuation_vip.expr_before_dispatch.bit_width = 64;
-    exit.continuation_vip.expr_before_dispatch.complete = true;
-    exit.continuation_vip.expr_before_dispatch.constant = *continuation_vip;
-    exit.continuation_vip.expr_after_dispatch =
-        exit.continuation_vip.expr_before_dispatch;
-    exit.continuation_vip.symbolic = false;
-  }
-  exit.native_target_pc =
-      parseOptionalHexExitAttr(call, "omill.virtual_exit_native_target_pc");
-  exit.is_partial_exit = call.hasFnAttr("omill.virtual_exit_partial");
-  exit.is_full_exit = call.hasFnAttr("omill.virtual_exit_full");
-  exit.reenters_vm = call.hasFnAttr("omill.virtual_exit_reenters_vm");
-  return exit;
+  return virtualExitSummaryFromBoundaryFact(*fact);
 }
 
 static std::optional<VirtualExitSummary> parseVirtualExitSummaryAttr(
     const llvm::Function &function) {
-  auto disposition = parseVirtualExitDispositionAttr(function);
-  if (!disposition.has_value())
+  auto fact = readBoundaryFact(function);
+  if (!fact || fact->exit_disposition == BoundaryDisposition::kUnknown)
     return std::nullopt;
-
-  VirtualExitSummary exit;
-  exit.disposition = *disposition;
-  exit.continuation_pc =
-      parseOptionalHexExitAttr(function, "omill.virtual_exit_continuation_pc");
-  auto continuation_vip =
-      parseOptionalHexExitAttr(function, "omill.virtual_exit_continuation_vip");
-  if (!continuation_vip)
-    continuation_vip = exit.continuation_pc;
-  if (continuation_vip) {
-    exit.continuation_vip.resolved_pc = *continuation_vip;
-    exit.continuation_vip.expr_before_dispatch.kind = VirtualExprKind::kConstant;
-    exit.continuation_vip.expr_before_dispatch.bit_width = 64;
-    exit.continuation_vip.expr_before_dispatch.complete = true;
-    exit.continuation_vip.expr_before_dispatch.constant = *continuation_vip;
-    exit.continuation_vip.expr_after_dispatch =
-        exit.continuation_vip.expr_before_dispatch;
-    exit.continuation_vip.symbolic = false;
-  }
-  exit.native_target_pc =
-      parseOptionalHexExitAttr(function, "omill.virtual_exit_native_target_pc");
-  exit.is_partial_exit = function.hasFnAttribute("omill.virtual_exit_partial");
-  exit.is_full_exit = function.hasFnAttribute("omill.virtual_exit_full");
-  exit.reenters_vm = function.hasFnAttribute("omill.virtual_exit_reenters_vm");
-  return exit;
+  return virtualExitSummaryFromBoundaryFact(*fact);
 }
 
 static std::optional<VirtualExitSummary> parseVirtualExitSummaryAttrWithFallback(
@@ -292,65 +203,14 @@ static bool shouldPreserveFrontierAsExit(
 
 static void annotateContinuationShimExit(llvm::Function &continuation,
                                          const VirtualExitSummary &exit) {
-  continuation.addFnAttr("omill.virtual_exit_disposition",
-                         renderVirtualExitDisposition(exit.disposition));
-  if (exit.continuation_pc.has_value()) {
-    continuation.addFnAttr("omill.virtual_exit_continuation_pc",
-                           llvm::utohexstr(*exit.continuation_pc));
-  }
-  if (exit.continuation_vip.resolved_pc.has_value()) {
-    continuation.addFnAttr("omill.virtual_exit_continuation_vip",
-                           llvm::utohexstr(*exit.continuation_vip.resolved_pc));
-  }
-  if (exit.native_target_pc.has_value()) {
-    continuation.addFnAttr("omill.virtual_exit_native_target_pc",
-                           llvm::utohexstr(*exit.native_target_pc));
-  }
-  if (exit.is_partial_exit)
-    continuation.addFnAttr("omill.virtual_exit_partial", "1");
-  if (exit.is_full_exit)
-    continuation.addFnAttr("omill.virtual_exit_full", "1");
-  if (exit.reenters_vm)
-    continuation.addFnAttr("omill.virtual_exit_reenters_vm", "1");
+  writeBoundaryFact(continuation, boundaryFactFromVirtualExitSummary(exit));
 }
 
 static void annotateExitOnCallSite(llvm::CallBase &call,
                                    const VirtualExitSummary *exit) {
   if (!exit)
     return;
-  call.addFnAttr(llvm::Attribute::get(call.getContext(),
-                                      "omill.virtual_exit_disposition",
-                                      renderVirtualExitDisposition(
-                                          exit->disposition)));
-  if (exit->continuation_pc.has_value()) {
-    call.addFnAttr(llvm::Attribute::get(call.getContext(),
-                                        "omill.virtual_exit_continuation_pc",
-                                        llvm::utohexstr(
-                                            *exit->continuation_pc)));
-  }
-  if (exit->continuation_vip.resolved_pc.has_value()) {
-    call.addFnAttr(llvm::Attribute::get(
-        call.getContext(), "omill.virtual_exit_continuation_vip",
-        llvm::utohexstr(*exit->continuation_vip.resolved_pc)));
-  }
-  if (exit->native_target_pc.has_value()) {
-    call.addFnAttr(llvm::Attribute::get(call.getContext(),
-                                        "omill.virtual_exit_native_target_pc",
-                                        llvm::utohexstr(
-                                            *exit->native_target_pc)));
-  }
-  if (exit->is_partial_exit)
-    call.addFnAttr(
-        llvm::Attribute::get(call.getContext(), "omill.virtual_exit_partial",
-                             "1"));
-  if (exit->is_full_exit)
-    call.addFnAttr(
-        llvm::Attribute::get(call.getContext(), "omill.virtual_exit_full",
-                             "1"));
-  if (exit->reenters_vm)
-    call.addFnAttr(llvm::Attribute::get(call.getContext(),
-                                        "omill.virtual_exit_reenters_vm",
-                                        "1"));
+  writeBoundaryFact(call, boundaryFactFromVirtualExitSummary(*exit));
 }
 
 static bool exprReferencesNamedSlot(const VirtualMachineModel &model,
@@ -416,6 +276,7 @@ static bool isSemanticallyLocalizedCallsite(
   return callsite.unresolved_reason == "call_target_import_pointer" ||
          callsite.unresolved_reason == "call_target_not_executable_in_image" ||
          callsite.unresolved_reason == "call_target_undecodable" ||
+         callsite.unresolved_reason == "call_target_desynchronized" ||
          callsite.unresolved_reason == "call_target_mid_instruction";
 }
 
@@ -429,16 +290,21 @@ static const VirtualHandlerSummary *lookupHandlerByVA(const VirtualMachineModel 
 }
 
 static llvm::Function *lookupLiftedTargetByPC(llvm::Module &M, uint64_t pc) {
-  if (auto *fn = M.getFunction(liftedFunctionName(pc)))
+  if (auto *fn = findLiftedOrCoveredFunctionByPC(M, pc))
     return fn;
 
-  auto block_name = (llvm::Twine("blk_") + llvm::Twine::utohexstr(pc)).str();
-  if (auto *fn = M.getFunction(block_name))
-    return fn;
+  for (auto &F : M) {
+    if (!hasLiftedSignature(F))
+      continue;
+    if (extractEntryVA(F.getName()) == pc || extractBlockPC(F.getName()) == pc)
+      return &F;
+    for (const auto &BB : F) {
+      if (extractBlockPC(BB.getName()) == pc)
+        return &F;
+    }
+  }
 
-  auto trace_block_name =
-      (llvm::Twine("block_") + llvm::Twine::utohexstr(pc)).str();
-  return M.getFunction(trace_block_name);
+  return nullptr;
 }
 
 static TargetArch targetArchForMaterializationModule(llvm::Module &M) {
@@ -1296,9 +1162,6 @@ static std::optional<uint64_t> resolveDispatchFromFacts(
 
   const FactStateRef summary_states[] = {
       {summary.outgoing_facts, summary.outgoing_stack_facts, "out/out"},
-      {summary.outgoing_facts, summary.incoming_stack_facts, "out/in-stack"},
-      {summary.incoming_facts, summary.outgoing_stack_facts, "in/out-stack"},
-      {summary.incoming_facts, summary.incoming_stack_facts, "in/in"},
   };
 
   auto try_expr = [&](const VirtualValueExpr &expr,
@@ -1310,6 +1173,26 @@ static std::optional<uint64_t> resolveDispatchFromFacts(
           diagnostics->push_back("dispatch-fallback " + summary.function_name +
                                  " state=" + state_scope.str() + "/" +
                                  state.name.str() + " target=0x" +
+                                 llvm::utohexstr(*resolved));
+        }
+        return resolved;
+      }
+    }
+    return std::optional<uint64_t>{};
+  };
+
+  auto try_incoming_states = [&](const VirtualValueExpr &expr,
+                                 llvm::StringRef state_scope,
+                                 const auto &states,
+                                 llvm::StringRef source_label) {
+    for (const auto &state : states) {
+      if (auto resolved = evaluateVirtualExpr(expr, state.slot_facts,
+                                              state.stack_facts)) {
+        if (diagnostics) {
+          diagnostics->push_back("dispatch-fallback " + summary.function_name +
+                                 " state=" + state_scope.str() + "/" +
+                                 source_label.str() + " edge=" +
+                                 state.edge_identity + " target=0x" +
                                  llvm::utohexstr(*resolved));
         }
         return resolved;
@@ -1331,12 +1214,38 @@ static std::optional<uint64_t> resolveDispatchFromFacts(
   if (auto resolved = try_expr(dispatch.target, "summary", summary_states))
     return resolved;
 
+  auto summary_incoming_states =
+      virtual_model::detail::expandIncomingContextStates(summary);
+  if (!summary_incoming_states.empty()) {
+    if (has_specialized_target) {
+      if (auto resolved = try_incoming_states(dispatch.specialized_target,
+                                              "summary", summary_incoming_states,
+                                              "incoming-phi")) {
+        return resolved;
+      }
+    }
+    if (auto resolved =
+            try_incoming_states(dispatch.target, "summary",
+                                summary_incoming_states, "incoming-phi")) {
+      return resolved;
+    }
+  } else if (has_specialized_target &&
+             dispatch.specialized_target_source ==
+                 VirtualDispatchResolutionSource::kIncomingFacts) {
+    if (auto resolved = evaluateVirtualExpr(dispatch.specialized_target,
+                                            summary.incoming_facts,
+                                            summary.incoming_stack_facts)) {
+      return resolved;
+    }
+  } else if (auto resolved = evaluateVirtualExpr(dispatch.target,
+                                                 summary.incoming_facts,
+                                                 summary.incoming_stack_facts)) {
+    return resolved;
+  }
+
   if (const auto *region = model.lookupRegionForHandler(summary.function_name)) {
     const FactStateRef region_states[] = {
         {region->outgoing_facts, region->outgoing_stack_facts, "out/out"},
-        {region->outgoing_facts, region->incoming_stack_facts, "out/in-stack"},
-        {region->incoming_facts, region->outgoing_stack_facts, "in/out-stack"},
-        {region->incoming_facts, region->incoming_stack_facts, "in/in"},
     };
     auto region_scope =
         (llvm::Twine("region#") + llvm::Twine(region->id)).str();
@@ -1348,6 +1257,37 @@ static std::optional<uint64_t> resolveDispatchFromFacts(
     }
     if (auto resolved = try_expr(dispatch.target, region_scope, region_states))
       return resolved;
+
+    auto region_incoming_states =
+        virtual_model::detail::expandIncomingContextStates(*region);
+    if (!region_incoming_states.empty()) {
+      if (has_specialized_target) {
+        if (auto resolved =
+                try_incoming_states(dispatch.specialized_target, region_scope,
+                                    region_incoming_states,
+                                    "region-incoming-phi")) {
+          return resolved;
+        }
+      }
+      if (auto resolved =
+              try_incoming_states(dispatch.target, region_scope,
+                                  region_incoming_states,
+                                  "region-incoming-phi")) {
+        return resolved;
+      }
+    } else if (has_specialized_target &&
+               dispatch.specialized_target_source ==
+                   VirtualDispatchResolutionSource::kRegionIncomingFacts) {
+      if (auto resolved = evaluateVirtualExpr(dispatch.specialized_target,
+                                              region->incoming_facts,
+                                              region->incoming_stack_facts)) {
+        return resolved;
+      }
+    } else if (auto resolved = evaluateVirtualExpr(dispatch.target,
+                                                   region->incoming_facts,
+                                                   region->incoming_stack_facts)) {
+      return resolved;
+    }
   }
 
   return std::nullopt;
@@ -1387,26 +1327,43 @@ static std::optional<uint64_t> resolveTerminalNextPcFromFacts(
   if (!next_pc_fact)
     return std::nullopt;
 
-  struct FactStateRef {
-    llvm::ArrayRef<VirtualSlotFact> slots;
-    llvm::ArrayRef<VirtualStackFact> stack;
-    llvm::StringRef name;
-  };
-
-  const FactStateRef states[] = {
-      {summary.outgoing_facts, summary.outgoing_stack_facts, "out/out"},
-      {summary.outgoing_facts, summary.incoming_stack_facts, "out/in-stack"},
-      {summary.incoming_facts, summary.outgoing_stack_facts, "in/out-stack"},
-      {summary.incoming_facts, summary.incoming_stack_facts, "in/in"},
-  };
-
   std::optional<uint64_t> first_resolved;
-  for (const auto &state : states) {
-    if (auto resolved =
-            evaluateVirtualExpr(next_pc_fact->value, state.slots, state.stack)) {
+  if (auto resolved = evaluateVirtualExpr(next_pc_fact->value,
+                                          summary.outgoing_facts,
+                                          summary.outgoing_stack_facts)) {
+    if (diagnostics) {
+      diagnostics->push_back("terminal-next-pc " + summary.function_name +
+                             " state=out/out target=0x" +
+                             llvm::utohexstr(*resolved));
+    }
+    first_resolved = resolved;
+    if (isExecutableTargetAddress(binary_memory, *resolved))
+      return resolved;
+  }
+
+  auto incoming_states = virtual_model::detail::expandIncomingContextStates(summary);
+  for (const auto &state : incoming_states) {
+    if (auto resolved = evaluateVirtualExpr(next_pc_fact->value, state.slot_facts,
+                                            state.stack_facts)) {
       if (diagnostics) {
         diagnostics->push_back("terminal-next-pc " + summary.function_name +
-                               " state=" + state.name.str() + " target=0x" +
+                               " state=incoming-phi edge=" + state.edge_identity +
+                               " target=0x" + llvm::utohexstr(*resolved));
+      }
+      if (!first_resolved)
+        first_resolved = resolved;
+      if (isExecutableTargetAddress(binary_memory, *resolved))
+        return resolved;
+    }
+  }
+
+  if (incoming_states.empty()) {
+    if (auto resolved = evaluateVirtualExpr(next_pc_fact->value,
+                                            summary.incoming_facts,
+                                            summary.incoming_stack_facts)) {
+      if (diagnostics) {
+        diagnostics->push_back("terminal-next-pc " + summary.function_name +
+                               " state=in/in target=0x" +
                                llvm::utohexstr(*resolved));
       }
       if (!first_resolved)
@@ -1998,6 +1955,55 @@ static std::set<std::string> collectReachableRewriteFunctionNames(
         worklist.push_back(callee);
       }
     }
+  }
+
+  // Root-slice reachability is handler-centric. Add one bounded IR-adjacent
+  // wrapper layer so constant dispatch wrappers around reachable lifted code
+  // remain eligible for rewrite even when they were not summarized as handlers.
+  std::set<std::string> base_reachable = reachable;
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    if (reachable.find(F.getName().str()) != reachable.end())
+      continue;
+
+    bool adjacent = false;
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+        if (!call)
+          continue;
+
+        if (auto *callee = call->getCalledFunction();
+            callee && !callee->isDeclaration() &&
+            base_reachable.find(callee->getName().str()) != base_reachable.end()) {
+          adjacent = true;
+          break;
+        }
+
+        auto *callee = call->getCalledFunction();
+        if (!callee || !isDispatchIntrinsicName(callee->getName()) ||
+            call->arg_size() < 2) {
+          continue;
+        }
+
+        auto *pc_arg = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+        if (!pc_arg)
+          continue;
+
+        if (auto *target = lookupLiftedTargetByPC(M, pc_arg->getZExtValue());
+            target &&
+            base_reachable.find(target->getName().str()) != base_reachable.end()) {
+          adjacent = true;
+          break;
+        }
+      }
+      if (adjacent)
+        break;
+    }
+
+    if (adjacent)
+      reachable.insert(F.getName().str());
   }
 
   return reachable;
@@ -3233,8 +3239,48 @@ static MaterializationResult runMaterialization(llvm::Module &M,
       }
 
       const auto *summary = final_model.lookupHandler(F.getName());
-      if (!summary)
+      if (!summary) {
+        for (auto &BB : F) {
+          for (auto &I : BB) {
+            auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+            if (!call || call->arg_size() < 2)
+              continue;
+            auto *callee = call->getCalledFunction();
+            if (!callee || !isDispatchIntrinsicName(callee->getName()))
+              continue;
+
+            auto *pc_arg =
+                llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+            if (!pc_arg)
+              continue;
+
+            auto resolved =
+                resolveTarget(M, binary_memory, final_model,
+                              call->getFunctionType(), pc_arg->getZExtValue(),
+                              &result.diagnostics);
+            const bool self_jump_target =
+                resolved.function == &F && isDispatchJumpName(callee->getName());
+            if (!resolved.function ||
+                (resolved.function == &F && !self_jump_target)) {
+              continue;
+            }
+
+            auto exit =
+                parseVirtualExitSummaryAttrWithFallback(*call, callee).value_or(
+                    [&] {
+                      VirtualExitSummary fallback;
+                      fallback.disposition = VirtualExitDisposition::kStayInVm;
+                      return fallback;
+                    }());
+            candidates.push_back(Candidate{call, &F, resolved.function,
+                                           resolved.pc,
+                                           isDispatchJumpName(callee->getName()),
+                                           resolved.store_pc_to_state,
+                                           std::move(exit)});
+          }
+        }
         continue;
+      }
       if (!is_terminal_recovery_relevant_handler(*summary))
         continue;
 
@@ -3685,6 +3731,9 @@ static MaterializationResult runMaterialization(llvm::Module &M,
           os << "  region-boundary " << boundary_name << "\n";
         for (const auto &handler_name : region.handler_names)
           os << "  region-handler " << handler_name << "\n";
+        for (const auto &phi : region.incoming_slot_phis) {
+          os << "  region-in-phi " << renderVirtualIncomingSlotPhi(phi) << "\n";
+        }
         for (const auto &fact : region.incoming_facts) {
           os << "  region-in slot[" << fact.slot_id
              << "] = " << renderVirtualValueExpr(fact.value) << "\n";
@@ -3692,6 +3741,10 @@ static MaterializationResult runMaterialization(llvm::Module &M,
         for (const auto &fact : region.outgoing_facts) {
           os << "  region-out slot[" << fact.slot_id
              << "] = " << renderVirtualValueExpr(fact.value) << "\n";
+        }
+        for (const auto &phi : region.incoming_stack_phis) {
+          os << "  region-stack-in-phi " << renderVirtualIncomingStackPhi(phi)
+             << "\n";
         }
         for (const auto &fact : region.incoming_stack_facts) {
           os << "  region-stack-in cell[" << fact.cell_id
@@ -3735,6 +3788,9 @@ static MaterializationResult runMaterialization(llvm::Module &M,
         os << " callsites=" << handler.callsites.size() << "\n";
         for (const auto &callee : handler.direct_callees)
           os << "  callee " << callee << "\n";
+        for (const auto &phi : handler.incoming_slot_phis) {
+          os << "  in-phi " << renderVirtualIncomingSlotPhi(phi) << "\n";
+        }
         for (const auto &fact : handler.incoming_facts) {
           os << "  in slot[" << fact.slot_id
              << "] = " << renderVirtualValueExpr(fact.value) << "\n";
@@ -3746,6 +3802,9 @@ static MaterializationResult runMaterialization(llvm::Module &M,
         for (const auto &fact : handler.outgoing_facts) {
           os << "  out slot[" << fact.slot_id
              << "] = " << renderVirtualValueExpr(fact.value) << "\n";
+        }
+        for (const auto &phi : handler.incoming_stack_phis) {
+          os << "  stack-in-phi " << renderVirtualIncomingStackPhi(phi) << "\n";
         }
         for (const auto &fact : handler.incoming_stack_facts) {
           os << "  stack-in cell[" << fact.cell_id
@@ -3759,33 +3818,9 @@ static MaterializationResult runMaterialization(llvm::Module &M,
           os << "  dispatch " << (dispatch.is_jump ? "jump" : "call")
              << " target=" << renderVirtualValueExpr(dispatch.target) << "\n";
           if (!dispatch.unresolved_reason.empty()) {
-            os << "    specialized_target source=";
-            switch (dispatch.specialized_target_source) {
-              case VirtualDispatchResolutionSource::kUnknown:
-                os << "unknown";
-                break;
-              case VirtualDispatchResolutionSource::kDirect:
-                os << "direct";
-                break;
-              case VirtualDispatchResolutionSource::kOutgoingFacts:
-                os << "outgoing_facts";
-                break;
-              case VirtualDispatchResolutionSource::kRegionOutgoingFacts:
-                os << "region_outgoing_facts";
-                break;
-              case VirtualDispatchResolutionSource::kIncomingFacts:
-                os << "incoming_facts";
-                break;
-              case VirtualDispatchResolutionSource::kRegionIncomingFacts:
-                os << "region_incoming_facts";
-                break;
-              case VirtualDispatchResolutionSource::kHelperArgumentSpecialization:
-                os << "helper_argument_specialization";
-                break;
-              case VirtualDispatchResolutionSource::kPreludeLocalization:
-                os << "prelude_localization";
-                break;
-            }
+            os << "    specialized_target source="
+               << renderVirtualDispatchResolutionSource(
+                      dispatch.specialized_target_source);
             os << " expr="
                << renderVirtualValueExpr(dispatch.specialized_target) << "\n";
           }
@@ -3808,33 +3843,9 @@ static MaterializationResult runMaterialization(llvm::Module &M,
                 os << "protected_boundary";
                 break;
             }
-            os << " source=";
-            switch (successor.resolution_source) {
-              case VirtualDispatchResolutionSource::kUnknown:
-                os << "unknown";
-                break;
-              case VirtualDispatchResolutionSource::kDirect:
-                os << "direct";
-                break;
-              case VirtualDispatchResolutionSource::kOutgoingFacts:
-                os << "outgoing_facts";
-                break;
-              case VirtualDispatchResolutionSource::kRegionOutgoingFacts:
-                os << "region_outgoing_facts";
-                break;
-              case VirtualDispatchResolutionSource::kIncomingFacts:
-                os << "incoming_facts";
-                break;
-              case VirtualDispatchResolutionSource::kRegionIncomingFacts:
-                os << "region_incoming_facts";
-                break;
-              case VirtualDispatchResolutionSource::kHelperArgumentSpecialization:
-                os << "helper_argument_specialization";
-                break;
-              case VirtualDispatchResolutionSource::kPreludeLocalization:
-                os << "prelude_localization";
-                break;
-            }
+            os << " source="
+               << renderVirtualDispatchResolutionSource(
+                      successor.resolution_source);
             os << " pc=0x" << llvm::utohexstr(successor.target_pc);
             if (successor.target_function_name.has_value())
               os << " fn=" << *successor.target_function_name;
@@ -3854,33 +3865,9 @@ static MaterializationResult runMaterialization(llvm::Module &M,
         for (const auto &callsite : handler.callsites) {
           os << "  callsite target=" << renderVirtualValueExpr(callsite.target)
              << "\n";
-          os << "    specialized_target source=";
-          switch (callsite.specialized_target_source) {
-            case VirtualDispatchResolutionSource::kUnknown:
-              os << "unknown";
-              break;
-            case VirtualDispatchResolutionSource::kDirect:
-              os << "direct";
-              break;
-            case VirtualDispatchResolutionSource::kOutgoingFacts:
-              os << "outgoing_facts";
-              break;
-            case VirtualDispatchResolutionSource::kRegionOutgoingFacts:
-              os << "region_outgoing_facts";
-              break;
-            case VirtualDispatchResolutionSource::kIncomingFacts:
-              os << "incoming_facts";
-              break;
-            case VirtualDispatchResolutionSource::kRegionIncomingFacts:
-              os << "region_incoming_facts";
-              break;
-            case VirtualDispatchResolutionSource::kHelperArgumentSpecialization:
-              os << "helper_argument_specialization";
-              break;
-            case VirtualDispatchResolutionSource::kPreludeLocalization:
-              os << "prelude_localization";
-              break;
-          }
+          os << "    specialized_target source="
+             << renderVirtualDispatchResolutionSource(
+                    callsite.specialized_target_source);
           os << " expr=" << renderVirtualValueExpr(callsite.specialized_target)
              << "\n";
           if (callsite.resolved_target_pc.has_value()) {

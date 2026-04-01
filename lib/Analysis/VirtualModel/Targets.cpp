@@ -27,6 +27,40 @@ static uint64_t nearbyEntrySearchWindow(TargetArch arch) {
   }
 }
 
+static uint64_t overlapDesyncWindow(TargetArch arch) {
+  switch (arch) {
+    case TargetArch::kAArch64:
+      return 4;
+    case TargetArch::kX86_64:
+    default:
+      return 8;
+  }
+}
+
+static bool looksLikePlausibleX86FunctionEntry(
+    const BinaryMemoryMap &binary_memory, uint64_t pc) {
+  uint8_t buf[6] = {};
+  if (!binary_memory.read(pc, buf, sizeof(buf)))
+    return false;
+  if (buf[0] == 0x55 || buf[0] == 0x53 || buf[0] == 0x56 || buf[0] == 0x57)
+    return true;
+  if (buf[0] == 0x41 && buf[1] >= 0x50 && buf[1] <= 0x57)
+    return true;
+  if (buf[0] == 0x48 && buf[1] == 0x83 && buf[2] == 0xEC)
+    return true;
+  if (buf[0] == 0x48 && buf[1] == 0x81 && buf[2] == 0xEC)
+    return true;
+  if (buf[0] == 0x48 && buf[1] == 0x89 && buf[3] == 0x24 &&
+      (buf[2] == 0x5C || buf[2] == 0x74 || buf[2] == 0x7C))
+    return true;
+  if (buf[0] == 0x4C && buf[1] == 0x89 && buf[3] == 0x24 &&
+      (buf[2] == 0x44 || buf[2] == 0x4C || buf[2] == 0x54 ||
+       buf[2] == 0x5C || buf[2] == 0x64 || buf[2] == 0x6C ||
+       buf[2] == 0x74 || buf[2] == 0x7C))
+    return true;
+  return false;
+}
+
 static std::string normalizeBoundaryName(llvm::StringRef name) {
   return name.lower();
 }
@@ -185,17 +219,71 @@ std::optional<uint64_t> findNearbyExecutableEntry(
     default: {
       const uint64_t kWindow = nearbyEntrySearchWindow(arch);
       uint64_t start = (target_pc > kWindow) ? (target_pc - kWindow) : 1;
+      std::optional<uint64_t> overlapping_owner_pc;
+      std::optional<uint64_t> plausible_overlapping_owner_pc;
+      std::optional<uint64_t> nearest_decodable_pc;
+      for (uint64_t candidate = target_pc; candidate > start; --candidate) {
+        uint64_t pc = candidate - 1;
+        if (!isTargetExecutable(binary_memory, pc))
+          continue;
+        if (pc < target_pc &&
+            (target_pc - pc) <= overlapDesyncWindow(TargetArch::kX86_64) &&
+            looksLikePlausibleX86FunctionEntry(binary_memory, pc) &&
+            !plausible_overlapping_owner_pc.has_value()) {
+          plausible_overlapping_owner_pc = pc;
+        }
+        auto next_pc = nextDecodableX86InstructionPC(binary_memory, pc);
+        if (next_pc.has_value() && pc < target_pc && *next_pc > target_pc &&
+            !overlapping_owner_pc.has_value()) {
+          overlapping_owner_pc = pc;
+          if (looksLikePlausibleX86FunctionEntry(binary_memory, pc) &&
+              !plausible_overlapping_owner_pc.has_value()) {
+            plausible_overlapping_owner_pc = pc;
+          }
+        }
+      }
       for (uint64_t candidate = target_pc; candidate > start; --candidate) {
         uint64_t pc = candidate - 1;
         if (!isTargetExecutable(binary_memory, pc))
           continue;
         auto decodable = isTargetDecodableEntry(binary_memory, pc, arch);
-        if (decodable.has_value() && *decodable)
-          return pc;
+        if (decodable.has_value() && *decodable) {
+          nearest_decodable_pc = pc;
+          break;
+        }
       }
+      if (nearest_decodable_pc.has_value())
+        return nearest_decodable_pc;
+      if (plausible_overlapping_owner_pc.has_value())
+        return plausible_overlapping_owner_pc;
+      if (overlapping_owner_pc.has_value())
+        return overlapping_owner_pc;
       return std::nullopt;
     }
   }
+}
+
+bool isLikelyDisassemblyDesyncTarget(const BinaryMemoryMap &binary_memory,
+                                     uint64_t target_pc,
+                                     std::optional<uint64_t> nearby_entry_pc,
+                                     TargetArch arch) {
+  if (!nearby_entry_pc.has_value())
+    return false;
+  if (target_pc == 0 || *nearby_entry_pc == 0 || *nearby_entry_pc >= target_pc)
+    return false;
+
+  const uint64_t delta = target_pc - *nearby_entry_pc;
+  if (delta == 0 || delta > overlapDesyncWindow(arch))
+    return false;
+
+  auto raw_target_decodable =
+      isTargetDecodableEntry(binary_memory, target_pc, arch);
+  if (!raw_target_decodable.has_value() || *raw_target_decodable)
+    return false;
+
+  auto nearby_entry_decodable =
+      isTargetDecodableEntry(binary_memory, *nearby_entry_pc, arch);
+  return nearby_entry_decodable.has_value() && *nearby_entry_decodable;
 }
 
 std::optional<std::string> resolveBoundaryNameForTarget(

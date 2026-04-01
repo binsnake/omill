@@ -17,6 +17,22 @@ namespace omill::virtual_model::detail {
 
 namespace {
 
+static uint64_t nearbyCoveredEntrySearchWindow(TargetArch arch) {
+  switch (arch) {
+    case TargetArch::kAArch64:
+      return 4;
+    case TargetArch::kX86_64:
+    default:
+      return 64;
+  }
+}
+
+static bool containsUnknownExpr(const VirtualValueExpr &expr) {
+  if (expr.kind == VirtualExprKind::kUnknown)
+    return true;
+  return llvm::any_of(expr.operands, containsUnknownExpr);
+}
+
 static std::string normalizeBoundaryNameForDispatch(llvm::StringRef name) {
   return name.lower();
 }
@@ -139,7 +155,7 @@ static std::optional<BoundaryTargetSummary> lookupBoundaryTargetSummary(
 }
 
 static std::optional<VirtualDispatchSuccessorSummary>
-classifyDispatchSuccessor(const VirtualMachineModel &model,
+classifyDispatchSuccessor(llvm::Module &M, const VirtualMachineModel &model,
                          const BinaryMemoryMap &binary_memory,
                          uint64_t pc, TargetArch target_arch) {
   if (auto boundary =
@@ -179,23 +195,39 @@ classifyDispatchSuccessor(const VirtualMachineModel &model,
     return successor;
   }
 
-  auto block_name = (llvm::Twine("blk_") + llvm::Twine::utohexstr(pc)).str();
-  if (model.lookupHandler(block_name)) {
+  if (auto *exact = findLiftedOrCoveredFunctionByPC(M, pc)) {
     VirtualDispatchSuccessorSummary successor;
-    successor.kind = VirtualSuccessorKind::kLiftedBlock;
+    llvm::StringRef handler_name(exact->getName());
+    if (handler_name.starts_with("blk_")) {
+      successor.kind = VirtualSuccessorKind::kLiftedBlock;
+    } else if (handler_name.starts_with("block_")) {
+      successor.kind = VirtualSuccessorKind::kTraceBlock;
+    } else {
+      successor.kind = VirtualSuccessorKind::kLiftedHandler;
+    }
     successor.target_pc = pc;
-    successor.target_function_name = block_name;
+    successor.target_function_name = exact->getName().str();
     return successor;
   }
 
-  auto trace_block_name =
-      (llvm::Twine("block_") + llvm::Twine::utohexstr(pc)).str();
-  if (model.lookupHandler(trace_block_name)) {
-    VirtualDispatchSuccessorSummary successor;
-    successor.kind = VirtualSuccessorKind::kTraceBlock;
-    successor.target_pc = pc;
-    successor.target_function_name = trace_block_name;
-    return successor;
+  if (auto nearby_pc = findNearestCoveredLiftedOrBlockPC(
+          M, pc, nearbyCoveredEntrySearchWindow(target_arch))) {
+    if (*nearby_pc != pc) {
+      if (auto *nearby = findLiftedOrCoveredFunctionByPC(M, *nearby_pc)) {
+        VirtualDispatchSuccessorSummary successor;
+        llvm::StringRef handler_name(nearby->getName());
+        if (handler_name.starts_with("blk_")) {
+          successor.kind = VirtualSuccessorKind::kLiftedBlock;
+        } else if (handler_name.starts_with("block_")) {
+          successor.kind = VirtualSuccessorKind::kTraceBlock;
+        } else {
+          successor.kind = VirtualSuccessorKind::kLiftedHandler;
+        }
+        successor.target_pc = *nearby_pc;
+        successor.target_function_name = nearby->getName().str();
+        return successor;
+      }
+    }
   }
 
   if (const auto *nearby = findNearbyLiftedHandlerEntry(model, pc, target_arch)) {
@@ -296,15 +328,18 @@ void summarizeDispatchSuccessors(llvm::Module &M, VirtualMachineModel &model,
     auto incoming_arg_map = argumentFactMapFor(summary.incoming_argument_facts);
     auto outgoing_stack_map = stackFactMapFor(summary.outgoing_stack_facts);
     auto incoming_stack_map = stackFactMapFor(summary.incoming_stack_facts);
+    auto incoming_states = expandIncomingContextStates(summary);
     std::map<unsigned, VirtualValueExpr> region_outgoing_map;
     std::map<unsigned, VirtualValueExpr> region_incoming_map;
     std::map<unsigned, VirtualValueExpr> region_outgoing_stack_map;
     std::map<unsigned, VirtualValueExpr> region_incoming_stack_map;
+    std::vector<IncomingContextState> region_incoming_states;
     if (region) {
       region_outgoing_map = factMapFor(region->outgoing_facts);
       region_incoming_map = factMapFor(region->incoming_facts);
       region_outgoing_stack_map = stackFactMapFor(region->outgoing_stack_facts);
       region_incoming_stack_map = stackFactMapFor(region->incoming_stack_facts);
+      region_incoming_states = expandIncomingContextStates(*region);
     }
 
     for (auto &dispatch : summary.dispatches) {
@@ -320,10 +355,15 @@ void summarizeDispatchSuccessors(llvm::Module &M, VirtualMachineModel &model,
         unsigned new_refs = countSymbolicRefs(expr);
         bool current_is_unknown = isUnknownLikeExpr(dispatch.specialized_target);
         bool new_is_unknown = isUnknownLikeExpr(expr);
+        bool current_has_state = containsStateSlotExpr(dispatch.specialized_target);
+        bool new_has_state = containsStateSlotExpr(expr);
+        bool new_contains_unknown = containsUnknownExpr(expr);
         bool current_is_original =
             exprEquals(dispatch.specialized_target, dispatch.target);
         bool new_is_original = exprEquals(expr, dispatch.target);
         if (new_is_unknown && !current_is_unknown)
+          return;
+        if (current_has_state && !new_has_state && new_contains_unknown)
           return;
         if ((current_is_original && !new_is_original && !new_is_unknown) ||
             new_refs < current_refs ||
@@ -334,6 +374,11 @@ void summarizeDispatchSuccessors(llvm::Module &M, VirtualMachineModel &model,
           dispatch.specialized_target_source = source;
         }
       };
+      auto note_resolution_source =
+          [&](VirtualDispatchResolutionSource source) {
+            if (source != VirtualDispatchResolutionSource::kUnknown)
+              dispatch.specialized_target_source = source;
+          };
 
       struct ResolvedPC {
         uint64_t pc = 0;
@@ -353,7 +398,8 @@ void summarizeDispatchSuccessors(llvm::Module &M, VirtualMachineModel &model,
           [&](VirtualValueExpr expr,
               const std::vector<VirtualSlotFact> &slot_facts,
               const std::vector<VirtualStackFact> &stack_facts,
-              VirtualDispatchResolutionSource source) {
+              VirtualDispatchResolutionSource source,
+              bool allow_choice_collection = true) {
             auto try_collect_expr = [&](VirtualValueExpr candidate) {
               annotateExprSlots(candidate, slot_ids);
               annotateExprStackCells(candidate, stack_cell_ids, slot_ids);
@@ -361,14 +407,18 @@ void summarizeDispatchSuccessors(llvm::Module &M, VirtualMachineModel &model,
               if (auto pc =
                       evaluateVirtualExpr(candidate, slot_facts, stack_facts,
                                           &binary_memory)) {
+                note_resolution_source(source);
                 append_pc(*pc, source);
                 return true;
               }
+              if (!allow_choice_collection)
+                return false;
               llvm::SmallVector<uint64_t, 4> choices;
               if (collectEvaluatedTargetChoices(candidate, slot_facts,
                                                 stack_facts, &boolean_slot_ids,
                                                 &boolean_slot_expr_keys,
                                                 choices, &binary_memory)) {
+                note_resolution_source(source);
                 for (uint64_t pc : choices)
                   append_pc(pc, source);
                 return true;
@@ -377,6 +427,7 @@ void summarizeDispatchSuccessors(llvm::Module &M, VirtualMachineModel &model,
                                                stack_facts, choices,
                                                &binary_memory) &&
                   !choices.empty()) {
+                note_resolution_source(source);
                 for (uint64_t pc : choices)
                   append_pc(pc, source);
                 return true;
@@ -396,7 +447,8 @@ void summarizeDispatchSuccessors(llvm::Module &M, VirtualMachineModel &model,
 
       collect_from_expr(dispatch.target, summary.outgoing_facts,
                         summary.outgoing_stack_facts,
-                        VirtualDispatchResolutionSource::kDirect);
+                        VirtualDispatchResolutionSource::kDirect,
+                        /*allow_choice_collection=*/incoming_states.empty());
       if (resolved_pcs.empty()) {
         auto specialized = specializeExpr(dispatch.target, outgoing_map,
                                           &outgoing_stack_map,
@@ -408,7 +460,8 @@ void summarizeDispatchSuccessors(llvm::Module &M, VirtualMachineModel &model,
             stackFactsForMap(rebased_outgoing_stack_map),
             exprEquals(specialized, dispatch.target)
                 ? VirtualDispatchResolutionSource::kOutgoingFacts
-                : VirtualDispatchResolutionSource::kHelperArgumentSpecialization);
+                : VirtualDispatchResolutionSource::kHelperArgumentSpecialization,
+            /*allow_choice_collection=*/incoming_states.empty());
       }
       if (resolved_pcs.empty() && region) {
         auto specialized = specializeExpr(dispatch.target, region_outgoing_map,
@@ -421,9 +474,31 @@ void summarizeDispatchSuccessors(llvm::Module &M, VirtualMachineModel &model,
             stackFactsForMap(rebased_region_outgoing_stack_map),
             exprEquals(specialized, dispatch.target)
                 ? VirtualDispatchResolutionSource::kRegionOutgoingFacts
-                : VirtualDispatchResolutionSource::kHelperArgumentSpecialization);
+                : VirtualDispatchResolutionSource::kHelperArgumentSpecialization,
+            /*allow_choice_collection=*/region_incoming_states.empty());
       }
-      if (resolved_pcs.empty()) {
+      if (resolved_pcs.empty() && !incoming_states.empty()) {
+        for (const auto &incoming_state : incoming_states) {
+          size_t resolved_count_before = resolved_pcs.size();
+          auto incoming_state_map = factMapFor(incoming_state.slot_facts);
+          auto incoming_state_stack_map =
+              stackFactMapFor(incoming_state.stack_facts);
+          auto specialized = specializeExpr(dispatch.target, incoming_state_map,
+                                            &incoming_state_stack_map,
+                                            &incoming_arg_map);
+          auto rebased_incoming_state_stack_map = rebaseOutgoingStackFacts(
+              model, incoming_state_map, incoming_state_stack_map);
+          collect_from_expr(specialized, incoming_state.slot_facts,
+                            stackFactsForMap(rebased_incoming_state_stack_map),
+                            VirtualDispatchResolutionSource::kIncomingPhiFacts);
+          if (resolved_pcs.size() != resolved_count_before) {
+            dispatch.specialized_target_source =
+                VirtualDispatchResolutionSource::kIncomingPhiFacts;
+            break;
+          }
+        }
+      }
+      if (resolved_pcs.empty() && incoming_states.empty()) {
         auto specialized = specializeExpr(dispatch.target, incoming_map,
                                           &incoming_stack_map,
                                           &incoming_arg_map);
@@ -433,7 +508,29 @@ void summarizeDispatchSuccessors(llvm::Module &M, VirtualMachineModel &model,
                           stackFactsForMap(rebased_incoming_stack_map),
                           VirtualDispatchResolutionSource::kIncomingFacts);
       }
-      if (resolved_pcs.empty() && region) {
+      if (resolved_pcs.empty() && region && !region_incoming_states.empty()) {
+        for (const auto &incoming_state : region_incoming_states) {
+          size_t resolved_count_before = resolved_pcs.size();
+          auto incoming_state_map = factMapFor(incoming_state.slot_facts);
+          auto incoming_state_stack_map =
+              stackFactMapFor(incoming_state.stack_facts);
+          auto specialized = specializeExpr(dispatch.target, incoming_state_map,
+                                            &incoming_state_stack_map,
+                                            &incoming_arg_map);
+          auto rebased_region_incoming_state_stack_map = rebaseOutgoingStackFacts(
+              model, incoming_state_map, incoming_state_stack_map);
+          collect_from_expr(
+              specialized, incoming_state.slot_facts,
+              stackFactsForMap(rebased_region_incoming_state_stack_map),
+              VirtualDispatchResolutionSource::kRegionIncomingPhiFacts);
+          if (resolved_pcs.size() != resolved_count_before) {
+            dispatch.specialized_target_source =
+                VirtualDispatchResolutionSource::kRegionIncomingPhiFacts;
+            break;
+          }
+        }
+      }
+      if (resolved_pcs.empty() && region && region_incoming_states.empty()) {
         auto specialized = specializeExpr(dispatch.target, region_incoming_map,
                                           &region_incoming_stack_map,
                                           &incoming_arg_map);
@@ -485,7 +582,7 @@ void summarizeDispatchSuccessors(llvm::Module &M, VirtualMachineModel &model,
 
       for (const auto &resolved_pc : resolved_pcs) {
         if (auto successor =
-                classifyDispatchSuccessor(model, binary_memory, resolved_pc.pc,
+                classifyDispatchSuccessor(M, model, binary_memory, resolved_pc.pc,
                                           target_arch)) {
           successor->resolution_source = resolved_pc.source;
           dispatch.successors.push_back(*successor);
@@ -530,6 +627,19 @@ void summarizeDispatchSuccessors(llvm::Module &M, VirtualMachineModel &model,
           [](const VirtualDispatchSuccessorSummary &successor) {
             return successor.kind == VirtualSuccessorKind::kUnknown;
           });
+      if (!incoming_states.empty() && dispatch.successors.size() > 1 &&
+          dispatch.specialized_target_source ==
+              VirtualDispatchResolutionSource::kHelperArgumentSpecialization) {
+        dispatch.specialized_target_source =
+            VirtualDispatchResolutionSource::kIncomingPhiFacts;
+      } else if (!region_incoming_states.empty() &&
+                 dispatch.successors.size() > 1 &&
+                 dispatch.specialized_target_source ==
+                     VirtualDispatchResolutionSource::
+                         kHelperArgumentSpecialization) {
+        dispatch.specialized_target_source =
+            VirtualDispatchResolutionSource::kRegionIncomingPhiFacts;
+      }
       if (has_unknown)
         dispatch.unresolved_reason = "missing_lifted_target";
     }

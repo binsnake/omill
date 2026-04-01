@@ -305,5 +305,8 @@ std::optional<bool> isTargetDecodableEntry(
     const BinaryMemoryMap &binary_memory, uint64_t target_pc, TargetArch arch);
 std::optional<uint64_t> findNearbyExecutableEntry(
     const BinaryMemoryMap &binary_memory, uint64_t target_pc, TargetArch arch);
+bool isLikelyDisassemblyDesyncTarget(
+    const BinaryMemoryMap &binary_memory, uint64_t target_pc,
+    std::optional<uint64_t> nearby_entry_pc, TargetArch arch);
 
 }  // namespace omill::virtual_model::detail

@@ -82,6 +82,7 @@ add_executable(omill-unit-tests
   unit/JumpTableConcretizerTest.cpp
   unit/IndirectCallResolverTest.cpp
   unit/DevirtualizationOrchestratorTest.cpp
+  unit/BinaryRegionReconstructorTest.cpp
   unit/ControlFlowUnflattenerTest.cpp
   unit/SynthesizeFlagsTest.cpp
   unit/SegmentsAATest.cpp
@@ -98,6 +99,11 @@ add_executable(omill-unit-tests
   unit/RemillNormalizationOrchestratorTest.cpp
   unit/ProtectedBoundaryUtilsTest.cpp
   unit/LiftedFunctionMapTest.cpp
+  unit/BoundaryFactTest.cpp
+  unit/ExecutableTargetFactTest.cpp
+  unit/ProtectorModelTest.cpp
+  unit/RuntimeTest.cpp
+  unit/LiftTargetPolicyTest.cpp
   unit/VirtualMachineModelTest.cpp
   unit/VirtualCFGMaterializationTest.cpp
   unit/BinaryMemoryMapTest.cpp

@@ -145,11 +145,19 @@ struct CachedStableArgumentFactEntry {
   VirtualValueExpr value;
 };
 
+struct IncomingContextState {
+  std::string edge_identity;
+  std::vector<VirtualSlotFact> slot_facts;
+  std::vector<VirtualStackFact> stack_facts;
+};
+
 struct CachedPropagationEntry {
   llvm::stable_hash fingerprint = 0;
   std::vector<CachedStableArgumentFactEntry> incoming_arguments;
+  std::vector<VirtualIncomingSlotPhi> incoming_slot_phis;
   std::vector<CachedStableSlotFactEntry> incoming_slots;
   std::vector<CachedStableSlotFactEntry> outgoing_slots;
+  std::vector<VirtualIncomingStackPhi> incoming_stack_phis;
   std::vector<CachedStableStackFactEntry> incoming_stack;
   std::vector<CachedStableStackFactEntry> outgoing_stack;
   bool stack_memory_budget_exceeded = false;
@@ -169,6 +177,51 @@ using BooleanSlotExprKey = std::tuple<std::string, int64_t, bool, bool>;
 using EquivalentStackCellGroupKey =
     std::tuple<std::string, int64_t, unsigned, bool, bool, int64_t, unsigned>;
 
+struct MaterializedStackCellKey {
+  unsigned base_slot_id = 0;
+  int64_t cell_offset = 0;
+  unsigned width = 0;
+
+  auto tie() const { return std::tie(base_slot_id, cell_offset, width); }
+
+  bool operator<(const MaterializedStackCellKey &other) const {
+    return tie() < other.tie();
+  }
+};
+
+struct StackModelContext {
+  std::map<SlotKey, unsigned> slot_ids;
+  std::map<unsigned, const VirtualStateSlotInfo *> slot_info;
+  std::map<StackCellKey, unsigned> stack_cell_ids;
+  std::map<unsigned, const VirtualStackCellInfo *> stack_cell_info;
+  std::map<EquivalentStackCellGroupKey, llvm::SmallVector<unsigned, 4>>
+      equivalent_stack_cell_groups;
+  std::map<MaterializedStackCellKey, unsigned> materialized_stack_cell_ids;
+};
+
+class StackModelBuilder {
+ public:
+  explicit StackModelBuilder(VirtualMachineModel &model);
+
+  void internSlot(VirtualStateSlotSummary &slot, llvm::StringRef handler_name);
+  void internStackCell(VirtualStackCellSummary &cell,
+                       llvm::StringRef handler_name);
+  void internExprReferencedSlots(const VirtualValueExpr &expr,
+                                 llvm::StringRef handler_name);
+
+  const std::map<SlotKey, unsigned> &slotIds() const { return slot_ids_; }
+  const std::map<StackCellKey, unsigned> &stackCellIds() const {
+    return stack_cell_ids_;
+  }
+
+ private:
+  VirtualMachineModel &model_;
+  std::map<SlotKey, unsigned> slot_ids_;
+  std::map<StackCellKey, unsigned> stack_cell_ids_;
+  unsigned next_slot_id_ = 0;
+  unsigned next_stack_cell_id_ = 0;
+};
+
 struct EntryPreludeCallInfo {
   uint64_t call_pc = 0;
   uint64_t target_pc = 0;
@@ -181,6 +234,8 @@ struct ResolvedCallSiteInfo {
       VirtualDispatchResolutionSource::kUnknown;
   std::optional<uint64_t> target_pc;
   std::optional<uint64_t> continuation_pc;
+  std::optional<unsigned> continuation_slot_id;
+  std::optional<unsigned> continuation_stack_cell_id;
 };
 
 struct LocalCallSiteState {
@@ -190,6 +245,7 @@ struct LocalCallSiteState {
 
 struct CachedModuleHandlerSummaryState {
   llvm::stable_hash module_fingerprint = 0;
+  uint64_t module_instance_serial = 0;
   std::map<std::string, CachedHandlerSummaryEntry> summaries;
   CachedRootSlicesEntry root_slices;
   std::map<std::string, CachedDirectCalleeEntry> direct_callees;

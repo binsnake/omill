@@ -17,6 +17,8 @@
 
 #include "omill/Analysis/IterativeLiftingSession.h"
 #include "omill/BC/BlockLifter.h"
+#include "omill/Devirtualization/BoundaryFact.h"
+#include "omill/Devirtualization/ExecutableTargetFact.h"
 #include "omill/Utils/LiftedNames.h"
 
 namespace omill {
@@ -70,60 +72,12 @@ std::vector<uint64_t> sortedValues(const llvm::DenseSet<uint64_t> &values) {
   return ordered;
 }
 
-std::optional<uint64_t> parseOptionalHexAttr(llvm::Attribute attr) {
-  if (!attr.isValid())
-    return std::nullopt;
-  auto text = attr.getValueAsString();
-  if (text.empty())
-    return std::nullopt;
-  if (text.consume_front("0x") || text.consume_front("0X")) {
-  }
-  uint64_t value = 0;
-  if (text.getAsInteger(16, value))
-    return std::nullopt;
-  return value;
-}
-
-std::optional<VirtualExitDisposition> parseVirtualExitDisposition(
-    const llvm::CallBase &call) {
-  auto attr = call.getFnAttr("omill.virtual_exit_disposition");
-  if (!attr.isValid())
-    return std::nullopt;
-  auto text = attr.getValueAsString();
-  if (text == "stay_in_vm")
-    return VirtualExitDisposition::kStayInVm;
-  if (text == "vm_exit_terminal")
-    return VirtualExitDisposition::kVmExitTerminal;
-  if (text == "vm_exit_native_call_reenter")
-    return VirtualExitDisposition::kVmExitNativeCallReenter;
-  if (text == "vm_exit_native_exec_unknown_return")
-    return VirtualExitDisposition::kVmExitNativeExecUnknownReturn;
-  if (text == "vm_enter")
-    return VirtualExitDisposition::kVmEnter;
-  if (text == "nested_vm_enter")
-    return VirtualExitDisposition::kNestedVmEnter;
-  return VirtualExitDisposition::kUnknown;
-}
-
-std::optional<VirtualExitDisposition> parseVirtualExitDisposition(
-    const llvm::Function &callee) {
-  auto attr = callee.getFnAttribute("omill.virtual_exit_disposition");
-  if (!attr.isValid())
-    return std::nullopt;
-  auto text = attr.getValueAsString();
-  if (text == "stay_in_vm")
-    return VirtualExitDisposition::kStayInVm;
-  if (text == "vm_exit_terminal")
-    return VirtualExitDisposition::kVmExitTerminal;
-  if (text == "vm_exit_native_call_reenter")
-    return VirtualExitDisposition::kVmExitNativeCallReenter;
-  if (text == "vm_exit_native_exec_unknown_return")
-    return VirtualExitDisposition::kVmExitNativeExecUnknownReturn;
-  if (text == "vm_enter")
-    return VirtualExitDisposition::kVmEnter;
-  if (text == "nested_vm_enter")
-    return VirtualExitDisposition::kNestedVmEnter;
-  return VirtualExitDisposition::kUnknown;
+VirtualExitDisposition getWorkItemExitDisposition(
+    const OutputRootClosureWorkItem &item) {
+  if (!item.boundary)
+    return VirtualExitDisposition::kUnknown;
+  return virtualExitDispositionFromBoundaryDisposition(
+      item.boundary->exit_disposition);
 }
 
 std::optional<uint64_t> extractFunctionSitePc(const llvm::Function &F) {
@@ -141,8 +95,42 @@ std::string buildClosureWorkIdentity(const OutputRootClosureWorkItem &item) {
   if (item.site_pc)
     id += llvm::utohexstr(*item.site_pc);
   id += ":" + llvm::utohexstr(item.target_pc);
-  if (item.continuation_vip_pc) {
-    id += ":" + llvm::utohexstr(*item.continuation_vip_pc);
+  if (item.boundary && item.boundary->continuation_vip_pc) {
+    id += ":" + llvm::utohexstr(*item.boundary->continuation_vip_pc);
+  }
+  if (item.boundary) {
+    id += ":boundary:" + llvm::StringRef(toString(item.boundary->kind)).str();
+    id += ":" +
+          llvm::StringRef(toString(item.boundary->exit_disposition)).str();
+    if (item.boundary->boundary_pc)
+      id += ":pc:" + llvm::utohexstr(*item.boundary->boundary_pc);
+    if (item.boundary->native_target_pc)
+      id += ":native:" + llvm::utohexstr(*item.boundary->native_target_pc);
+    if (item.boundary->is_partial_exit)
+      id += ":partial";
+    if (item.boundary->is_full_exit)
+      id += ":full";
+    if (item.boundary->reenters_vm)
+      id += ":reenter";
+  }
+  if (item.executable_target) {
+    const auto &fact = *item.executable_target;
+    id += ":fact:" + llvm::utohexstr(fact.raw_target_pc);
+    id += ":" + llvm::StringRef(toString(fact.kind)).str();
+    id += ":" + llvm::StringRef(toString(fact.trust)).str();
+    if (fact.invalidated_executable_entry) {
+      id += ":invalidated";
+      if (fact.invalidated_entry_source_pc)
+        id += ":" + llvm::utohexstr(*fact.invalidated_entry_source_pc);
+      if (fact.invalidated_entry_failed_pc)
+        id += ":" + llvm::utohexstr(*fact.invalidated_entry_failed_pc);
+    }
+    if (fact.effective_target_pc)
+      id += ":effective:" + llvm::utohexstr(*fact.effective_target_pc);
+    if (fact.canonical_owner_pc)
+      id += ":owner:" + llvm::utohexstr(*fact.canonical_owner_pc);
+    if (fact.exact_fallthrough_target)
+      id += ":exact_fallthrough";
   }
   return id;
 }
@@ -215,55 +203,26 @@ OutputRootClosureTargetSummary collectOutputRootClosureTargets(
 
           if (!callee->isDeclaration())
             continue;
-          if (auto target_attr =
-                  parseOptionalHexAttr(callee->getFnAttribute(
-                      "omill.native_direct_target_pc"));
-              target_attr.has_value()) {
-            uint64_t target = normalize_target_pc(*target_attr);
+          if (auto boundary_fact = readBoundaryFact(*callee);
+              boundary_fact && boundary_fact->native_target_pc) {
+            uint64_t target = normalize_target_pc(*boundary_fact->native_target_pc);
             if (is_code_address(target) &&
                 (include_defined_targets || !has_defined_target(target))) {
               constant_code_targets.insert(target);
               continue;
             }
           }
-          if (auto target_attr =
-                  parseOptionalHexAttr(callee->getFnAttribute(
-                      "omill.virtual_exit_native_target_pc"));
-              target_attr.has_value()) {
-            uint64_t target = normalize_target_pc(*target_attr);
+          if (auto boundary_fact = readBoundaryFact(*callee);
+              boundary_fact && boundary_fact->boundary_pc) {
+            uint64_t target = normalize_target_pc(*boundary_fact->boundary_pc);
             if (is_code_address(target) &&
                 (include_defined_targets || !has_defined_target(target))) {
               constant_code_targets.insert(target);
               continue;
             }
           }
-          if (auto boundary_attr =
-                  parseOptionalHexAttr(callee->getFnAttribute(
-                      "omill.native_boundary_pc"));
-              boundary_attr.has_value()) {
-            uint64_t target = normalize_target_pc(*boundary_attr);
-            if (is_code_address(target) &&
-                (include_defined_targets || !has_defined_target(target))) {
-              constant_code_targets.insert(target);
-              continue;
-            }
-          }
-          if (auto vm_enter_attr =
-                  parseOptionalHexAttr(callee->getFnAttribute(
-                      "omill.vm_enter_target_pc"));
-              vm_enter_attr.has_value()) {
-            uint64_t target = normalize_target_pc(*vm_enter_attr);
-            if (is_code_address(target) &&
-                (include_defined_targets || !has_defined_target(target))) {
-              constant_code_targets.insert(target);
-              continue;
-            }
-          }
-          if (auto executable_attr =
-                  parseOptionalHexAttr(callee->getFnAttribute(
-                      "omill.executable_target_pc"));
-              executable_attr.has_value()) {
-            uint64_t target = normalize_target_pc(*executable_attr);
+          if (auto executable_fact = readExecutableTargetFact(*callee)) {
+            uint64_t target = normalize_target_pc(executable_fact->raw_target_pc);
             if (is_code_address(target) &&
                 (include_defined_targets || !has_defined_target(target))) {
               constant_code_targets.insert(target);
@@ -360,22 +319,68 @@ std::vector<OutputRootClosureWorkItem> collectOutputRootClosureWorkItems(
     item.vip_symbolic = vip_symbolic;
     item.source_kind = source_kind;
     if (call) {
-      item.exit_disposition =
-          parseVirtualExitDisposition(*call).value_or(VirtualExitDisposition::kUnknown);
-      if (item.exit_disposition == VirtualExitDisposition::kUnknown && callee) {
-        item.exit_disposition = parseVirtualExitDisposition(*callee)
-                                    .value_or(VirtualExitDisposition::kUnknown);
+      item.boundary = readBoundaryFact(*call);
+      if ((!item.boundary ||
+           item.boundary->exit_disposition == BoundaryDisposition::kUnknown) &&
+          callee) {
+        if (auto callee_boundary = readBoundaryFact(*callee)) {
+          if (!item.boundary) {
+            item.boundary = callee_boundary;
+          } else {
+            if (!item.boundary->boundary_pc)
+              item.boundary->boundary_pc = callee_boundary->boundary_pc;
+            if (!item.boundary->native_target_pc)
+              item.boundary->native_target_pc = callee_boundary->native_target_pc;
+            if (!item.boundary->continuation_pc)
+              item.boundary->continuation_pc = callee_boundary->continuation_pc;
+            if (!item.boundary->continuation_vip_pc) {
+              item.boundary->continuation_vip_pc =
+                  callee_boundary->continuation_vip_pc;
+            }
+            if (item.boundary->exit_disposition == BoundaryDisposition::kUnknown) {
+              item.boundary->exit_disposition =
+                  callee_boundary->exit_disposition;
+            }
+            item.boundary->is_partial_exit =
+                item.boundary->is_partial_exit || callee_boundary->is_partial_exit;
+            item.boundary->is_full_exit =
+                item.boundary->is_full_exit || callee_boundary->is_full_exit;
+            item.boundary->reenters_vm =
+                item.boundary->reenters_vm || callee_boundary->reenters_vm;
+            item.boundary->is_vm_enter =
+                item.boundary->is_vm_enter || callee_boundary->is_vm_enter;
+            item.boundary->is_nested_vm_enter =
+                item.boundary->is_nested_vm_enter ||
+                callee_boundary->is_nested_vm_enter;
+            if (item.boundary->kind == BoundaryKind::kUnknown) {
+              item.boundary->kind = callee_boundary->kind;
+            }
+          }
+        }
       }
-      item.continuation_vip_pc = parseOptionalHexAttr(
-          call->getFnAttr("omill.virtual_exit_continuation_vip"));
-      if (!item.continuation_vip_pc) {
-        item.continuation_vip_pc = parseOptionalHexAttr(
-            call->getFnAttr("omill.virtual_exit_continuation_pc"));
+      item.executable_target = readExecutableTargetFact(*call);
+    }
+    if (item.source_kind ==
+            OutputRootClosureSourceKind::kMissingBlockHandlerTarget) {
+      if (!item.boundary)
+        item.boundary = BoundaryFact{};
+      if (item.boundary->exit_disposition == BoundaryDisposition::kUnknown) {
+        item.boundary->exit_disposition = BoundaryDisposition::kVmExitTerminal;
+        item.boundary->kind = BoundaryKind::kTerminalBoundary;
+        if (!item.boundary->boundary_pc)
+          item.boundary->boundary_pc = target_pc;
       }
     }
+    if (item.executable_target &&
+        item.executable_target->invalidated_executable_entry &&
+        item.source_kind ==
+            OutputRootClosureSourceKind::kMissingBlockHandlerTarget) {
+      item.source_kind = OutputRootClosureSourceKind::kInvalidatedExecutableTarget;
+    }
+    const auto item_disposition = getWorkItemExitDisposition(item);
     if (!include_defined_targets && has_defined_target(target_pc) &&
-        item.exit_disposition != VirtualExitDisposition::kVmEnter &&
-        item.exit_disposition != VirtualExitDisposition::kNestedVmEnter) {
+        item_disposition != VirtualExitDisposition::kVmEnter &&
+        item_disposition != VirtualExitDisposition::kNestedVmEnter) {
       return;
     }
     item.identity = buildClosureWorkIdentity(item);
@@ -407,6 +412,16 @@ std::vector<OutputRootClosureWorkItem> collectOutputRootClosureWorkItems(
         const unsigned site_index = next_site_index[F.getName().str()]++;
 
         if (auto *callee = call->getCalledFunction()) {
+          if (callee->getName() == "__omill_missing_block_handler" &&
+              call->arg_size() >= 1) {
+            if (auto *ci =
+                    llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(0))) {
+              add_item(F, site_index, ci->getZExtValue(),
+                       OutputRootClosureSourceKind::kMissingBlockHandlerTarget,
+                       call, callee);
+            }
+          }
+
           if ((callee->getName() == "__remill_function_call" ||
                callee->getName() == "__remill_jump") &&
               call->arg_size() >= 3) {
@@ -436,47 +451,22 @@ std::vector<OutputRootClosureWorkItem> collectOutputRootClosureWorkItems(
                 omill::isDispatchIntrinsicName(callee->getName())) {
               continue;
             }
-            if (auto target_attr =
-                    parseOptionalHexAttr(callee->getFnAttribute(
-                        "omill.native_direct_target_pc"));
-                target_attr.has_value()) {
-              add_item(F, site_index, *target_attr,
+            if (auto boundary_fact = readBoundaryFact(*callee);
+                boundary_fact && boundary_fact->native_target_pc) {
+              add_item(F, site_index, *boundary_fact->native_target_pc,
                        OutputRootClosureSourceKind::kConstantCodeTarget, call,
                        callee);
               continue;
             }
-            if (auto target_attr =
-                    parseOptionalHexAttr(callee->getFnAttribute(
-                        "omill.virtual_exit_native_target_pc"));
-                target_attr.has_value()) {
-              add_item(F, site_index, *target_attr,
+            if (auto boundary_fact = readBoundaryFact(*callee);
+                boundary_fact && boundary_fact->boundary_pc) {
+              add_item(F, site_index, *boundary_fact->boundary_pc,
                        OutputRootClosureSourceKind::kConstantCodeTarget, call,
                        callee);
               continue;
             }
-            if (auto boundary_attr =
-                    parseOptionalHexAttr(callee->getFnAttribute(
-                        "omill.native_boundary_pc"));
-                boundary_attr.has_value()) {
-              add_item(F, site_index, *boundary_attr,
-                       OutputRootClosureSourceKind::kConstantCodeTarget, call,
-                       callee);
-              continue;
-            }
-            if (auto vm_enter_attr =
-                    parseOptionalHexAttr(callee->getFnAttribute(
-                        "omill.vm_enter_target_pc"));
-                vm_enter_attr.has_value()) {
-              add_item(F, site_index, *vm_enter_attr,
-                       OutputRootClosureSourceKind::kConstantCodeTarget, call,
-                       callee);
-              continue;
-            }
-            if (auto executable_attr =
-                    parseOptionalHexAttr(callee->getFnAttribute(
-                        "omill.executable_target_pc"));
-                executable_attr.has_value()) {
-              add_item(F, site_index, *executable_attr,
+            if (auto executable_fact = readExecutableTargetFact(*callee)) {
+              add_item(F, site_index, executable_fact->raw_target_pc,
                        OutputRootClosureSourceKind::kConstantCodeTarget, call,
                        callee);
               continue;
@@ -591,7 +581,9 @@ std::vector<OutputRootClosureWorkItem> collectVmUnresolvedContinuationWorkItems(
       item.site_index = next_site_index[item.owner_function]++;
       item.site_pc = extractFunctionSitePc(F);
       item.target_pc = target;
-      item.exit_disposition = VirtualExitDisposition::kStayInVm;
+      item.boundary = BoundaryFact{};
+      item.boundary->exit_disposition = BoundaryDisposition::kStayInVm;
+      item.boundary->kind = BoundaryKind::kContinuation;
       item.source_kind =
           OutputRootClosureSourceKind::kVmUnresolvedContinuationTarget;
       item.identity = buildClosureWorkIdentity(item);

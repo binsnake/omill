@@ -31,6 +31,13 @@ class BinaryMemoryMap;
 /// distinguish "mapped byte range" from "first instruction decodes".
 bool canDecodeX86InstructionAt(const BinaryMemoryMap &mem, uint64_t pc);
 
+/// Return the end PC of the first decodable x86-64 instruction when the
+/// instruction has a linear byte extent that can be used for overlap/owner
+/// reasoning. Returns std::nullopt if the bytes do not decode or if the
+/// instruction does not expose a trustworthy linear extent.
+std::optional<uint64_t> nextDecodableX86InstructionPC(
+    const BinaryMemoryMap &mem, uint64_t pc);
+
 /// Concrete x86-64 emulator for the EasyAntiCheat hash-dispatch VM.
 ///
 /// The architecture is flat and trace-driven: a wrapper seeds [r12+0x190] with

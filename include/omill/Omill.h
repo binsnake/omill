@@ -24,6 +24,12 @@ enum class CleanupProfile {
   kFinal,
 };
 
+enum class RecoveryPipelinePhase {
+  kPreserve,
+  kResolve,
+  kCollapse,
+};
+
 enum class TerminalBoundaryRecoveryStatus {
   kClosedCandidate,
   kVmLikeOpen,

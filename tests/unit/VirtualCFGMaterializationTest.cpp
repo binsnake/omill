@@ -775,6 +775,88 @@ TEST_F(VirtualCFGMaterializationTest, MaterializesPhiDispatchAsSwitch) {
 }
 
 TEST_F(VirtualCFGMaterializationTest,
+       MaterializesDispatchFromIncomingPhiFactsAsSwitch) {
+  auto M = createModule();
+  auto *i8_ty = llvm::Type::getInt8Ty(Ctx);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+
+  auto *dispatch = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "__omill_dispatch_call", *M);
+
+  auto *target_a = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "sub_180005b00", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target_a);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target_a->getArg(0));
+  }
+
+  auto *target_b = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "sub_180005c00", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target_b);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(target_b->getArg(0));
+  }
+
+  auto *helper = llvm::Function::Create(
+      lifted_ty, llvm::Function::ExternalLinkage, "sub_180005a00", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", helper);
+    llvm::IRBuilder<> B(entry);
+    auto *slot = B.CreateGEP(i8_ty, helper->getArg(0), B.getInt64(0x190));
+    auto *target = B.CreateLoad(i64_ty, slot);
+    auto *call =
+        B.CreateCall(dispatch, {helper->getArg(0), target, helper->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  auto build_caller = [&](llvm::StringRef name, uint64_t pc) {
+    auto *caller = llvm::Function::Create(lifted_ty,
+                                          llvm::Function::ExternalLinkage,
+                                          name, *M);
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", caller);
+    llvm::IRBuilder<> B(entry);
+    auto *slot = B.CreateGEP(i8_ty, caller->getArg(0), B.getInt64(0x190));
+    B.CreateStore(B.getInt64(pc), slot);
+    auto *call =
+        B.CreateCall(helper, {caller->getArg(0), caller->getArg(1), caller->getArg(2)});
+    B.CreateRet(call);
+  };
+  build_caller("sub_180005800", 0x180005B00ULL);
+  build_caller("sub_180005900", 0x180005C00ULL);
+
+  runPass(*M);
+
+  unsigned dispatch_calls = 0;
+  unsigned direct_calls = 0;
+  unsigned switch_terms = 0;
+  for (auto &BB : *helper) {
+    if (llvm::isa<llvm::SwitchInst>(BB.getTerminator()))
+      ++switch_terms;
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *callee = CI->getCalledFunction();
+      if (!callee)
+        continue;
+      if (callee->getName() == "__omill_dispatch_call")
+        ++dispatch_calls;
+      if (callee == target_a || callee == target_b)
+        ++direct_calls;
+    }
+  }
+
+  EXPECT_EQ(dispatch_calls, 0u);
+  EXPECT_EQ(direct_calls, 2u);
+  EXPECT_EQ(switch_terms, 1u);
+}
+
+TEST_F(VirtualCFGMaterializationTest,
        MaterializesDispatchFromBoundaryAdjacentRegionFacts) {
   auto M = createModule();
   auto *void_ty = llvm::Type::getVoidTy(Ctx);

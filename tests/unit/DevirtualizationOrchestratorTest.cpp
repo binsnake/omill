@@ -1,4 +1,5 @@
 #include "omill/Devirtualization/Orchestrator.h"
+#include "omill/Devirtualization/ExecutableTargetFact.h"
 
 #include <gtest/gtest.h>
 
@@ -823,14 +824,17 @@ TEST_F(DevirtualizationOrchestratorTest,
       Session.discovered_frontier_work_items.end(),
       [](const omill::FrontierWorkItem &item) {
         return item.target_pc && *item.target_pc == 0x401020u &&
-               item.exit_disposition ==
+               item.boundary.has_value() &&
+               omill::virtualExitDispositionFromBoundaryDisposition(
+                   item.boundary->exit_disposition) ==
                    omill::VirtualExitDisposition::kVmExitNativeCallReenter;
       }));
 
   std::set<std::optional<uint64_t>> ContinuationVips;
   std::set<std::string> Identities;
   for (const auto &item : Session.discovered_frontier_work_items) {
-    ContinuationVips.insert(item.continuation_vip_pc);
+    ContinuationVips.insert(item.boundary ? item.boundary->continuation_vip_pc
+                                          : std::nullopt);
     Identities.insert(item.identity);
   }
   EXPECT_EQ(ContinuationVips.size(), 2u);
@@ -887,7 +891,8 @@ TEST_F(DevirtualizationOrchestratorTest,
 
   std::set<std::optional<uint64_t>> ContinuationVips;
   for (const auto &item : Session.late_frontier_work_items)
-    ContinuationVips.insert(item.continuation_vip_pc);
+    ContinuationVips.insert(item.boundary ? item.boundary->continuation_vip_pc
+                                          : std::nullopt);
   EXPECT_EQ(ContinuationVips.size(), 2u);
   EXPECT_TRUE(ContinuationVips.count(0x401080u) == 1u);
   EXPECT_TRUE(ContinuationVips.count(0x4010A0u) == 1u);
@@ -967,7 +972,8 @@ TEST_F(DevirtualizationOrchestratorTest,
     if (item.target_pc && *item.target_pc == 0x401120u &&
         item.identity.find("closure:") == 0) {
       ++matching;
-      continuation_vips.insert(item.continuation_vip_pc);
+      continuation_vips.insert(item.boundary ? item.boundary->continuation_vip_pc
+                                             : std::nullopt);
     }
   }
   EXPECT_GE(matching, 2u);
@@ -1022,21 +1028,14 @@ TEST_F(DevirtualizationOrchestratorTest,
       CallBoundaryCallbacks);
 
   EXPECT_GE(Summary.classified_native_exit, 1u);
-  auto It = std::find_if(Orchestrator.session().frontier_work_by_identity.begin(),
-                         Orchestrator.session().frontier_work_by_identity.end(),
-                         [](const auto &entry) {
-                           const auto &item = entry.second;
-                           return item.target_pc && *item.target_pc == 0x401140u;
-                         });
-  ASSERT_NE(It, Orchestrator.session().frontier_work_by_identity.end());
-  EXPECT_EQ(It->second.kind, omill::FrontierWorkKind::kNativeCallBoundary);
-  EXPECT_TRUE(It->second.status == omill::FrontierWorkStatus::kClassifiedNativeExit ||
-              It->second.status == omill::FrontierWorkStatus::kSkippedMaterialized);
-  EXPECT_EQ(It->second.exit_disposition,
-            omill::VirtualExitDisposition::kVmExitNativeCallReenter);
   auto *BoundaryDecl = M.getFunction("sub_401140");
   ASSERT_NE(BoundaryDecl, nullptr);
   EXPECT_TRUE(BoundaryDecl->isDeclaration());
+  auto BoundaryFact = omill::readBoundaryFact(*BoundaryDecl);
+  ASSERT_TRUE(BoundaryFact.has_value());
+  EXPECT_EQ(omill::virtualExitDispositionFromBoundaryDisposition(
+                BoundaryFact->exit_disposition),
+            omill::VirtualExitDisposition::kVmExitNativeCallReenter);
   EXPECT_TRUE(BoundaryDecl->hasFnAttribute("omill.virtual_exit_native_target_pc"));
   EXPECT_EQ(BoundaryDecl->getFnAttribute("omill.virtual_exit_native_target_pc")
                 .getValueAsString(),
@@ -1374,6 +1373,114 @@ TEST_F(DevirtualizationOrchestratorTest,
 }
 
 TEST_F(DevirtualizationOrchestratorTest,
+       BuildExecutionPlanRefreshesOnlyDirtyHandlerNodesAfterInitialProjection) {
+  llvm::Module M("session_graph_incremental_refresh", Ctx);
+  auto *RootA = addLiftedFunction(M, "sub_401000");
+  RootA->addFnAttr("omill.output_root");
+  auto *RootB = addLiftedFunction(M, "sub_401100");
+  RootB->addFnAttr("omill.output_root");
+
+  omill::DevirtualizationOrchestrator Orchestrator;
+  omill::DevirtualizationRequest Request;
+  Request.root_vas.push_back(0x401000);
+  (void)Orchestrator.buildExecutionPlan(M, Request);
+
+  auto &Session = const_cast<omill::DevirtualizationSession &>(Orchestrator.session());
+  auto HandlerIt = Session.graph.handler_nodes.find("sub_401100");
+  ASSERT_NE(HandlerIt, Session.graph.handler_nodes.end());
+  ASSERT_TRUE(HandlerIt->second.local_summary.has_value());
+  HandlerIt->second.local_summary->direct_callees = {"sentinel_helper"};
+
+  RootA->addFnAttr("omill.vm_newly_lifted");
+  (void)Orchestrator.buildExecutionPlan(M, Request);
+
+  auto HandlerItAfter = Orchestrator.session().graph.handler_nodes.find("sub_401100");
+  ASSERT_NE(HandlerItAfter, Orchestrator.session().graph.handler_nodes.end());
+  ASSERT_TRUE(HandlerItAfter->second.local_summary.has_value());
+  ASSERT_EQ(HandlerItAfter->second.local_summary->direct_callees.size(), 1u);
+  EXPECT_EQ(HandlerItAfter->second.local_summary->direct_callees.front(),
+            "sentinel_helper");
+}
+
+TEST_F(DevirtualizationOrchestratorTest,
+       BuildExecutionPlanRefreshesOnlyDirtyDerivedRootSlicesAfterInitialProjection) {
+  llvm::Module M("session_graph_incremental_root_slices", Ctx);
+  auto *RootA = addLiftedFunction(M, "sub_401000");
+  RootA->addFnAttr("omill.output_root");
+  auto *RootB = addLiftedFunction(M, "sub_401100");
+  RootB->addFnAttr("omill.output_root");
+
+  omill::DevirtualizationOrchestrator Orchestrator;
+  omill::DevirtualizationRequest Request;
+  Request.root_vas.push_back(0x401000);
+  (void)Orchestrator.buildExecutionPlan(M, Request);
+
+  auto &Session = const_cast<omill::DevirtualizationSession &>(Orchestrator.session());
+  auto RootSliceIt = Session.graph.root_slices_by_va.find(0x401100u);
+  ASSERT_NE(RootSliceIt, Session.graph.root_slices_by_va.end());
+  RootSliceIt->second.frontier_edge_identities = {"sentinel_edge"};
+  RootSliceIt->second.reachable_handler_names = {"sub_401100"};
+
+  RootA->addFnAttr("omill.vm_newly_lifted");
+  (void)Orchestrator.buildExecutionPlan(M, Request);
+
+  EXPECT_EQ(Orchestrator.session().graph.dirty_root_vas.count(0x401100u), 0u);
+  auto RootSliceItAfter =
+      Orchestrator.session().graph.root_slices_by_va.find(0x401100u);
+  ASSERT_NE(RootSliceItAfter,
+            Orchestrator.session().graph.root_slices_by_va.end());
+  ASSERT_EQ(RootSliceItAfter->second.frontier_edge_identities.size(), 1u);
+  EXPECT_EQ(RootSliceItAfter->second.frontier_edge_identities.front(),
+            "sentinel_edge");
+}
+
+TEST_F(DevirtualizationOrchestratorTest,
+       RefreshSessionStateReportsIncrementalSessionGraphTelemetry) {
+  llvm::Module M("session_graph_round_telemetry", Ctx);
+  auto *Root = addLiftedFunction(M, "sub_401000");
+  Root->addFnAttr("omill.output_root");
+  auto *Jump = llvm::Function::Create(
+      liftedFnTy(Ctx), llvm::Function::ExternalLinkage, "__remill_jump", M);
+
+  auto &Entry = Root->getEntryBlock();
+  Entry.getTerminator()->eraseFromParent();
+  llvm::IRBuilder<> B(&Entry);
+  B.CreateCall(Jump, {Root->getArg(0), B.getInt64(0x4011C0), Root->getArg(2)});
+  B.CreateRet(Root->getArg(2));
+
+  omill::DevirtualizationOrchestrator Orchestrator;
+  omill::DevirtualizationRequest Request;
+  Request.root_vas.push_back(0x401000);
+  (void)Orchestrator.buildExecutionPlan(M, Request);
+
+  auto &Session =
+      const_cast<omill::DevirtualizationSession &>(Orchestrator.session());
+  ASSERT_FALSE(Session.graph.edge_facts_by_identity.empty());
+  auto EdgeIt = Session.graph.edge_facts_by_identity.begin();
+  EdgeIt->second.kind = omill::FrontierWorkKind::kNativeCallBoundary;
+  EdgeIt->second.boundary = omill::BoundaryFact{};
+  EdgeIt->second.boundary->exit_disposition =
+      omill::BoundaryDisposition::kVmExitNativeExecUnknownReturn;
+  auto *NoopTy = llvm::FunctionType::get(llvm::Type::getVoidTy(Ctx), false);
+  auto *Noop = llvm::Function::Create(NoopTy, llvm::Function::ExternalLinkage,
+                                      "noop_telemetry", M);
+  Entry.getTerminator()->eraseFromParent();
+  llvm::IRBuilder<> DirtyB(&Entry);
+  DirtyB.CreateCall(Jump, {Root->getArg(0), DirtyB.getInt64(0x4011C0),
+                           Root->getArg(2)});
+  DirtyB.CreateCall(Noop);
+  DirtyB.CreateRet(Root->getArg(2));
+
+  (void)Orchestrator.buildExecutionPlan(M, Request);
+
+  EXPECT_GE(Orchestrator.session().latest_round.dirty_handler_nodes, 1u);
+  EXPECT_GE(Orchestrator.session().latest_round.dirty_edge_facts, 1u);
+  EXPECT_EQ(Orchestrator.session().latest_round.dirty_boundary_facts, 1u);
+  EXPECT_GE(Orchestrator.session().latest_round.dirty_root_slices, 1u);
+  EXPECT_GE(Orchestrator.session().latest_round.rebuilt_root_slices, 1u);
+}
+
+TEST_F(DevirtualizationOrchestratorTest,
        ImportNestedVmEnterChildrenUpdatesPersistentSessionRegionNode) {
   llvm::Module M("session_graph_nested_region", Ctx);
   auto *Root = addLiftedFunction(M, "sub_401000");
@@ -1553,18 +1660,111 @@ TEST_F(DevirtualizationOrchestratorTest,
       M, *FakeLifter, *Orchestrator.session().iterative_session, Callbacks);
 
   EXPECT_GE(Summary.failed_lift, 1u);
-  auto It = std::find_if(Orchestrator.session().frontier_work_by_identity.begin(),
-                         Orchestrator.session().frontier_work_by_identity.end(),
-                         [](const auto &entry) {
-                           const auto &item = entry.second;
-                           return item.target_pc && *item.target_pc == 0x401220u &&
-                                  item.identity.find("closure:") == 0;
-                         });
-  ASSERT_NE(It, Orchestrator.session().frontier_work_by_identity.end());
-  EXPECT_EQ(It->second.kind, omill::FrontierWorkKind::kLiftableBlock);
-  EXPECT_EQ(It->second.status, omill::FrontierWorkStatus::kFailedLift);
-  EXPECT_EQ(It->second.failure_reason,
-            "recovery_mode_deferred_liftable_block");
+  EXPECT_EQ(M.getFunction("sub_401220"), nullptr);
+  EXPECT_EQ(M.getFunction("blk_401220"), nullptr);
+}
+
+TEST_F(DevirtualizationOrchestratorTest,
+       AdvanceFrontierWorkDefersQuarantinedSelectorArmUntilTrustedWorkStalls) {
+  llvm::Module M("quarantined_selector_arm", Ctx);
+  auto *Owner = addLiftedFunction(M, "sub_401000");
+  Owner->addFnAttr("omill.output_root");
+
+  omill::DevirtualizationOrchestrator Orchestrator(
+      {}, std::make_shared<omill::IterativeLiftingSession>());
+
+  omill::FrontierWorkItem Trusted;
+  Trusted.owner_function = "sub_401000";
+  Trusted.site_index = 0;
+  Trusted.site_pc = 0x401000u;
+  Trusted.target_pc = 0x401260u;
+  Trusted.identity = "closure:trusted";
+  Trusted.boundary = omill::BoundaryFact{};
+  Trusted.boundary->boundary_pc = 0x401260u;
+  Trusted.boundary->exit_disposition = omill::BoundaryDisposition::kVmEnter;
+  Trusted.boundary->is_vm_enter = true;
+  Trusted.kind = omill::FrontierWorkKind::kVmEnterBoundary;
+  Trusted.scheduling_class = omill::FrontierSchedulingClass::kTrustedLive;
+
+  omill::FrontierWorkItem Quarantined;
+  Quarantined.owner_function = "sub_401000";
+  Quarantined.site_index = 0;
+  Quarantined.site_pc = 0x401000u;
+  Quarantined.target_pc = 0x401230u;
+  Quarantined.identity = "closure:quarantined";
+  Quarantined.executable_target = omill::ExecutableTargetFact{};
+  Quarantined.executable_target->raw_target_pc = 0x401230u;
+  Quarantined.executable_target->invalidated_executable_entry = true;
+  Quarantined.kind = omill::FrontierWorkKind::kUnknownExecutableTarget;
+  Quarantined.scheduling_class =
+      omill::FrontierSchedulingClass::kQuarantinedSelectorArm;
+  Quarantined.continuation_confidence =
+      omill::ContinuationConfidence::kDeadArmSuspect;
+  Quarantined.continuation_liveness =
+      omill::ContinuationLiveness::kQuarantined;
+
+  auto &TrustedEdge =
+      Orchestrator.session().graph.edge_facts_by_identity[Trusted.identity];
+  TrustedEdge.identity = Trusted.identity;
+  TrustedEdge.owner_function = Trusted.owner_function;
+  TrustedEdge.site_index = Trusted.site_index;
+  TrustedEdge.site_pc = Trusted.site_pc;
+  TrustedEdge.target_pc = Trusted.target_pc;
+  TrustedEdge.boundary = Trusted.boundary;
+  TrustedEdge.kind = Trusted.kind;
+  TrustedEdge.status = Trusted.status;
+  TrustedEdge.scheduling_class = Trusted.scheduling_class;
+
+  auto &QuarantinedEdge =
+      Orchestrator.session().graph.edge_facts_by_identity[Quarantined.identity];
+  QuarantinedEdge.identity = Quarantined.identity;
+  QuarantinedEdge.owner_function = Quarantined.owner_function;
+  QuarantinedEdge.site_index = Quarantined.site_index;
+  QuarantinedEdge.site_pc = Quarantined.site_pc;
+  QuarantinedEdge.target_pc = Quarantined.target_pc;
+  QuarantinedEdge.executable_target = Quarantined.executable_target;
+  QuarantinedEdge.kind = Quarantined.kind;
+  QuarantinedEdge.status = Quarantined.status;
+  QuarantinedEdge.scheduling_class = Quarantined.scheduling_class;
+  QuarantinedEdge.continuation_confidence =
+      Quarantined.continuation_confidence;
+  QuarantinedEdge.continuation_liveness =
+      Quarantined.continuation_liveness;
+
+  Orchestrator.session().late_frontier_work_items = {Trusted, Quarantined};
+
+  auto Callbacks = makeFrontierCallbacks();
+  Callbacks.read_target_bytes = [](uint64_t target, uint8_t *out, size_t size) {
+    if (size < 16)
+      return false;
+    if (target == 0x401260u) {
+      const uint8_t bytes[16] = {0x9C, 0x50, 0x51, 0x52, 0x53, 0x54,
+                                 0x55, 0x56, 0x57, 0x90, 0x90, 0x90,
+                                 0x90, 0x90, 0x90, 0x90};
+      std::memcpy(out, bytes, sizeof(bytes));
+      return true;
+    }
+    const uint8_t bytes[16] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+                               0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+                               0x90, 0x90, 0x90, 0x90};
+    std::memcpy(out, bytes, sizeof(bytes));
+    return true;
+  };
+
+  auto *FakeLifter =
+      reinterpret_cast<omill::BlockLifter *>(static_cast<uintptr_t>(0x1));
+  auto Summary = Orchestrator.advanceFrontierWork(
+      M, *FakeLifter, *Orchestrator.session().iterative_session, Callbacks);
+
+  EXPECT_TRUE(llvm::any_of(Summary.notes, [](const std::string &note) {
+    return note.find("deferred_quarantined:closure:quarantined") !=
+           std::string::npos;
+  }));
+  auto It =
+      Orchestrator.session().graph.edge_facts_by_identity.find("closure:quarantined");
+  ASSERT_NE(It, Orchestrator.session().graph.edge_facts_by_identity.end());
+  EXPECT_EQ(It->second.status, omill::FrontierWorkStatus::kPending);
+  EXPECT_EQ(It->second.failure_reason, "quarantined_selector_arm_deferred");
 }
 
 TEST_F(DevirtualizationOrchestratorTest,
@@ -1610,22 +1810,72 @@ TEST_F(DevirtualizationOrchestratorTest,
       VmEnterCallbacks);
 
   EXPECT_GE(Summary.classified_vm_enter, 1u);
-  auto It = std::find_if(Orchestrator.session().frontier_work_by_identity.begin(),
-                         Orchestrator.session().frontier_work_by_identity.end(),
-                         [](const auto &entry) {
-                           const auto &item = entry.second;
-                           return item.target_pc && *item.target_pc == 0x4011c0u;
-                         });
-  ASSERT_NE(It, Orchestrator.session().frontier_work_by_identity.end());
-  EXPECT_EQ(It->second.kind, omill::FrontierWorkKind::kVmEnterBoundary);
-  EXPECT_EQ(It->second.status,
-            omill::FrontierWorkStatus::kClassifiedVmEnter);
   auto *VmEnterDecl = M.getFunction("omill_vm_enter_target_4011C0");
   ASSERT_NE(VmEnterDecl, nullptr);
+  auto BoundaryFact = omill::readBoundaryFact(*VmEnterDecl);
+  ASSERT_TRUE(BoundaryFact.has_value());
+  EXPECT_EQ(omill::virtualExitDispositionFromBoundaryDisposition(
+                BoundaryFact->exit_disposition),
+            omill::VirtualExitDisposition::kVmEnter);
   EXPECT_EQ(VmEnterDecl->getFnAttribute("omill.virtual_exit_disposition")
                 .getValueAsString(),
             "vm_enter");
   EXPECT_TRUE(VmEnterDecl->hasFnAttribute("omill.vm_enter_target_pc"));
+}
+
+TEST_F(DevirtualizationOrchestratorTest,
+       AdvanceFrontierWorkClassifiesLateCallPushfqWrapperAsNativeBoundary) {
+  llvm::Module M("late_call_pushfq_native_boundary", Ctx);
+  auto *Root = addLiftedFunction(M, "sub_401000");
+  Root->addFnAttr("omill.output_root");
+  auto *Jump = llvm::Function::Create(
+      liftedFnTy(Ctx), llvm::Function::ExternalLinkage, "__remill_jump", M);
+
+  auto &Entry = Root->getEntryBlock();
+  Entry.getTerminator()->eraseFromParent();
+  llvm::IRBuilder<> B(&Entry);
+  B.CreateCall(Jump, {Root->getArg(0), B.getInt64(0x4017f1), Root->getArg(2)});
+  B.CreateRet(Root->getArg(2));
+
+  omill::DevirtualizationOrchestrator Orchestrator(
+      {}, std::make_shared<omill::IterativeLiftingSession>());
+  omill::DevirtualizationRequest Request;
+  Request.root_vas.push_back(0x401000);
+  (void)Orchestrator.buildExecutionPlan(M, Request);
+
+  auto BoundaryCallbacks = makeFrontierCallbacks();
+  BoundaryCallbacks.read_target_bytes = [](uint64_t, uint8_t *out, size_t size) {
+    if (size < 66)
+      return false;
+    const uint8_t bytes[66] = {
+        0x41, 0x56, 0x9C, 0x49, 0xBE, 0xB4, 0xBB, 0x0F, 0x93, 0x88, 0xC0,
+        0xBA, 0x3F, 0x49, 0x8B, 0xFE, 0x41, 0xBE, 0x17, 0x32, 0x1F, 0x49,
+        0x41, 0x81, 0xEE, 0x97, 0xF3, 0x24, 0xDF, 0x66, 0x44, 0x85, 0xF7,
+        0x48, 0x8B, 0x7C, 0x24, 0x18, 0x48, 0xC7, 0x44, 0x24, 0x18, 0x1B,
+        0xF8, 0xDB, 0xC4, 0x4E, 0x8B, 0xB4, 0x34, 0x88, 0xC1, 0x05, 0x96,
+        0x9D, 0x48, 0x8D, 0x64, 0x24, 0x10, 0xE8, 0xCA, 0xAB, 0x02, 0x00};
+    std::memcpy(out, bytes, sizeof(bytes));
+    return true;
+  };
+  BoundaryCallbacks.can_decode_target = [](uint64_t) { return true; };
+
+  (void)Orchestrator.discoverFrontierWork(
+      M, BoundaryCallbacks, omill::FrontierDiscoveryPhase::kOutputRootClosure);
+
+  auto *FakeLifter =
+      reinterpret_cast<omill::BlockLifter *>(static_cast<uintptr_t>(0x1));
+  auto Summary = Orchestrator.advanceFrontierWork(
+      M, *FakeLifter, *Orchestrator.session().iterative_session,
+      BoundaryCallbacks);
+
+  EXPECT_GE(Summary.classified_native_exit, 1u);
+  auto *BoundaryDecl = M.getFunction("sub_4017f1");
+  ASSERT_NE(BoundaryDecl, nullptr);
+  auto BoundaryFact = omill::readBoundaryFact(*BoundaryDecl);
+  ASSERT_TRUE(BoundaryFact.has_value());
+  EXPECT_EQ(omill::virtualExitDispositionFromBoundaryDisposition(
+                BoundaryFact->exit_disposition),
+            omill::VirtualExitDisposition::kVmExitNativeExecUnknownReturn);
 }
 
 TEST_F(DevirtualizationOrchestratorTest,
@@ -1670,16 +1920,209 @@ TEST_F(DevirtualizationOrchestratorTest,
       CallBoundaryCallbacks);
 
   EXPECT_GE(Summary.classified_terminal, 1u);
+  EXPECT_EQ(Summary.classified_terminal, 1u);
+}
+
+TEST_F(DevirtualizationOrchestratorTest,
+       AdvanceFrontierWorkClassifiesMissingBlockClosureTargetAsTerminalBoundary) {
+  llvm::Module M("missing_block_closure_frontier", Ctx);
+  auto *Root = addLiftedFunction(M, "sub_401000");
+  Root->addFnAttr("omill.output_root");
+  auto *MissingBlock = llvm::Function::Create(
+      llvm::FunctionType::get(llvm::Type::getVoidTy(Ctx),
+                              {llvm::Type::getInt64Ty(Ctx)}, false),
+      llvm::Function::ExternalLinkage, "__omill_missing_block_handler", M);
+
+  auto &Entry = Root->getEntryBlock();
+  Entry.getTerminator()->eraseFromParent();
+  llvm::IRBuilder<> B(&Entry);
+  B.CreateCall(MissingBlock, {B.getInt64(0x4012A0)});
+  B.CreateRet(Root->getArg(2));
+
+  omill::DevirtualizationOrchestrator Orchestrator(
+      {}, std::make_shared<omill::IterativeLiftingSession>());
+  omill::DevirtualizationRequest Request;
+  Request.root_vas.push_back(0x401000);
+  (void)Orchestrator.buildExecutionPlan(M, Request);
+
+  auto Callbacks = makeFrontierCallbacks();
+  auto DiscoverSummary = Orchestrator.discoverFrontierWork(
+      M, Callbacks, omill::FrontierDiscoveryPhase::kOutputRootClosure);
+
+  EXPECT_GE(DiscoverSummary.discovered, 1u);
+  auto PendingIt = std::find_if(
+      Orchestrator.session().discovered_frontier_work_items.begin(),
+      Orchestrator.session().discovered_frontier_work_items.end(),
+      [](const omill::FrontierWorkItem &item) {
+        return item.target_pc && *item.target_pc == 0x4012A0u &&
+               item.identity.find("closure:") == 0;
+      });
+  ASSERT_NE(PendingIt, Orchestrator.session().discovered_frontier_work_items.end());
+  ASSERT_TRUE(PendingIt->boundary.has_value());
+  EXPECT_EQ(omill::virtualExitDispositionFromBoundaryDisposition(
+                PendingIt->boundary->exit_disposition),
+            omill::VirtualExitDisposition::kVmExitTerminal);
+  EXPECT_EQ(PendingIt->status, omill::FrontierWorkStatus::kPending);
+
+  auto *FakeLifter =
+      reinterpret_cast<omill::BlockLifter *>(static_cast<uintptr_t>(0x1));
+  auto AdvanceSummary = Orchestrator.advanceFrontierWork(
+      M, *FakeLifter, *Orchestrator.session().iterative_session, Callbacks);
+
+  EXPECT_GE(AdvanceSummary.classified_terminal, 1u);
   auto It = std::find_if(Orchestrator.session().frontier_work_by_identity.begin(),
                          Orchestrator.session().frontier_work_by_identity.end(),
                          [](const auto &entry) {
                            const auto &item = entry.second;
-                           return item.target_pc && *item.target_pc == 0x401260u;
+                           return item.target_pc && *item.target_pc == 0x4012A0u;
                          });
   ASSERT_NE(It, Orchestrator.session().frontier_work_by_identity.end());
   EXPECT_EQ(It->second.kind, omill::FrontierWorkKind::kTerminalBoundary);
+  ASSERT_TRUE(It->second.boundary.has_value());
+  EXPECT_EQ(omill::virtualExitDispositionFromBoundaryDisposition(
+                It->second.boundary->exit_disposition),
+            omill::VirtualExitDisposition::kVmExitTerminal);
   EXPECT_EQ(It->second.status,
             omill::FrontierWorkStatus::kClassifiedTerminal);
+  EXPECT_EQ(It->second.failure_reason, "non_liftable_terminal_boundary");
+}
+
+TEST_F(
+    DevirtualizationOrchestratorTest,
+    AdvanceFrontierWorkMaterializesInvalidatedExecutableMissingBlockAsPlaceholder) {
+  llvm::Module M("invalidated_missing_block_frontier", Ctx);
+  auto *Root = addLiftedFunction(M, "sub_401000");
+  Root->addFnAttr("omill.output_root");
+  auto *MissingBlock = llvm::Function::Create(
+      llvm::FunctionType::get(llvm::Type::getVoidTy(Ctx),
+                              {llvm::Type::getInt64Ty(Ctx)}, false),
+      llvm::Function::ExternalLinkage, "__omill_missing_block_handler", M);
+
+  auto &Entry = Root->getEntryBlock();
+  Entry.getTerminator()->eraseFromParent();
+  llvm::IRBuilder<> B(&Entry);
+  auto *call = B.CreateCall(MissingBlock, {B.getInt64(0x4012A0)});
+  call->setMetadata(
+      "omill.invalidated_executable_entry",
+      llvm::MDTuple::get(
+          Ctx, {llvm::ConstantAsMetadata::get(
+                    llvm::ConstantInt::get(llvm::Type::getInt1Ty(Ctx), 1))}));
+  call->setMetadata(
+      "omill.invalidated_entry_source_pc",
+      llvm::MDTuple::get(
+          Ctx, {llvm::ConstantAsMetadata::get(B.getInt64(0x4012A0))}));
+  call->setMetadata(
+      "omill.invalidated_entry_failed_pc",
+      llvm::MDTuple::get(
+          Ctx, {llvm::ConstantAsMetadata::get(B.getInt64(0x4012AA))}));
+  B.CreateRet(Root->getArg(2));
+
+  omill::DevirtualizationOrchestrator Orchestrator(
+      {}, std::make_shared<omill::IterativeLiftingSession>());
+  omill::DevirtualizationRequest Request;
+  Request.root_vas.push_back(0x401000);
+  (void)Orchestrator.buildExecutionPlan(M, Request);
+
+  auto Callbacks = makeFrontierCallbacks();
+  Callbacks.can_decode_target = [](uint64_t) { return true; };
+  auto DiscoverSummary = Orchestrator.discoverFrontierWork(
+      M, Callbacks, omill::FrontierDiscoveryPhase::kOutputRootClosure);
+
+  EXPECT_GE(DiscoverSummary.discovered, 1u);
+  auto PendingIt = std::find_if(
+      Orchestrator.session().discovered_frontier_work_items.begin(),
+      Orchestrator.session().discovered_frontier_work_items.end(),
+      [](const omill::FrontierWorkItem &item) {
+        return item.target_pc && *item.target_pc == 0x4012A0u &&
+               item.executable_target &&
+               item.executable_target->invalidated_executable_entry;
+      });
+  ASSERT_NE(PendingIt,
+            Orchestrator.session().discovered_frontier_work_items.end());
+  ASSERT_TRUE(PendingIt->executable_target.has_value());
+  ASSERT_TRUE(PendingIt->executable_target->invalidated_entry_source_pc.has_value());
+  ASSERT_TRUE(PendingIt->executable_target->invalidated_entry_failed_pc.has_value());
+  EXPECT_EQ(*PendingIt->executable_target->invalidated_entry_source_pc, 0x4012A0u);
+  EXPECT_EQ(*PendingIt->executable_target->invalidated_entry_failed_pc, 0x4012AAu);
+
+  auto *FakeLifter =
+      reinterpret_cast<omill::BlockLifter *>(static_cast<uintptr_t>(0x1));
+  auto AdvanceSummary = Orchestrator.advanceFrontierWork(
+      M, *FakeLifter, *Orchestrator.session().iterative_session, Callbacks);
+
+  EXPECT_GE(AdvanceSummary.skipped_materialized, 1u);
+  auto It = std::find_if(Orchestrator.session().frontier_work_by_identity.begin(),
+                         Orchestrator.session().frontier_work_by_identity.end(),
+                         [](const auto &entry) {
+                           const auto &item = entry.second;
+                           return item.target_pc && *item.target_pc == 0x4012A0u;
+                         });
+  ASSERT_NE(It, Orchestrator.session().frontier_work_by_identity.end());
+  ASSERT_TRUE(It->second.executable_target.has_value());
+  EXPECT_TRUE(It->second.executable_target->invalidated_executable_entry);
+  EXPECT_EQ(It->second.kind, omill::FrontierWorkKind::kUnknownExecutableTarget);
+  EXPECT_EQ(It->second.status,
+            omill::FrontierWorkStatus::kSkippedMaterialized);
+
+  llvm::Function *placeholder = nullptr;
+  for (auto &F : M) {
+    if (!F.getName().contains_insensitive("4012a0"))
+      continue;
+    placeholder = &F;
+    break;
+  }
+  ASSERT_NE(placeholder, nullptr);
+  auto placeholder_fact = omill::readExecutableTargetFact(*placeholder);
+  ASSERT_TRUE(placeholder_fact.has_value());
+  EXPECT_TRUE(placeholder_fact->invalidated_executable_entry);
+  ASSERT_TRUE(placeholder_fact->invalidated_entry_source_pc.has_value());
+  ASSERT_TRUE(placeholder_fact->invalidated_entry_failed_pc.has_value());
+}
+
+TEST_F(DevirtualizationOrchestratorTest,
+       AdvanceFrontierWorkClassifiesJunkExecutableSnippetAsTerminalBoundary) {
+  llvm::Module M("terminal_junk_frontier", Ctx);
+  auto *Root = addLiftedFunction(M, "sub_401000");
+  Root->addFnAttr("omill.output_root");
+  auto *Jump = llvm::Function::Create(
+      liftedFnTy(Ctx), llvm::Function::ExternalLinkage, "__remill_jump", M);
+
+  auto &Entry = Root->getEntryBlock();
+  Entry.getTerminator()->eraseFromParent();
+  llvm::IRBuilder<> B(&Entry);
+  B.CreateCall(Jump, {Root->getArg(0), B.getInt64(0x4012cf), Root->getArg(2)});
+  B.CreateRet(Root->getArg(2));
+
+  omill::DevirtualizationOrchestrator Orchestrator(
+      {}, std::make_shared<omill::IterativeLiftingSession>());
+  omill::DevirtualizationRequest Request;
+  Request.root_vas.push_back(0x401000);
+  (void)Orchestrator.buildExecutionPlan(M, Request);
+
+  auto CallBoundaryCallbacks = makeFrontierCallbacks();
+  CallBoundaryCallbacks.read_target_bytes = [](uint64_t, uint8_t *out,
+                                               size_t size) {
+    if (size < 16)
+      return false;
+    const uint8_t bytes[16] = {0x59, 0xEE, 0xF9, 0x60, 0x93, 0xFC,
+                               0x5C, 0xAD, 0xB3, 0xAD, 0x3D, 0x20,
+                               0x67, 0x46, 0xAD, 0xB3};
+    std::memcpy(out, bytes, sizeof(bytes));
+    return true;
+  };
+  CallBoundaryCallbacks.can_decode_target = [](uint64_t) { return true; };
+
+  (void)Orchestrator.discoverFrontierWork(
+      M, CallBoundaryCallbacks, omill::FrontierDiscoveryPhase::kOutputRootClosure);
+
+  auto *FakeLifter =
+      reinterpret_cast<omill::BlockLifter *>(static_cast<uintptr_t>(0x1));
+  auto Summary = Orchestrator.advanceFrontierWork(
+      M, *FakeLifter, *Orchestrator.session().iterative_session,
+      CallBoundaryCallbacks);
+
+  EXPECT_GE(Summary.classified_terminal, 1u);
+  EXPECT_EQ(Summary.classified_terminal, 1u);
 }
 
 TEST_F(DevirtualizationOrchestratorTest,

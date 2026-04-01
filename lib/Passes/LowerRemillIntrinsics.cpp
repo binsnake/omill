@@ -1171,10 +1171,12 @@ bool lowerErrorAndMissing(llvm::Function &F, IntrinsicTable &table) {
     llvm::SmallVector<llvm::BasicBlock *, 4> old_succs(successors(BB));
 
     llvm::Value *pc = CI->getArgOperand(1);
+    llvm::CallInst *replacement_call = nullptr;
     if (kind == IntrinsicKind::kError)
-      Builder.CreateCall(error_handler, {pc});
+      replacement_call = Builder.CreateCall(error_handler, {pc});
     else
-      Builder.CreateCall(missing_handler, {pc});
+      replacement_call = Builder.CreateCall(missing_handler, {pc});
+    replacement_call->copyMetadata(*CI);
 
     llvm::Instruction *new_term;
     if (F.getReturnType()->isVoidTy())

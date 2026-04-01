@@ -1542,10 +1542,11 @@ void applyDirectCalleeEffects(
     LocalizedReplayCacheState *localized_replay_cache,
     llvm::ArrayRef<unsigned> relevant_caller_slot_ids,
     llvm::ArrayRef<unsigned> relevant_caller_stack_cell_ids) {
-  const auto slot_ids = buildSlotIdMap(model);
-  const auto slot_info = buildSlotInfoMap(model);
-  const auto stack_cell_ids = buildStackCellIdMap(model);
-  const auto stack_cell_info = buildStackCellInfoMap(model);
+  const auto stack_model = buildStackModelContext(model);
+  const auto &slot_ids = stack_model.slot_ids;
+  const auto &slot_info = stack_model.slot_info;
+  const auto &stack_cell_ids = stack_model.stack_cell_ids;
+  const auto &stack_cell_info = stack_model.stack_cell_info;
   const auto &dl = caller_fn.getParent()->getDataLayout();
   std::map<StackCellKey, VirtualValueExpr> caller_structural_outgoing_stack;
   llvm::SmallPtrSet<const llvm::Function *, 8> visiting;

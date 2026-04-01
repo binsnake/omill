@@ -22,10 +22,13 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
 #include <llvm/ADT/SmallVector.h>
+
+#include "omill/BC/LiftTargetPolicy.h"
 
 namespace llvm {
 class Function;
@@ -69,6 +72,18 @@ class BlockManager {
 
   /// Try to read an executable byte at \p addr.
   virtual bool TryReadExecutableByte(uint64_t addr, uint8_t *byte) = 0;
+
+  /// Resolve a discovered executable control-flow target into a typed
+  /// lift-target decision.
+  virtual LiftTargetDecision ResolveLiftTarget(uint64_t source_pc,
+                                               uint64_t raw_target_pc,
+                                               LiftTargetEdgeKind edge_kind);
+
+  /// Resolve a decode failure while lifting the block that began at
+  /// \p source_addr into a typed recovery decision.
+  virtual DecodeFailureDecision ResolveDecodeFailure(
+      uint64_t source_addr, uint64_t failed_pc,
+      const DecodeFailureContext &ctx);
 
   /// Optional destination module for lifted block functions.
   /// If null, BlockLifter falls back to the Remill intrinsic module.

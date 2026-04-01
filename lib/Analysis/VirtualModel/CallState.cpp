@@ -142,6 +142,8 @@ VirtualValueExpr summarizeSpecializedCallArg(
   if (arg_index >= call.arg_size())
     return VirtualValueExpr{};
   auto expr = summarizeValueExpr(call.getArgOperand(arg_index), dl);
+  annotateExprSlots(expr, slot_ids);
+  annotateExprStackCells(expr, stack_cell_ids, slot_ids);
   auto specialized = specializeExprToFixpoint(expr, caller_outgoing,
                                               &caller_outgoing_stack,
                                               &caller_argument_map, slot_ids,

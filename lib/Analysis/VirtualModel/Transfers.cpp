@@ -72,7 +72,9 @@ std::map<unsigned, VirtualValueExpr> rebaseOutgoingStackFacts(
     const VirtualMachineModel &model,
     const std::map<unsigned, VirtualValueExpr> &outgoing_slots,
     const std::map<unsigned, VirtualValueExpr> &outgoing_stack) {
-  auto tracked = buildTrackedFactState(model, outgoing_slots, outgoing_stack);
+  auto stack_model = buildStackModelContext(model);
+  auto tracked =
+      buildTrackedFactState(stack_model, outgoing_slots, outgoing_stack);
   return tracked.materialized_stack_facts;
 }
 
@@ -109,13 +111,16 @@ llvm::SmallDenseSet<unsigned, 16> rebaseWrittenStackCellIds(
     const VirtualMachineModel &model,
     const std::map<unsigned, VirtualValueExpr> &outgoing_slots,
     llvm::ArrayRef<unsigned> written_stack_cell_ids) {
-  auto tracked = buildTrackedFactState(model, outgoing_slots, {});
+  auto stack_model = buildStackModelContext(model);
+  auto tracked = buildTrackedFactState(stack_model, outgoing_slots, {});
   std::set<CanonicalStackFactKey> written_keys;
   for (unsigned cell_id : written_stack_cell_ids) {
-    if (auto key = canonicalStackFactKeyForCellId(model, tracked, cell_id))
+    if (auto key =
+            canonicalStackFactKeyForCellId(stack_model, tracked, cell_id))
       written_keys.insert(*key);
   }
-  return materializeTrackedWrittenStackCellIds(model, tracked, written_keys);
+  return materializeTrackedWrittenStackCellIds(stack_model, tracked,
+                                               written_keys);
 }
 
 unsigned rebaseSingleStackCellId(

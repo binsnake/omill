@@ -325,6 +325,50 @@ TEST_F(LiftedNamesTest, FindNearestCoveredLiftedOrBlockPC_FindsNearbyEntry) {
   EXPECT_EQ(*found, 0x180001240ULL);
 }
 
+TEST_F(LiftedNamesTest,
+       FindLiftedOrCoveredFunctionByPC_IgnoresInferredMidInstructionPC) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  auto *F = createLiftedFunction(*M, "sub_180001800");
+
+  auto *named = llvm::BasicBlock::Create(Ctx, "block_180001840", F);
+  llvm::IRBuilder<> NamedB(named);
+  NamedB.CreateRet(F->getArg(2));
+
+  auto *plain = llvm::BasicBlock::Create(Ctx, "plain", F);
+  llvm::IRBuilder<> PlainB(plain);
+  auto *pc_plus =
+      PlainB.CreateAdd(F->getArg(1), llvm::ConstantInt::get(
+                                         llvm::Type::getInt64Ty(Ctx), 0x92));
+  (void)pc_plus;
+  PlainB.CreateRet(F->getArg(2));
+
+  auto *found = omill::findLiftedOrCoveredFunctionByPC(*M, 0x180001892ULL);
+  EXPECT_EQ(found, nullptr);
+}
+
+TEST_F(LiftedNamesTest,
+       FindNearestCoveredLiftedOrBlockPC_IgnoresInferredMidInstructionPC) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  auto *F = createLiftedFunction(*M, "sub_180001800");
+
+  auto *named = llvm::BasicBlock::Create(Ctx, "block_180001840", F);
+  llvm::IRBuilder<> NamedB(named);
+  NamedB.CreateRet(F->getArg(2));
+
+  auto *plain = llvm::BasicBlock::Create(Ctx, "plain", F);
+  llvm::IRBuilder<> PlainB(plain);
+  auto *pc_plus =
+      PlainB.CreateAdd(F->getArg(1), llvm::ConstantInt::get(
+                                         llvm::Type::getInt64Ty(Ctx), 0x92));
+  (void)pc_plus;
+  PlainB.CreateRet(F->getArg(2));
+
+  auto found =
+      omill::findNearestCoveredLiftedOrBlockPC(*M, 0x180001892ULL, 0x80);
+  ASSERT_TRUE(found.has_value());
+  EXPECT_EQ(*found, 0x180001840ULL);
+}
+
 TEST_F(LiftedNamesTest, FindStructuralCodeTargetFunctionByPC_FindsPlaceholderDecl) {
   auto M = std::make_unique<llvm::Module>("test", Ctx);
   auto *F = createLiftedDecl(*M, "omill_executable_target_1801F7733");

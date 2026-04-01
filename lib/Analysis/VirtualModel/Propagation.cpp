@@ -46,117 +46,45 @@ static std::set<unsigned> collectReferencedStackCellIds(
 }
 
 void canonicalizeVirtualState(VirtualMachineModel &model) {
-  auto &slots = model.mutableSlots();
-  auto &stack_cells = model.mutableStackCells();
   auto &handlers = model.mutableHandlers();
-  std::map<SlotKey, unsigned> slot_ids;
-  std::map<StackCellKey, unsigned> stack_cell_ids;
-  unsigned next_id = 0;
-  unsigned next_stack_cell_id = 0;
-
-  auto intern_slot = [&](VirtualStateSlotSummary &slot,
-                         llvm::StringRef handler_name) {
-    auto key = slotKeyForSummary(slot);
-    auto it = slot_ids.find(key);
-    if (it == slot_ids.end()) {
-      unsigned id = next_id++;
-      slot_ids.emplace(key, id);
-      slots.push_back(VirtualStateSlotInfo{id, slot.base_name, slot.offset,
-                                           slot.width, slot.from_argument,
-                                           slot.from_alloca, {}});
-      it = slot_ids.find(key);
-    }
-    slot.canonical_id = it->second;
-    auto &info = slots[it->second];
-    if (std::find(info.handler_names.begin(), info.handler_names.end(),
-                  handler_name.str()) == info.handler_names.end()) {
-      info.handler_names.push_back(handler_name.str());
-    }
-  };
-
-  auto intern_stack_cell = [&](VirtualStackCellSummary &cell,
-                               llvm::StringRef handler_name) {
-    VirtualStateSlotSummary base_slot;
-    base_slot.base_name = cell.base_name;
-    base_slot.offset = cell.base_offset;
-    base_slot.width = cell.base_width;
-    base_slot.from_argument = cell.base_from_argument;
-    base_slot.from_alloca = cell.base_from_alloca;
-    intern_slot(base_slot, handler_name);
-    cell.canonical_base_slot_id = base_slot.canonical_id;
-
-    auto intern_cell_info = [&](VirtualStackCellSummary &summary) {
-      auto key = stackCellKeyForSummary(summary);
-      auto it = stack_cell_ids.find(key);
-      if (it == stack_cell_ids.end()) {
-        unsigned id = next_stack_cell_id++;
-        stack_cell_ids.emplace(key, id);
-        stack_cells.push_back(VirtualStackCellInfo{
-            id,
-            *summary.canonical_base_slot_id,
-            summary.base_name,
-            summary.base_offset,
-            summary.base_width,
-            summary.offset,
-            summary.width,
-            summary.base_from_argument,
-            summary.base_from_alloca,
-            {},
-        });
-        it = stack_cell_ids.find(key);
-      }
-      auto &info = stack_cells[it->second];
-      if (std::find(info.handler_names.begin(), info.handler_names.end(),
-                    handler_name.str()) == info.handler_names.end()) {
-        info.handler_names.push_back(handler_name.str());
-      }
-      return it;
-    };
-
-    if (cell.offset != 0) {
-      VirtualStackCellSummary zero_cell = cell;
-      zero_cell.offset = 0;
-      zero_cell.canonical_id.reset();
-      zero_cell.canonical_base_slot_id = cell.canonical_base_slot_id;
-      intern_cell_info(zero_cell);
-    }
-
-    auto it = intern_cell_info(cell);
-    cell.canonical_id = it->second;
-  };
-
-  auto intern_expr_slots = [&](const VirtualValueExpr &expr,
-                               llvm::StringRef handler_name) {
-    std::vector<VirtualStateSlotSummary> referenced_slots;
-    collectExprReferencedStateSlots(expr, referenced_slots);
-    for (auto &slot : referenced_slots)
-      intern_slot(slot, handler_name);
-  };
+  StackModelBuilder stack_model_builder(model);
 
   for (auto &summary : handlers) {
     for (auto &slot : summary.state_slots)
-      intern_slot(slot, summary.function_name);
+      stack_model_builder.internSlot(slot, summary.function_name);
     for (auto &transfer : summary.state_transfers)
-      intern_slot(transfer.target_slot, summary.function_name);
+      stack_model_builder.internSlot(transfer.target_slot, summary.function_name);
     for (auto &cell : summary.stack_cells)
-      intern_stack_cell(cell, summary.function_name);
+      stack_model_builder.internStackCell(cell, summary.function_name);
     for (auto &transfer : summary.stack_transfers)
-      intern_stack_cell(transfer.target_cell, summary.function_name);
+      stack_model_builder.internStackCell(transfer.target_cell,
+                                          summary.function_name);
     for (const auto &dispatch : summary.dispatches)
-      intern_expr_slots(dispatch.target, summary.function_name);
+      stack_model_builder.internExprReferencedSlots(dispatch.target,
+                                                    summary.function_name);
     for (const auto &callsite : summary.callsites)
-      intern_expr_slots(callsite.target, summary.function_name);
+      stack_model_builder.internExprReferencedSlots(callsite.target,
+                                                    summary.function_name);
     for (const auto &transfer : summary.state_transfers)
-      intern_expr_slots(transfer.value, summary.function_name);
+      stack_model_builder.internExprReferencedSlots(transfer.value,
+                                                    summary.function_name);
     for (const auto &transfer : summary.stack_transfers)
-      intern_expr_slots(transfer.value, summary.function_name);
+      stack_model_builder.internExprReferencedSlots(transfer.value,
+                                                    summary.function_name);
     for (const auto &fact : summary.specialization_facts)
-      intern_expr_slots(fact.value, summary.function_name);
+      stack_model_builder.internExprReferencedSlots(fact.value,
+                                                    summary.function_name);
     for (const auto &fact : summary.specialization_stack_facts)
-      intern_expr_slots(fact.value, summary.function_name);
+      stack_model_builder.internExprReferencedSlots(fact.value,
+                                                    summary.function_name);
     for (const auto &fact : summary.incoming_argument_facts)
-      intern_expr_slots(fact.value, summary.function_name);
+      stack_model_builder.internExprReferencedSlots(fact.value,
+                                                    summary.function_name);
   }
+
+  const auto stack_model = buildStackModelContext(model);
+  const auto &slot_ids = stack_model.slot_ids;
+  const auto &stack_cell_ids = stack_model.stack_cell_ids;
 
   for (auto &summary : handlers) {
     for (auto &dispatch : summary.dispatches)
@@ -374,12 +302,13 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
   };
 
   auto &handlers = model.mutableHandlers();
-  const auto slot_ids = buildSlotIdMap(model);
-  const auto slot_info = buildSlotInfoMap(model);
-  const auto stack_cell_ids = buildStackCellIdMap(model);
-  const auto stack_cell_info = buildStackCellInfoMap(model);
-  const auto equivalent_stack_cell_groups =
-      buildEquivalentStackCellGroupMap(model);
+  const auto stack_model = buildStackModelContext(model);
+  const auto &slot_ids = stack_model.slot_ids;
+  const auto &slot_info = stack_model.slot_info;
+  const auto &stack_cell_ids = stack_model.stack_cell_ids;
+  const auto &stack_cell_info = stack_model.stack_cell_info;
+  const auto &equivalent_stack_cell_groups =
+      stack_model.equivalent_stack_cell_groups;
   vmModelStageDebugLog("propagate: maps-built handlers=" +
                        llvm::Twine(handlers.size()).str() + " slots=" +
                        llvm::Twine(slot_ids.size()).str() + " stack_cells=" +
@@ -428,6 +357,22 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
                        llvm::Twine(handlers_with_direct_callees.size()).str() +
                        " prelude_handlers=" +
                        llvm::Twine(handlers_with_prelude.size()).str());
+  std::vector<std::map<const llvm::CallBase *, unsigned>> tracked_callsite_indices(
+      handlers.size());
+  for (size_t i = 0; i < handlers.size(); ++i) {
+    auto *handler_fn = M.getFunction(handlers[i].function_name);
+    if (!handler_fn)
+      continue;
+    unsigned tracked_index = 0;
+    for (auto &BB : *handler_fn) {
+      for (auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+        if (!call || !call->getCalledFunction())
+          continue;
+        tracked_callsite_indices[i].emplace(call, tracked_index++);
+      }
+    }
+  }
   std::vector<llvm::SmallVector<unsigned, 16>> relevant_outgoing_slot_ids(
       handlers.size());
   std::vector<llvm::SmallVector<unsigned, 16>> relevant_outgoing_stack_cell_ids(
@@ -506,6 +451,12 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
       handlers.size());
   std::vector<std::map<unsigned, VirtualValueExpr>> outgoing_stack_maps(
       handlers.size());
+  using IncomingSlotArmMap =
+      std::map<unsigned, std::map<std::string, VirtualIncomingContextArm>>;
+  using IncomingStackArmMap =
+      std::map<unsigned, std::map<std::string, VirtualIncomingContextArm>>;
+  std::vector<IncomingSlotArmMap> incoming_slot_arm_maps(handlers.size());
+  std::vector<IncomingStackArmMap> incoming_stack_arm_maps(handlers.size());
   std::vector<std::set<unsigned>> dynamic_live_in_slot_ids(handlers.size());
   std::vector<std::set<unsigned>> dynamic_live_in_stack_cell_ids(
       handlers.size());
@@ -586,6 +537,50 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
                                          key.incoming_argument_fingerprint,
                                          key.callee_outgoing_fingerprint);
       };
+  auto rebuild_slot_arm_map =
+      [](llvm::ArrayRef<VirtualIncomingSlotPhi> phis) {
+        IncomingSlotArmMap result;
+        for (const auto &phi : phis) {
+          for (const auto &arm : phi.arms)
+            result[phi.slot_id][arm.edge_identity] = arm;
+        }
+        return result;
+      };
+  auto rebuild_stack_arm_map =
+      [](llvm::ArrayRef<VirtualIncomingStackPhi> phis) {
+        IncomingStackArmMap result;
+        for (const auto &phi : phis) {
+          for (const auto &arm : phi.arms)
+            result[phi.cell_id][arm.edge_identity] = arm;
+        }
+        return result;
+      };
+  auto callsite_edge_identity = [&](size_t source_index,
+                                    const llvm::CallBase &call,
+                                    llvm::StringRef callee_name) {
+    unsigned tracked_index = 0;
+    auto it = tracked_callsite_indices[source_index].find(&call);
+    if (it != tracked_callsite_indices[source_index].end())
+      tracked_index = it->second;
+    return (llvm::Twine(handlers[source_index].function_name) + ":callsite:" +
+            llvm::Twine(tracked_index) + ":" + callee_name)
+        .str();
+  };
+  auto prelude_edge_identity = [&](size_t source_index, uint64_t target_pc) {
+    return (llvm::Twine(handlers[source_index].function_name) + ":prelude:0x" +
+            llvm::Twine::utohexstr(target_pc))
+        .str();
+  };
+  auto record_incoming_slot_arm =
+      [&](size_t target_index, unsigned slot_id,
+          const VirtualIncomingContextArm &arm) {
+        incoming_slot_arm_maps[target_index][slot_id][arm.edge_identity] = arm;
+      };
+  auto record_incoming_stack_arm =
+      [&](size_t target_index, unsigned cell_id,
+          const VirtualIncomingContextArm &arm) {
+        incoming_stack_arm_maps[target_index][cell_id][arm.edge_identity] = arm;
+      };
 
   for (size_t i = 0; i < handlers.size(); ++i) {
     auto *handler_fn = M.getFunction(handlers[i].function_name);
@@ -602,10 +597,14 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
             cache_it->second.incoming_slots, slot_ids, stack_cell_ids);
         outgoing_maps[i] = restoreStableSlotFactMap(
             cache_it->second.outgoing_slots, slot_ids, stack_cell_ids);
+        incoming_slot_arm_maps[i] =
+            rebuild_slot_arm_map(cache_it->second.incoming_slot_phis);
         incoming_stack_maps[i] = restoreStableStackFactMap(
             cache_it->second.incoming_stack, slot_ids, stack_cell_ids);
         outgoing_stack_maps[i] = restoreStableStackFactMap(
             cache_it->second.outgoing_stack, slot_ids, stack_cell_ids);
+        incoming_stack_arm_maps[i] =
+            rebuild_stack_arm_map(cache_it->second.incoming_stack_phis);
         handlers[i].stack_memory_budget_exceeded =
             cache_it->second.stack_memory_budget_exceeded;
         restored_propagation_state[i] = 1;
@@ -1176,6 +1175,21 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
           auto callee_it = handler_index.find(callee->getName().str());
           if (callee_it == handler_index.end())
             continue;
+          const auto edge_identity =
+              callsite_edge_identity(i, *call, callee->getName());
+          const unsigned source_site_index =
+              tracked_callsite_indices[i].count(call)
+                  ? tracked_callsite_indices[i].find(call)->second
+                  : 0u;
+          auto make_direct_arm = [&](const VirtualValueExpr &value) {
+            VirtualIncomingContextArm arm;
+            arm.edge_identity = edge_identity;
+            arm.source_kind = VirtualIncomingContextSourceKind::kDirectCallsite;
+            arm.source_handler_name = handlers[i].function_name;
+            arm.source_site_index = source_site_index;
+            arm.value = value;
+            return arm;
+          };
 
           auto &callee_incoming = incoming_maps[callee_it->second];
           auto &callee_incoming_stack = incoming_stack_maps[callee_it->second];
@@ -1202,6 +1216,8 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
               continue;
             merge_fact(callee_incoming, slot_id, value, callee_it->second,
                        /*arg_change=*/false);
+            record_incoming_slot_arm(callee_it->second, slot_id,
+                                     make_direct_arm(value));
           }
           for (const auto &[cell_id, value] : caller_outgoing_stack) {
             if (!allowed_stack.empty() && !allowed_stack.count(cell_id))
@@ -1213,6 +1229,8 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
               continue;
             merge_fact(callee_incoming_stack, cell_id, value,
                        callee_it->second, /*arg_change=*/false);
+            record_incoming_stack_arm(callee_it->second, cell_id,
+                                      make_direct_arm(value));
           }
 
           for (unsigned callee_slot_id : callee_summary.live_in_slot_ids) {
@@ -1233,6 +1251,8 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
               continue;
             merge_fact(callee_incoming, callee_slot_id, value_it->second,
                        callee_it->second, /*arg_change=*/false);
+            record_incoming_slot_arm(callee_it->second, callee_slot_id,
+                                     make_direct_arm(value_it->second));
           }
 
           for (unsigned callee_cell_id : callee_summary.live_in_stack_cell_ids) {
@@ -1255,6 +1275,8 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
               continue;
             merge_fact(callee_incoming_stack, callee_cell_id, value_it->second,
                        callee_it->second, /*arg_change=*/false);
+            record_incoming_stack_arm(callee_it->second, callee_cell_id,
+                                      make_direct_arm(value_it->second));
           }
 
           for (unsigned arg_index = 0; arg_index < call->arg_size(); ++arg_index) {
@@ -1289,9 +1311,13 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
                                       std::to_string(callee_cell_id) +
                                       " pc=0x" +
                                       llvm::utohexstr(*continuation_pc));
+                auto continuation_value =
+                    constantExpr(*continuation_pc, cell->width * 8);
                 merge_fact(callee_incoming_stack, callee_cell_id,
-                           constantExpr(*continuation_pc, cell->width * 8),
+                           continuation_value,
                            callee_it->second, /*arg_change=*/false);
+                record_incoming_stack_arm(callee_it->second, callee_cell_id,
+                                          make_direct_arm(continuation_value));
               }
             }
           }
@@ -1318,6 +1344,16 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
         continue;
       if (const auto *target_summary =
               lookupHandlerByEntryVA(model, prelude_infos[i]->target_pc)) {
+        const auto edge_identity =
+            prelude_edge_identity(i, prelude_infos[i]->target_pc);
+        auto make_prelude_arm = [&](const VirtualValueExpr &value) {
+          VirtualIncomingContextArm arm;
+          arm.edge_identity = edge_identity;
+          arm.source_kind = VirtualIncomingContextSourceKind::kEntryPrelude;
+          arm.source_handler_name = handlers[i].function_name;
+          arm.value = value;
+          return arm;
+        };
         llvm::SmallPtrSet<const llvm::Function *, 8> visiting;
         auto localized = computeEntryPreludeCallOutgoingFacts(
             M, model, *target_summary, slot_info, stack_cell_info, slot_ids,
@@ -1344,6 +1380,7 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
             }
             merge_fact(incoming_maps[i], slot_id, value, i,
                        /*arg_change=*/false);
+            record_incoming_slot_arm(i, slot_id, make_prelude_arm(value));
           }
           for (const auto &[cell_id, value] : localized->outgoing_stack) {
             if (!written_stack_cells.empty() &&
@@ -1358,6 +1395,7 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
             }
             merge_fact(incoming_stack_maps[i], cell_id, value, i,
                        /*arg_change=*/false);
+            record_incoming_stack_arm(i, cell_id, make_prelude_arm(value));
           }
         }
       }
@@ -1432,6 +1470,16 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
           VirtualArgumentFact{arg_index, value});
     }
 
+    handlers[i].incoming_slot_phis.clear();
+    for (const auto &[slot_id, arm_map] : incoming_slot_arm_maps[i]) {
+      VirtualIncomingSlotPhi phi;
+      phi.slot_id = slot_id;
+      for (const auto &[edge_identity, arm] : arm_map)
+        phi.arms.push_back(arm);
+      phi.merged_value = mergeIncomingContextArmValues(phi.arms);
+      handlers[i].incoming_slot_phis.push_back(std::move(phi));
+    }
+
     handlers[i].incoming_facts.clear();
     for (const auto &[slot_id, value] : incoming_maps[i])
       handlers[i].incoming_facts.push_back(VirtualSlotFact{slot_id, value});
@@ -1439,6 +1487,16 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
     handlers[i].outgoing_facts.clear();
     for (const auto &[slot_id, value] : outgoing_maps[i])
       handlers[i].outgoing_facts.push_back(VirtualSlotFact{slot_id, value});
+
+    handlers[i].incoming_stack_phis.clear();
+    for (const auto &[cell_id, arm_map] : incoming_stack_arm_maps[i]) {
+      VirtualIncomingStackPhi phi;
+      phi.cell_id = cell_id;
+      for (const auto &[edge_identity, arm] : arm_map)
+        phi.arms.push_back(arm);
+      phi.merged_value = mergeIncomingContextArmValues(phi.arms);
+      handlers[i].incoming_stack_phis.push_back(std::move(phi));
+    }
 
     handlers[i].incoming_stack_facts.clear();
     for (const auto &[cell_id, value] : incoming_stack_maps[i])
@@ -1454,8 +1512,10 @@ void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
       entry.fingerprint = handler_fingerprints[i];
       entry.incoming_arguments =
           captureStableArgumentFacts(incoming_argument_maps[i]);
+      entry.incoming_slot_phis = handlers[i].incoming_slot_phis;
       entry.incoming_slots = captureStableSlotFacts(incoming_maps[i], slot_info);
       entry.outgoing_slots = captureStableSlotFacts(outgoing_maps[i], slot_info);
+      entry.incoming_stack_phis = handlers[i].incoming_stack_phis;
       entry.incoming_stack =
           captureStableStackFacts(incoming_stack_maps[i], stack_cell_info);
       entry.outgoing_stack =

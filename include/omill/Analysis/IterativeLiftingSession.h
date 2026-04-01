@@ -7,10 +7,13 @@
 #include <llvm/IR/PassManager.h>
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
+#include "omill/Analysis/BinaryRegion.h"
 #include "omill/BC/BlockLifterAnalysis.h"
 #include "omill/BC/TraceLiftAnalysis.h"
 
@@ -38,10 +41,17 @@ struct LiftNode {
 
 struct LiftEdge {
   LiftEdgeKind kind = LiftEdgeKind::kIndirectBranch;
+  std::string edge_identity;
   uint64_t source_pc = 0;
   uint64_t target_pc = 0;
+  std::optional<uint64_t> effective_target_pc;
+  std::optional<uint64_t> canonical_owner_pc;
   bool resolved = false;
   bool native_boundary = false;
+  EdgeResolutionStatus resolution_status = EdgeResolutionStatus::kUnknown;
+  EdgeRestatementKind restatement_kind = EdgeRestatementKind::kUnknown;
+  std::vector<LearnedOutgoingEdge> learned_outgoing_edges;
+  std::optional<std::string> binary_region_snapshot_key;
 };
 
 struct IterativeRoundSummary {
@@ -86,6 +96,11 @@ class LiftGraph {
 
   LiftEdge &addOrUpdateEdge(const LiftEdge &edge);
   void syncOutgoingEdges(uint64_t source_pc, llvm::ArrayRef<LiftEdge> edges);
+  void recordLearnedOutgoingEdges(
+      uint64_t source_pc, llvm::ArrayRef<LearnedOutgoingEdge> edges,
+      EdgeResolutionStatus resolution_status,
+      EdgeRestatementKind restatement_kind,
+      std::optional<std::string> snapshot_key = std::nullopt);
   llvm::ArrayRef<LiftEdge> edges() const { return edges_; }
   llvm::SmallVector<const LiftEdge *, 4> outgoingEdges(uint64_t source_pc) const;
   llvm::SmallVector<const LiftEdge *, 8> unresolvedEdges() const;
@@ -140,6 +155,9 @@ class IterativeLiftingSession {
 
   VirtualContextSummary &summaryFor(uint64_t pc);
   const VirtualContextSummary *lookupSummary(uint64_t pc) const;
+  void recordBinaryRegionSnapshot(BinaryRegionSnapshot snapshot);
+  const BinaryRegionSnapshot *lookupBinaryRegionSnapshot(
+      llvm::StringRef snapshot_key) const;
 
   void clearRoundSummaries();
   void recordRoundSummary(IterativeRoundSummary summary);
@@ -154,6 +172,7 @@ class IterativeLiftingSession {
   llvm::DenseSet<uint64_t> queued_targets_;
   llvm::SmallVector<uint64_t, 16> pending_targets_;
   llvm::DenseMap<uint64_t, VirtualContextSummary> summaries_;
+  std::map<std::string, BinaryRegionSnapshot> binary_region_snapshots_;
   llvm::SmallVector<IterativeRoundSummary, 16> round_summaries_;
   TraceLiftCallback trace_lift_callback_;
   BlockLiftCallback block_lift_callback_;

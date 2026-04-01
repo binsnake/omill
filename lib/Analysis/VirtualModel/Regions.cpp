@@ -16,6 +16,18 @@ static std::string normalizeBoundaryNameForRegion(llvm::StringRef name) {
   return name.lower();
 }
 
+template <typename SummaryT>
+static std::optional<uint64_t> resolveFromIncomingPhiStates(
+    const VirtualValueExpr &expr, const SummaryT &summary) {
+  for (const auto &state : expandIncomingContextStates(summary)) {
+    if (auto resolved =
+            evaluateVirtualExpr(expr, state.slot_facts, state.stack_facts)) {
+      return resolved;
+    }
+  }
+  return std::nullopt;
+}
+
 }  // namespace
 
 void summarizeVirtualRegions(VirtualMachineModel &model,
@@ -26,6 +38,14 @@ void summarizeVirtualRegions(VirtualMachineModel &model,
   const auto &handlers = model.handlers();
   if (handlers.empty())
     return;
+
+  auto lookup_stack_cell = [&](unsigned id) -> const VirtualStackCellInfo * {
+    auto it = llvm::find_if(model.stackCells(),
+                            [&](const VirtualStackCellInfo &cell) {
+                              return cell.id == id;
+                            });
+    return it == model.stackCells().end() ? nullptr : &*it;
+  };
 
   std::map<std::string, size_t> handler_index;
   for (size_t i = 0; i < handlers.size(); ++i)
@@ -49,6 +69,9 @@ void summarizeVirtualRegions(VirtualMachineModel &model,
     for (const auto &dispatch : summary.dispatches) {
       auto target_pc = evaluateVirtualExpr(dispatch.target, summary.outgoing_facts,
                                            summary.outgoing_stack_facts);
+      if (!target_pc) {
+        target_pc = resolveFromIncomingPhiStates(dispatch.target, summary);
+      }
       if (!target_pc) {
         target_pc = evaluateVirtualExpr(dispatch.target, summary.incoming_facts,
                                         summary.incoming_stack_facts);
@@ -107,6 +130,52 @@ void summarizeVirtualRegions(VirtualMachineModel &model,
     }
   };
 
+  auto merge_incoming_slot_phi = [](std::map<unsigned,
+                                             std::map<std::string,
+                                                      VirtualIncomingContextArm>>
+                                        &dst,
+                                    const VirtualIncomingSlotPhi &phi) {
+    auto &arm_map = dst[phi.slot_id];
+    for (const auto &arm : phi.arms) {
+      auto existing = arm_map.find(arm.edge_identity);
+      if (existing == arm_map.end()) {
+        arm_map.emplace(arm.edge_identity, arm);
+        continue;
+      }
+      auto merged = mergeIncomingExpr(existing->second.value, arm.value);
+      if (merged.has_value())
+        existing->second.value = std::move(*merged);
+      else
+        existing->second.value =
+            unknownExpr(existing->second.value.bit_width
+                            ? existing->second.value.bit_width
+                            : arm.value.bit_width);
+    }
+  };
+
+  auto merge_incoming_stack_phi = [](std::map<unsigned,
+                                              std::map<std::string,
+                                                       VirtualIncomingContextArm>>
+                                         &dst,
+                                     const VirtualIncomingStackPhi &phi) {
+    auto &arm_map = dst[phi.cell_id];
+    for (const auto &arm : phi.arms) {
+      auto existing = arm_map.find(arm.edge_identity);
+      if (existing == arm_map.end()) {
+        arm_map.emplace(arm.edge_identity, arm);
+        continue;
+      }
+      auto merged = mergeIncomingExpr(existing->second.value, arm.value);
+      if (merged.has_value())
+        existing->second.value = std::move(*merged);
+      else
+        existing->second.value =
+            unknownExpr(existing->second.value.bit_width
+                            ? existing->second.value.bit_width
+                            : arm.value.bit_width);
+    }
+  };
+
   std::vector<uint8_t> visited(handlers.size(), 0);
   unsigned next_region_id = 0;
   for (size_t root = 0; root < handlers.size(); ++root) {
@@ -146,6 +215,10 @@ void summarizeVirtualRegions(VirtualMachineModel &model,
     std::map<unsigned, VirtualValueExpr> outgoing_map;
     std::map<unsigned, VirtualValueExpr> incoming_stack_map;
     std::map<unsigned, VirtualValueExpr> outgoing_stack_map;
+    std::map<unsigned, std::map<std::string, VirtualIncomingContextArm>>
+        incoming_slot_phi_arms;
+    std::map<unsigned, std::map<std::string, VirtualIncomingContextArm>>
+        incoming_stack_phi_arms;
     std::set<size_t> component_set(component.begin(), component.end());
 
     for (size_t index : component) {
@@ -161,9 +234,7 @@ void summarizeVirtualRegions(VirtualMachineModel &model,
                                summary.live_in_stack_cell_ids.end());
       written_stack_ids.insert(summary.written_stack_cell_ids.begin(),
                                summary.written_stack_cell_ids.end());
-      merge_fact_maps(incoming_map, summary.incoming_facts);
       merge_fact_maps(outgoing_map, summary.outgoing_facts);
-      merge_stack_fact_maps(incoming_stack_map, summary.incoming_stack_facts);
       merge_stack_fact_maps(outgoing_stack_map, summary.outgoing_stack_facts);
 
       bool has_region_predecessor = false;
@@ -192,8 +263,41 @@ void summarizeVirtualRegions(VirtualMachineModel &model,
 
       if (!has_region_successor || !adjacent_boundary_names[index].empty())
         exit_handlers.insert(summary.function_name);
-      if (!has_region_predecessor || !adjacent_boundary_names[index].empty())
+      if (!has_region_predecessor || !adjacent_boundary_names[index].empty()) {
         entry_handlers.insert(summary.function_name);
+        merge_fact_maps(incoming_map, summary.incoming_facts);
+        for (const auto &phi : summary.incoming_slot_phis)
+          merge_incoming_slot_phi(incoming_slot_phi_arms, phi);
+        merge_stack_fact_maps(incoming_stack_map, summary.incoming_stack_facts);
+        for (const auto &phi : summary.incoming_stack_phis)
+          merge_incoming_stack_phi(incoming_stack_phi_arms, phi);
+        for (unsigned slot_id : summary.live_in_slot_ids) {
+          if (incoming_map.find(slot_id) != incoming_map.end() ||
+              incoming_slot_phi_arms.find(slot_id) !=
+                  incoming_slot_phi_arms.end()) {
+            continue;
+          }
+          unsigned bit_width = 64;
+          if (const auto *slot = model.lookupSlot(slot_id); slot &&
+              slot->width != 0) {
+            bit_width = slot->width * 8u;
+          }
+          incoming_map.emplace(slot_id, unknownExpr(bit_width));
+        }
+        for (unsigned cell_id : summary.live_in_stack_cell_ids) {
+          if (incoming_stack_map.find(cell_id) != incoming_stack_map.end() ||
+              incoming_stack_phi_arms.find(cell_id) !=
+                  incoming_stack_phi_arms.end()) {
+            continue;
+          }
+          unsigned bit_width = 64;
+          if (const auto *cell = lookup_stack_cell(cell_id); cell &&
+              cell->width != 0) {
+            bit_width = cell->width * 8u;
+          }
+          incoming_stack_map.emplace(cell_id, unknownExpr(bit_width));
+        }
+      }
     }
 
     VirtualRegionSummary region;
@@ -225,14 +329,32 @@ void summarizeVirtualRegions(VirtualMachineModel &model,
                                          live_in_stack_ids.end());
     region.written_stack_cell_ids.assign(written_stack_ids.begin(),
                                          written_stack_ids.end());
-    for (const auto &[slot_id, value] : incoming_map)
-      region.incoming_facts.push_back(VirtualSlotFact{slot_id, value});
     for (const auto &[slot_id, value] : outgoing_map)
       region.outgoing_facts.push_back(VirtualSlotFact{slot_id, value});
-    for (const auto &[cell_id, value] : incoming_stack_map)
-      region.incoming_stack_facts.push_back(VirtualStackFact{cell_id, value});
     for (const auto &[cell_id, value] : outgoing_stack_map)
       region.outgoing_stack_facts.push_back(VirtualStackFact{cell_id, value});
+    for (const auto &[slot_id, arm_map] : incoming_slot_phi_arms) {
+      VirtualIncomingSlotPhi phi;
+      phi.slot_id = slot_id;
+      for (const auto &[edge_identity, arm] : arm_map)
+        phi.arms.push_back(arm);
+      phi.merged_value = mergeIncomingContextArmValues(phi.arms);
+      incoming_map[slot_id] = phi.merged_value;
+      region.incoming_slot_phis.push_back(std::move(phi));
+    }
+    for (const auto &[cell_id, arm_map] : incoming_stack_phi_arms) {
+      VirtualIncomingStackPhi phi;
+      phi.cell_id = cell_id;
+      for (const auto &[edge_identity, arm] : arm_map)
+        phi.arms.push_back(arm);
+      phi.merged_value = mergeIncomingContextArmValues(phi.arms);
+      incoming_stack_map[cell_id] = phi.merged_value;
+      region.incoming_stack_phis.push_back(std::move(phi));
+    }
+    for (const auto &[slot_id, value] : incoming_map)
+      region.incoming_facts.push_back(VirtualSlotFact{slot_id, value});
+    for (const auto &[cell_id, value] : incoming_stack_map)
+      region.incoming_stack_facts.push_back(VirtualStackFact{cell_id, value});
     regions.push_back(std::move(region));
   }
 }

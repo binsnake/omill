@@ -5,10 +5,13 @@
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
 
+#include <algorithm>
 #include <map>
 #include <optional>
 #include <string>
 #include <vector>
+
+#include "omill/Utils/LiftedNames.h"
 
 namespace omill::virtual_model::detail {
 
@@ -31,6 +34,16 @@ static std::optional<unsigned> lookupNamedSlotId(
   if (it == slot_ids.end())
     return std::nullopt;
   return it->second;
+}
+
+static uint64_t nearbyCoveredEntrySearchWindow(TargetArch arch) {
+  switch (arch) {
+    case TargetArch::kAArch64:
+      return 4;
+    case TargetArch::kX86_64:
+    default:
+      return 64;
+  }
 }
 
 static bool exprMatchesSlot(const VirtualValueExpr &expr, unsigned slot_id) {
@@ -178,6 +191,34 @@ ResolvedCallSiteInfo resolveCallSiteInfo(
         resolveSpecializedExprToConstant(continuation_expr, callsite_slots,
                                          callsite_stack);
   }
+  if (call.arg_size() >= 6) {
+    const unsigned storage_width =
+        std::max(1u, getValueBitWidth(call.getArgOperand(5), dl) / 8u);
+    if (auto slot = extractStateSlotSummary(call.getArgOperand(5), storage_width,
+                                            dl)) {
+      if (auto slot_id = lookupSlotIdForSummary(*slot, slot_ids))
+        info.continuation_slot_id = *slot_id;
+    }
+    if (!info.continuation_stack_cell_id) {
+      auto continuation_storage_expr =
+          summarizeValueExpr(call.getArgOperand(5), dl);
+      annotateExprSlots(continuation_storage_expr, slot_ids);
+      annotateExprStackCells(continuation_storage_expr, stack_cell_ids, slot_ids);
+      if (auto cell = extractStackCellSummaryFromExpr(
+              continuation_storage_expr, storage_width,
+              nativeStackPointerOffsetForValue(&call))) {
+        if (auto cell_id = lookupStackCellIdForSummary(*cell, stack_cell_ids))
+          info.continuation_stack_cell_id = *cell_id;
+      }
+    }
+    auto continuation_storage = summarizeSpecializedCallArg(
+        call, 5, dl, slot_ids, stack_cell_ids, callsite_slots, callsite_stack,
+        caller_argument_map);
+    if (continuation_storage.slot_id)
+      info.continuation_slot_id = continuation_storage.slot_id;
+    if (continuation_storage.stack_cell_id)
+      info.continuation_stack_cell_id = continuation_storage.stack_cell_id;
+  }
   if (!info.continuation_pc)
     info.continuation_pc = inferLiftedCallContinuationPc(call);
   if (info.continuation_pc.has_value()) {
@@ -230,6 +271,23 @@ void summarizeCallSites(llvm::Module &M, VirtualMachineModel &model,
 
   auto &handlers = model.mutableHandlers();
   const auto &dl = M.getDataLayout();
+  auto ensure_continuation_slot_id = [&](llvm::CallBase &call,
+                                         llvm::StringRef handler_name) {
+    if (call.arg_size() < 6)
+      return;
+    const unsigned storage_width =
+        std::max(1u, getValueBitWidth(call.getArgOperand(5), dl) / 8u);
+    auto slot =
+        extractStateSlotSummary(call.getArgOperand(5), storage_width, dl);
+    if (!slot || lookupSlotIdForSummary(*slot, slot_ids))
+      return;
+    unsigned slot_id = static_cast<unsigned>(model.mutableSlots().size());
+    model.mutableSlots().push_back(VirtualStateSlotInfo{
+        slot_id, slot->base_name, slot->offset, slot->width, slot->from_argument,
+        slot->from_alloca, {handler_name.str()}});
+    slot_ids.emplace(slotKeyForSummary(*slot), slot_id);
+    slot_info = buildSlotInfoMap(model);
+  };
   for (auto &summary : handlers) {
     for (auto &callsite : summary.callsites) {
       callsite.specialized_target = callsite.target;
@@ -238,6 +296,8 @@ void summarizeCallSites(llvm::Module &M, VirtualMachineModel &model,
       callsite.resolved_target_pc.reset();
       callsite.recovered_entry_pc.reset();
       callsite.continuation_pc.reset();
+      callsite.continuation_slot_id.reset();
+      callsite.continuation_stack_cell_id.reset();
       callsite.is_executable_in_image = false;
       callsite.is_decodable_entry = false;
       callsite.target_function_name.reset();
@@ -268,6 +328,8 @@ void summarizeCallSites(llvm::Module &M, VirtualMachineModel &model,
           continue;
         if (callsite_index >= summary.callsites.size())
           continue;
+
+        ensure_continuation_slot_id(*call, summary.function_name);
 
         auto &callsite_summary = summary.callsites[callsite_index++];
         auto local_state = computeLocalFactsBeforeCall(
@@ -326,9 +388,15 @@ void summarizeCallSites(llvm::Module &M, VirtualMachineModel &model,
         callsite_summary.specialized_target_source = resolved.target_source;
         callsite_summary.resolved_target_pc = resolved.target_pc;
         callsite_summary.continuation_pc = resolved.continuation_pc;
+        callsite_summary.continuation_slot_id = resolved.continuation_slot_id;
+        callsite_summary.continuation_stack_cell_id =
+            resolved.continuation_stack_cell_id;
 
         if (!resolved.target_pc.has_value()) {
           callsite_summary.unresolved_reason = "call_target_unresolved";
+          vmModelImportDebugLog("callsite-unresolved handler=" +
+                                summary.function_name +
+                                " reason=call_target_unresolved");
           continue;
         }
         callsite_summary.is_executable_in_image =
@@ -342,26 +410,79 @@ void summarizeCallSites(llvm::Module &M, VirtualMachineModel &model,
                     ? "call_target_not_executable_in_image"
                     : "call_target_out_of_image";
           }
+          vmModelImportDebugLog("callsite-unresolved handler=" +
+                                summary.function_name + " target=0x" +
+                                llvm::utohexstr(*resolved.target_pc) +
+                                " reason=" + callsite_summary.unresolved_reason);
           continue;
         }
 
         auto decodable_entry = isTargetDecodableEntry(
             binary_memory, *resolved.target_pc, target_arch);
+        auto *exact_target_function =
+            findLiftedOrCoveredFunctionByPC(M, *resolved.target_pc);
+        std::optional<VirtualHandlerSummary> target_summary_storage;
         const auto *target_summary =
             lookupHandlerByEntryVA(model, *resolved.target_pc);
-        std::optional<uint64_t> nearby_entry_pc;
-        const VirtualHandlerSummary *nearby_summary = nullptr;
         if (!target_summary) {
-          nearby_summary = findNearbyLiftedHandlerEntry(
-              model, *resolved.target_pc, target_arch);
-          if (nearby_summary && nearby_summary->entry_va.has_value()) {
-            nearby_entry_pc = nearby_summary->entry_va;
+          if (exact_target_function) {
+            auto exact_name = exact_target_function->getName().str();
+            target_summary = model.lookupHandler(exact_name);
+            if (!target_summary) {
+              target_summary_storage = summarizeFunction(*exact_target_function);
+              target_summary = &*target_summary_storage;
+            }
+          } else {
+            target_summary = model.lookupHandler(
+                liftedFunctionName(*resolved.target_pc));
+          }
+        }
+        std::optional<uint64_t> nearby_entry_pc;
+        std::optional<VirtualHandlerSummary> nearby_summary_storage;
+        const VirtualHandlerSummary *nearby_summary = nullptr;
+        std::optional<std::string> nearby_function_name;
+        if (!target_summary) {
+          if (auto module_nearby_pc = findNearestCoveredLiftedOrBlockPC(
+                  M, *resolved.target_pc,
+                  nearbyCoveredEntrySearchWindow(target_arch))) {
+            if (*module_nearby_pc != *resolved.target_pc) {
+              nearby_entry_pc = *module_nearby_pc;
+              if (auto *nearby_function =
+                      findLiftedOrCoveredFunctionByPC(M, *module_nearby_pc)) {
+                nearby_function_name = nearby_function->getName().str();
+                nearby_summary = model.lookupHandler(*nearby_function_name);
+                if (!nearby_summary &&
+                    nearby_function_name->compare(0, 4, "sub_") == 0) {
+                  nearby_summary =
+                      model.lookupHandler(liftedFunctionName(*module_nearby_pc));
+                }
+                if (!nearby_summary) {
+                  nearby_summary_storage = summarizeFunction(*nearby_function);
+                  nearby_summary = &*nearby_summary_storage;
+                }
+              }
+            }
+          }
+          if (!nearby_entry_pc) {
+            nearby_summary = findNearbyLiftedHandlerEntry(
+                model, *resolved.target_pc, target_arch);
+            if (nearby_summary && nearby_summary->entry_va.has_value()) {
+              nearby_entry_pc = nearby_summary->entry_va;
+              nearby_function_name = nearby_summary->function_name;
+            }
+          }
+          if (nearby_function_name) {
             callsite_summary.recovered_target_function_name =
-                nearby_summary->function_name;
+                *nearby_function_name;
           }
         }
         if (target_summary) {
           callsite_summary.is_decodable_entry = true;
+          callsite_summary.target_function_name = target_summary->function_name;
+        } else if (exact_target_function) {
+          callsite_summary.is_decodable_entry = true;
+          callsite_summary.target_function_name =
+              exact_target_function->getName().str();
         } else if (decodable_entry.has_value()) {
           callsite_summary.is_decodable_entry = *decodable_entry;
           if (!nearby_summary && !*decodable_entry) {
@@ -369,9 +490,19 @@ void summarizeCallSites(llvm::Module &M, VirtualMachineModel &model,
                 binary_memory, *resolved.target_pc, target_arch);
             if (nearby_entry_pc) {
               nearby_summary = lookupHandlerByEntryVA(model, *nearby_entry_pc);
+              if (!nearby_summary) {
+                if (auto *nearby_function =
+                        findLiftedOrCoveredFunctionByPC(M, *nearby_entry_pc)) {
+                  nearby_function_name = nearby_function->getName().str();
+                  nearby_summary = model.lookupHandler(*nearby_function_name);
+                }
+              }
               if (nearby_summary) {
                 callsite_summary.recovered_target_function_name =
                     nearby_summary->function_name;
+              } else if (nearby_function_name) {
+                callsite_summary.recovered_target_function_name =
+                    *nearby_function_name;
               }
             }
           }
@@ -380,13 +511,26 @@ void summarizeCallSites(llvm::Module &M, VirtualMachineModel &model,
         }
         if (!target_summary && !nearby_summary) {
           if (nearby_entry_pc) {
-            callsite_summary.unresolved_reason = "call_target_nearby_unlifted";
+            callsite_summary.unresolved_reason =
+                isLikelyDisassemblyDesyncTarget(binary_memory,
+                                               *resolved.target_pc,
+                                               nearby_entry_pc, target_arch)
+                    ? "call_target_desynchronized"
+                    : "call_target_nearby_unlifted";
           } else {
             callsite_summary.unresolved_reason =
                 (decodable_entry.has_value() && !*decodable_entry)
                     ? "call_target_undecodable"
                     : "call_target_unlifted";
           }
+          vmModelImportDebugLog("callsite-unresolved handler=" +
+                                summary.function_name + " target=0x" +
+                                llvm::utohexstr(*resolved.target_pc) +
+                                " nearby=" +
+                                (nearby_entry_pc
+                                     ? ("0x" + llvm::utohexstr(*nearby_entry_pc))
+                                     : std::string("-")) +
+                                " reason=" + callsite_summary.unresolved_reason);
           continue;
         }
 
@@ -395,8 +539,6 @@ void summarizeCallSites(llvm::Module &M, VirtualMachineModel &model,
         if (!target_summary) {
           if (nearby_summary)
             callsite_summary.unresolved_reason = "call_target_mid_instruction";
-        } else {
-          callsite_summary.target_function_name = target_summary->function_name;
         }
 
         llvm::SmallPtrSet<const llvm::Function *, 8> visiting;
@@ -410,15 +552,32 @@ void summarizeCallSites(llvm::Module &M, VirtualMachineModel &model,
         if (!localized) {
           if (callsite_summary.unresolved_reason.empty())
             callsite_summary.unresolved_reason = "call_return_unresolved";
+          vmModelImportDebugLog("callsite-return-unresolved handler=" +
+                                summary.function_name + " target_fn=" +
+                                localized_target_summary->function_name +
+                                " reason=" + callsite_summary.unresolved_reason);
           continue;
         }
 
-        llvm::SmallDenseSet<unsigned, 16> written_slots(
-            localized_target_summary->written_slot_ids.begin(),
-            localized_target_summary->written_slot_ids.end());
+        llvm::SmallDenseSet<unsigned, 16> written_slots;
+        if (!localized->written_slot_ids.empty()) {
+          written_slots.insert(localized->written_slot_ids.begin(),
+                               localized->written_slot_ids.end());
+        } else {
+          written_slots.insert(localized_target_summary->written_slot_ids.begin(),
+                               localized_target_summary->written_slot_ids.end());
+        }
+        std::vector<unsigned> written_stack_cell_ids;
+        if (!localized->written_stack_cell_ids.empty()) {
+          written_stack_cell_ids.assign(localized->written_stack_cell_ids.begin(),
+                                        localized->written_stack_cell_ids.end());
+        } else {
+          written_stack_cell_ids.assign(
+              localized_target_summary->written_stack_cell_ids.begin(),
+              localized_target_summary->written_stack_cell_ids.end());
+        }
         auto written_stack_cells = rebaseWrittenStackCellIds(
-            model, localized->outgoing_slots,
-            localized_target_summary->written_stack_cell_ids);
+            model, localized->outgoing_slots, written_stack_cell_ids);
 
         for (const auto &[slot_id, value] : localized->outgoing_slots) {
           if (!written_slots.empty() && !written_slots.count(slot_id))
@@ -454,6 +613,24 @@ void summarizeCallSites(llvm::Module &M, VirtualMachineModel &model,
             callsite_summary.return_slot_facts.empty() &&
             callsite_summary.return_stack_facts.empty()) {
           callsite_summary.unresolved_reason = "call_return_unresolved";
+          vmModelImportDebugLog("callsite-return-empty handler=" +
+                                summary.function_name + " target_fn=" +
+                                localized_target_summary->function_name +
+                                " outgoing_slots=" +
+                                llvm::Twine(localized->outgoing_slots.size()).str() +
+                                " outgoing_stack=" +
+                                llvm::Twine(localized->outgoing_stack.size()).str() +
+                                " written_slots=" +
+                                llvm::Twine(localized->written_slot_ids.size()).str() +
+                                " written_stack=" +
+                                llvm::Twine(localized->written_stack_cell_ids.size()).str());
+          for (const auto &[slot_id, value] : localized->outgoing_slots) {
+            vmModelImportDebugLog("callsite-return-empty-slot handler=" +
+                                  summary.function_name + " target_fn=" +
+                                  localized_target_summary->function_name + " slot=" +
+                                  llvm::Twine(slot_id).str() + " value=" +
+                                  renderVirtualValueExpr(value));
+          }
         }
       }
     }

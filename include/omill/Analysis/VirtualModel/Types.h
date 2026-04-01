@@ -88,7 +88,9 @@ enum class VirtualDispatchResolutionSource {
   kOutgoingFacts,
   kRegionOutgoingFacts,
   kIncomingFacts,
+  kIncomingPhiFacts,
   kRegionIncomingFacts,
+  kRegionIncomingPhiFacts,
   kHelperArgumentSpecialization,
   kPreludeLocalization,
 };
@@ -232,6 +234,33 @@ struct VirtualStackFact {
   VirtualValueExpr value;
 };
 
+enum class VirtualIncomingContextSourceKind {
+  kDirectCallsite,
+  kEntryPrelude,
+  kLocalizedCallee,
+};
+
+struct VirtualIncomingContextArm {
+  std::string edge_identity;
+  VirtualIncomingContextSourceKind source_kind =
+      VirtualIncomingContextSourceKind::kDirectCallsite;
+  std::string source_handler_name;
+  unsigned source_site_index = 0;
+  VirtualValueExpr value;
+};
+
+struct VirtualIncomingSlotPhi {
+  unsigned slot_id = 0;
+  VirtualValueExpr merged_value;
+  std::vector<VirtualIncomingContextArm> arms;
+};
+
+struct VirtualIncomingStackPhi {
+  unsigned cell_id = 0;
+  VirtualValueExpr merged_value;
+  std::vector<VirtualIncomingContextArm> arms;
+};
+
 struct VirtualCallSiteSummary {
   bool is_call = false;
   VirtualValueExpr target;
@@ -241,6 +270,8 @@ struct VirtualCallSiteSummary {
   std::optional<uint64_t> resolved_target_pc;
   std::optional<uint64_t> recovered_entry_pc;
   std::optional<uint64_t> continuation_pc;
+  std::optional<unsigned> continuation_slot_id;
+  std::optional<unsigned> continuation_stack_cell_id;
   VirtualInstructionPointerSummary vip;
   VirtualExitSummary exit;
   bool is_executable_in_image = false;
@@ -280,8 +311,10 @@ struct VirtualHandlerSummary {
   std::vector<VirtualSlotFact> specialization_facts;
   std::vector<VirtualStackFact> specialization_stack_facts;
   std::vector<VirtualArgumentFact> incoming_argument_facts;
+  std::vector<VirtualIncomingSlotPhi> incoming_slot_phis;
   std::vector<VirtualSlotFact> incoming_facts;
   std::vector<VirtualSlotFact> outgoing_facts;
+  std::vector<VirtualIncomingStackPhi> incoming_stack_phis;
   std::vector<VirtualStackFact> incoming_stack_facts;
   std::vector<VirtualStackFact> outgoing_stack_facts;
   bool has_unsupported_stack_memory = false;
@@ -304,8 +337,10 @@ struct VirtualRegionSummary {
   std::vector<unsigned> written_slot_ids;
   std::vector<unsigned> live_in_stack_cell_ids;
   std::vector<unsigned> written_stack_cell_ids;
+  std::vector<VirtualIncomingSlotPhi> incoming_slot_phis;
   std::vector<VirtualSlotFact> incoming_facts;
   std::vector<VirtualSlotFact> outgoing_facts;
+  std::vector<VirtualIncomingStackPhi> incoming_stack_phis;
   std::vector<VirtualStackFact> incoming_stack_facts;
   std::vector<VirtualStackFact> outgoing_stack_facts;
 };
@@ -338,5 +373,9 @@ struct VirtualRootSliceSummary {
 };
 
 std::string renderVirtualValueExpr(const VirtualValueExpr &expr);
+std::string renderVirtualIncomingContextSourceKind(
+    VirtualIncomingContextSourceKind kind);
+std::string renderVirtualIncomingSlotPhi(const VirtualIncomingSlotPhi &phi);
+std::string renderVirtualIncomingStackPhi(const VirtualIncomingStackPhi &phi);
 
 }  // namespace omill

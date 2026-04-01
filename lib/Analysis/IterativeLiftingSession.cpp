@@ -1,5 +1,7 @@
 #include "omill/Analysis/IterativeLiftingSession.h"
 
+#include <llvm/ADT/StringExtras.h>
+
 #include <utility>
 
 namespace omill {
@@ -10,8 +12,15 @@ namespace {
 
 bool sameEdge(const LiftEdge &lhs, const LiftEdge &rhs) {
   return lhs.kind == rhs.kind && lhs.source_pc == rhs.source_pc &&
-         lhs.target_pc == rhs.target_pc && lhs.resolved == rhs.resolved &&
-         lhs.native_boundary == rhs.native_boundary;
+         lhs.target_pc == rhs.target_pc &&
+         lhs.effective_target_pc == rhs.effective_target_pc &&
+         lhs.canonical_owner_pc == rhs.canonical_owner_pc &&
+         lhs.resolved == rhs.resolved &&
+         lhs.native_boundary == rhs.native_boundary &&
+         lhs.resolution_status == rhs.resolution_status &&
+         lhs.restatement_kind == rhs.restatement_kind &&
+         lhs.learned_outgoing_edges == rhs.learned_outgoing_edges &&
+         lhs.binary_region_snapshot_key == rhs.binary_region_snapshot_key;
 }
 
 }  // namespace
@@ -41,6 +50,39 @@ LiftEdge &LiftGraph::addOrUpdateEdge(const LiftEdge &edge) {
     }
     if (edge.native_boundary && !existing.native_boundary) {
       existing.native_boundary = true;
+      changed = true;
+    }
+    if (edge.effective_target_pc && existing.effective_target_pc != edge.effective_target_pc) {
+      existing.effective_target_pc = edge.effective_target_pc;
+      changed = true;
+    }
+    if (edge.canonical_owner_pc &&
+        existing.canonical_owner_pc != edge.canonical_owner_pc) {
+      existing.canonical_owner_pc = edge.canonical_owner_pc;
+      changed = true;
+    }
+    if (edge.resolution_status != EdgeResolutionStatus::kUnknown &&
+        existing.resolution_status != edge.resolution_status) {
+      existing.resolution_status = edge.resolution_status;
+      changed = true;
+    }
+    if (edge.restatement_kind != EdgeRestatementKind::kUnknown &&
+        existing.restatement_kind != edge.restatement_kind) {
+      existing.restatement_kind = edge.restatement_kind;
+      changed = true;
+    }
+    if (!edge.learned_outgoing_edges.empty() &&
+        existing.learned_outgoing_edges != edge.learned_outgoing_edges) {
+      existing.learned_outgoing_edges = edge.learned_outgoing_edges;
+      changed = true;
+    }
+    if (edge.binary_region_snapshot_key &&
+        existing.binary_region_snapshot_key != edge.binary_region_snapshot_key) {
+      existing.binary_region_snapshot_key = edge.binary_region_snapshot_key;
+      changed = true;
+    }
+    if (!edge.edge_identity.empty() && existing.edge_identity.empty()) {
+      existing.edge_identity = edge.edge_identity;
       changed = true;
     }
     if (changed)
@@ -108,6 +150,53 @@ void LiftGraph::syncOutgoingEdges(uint64_t source_pc,
   rebuilt.append(normalized.begin(), normalized.end());
   edges_.swap(rebuilt);
   markDirty(source_pc);
+}
+
+void LiftGraph::recordLearnedOutgoingEdges(
+    uint64_t source_pc, llvm::ArrayRef<LearnedOutgoingEdge> edges,
+    EdgeResolutionStatus resolution_status,
+    EdgeRestatementKind restatement_kind,
+    std::optional<std::string> snapshot_key) {
+  llvm::SmallVector<LiftEdge, 8> lifted_edges;
+  lifted_edges.reserve(edges.size());
+  for (const auto &edge : edges) {
+    LiftEdge lifted_edge;
+    lifted_edge.source_pc = source_pc;
+    lifted_edge.target_pc = edge.target_pc.value_or(0);
+    lifted_edge.effective_target_pc = edge.target_pc;
+    lifted_edge.resolved = edge.resolution_status == EdgeResolutionStatus::kResolved ||
+                           edge.resolution_status == EdgeResolutionStatus::kBoundary ||
+                           edge.resolution_status == EdgeResolutionStatus::kTerminal;
+    lifted_edge.native_boundary = edge.is_boundary;
+    lifted_edge.resolution_status = edge.resolution_status;
+    lifted_edge.restatement_kind = edge.restatement_kind;
+    lifted_edge.learned_outgoing_edges = {edge};
+    lifted_edge.binary_region_snapshot_key = snapshot_key;
+    if (edge.is_boundary) {
+      lifted_edge.kind = LiftEdgeKind::kIndirectCall;
+    } else if (edge.is_terminal) {
+      lifted_edge.kind = LiftEdgeKind::kReturn;
+    } else if (edge.is_unresolved_indirect) {
+      lifted_edge.kind = LiftEdgeKind::kIndirectBranch;
+    } else {
+      lifted_edge.kind = LiftEdgeKind::kDirectBranch;
+    }
+    lifted_edges.push_back(std::move(lifted_edge));
+  }
+
+  if (lifted_edges.empty()) {
+    LiftEdge marker;
+    marker.kind = LiftEdgeKind::kIndirectBranch;
+    marker.source_pc = source_pc;
+    marker.target_pc = 0;
+    marker.resolution_status = resolution_status;
+    marker.restatement_kind = restatement_kind;
+    marker.binary_region_snapshot_key = std::move(snapshot_key);
+    addOrUpdateEdge(marker);
+    return;
+  }
+
+  syncOutgoingEdges(source_pc, lifted_edges);
 }
 
 llvm::SmallVector<const LiftEdge *, 4> LiftGraph::outgoingEdges(
@@ -203,6 +292,29 @@ const VirtualContextSummary *IterativeLiftingSession::lookupSummary(
     uint64_t pc) const {
   auto it = summaries_.find(pc);
   return (it != summaries_.end()) ? &it->second : nullptr;
+}
+
+void IterativeLiftingSession::recordBinaryRegionSnapshot(
+    BinaryRegionSnapshot snapshot) {
+  if (snapshot.snapshot_key.empty()) {
+    snapshot.snapshot_key = "region:" + llvm::utohexstr(snapshot.entry_pc);
+  }
+  for (const auto &[block_pc, block] : snapshot.blocks_by_pc) {
+    graph_.recordLearnedOutgoingEdges(block_pc, block.outgoing_edges,
+                                      snapshot.closure_kind ==
+                                              BinaryRegionClosureKind::kClosed
+                                          ? EdgeResolutionStatus::kResolved
+                                          : EdgeResolutionStatus::kUnresolved,
+                                      EdgeRestatementKind::kProofSupplied,
+                                      snapshot.snapshot_key);
+  }
+  binary_region_snapshots_[snapshot.snapshot_key] = std::move(snapshot);
+}
+
+const BinaryRegionSnapshot *IterativeLiftingSession::lookupBinaryRegionSnapshot(
+    llvm::StringRef snapshot_key) const {
+  auto it = binary_region_snapshots_.find(snapshot_key.str());
+  return (it != binary_region_snapshots_.end()) ? &it->second : nullptr;
 }
 
 void IterativeLiftingSession::clearRoundSummaries() {

@@ -16,7 +16,14 @@ struct VirtualModelRunTelemetry {
   bool dirty_scope_requested = false;
   bool session_graph_projection_used = false;
   bool session_graph_handler_scope_used = false;
+  bool session_graph_handler_projection_used = false;
   bool session_graph_boundary_projection_used = false;
+  bool session_graph_vip_projection_used = false;
+  bool session_graph_propagation_projection_used = false;
+  bool session_graph_canonical_state_projection_used = false;
+  bool session_graph_direct_callee_projection_used = false;
+  bool session_graph_seed_projection_used = false;
+  bool selected_handler_iteration_used = false;
   unsigned seed_handler_count = 0;
   unsigned summarized_handlers = 0;
   unsigned cached_summary_hits = 0;

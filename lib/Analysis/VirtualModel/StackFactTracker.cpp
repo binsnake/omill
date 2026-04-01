@@ -6,8 +6,6 @@ namespace omill::virtual_model::detail {
 
 namespace {
 
-using MaterializedStackKey = std::tuple<unsigned, int64_t, unsigned>;
-
 std::optional<int64_t> stackBaseDeltaForExpr(const VirtualValueExpr &expr,
                                             unsigned slot_id) {
   if (expr.kind == VirtualExprKind::kStateSlot && expr.slot_id == slot_id)
@@ -74,21 +72,6 @@ void mergeMaterializedStructuralFact(
                                                 : value.bit_width);
 }
 
-std::optional<unsigned> resolveBaseSlotIdForSummary(
-    const VirtualMachineModel &model, const VirtualStackCellSummary &summary) {
-  if (summary.canonical_base_slot_id.has_value())
-    return summary.canonical_base_slot_id;
-
-  auto slot_ids = buildSlotIdMap(model);
-  VirtualStateSlotSummary slot;
-  slot.base_name = summary.base_name;
-  slot.offset = summary.base_offset;
-  slot.width = summary.base_width;
-  slot.from_argument = summary.base_from_argument;
-  slot.from_alloca = summary.base_from_alloca;
-  return lookupSlotIdForSummary(slot, slot_ids);
-}
-
 }  // namespace
 
 std::optional<int64_t> inferTrackedStackBaseDeltaForSlot(
@@ -147,11 +130,10 @@ bool mergeTrackedStackFact(TrackedFactState &state,
 }
 
 std::optional<CanonicalStackFactKey> canonicalStackFactKeyForCellId(
-    const VirtualMachineModel &model, const TrackedFactState &state,
+    const StackModelContext &context, const TrackedFactState &state,
     unsigned cell_id) {
-  auto cell_info = buildStackCellInfoMap(model);
-  auto it = cell_info.find(cell_id);
-  if (it == cell_info.end())
+  auto it = context.stack_cell_info.find(cell_id);
+  if (it == context.stack_cell_info.end())
     return std::nullopt;
 
   int64_t delta = 0;
@@ -165,10 +147,17 @@ std::optional<CanonicalStackFactKey> canonicalStackFactKeyForCellId(
                                it->second->width};
 }
 
-std::optional<CanonicalStackFactKey> canonicalStackFactKeyForSummary(
+std::optional<CanonicalStackFactKey> canonicalStackFactKeyForCellId(
     const VirtualMachineModel &model, const TrackedFactState &state,
+    unsigned cell_id) {
+  auto context = buildStackModelContext(model);
+  return canonicalStackFactKeyForCellId(context, state, cell_id);
+}
+
+std::optional<CanonicalStackFactKey> canonicalStackFactKeyForSummary(
+    const StackModelContext &context, const TrackedFactState &state,
     const VirtualStackCellSummary &summary) {
-  auto base_slot_id = resolveBaseSlotIdForSummary(model, summary);
+  auto base_slot_id = resolveBaseSlotIdForSummary(summary, context);
   if (!base_slot_id)
     return std::nullopt;
 
@@ -182,14 +171,40 @@ std::optional<CanonicalStackFactKey> canonicalStackFactKeyForSummary(
                                summary.width};
 }
 
-bool assignTrackedStackFactForCellId(const VirtualMachineModel &model,
+std::optional<CanonicalStackFactKey> canonicalStackFactKeyForSummary(
+    const VirtualMachineModel &model, const TrackedFactState &state,
+    const VirtualStackCellSummary &summary) {
+  auto context = buildStackModelContext(model);
+  return canonicalStackFactKeyForSummary(context, state, summary);
+}
+
+bool assignTrackedStackFactForCellId(const StackModelContext &context,
                                      TrackedFactState &state, unsigned cell_id,
                                      const VirtualValueExpr &value) {
-  auto key = canonicalStackFactKeyForCellId(model, state, cell_id);
+  auto key = canonicalStackFactKeyForCellId(context, state, cell_id);
   if (!key)
     return false;
   bool changed = mergeTrackedStackFact(state, *key, value);
-  state.materialized_stack_facts = materializeTrackedStackFacts(model, state);
+  state.materialized_stack_facts = materializeTrackedStackFacts(context, state);
+  return changed;
+}
+
+bool assignTrackedStackFactForCellId(const VirtualMachineModel &model,
+                                     TrackedFactState &state, unsigned cell_id,
+                                     const VirtualValueExpr &value) {
+  auto context = buildStackModelContext(model);
+  return assignTrackedStackFactForCellId(context, state, cell_id, value);
+}
+
+bool assignTrackedStackFactForSummary(const StackModelContext &context,
+                                      TrackedFactState &state,
+                                      const VirtualStackCellSummary &summary,
+                                      const VirtualValueExpr &value) {
+  auto key = canonicalStackFactKeyForSummary(context, state, summary);
+  if (!key)
+    return false;
+  bool changed = mergeTrackedStackFact(state, *key, value);
+  state.materialized_stack_facts = materializeTrackedStackFacts(context, state);
   return changed;
 }
 
@@ -197,23 +212,12 @@ bool assignTrackedStackFactForSummary(const VirtualMachineModel &model,
                                       TrackedFactState &state,
                                       const VirtualStackCellSummary &summary,
                                       const VirtualValueExpr &value) {
-  auto key = canonicalStackFactKeyForSummary(model, state, summary);
-  if (!key)
-    return false;
-  bool changed = mergeTrackedStackFact(state, *key, value);
-  state.materialized_stack_facts = materializeTrackedStackFacts(model, state);
-  return changed;
+  auto context = buildStackModelContext(model);
+  return assignTrackedStackFactForSummary(context, state, summary, value);
 }
 
 std::map<unsigned, VirtualValueExpr> materializeTrackedStackFacts(
-    const VirtualMachineModel &model, const TrackedFactState &state) {
-  std::map<MaterializedStackKey, unsigned> cell_ids;
-  for (const auto &cell : model.stackCells()) {
-    cell_ids.emplace(MaterializedStackKey{cell.base_slot_id, cell.cell_offset,
-                                          cell.width},
-                     cell.id);
-  }
-
+    const StackModelContext &context, const TrackedFactState &state) {
   std::map<unsigned, VirtualValueExpr> materialized;
   for (const auto &[key, value] : state.stack_facts) {
     int64_t delta = 0;
@@ -222,10 +226,9 @@ std::map<unsigned, VirtualValueExpr> materializeTrackedStackFacts(
       delta = delta_it->second;
     }
     auto current_offset = key.cell_offset + delta;
-    auto id_it =
-        cell_ids.find(MaterializedStackKey{key.base_slot_id, current_offset,
-                                           key.width});
-    if (id_it == cell_ids.end())
+    auto id_it = context.materialized_stack_cell_ids.find(
+        MaterializedStackCellKey{key.base_slot_id, current_offset, key.width});
+    if (id_it == context.materialized_stack_cell_ids.end())
       continue;
     mergeMaterializedStackFact(materialized, id_it->second, value);
   }
@@ -233,13 +236,18 @@ std::map<unsigned, VirtualValueExpr> materializeTrackedStackFacts(
   return materialized;
 }
 
-std::map<StackCellKey, VirtualValueExpr> materializeTrackedStructuralStackFacts(
+std::map<unsigned, VirtualValueExpr> materializeTrackedStackFacts(
     const VirtualMachineModel &model, const TrackedFactState &state) {
-  auto slot_info = buildSlotInfoMap(model);
+  auto context = buildStackModelContext(model);
+  return materializeTrackedStackFacts(context, state);
+}
+
+std::map<StackCellKey, VirtualValueExpr> materializeTrackedStructuralStackFacts(
+    const StackModelContext &context, const TrackedFactState &state) {
   std::map<StackCellKey, VirtualValueExpr> materialized;
   for (const auto &[key, value] : state.stack_facts) {
-    auto slot_it = slot_info.find(key.base_slot_id);
-    if (slot_it == slot_info.end())
+    auto slot_it = context.slot_info.find(key.base_slot_id);
+    if (slot_it == context.slot_info.end())
       continue;
     int64_t delta = 0;
     if (auto delta_it = state.stack_base_deltas.find(key.base_slot_id);
@@ -256,16 +264,15 @@ std::map<StackCellKey, VirtualValueExpr> materializeTrackedStructuralStackFacts(
   return materialized;
 }
 
-llvm::SmallDenseSet<unsigned, 16> materializeTrackedWrittenStackCellIds(
-    const VirtualMachineModel &model, const TrackedFactState &state,
-    const std::set<CanonicalStackFactKey> &written_stack_keys) {
-  std::map<MaterializedStackKey, unsigned> cell_ids;
-  for (const auto &cell : model.stackCells()) {
-    cell_ids.emplace(MaterializedStackKey{cell.base_slot_id, cell.cell_offset,
-                                          cell.width},
-                     cell.id);
-  }
+std::map<StackCellKey, VirtualValueExpr> materializeTrackedStructuralStackFacts(
+    const VirtualMachineModel &model, const TrackedFactState &state) {
+  auto context = buildStackModelContext(model);
+  return materializeTrackedStructuralStackFacts(context, state);
+}
 
+llvm::SmallDenseSet<unsigned, 16> materializeTrackedWrittenStackCellIds(
+    const StackModelContext &context, const TrackedFactState &state,
+    const std::set<CanonicalStackFactKey> &written_stack_keys) {
   llvm::SmallDenseSet<unsigned, 16> materialized;
   for (const auto &key : written_stack_keys) {
     int64_t delta = 0;
@@ -273,29 +280,36 @@ llvm::SmallDenseSet<unsigned, 16> materializeTrackedWrittenStackCellIds(
         delta_it != state.stack_base_deltas.end()) {
       delta = delta_it->second;
     }
-    auto it = cell_ids.find(MaterializedStackKey{key.base_slot_id,
-                                                 key.cell_offset + delta,
-                                                 key.width});
-    if (it != cell_ids.end())
+    auto it = context.materialized_stack_cell_ids.find(MaterializedStackCellKey{
+        key.base_slot_id, key.cell_offset + delta, key.width});
+    if (it != context.materialized_stack_cell_ids.end())
       materialized.insert(it->second);
   }
   return materialized;
 }
 
+llvm::SmallDenseSet<unsigned, 16> materializeTrackedWrittenStackCellIds(
+    const VirtualMachineModel &model, const TrackedFactState &state,
+    const std::set<CanonicalStackFactKey> &written_stack_keys) {
+  auto context = buildStackModelContext(model);
+  return materializeTrackedWrittenStackCellIds(context, state,
+                                               written_stack_keys);
+}
+
 void normalizeLocalizedOutgoingFacts(const VirtualMachineModel &model,
                                      CallsiteLocalizedOutgoingFacts &localized) {
-  localized.tracked_state =
-      buildTrackedFactState(model, localized.outgoing_slots,
-                            localized.outgoing_stack,
-                            &localized.structural_outgoing_stack);
+  const auto context = buildStackModelContext(model);
+  localized.tracked_state = buildTrackedFactState(
+      context, localized.outgoing_slots, localized.outgoing_stack,
+      &localized.structural_outgoing_stack);
 
   std::set<CanonicalStackFactKey> normalized_written_keys =
       localized.written_stack_keys;
 
   for (unsigned cell_id : localized.written_stack_cell_ids) {
-    if (auto key =
-            canonicalStackFactKeyForCellId(model, localized.tracked_state,
-                                           cell_id)) {
+    if (auto key = canonicalStackFactKeyForCellId(context,
+                                                  localized.tracked_state,
+                                                  cell_id)) {
       normalized_written_keys.insert(*key);
     }
   }
@@ -310,7 +324,7 @@ void normalizeLocalizedOutgoingFacts(const VirtualMachineModel &model,
     summary.offset = structural_key.cell_offset;
     summary.width = structural_key.width;
     if (auto key =
-            canonicalStackFactKeyForSummary(model, localized.tracked_state,
+            canonicalStackFactKeyForSummary(context, localized.tracked_state,
                                             summary)) {
       normalized_written_keys.insert(*key);
     }
@@ -319,25 +333,25 @@ void normalizeLocalizedOutgoingFacts(const VirtualMachineModel &model,
   localized.written_stack_keys = std::move(normalized_written_keys);
   localized.outgoing_stack = localized.tracked_state.materialized_stack_facts;
   localized.structural_outgoing_stack =
-      materializeTrackedStructuralStackFacts(model, localized.tracked_state);
+      materializeTrackedStructuralStackFacts(context, localized.tracked_state);
   localized.written_stack_cell_ids.clear();
   for (unsigned cell_id : materializeTrackedWrittenStackCellIds(
-           model, localized.tracked_state, localized.written_stack_keys)) {
+           context, localized.tracked_state, localized.written_stack_keys)) {
     localized.written_stack_cell_ids.insert(cell_id);
   }
 }
 
 TrackedFactState buildTrackedFactState(
-    const VirtualMachineModel &model,
+    const StackModelContext &context,
     const std::map<unsigned, VirtualValueExpr> &slot_facts,
     const std::map<unsigned, VirtualValueExpr> &stack_facts,
     const std::map<StackCellKey, VirtualValueExpr> *structural_stack_facts) {
   TrackedFactState state;
   state.slot_facts = slot_facts;
-  refreshTrackedFactState(model, state);
+  refreshTrackedFactState(context, state);
 
   for (const auto &[cell_id, value] : stack_facts)
-    (void) assignTrackedStackFactForCellId(model, state, cell_id, value);
+    (void) assignTrackedStackFactForCellId(context, state, cell_id, value);
 
   if (structural_stack_facts) {
     for (const auto &[key, value] : *structural_stack_facts) {
@@ -349,30 +363,47 @@ TrackedFactState buildTrackedFactState(
       summary.base_from_alloca = key.base_slot.from_alloca;
       summary.offset = key.cell_offset;
       summary.width = key.width;
-      (void) assignTrackedStackFactForSummary(model, state, summary, value);
+      (void) assignTrackedStackFactForSummary(context, state, summary, value);
     }
   }
 
-  state.materialized_stack_facts = materializeTrackedStackFacts(model, state);
+  state.materialized_stack_facts = materializeTrackedStackFacts(context, state);
   return state;
+}
+
+TrackedFactState buildTrackedFactState(
+    const VirtualMachineModel &model,
+    const std::map<unsigned, VirtualValueExpr> &slot_facts,
+    const std::map<unsigned, VirtualValueExpr> &stack_facts,
+    const std::map<StackCellKey, VirtualValueExpr> *structural_stack_facts) {
+  auto context = buildStackModelContext(model);
+  return buildTrackedFactState(context, slot_facts, stack_facts,
+                               structural_stack_facts);
+}
+
+void refreshTrackedFactState(const StackModelContext &context,
+                             TrackedFactState &state) {
+  state.stack_base_deltas.clear();
+  for (const auto &[slot_id, slot] : context.slot_info) {
+    (void) slot;
+    if (auto delta =
+            inferTrackedStackBaseDeltaForSlot(state.slot_facts, slot_id)) {
+      state.stack_base_deltas.emplace(slot_id, *delta);
+    }
+  }
+  state.materialized_stack_facts = materializeTrackedStackFacts(context, state);
 }
 
 void refreshTrackedFactState(const VirtualMachineModel &model,
                              TrackedFactState &state) {
-  state.stack_base_deltas.clear();
-  for (const auto &slot : model.slots()) {
-    if (auto delta =
-            inferTrackedStackBaseDeltaForSlot(state.slot_facts, slot.id)) {
-      state.stack_base_deltas.emplace(slot.id, *delta);
-    }
-  }
-  state.materialized_stack_facts = materializeTrackedStackFacts(model, state);
+  auto context = buildStackModelContext(model);
+  refreshTrackedFactState(context, state);
 }
 
 std::optional<TrackedStackLookupResult> lookupTrackedStackFact(
-    const VirtualMachineModel &model, const TrackedFactState &state,
+    const StackModelContext &context, const TrackedFactState &state,
     const VirtualStackCellSummary &summary) {
-  auto base_slot_id = resolveBaseSlotIdForSummary(model, summary);
+  auto base_slot_id = resolveBaseSlotIdForSummary(summary, context);
   if (!base_slot_id)
     return std::nullopt;
 
@@ -405,6 +436,13 @@ std::optional<TrackedStackLookupResult> lookupTrackedStackFact(
   }
 
   return std::nullopt;
+}
+
+std::optional<TrackedStackLookupResult> lookupTrackedStackFact(
+    const VirtualMachineModel &model, const TrackedFactState &state,
+    const VirtualStackCellSummary &summary) {
+  auto context = buildStackModelContext(model);
+  return lookupTrackedStackFact(context, state, summary);
 }
 
 VirtualValueExpr resolveTrackedStackExpr(

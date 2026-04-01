@@ -1,5 +1,8 @@
 #include "omill/Utils/LiftedNames.h"
 
+#include "omill/Devirtualization/BoundaryFact.h"
+#include "omill/Devirtualization/ExecutableTargetFact.h"
+
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/ADT/SmallVector.h>
@@ -330,9 +333,10 @@ llvm::Function *findLiftedOrCoveredFunctionByPC(llvm::Module &M, uint64_t pc) {
       continue;
     if (extractEntryVA(F.getName()) == pc || extractBlockPC(F.getName()) == pc)
       return &F;
-    auto pc_to_bb = collectBlockPCMap(F);
-    if (pc_to_bb.find(pc) != pc_to_bb.end())
-      return &F;
+    for (const auto &BB : F) {
+      if (extractBlockPC(BB.getName()) == pc)
+        return &F;
+    }
   }
 
   return nullptr;
@@ -372,9 +376,11 @@ std::optional<uint64_t> findNearestCoveredLiftedOrBlockPC(llvm::Module &M,
       consider(entry_pc);
     if (uint64_t block_pc = extractBlockPC(F.getName()); block_pc != 0)
       consider(block_pc);
-    for (const auto &[block_pc, BB] : collectBlockPCMap(F)) {
-      (void)BB;
-      consider(block_pc);
+    for (const auto &BB : F) {
+      if (uint64_t named_block_pc = extractBlockPC(BB.getName());
+          named_block_pc != 0) {
+        consider(named_block_pc);
+      }
     }
   }
 
@@ -431,29 +437,20 @@ uint64_t extractStructuralCodeTargetPC(llvm::StringRef name) {
 }
 
 uint64_t extractStructuralCodeTargetPC(const llvm::Function &F) {
-  auto parseHexAttr = [&](llvm::StringRef key) -> uint64_t {
-    auto attr = F.getFnAttribute(key);
-    if (!attr.isValid())
-      return 0;
-    auto text = attr.getValueAsString();
-    if (text.consume_front("0x") || text.consume_front("0X")) {
-    }
-    uint64_t value = 0;
-    if (text.getAsInteger(16, value))
-      return 0;
-    return value;
-  };
-
-  if (uint64_t pc = parseHexAttr("omill.native_direct_target_pc"))
-    return pc;
-  if (uint64_t pc = parseHexAttr("omill.virtual_exit_native_target_pc"))
-    return pc;
-  if (uint64_t pc = parseHexAttr("omill.executable_target_pc"))
-    return pc;
-  if (uint64_t pc = parseHexAttr("omill.vm_enter_target_pc"))
-    return pc;
-  if (uint64_t pc = parseHexAttr("omill.native_boundary_pc"))
-    return pc;
+  if (auto attr = F.getFnAttribute("omill.executable_target_pc");
+      attr.isValid()) {
+    uint64_t pc = 0;
+    if (!attr.getValueAsString().getAsInteger(16, pc))
+      return pc;
+  }
+  if (auto fact = readExecutableTargetFact(F))
+    return fact->raw_target_pc;
+  if (auto boundary_fact = readBoundaryFact(F)) {
+    if (boundary_fact->native_target_pc)
+      return *boundary_fact->native_target_pc;
+    if (boundary_fact->boundary_pc)
+      return *boundary_fact->boundary_pc;
+  }
   return extractStructuralCodeTargetPC(F.getName());
 }
 

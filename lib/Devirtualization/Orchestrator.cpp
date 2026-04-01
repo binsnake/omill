@@ -18,7 +18,10 @@
 #include <set>
 
 #include "omill/Analysis/VMTraceEmulator.h"
+#include "Analysis/VirtualModel/CoreDecls.h"
 #include "omill/BC/BlockLifter.h"
+#include "omill/Devirtualization/BoundaryFact.h"
+#include "omill/Devirtualization/ExecutableTargetFact.h"
 #include "omill/Devirtualization/OutputRootClosure.h"
 #include "omill/Remill/Normalization.h"
 #include "omill/Utils/LiftedNames.h"
@@ -36,8 +39,32 @@ bool isDispatchName(llvm::StringRef name) {
 
 struct SessionGraphProjectionCacheEntry {
   llvm::stable_hash module_fingerprint = 0;
+  uint64_t projection_serial = 0;
   SessionGraphState state;
 };
+
+constexpr const char *kSessionGraphProjectionSerialMetadata =
+    "omill.session_graph_projection.serial";
+
+uint64_t nextSessionGraphProjectionSerial() {
+  static uint64_t serial = 1;
+  return serial++;
+}
+
+std::optional<uint64_t> moduleSessionGraphProjectionSerial(
+    const llvm::Module &M) {
+  auto *named = M.getNamedMetadata(kSessionGraphProjectionSerialMetadata);
+  if (!named || named->getNumOperands() == 0)
+    return std::nullopt;
+  auto *tuple = named->getOperand(0);
+  if (!tuple || tuple->getNumOperands() == 0)
+    return std::nullopt;
+  auto *meta =
+      llvm::mdconst::dyn_extract_or_null<llvm::ConstantInt>(tuple->getOperand(0));
+  if (!meta)
+    return std::nullopt;
+  return meta->getZExtValue();
+}
 
 std::map<const llvm::Module *, SessionGraphProjectionCacheEntry> &
 sessionGraphProjectionCache() {
@@ -46,40 +73,35 @@ sessionGraphProjectionCache() {
   return *cache;
 }
 
-std::optional<uint64_t> parseOptionalHexAttr(llvm::Attribute attr) {
-  if (!attr.isValid())
-    return std::nullopt;
-  auto text = attr.getValueAsString();
-  if (text.empty())
-    return std::nullopt;
-  if (text.consume_front("0x") || text.consume_front("0X")) {
-  }
-  uint64_t value = 0;
-  if (text.getAsInteger(16, value))
-    return std::nullopt;
-  return value;
+VirtualExitDisposition boundaryDisposition(
+    const std::optional<BoundaryFact> &fact) {
+  if (!fact)
+    return VirtualExitDisposition::kUnknown;
+  return virtualExitDispositionFromBoundaryDisposition(fact->exit_disposition);
 }
 
-std::optional<VirtualExitDisposition> parseVirtualExitDisposition(
-    const llvm::CallBase &call) {
-  auto attr = call.getFnAttr("omill.virtual_exit_disposition");
-  if (!attr.isValid())
+std::optional<uint64_t> boundaryContinuationVipPc(
+    const std::optional<BoundaryFact> &fact) {
+  if (!fact)
     return std::nullopt;
-  auto text = attr.getValueAsString();
-  if (text == "stay_in_vm")
-    return VirtualExitDisposition::kStayInVm;
-  if (text == "vm_exit_terminal")
-    return VirtualExitDisposition::kVmExitTerminal;
-  if (text == "vm_exit_native_call_reenter")
-    return VirtualExitDisposition::kVmExitNativeCallReenter;
-  if (text == "vm_exit_native_exec_unknown_return")
-    return VirtualExitDisposition::kVmExitNativeExecUnknownReturn;
-  if (text == "vm_enter")
-    return VirtualExitDisposition::kVmEnter;
-  if (text == "nested_vm_enter")
-    return VirtualExitDisposition::kNestedVmEnter;
-  return VirtualExitDisposition::kUnknown;
+  return fact->continuation_vip_pc;
 }
+
+std::optional<unsigned> boundaryContinuationSlotId(
+    const std::optional<BoundaryFact> &fact) {
+  if (!fact)
+    return std::nullopt;
+  return fact->continuation_slot_id;
+}
+
+std::optional<unsigned> boundaryContinuationStackCellId(
+    const std::optional<BoundaryFact> &fact) {
+  if (!fact)
+    return std::nullopt;
+  return fact->continuation_stack_cell_id;
+}
+
+void classifyContinuationCandidate(FrontierWorkItem &item);
 
 bool isLiftedHelperName(llvm::StringRef name) {
   return name.starts_with("blk_") || name.starts_with("block_") ||
@@ -93,6 +115,14 @@ bool isBlockLiftName(llvm::StringRef name) {
 bool isTerminalBoundaryRecoveryModeEnabled() {
   const char *value = std::getenv("OMILL_TERMINAL_BOUNDARY_RECOVERY");
   return value && value[0] != '\0' && value[0] != '0';
+}
+
+bool envFlagEnabled(const char *name) {
+  const char *value = std::getenv(name);
+  if (!value || value[0] == '\0')
+    return false;
+  auto sv = llvm::StringRef(value).lower();
+  return !(sv == "0" || sv == "false" || sv == "off" || sv == "no");
 }
 
 bool functionLooksLikeVmBoundary(const llvm::Function &F) {
@@ -129,6 +159,11 @@ bool isTrackedLiftUnit(const llvm::Function &F) {
   if (!isLiftedHelperName(F.getName()) && !functionLooksLikeVmBoundary(F))
     return false;
   return extractLiftUnitVA(F).has_value();
+}
+
+bool isSessionGraphTrackedFunction(const llvm::Function &F) {
+  return isTrackedLiftUnit(F) || F.hasFnAttribute("omill.output_root") ||
+         F.hasFnAttribute("omill.closed_root_slice_root");
 }
 
 bool hasKnownMaterializedTarget(const llvm::Module &M, uint64_t pc) {
@@ -217,6 +252,12 @@ std::string unresolvedExitIdentity(const UnresolvedExitSite &site) {
   if (site.continuation_vip_pc)
     key += llvm::utohexstr(*site.continuation_vip_pc);
   key += ":";
+  if (site.continuation_slot_id)
+    key += std::to_string(*site.continuation_slot_id);
+  key += ":";
+  if (site.continuation_stack_cell_id)
+    key += std::to_string(*site.continuation_stack_cell_id);
+  key += ":";
   key += site.vip_symbolic ? "sym" : "concrete";
   key += ":";
   key += std::to_string(static_cast<int>(site.exit_disposition));
@@ -229,6 +270,40 @@ std::string unresolvedExitStableSiteKey(const UnresolvedExitSite &site) {
                     std::to_string(static_cast<int>(site.kind)) + ":";
   if (site.site_pc)
     key += llvm::utohexstr(*site.site_pc);
+  return key;
+}
+
+std::string frontierStableSiteKey(const FrontierWorkItem &item) {
+  std::string key =
+      (item.identity.find("closure:") == 0
+           ? "closure"
+           : (item.owner_function == "__frontier__" ? "frontier"
+                                                    : "unresolved")) +
+      std::string(":") + item.owner_function + ":" +
+      std::to_string(item.site_index) + ":";
+  if (item.site_pc)
+    key += llvm::utohexstr(*item.site_pc);
+  key += ":";
+  if (item.target_pc)
+    key += llvm::utohexstr(*item.target_pc);
+  key += ":" + std::to_string(static_cast<int>(item.root_frontier_kind));
+  return key;
+}
+
+std::string edgeStableSiteKey(const SessionEdgeFact &edge) {
+  std::string key =
+      (edge.from_output_root_closure
+           ? "closure"
+           : (edge.owner_function == "__frontier__" ? "frontier"
+                                                    : "unresolved")) +
+      std::string(":") + edge.owner_function + ":" +
+      std::to_string(edge.site_index) + ":";
+  if (edge.site_pc)
+    key += llvm::utohexstr(*edge.site_pc);
+  key += ":";
+  if (edge.target_pc)
+    key += llvm::utohexstr(*edge.target_pc);
+  key += ":" + std::to_string(static_cast<int>(edge.root_frontier_kind));
   return key;
 }
 
@@ -262,13 +337,32 @@ FrontierWorkItem makeFrontierWorkItem(const UnresolvedExitSite &site) {
           ? VirtualRootFrontierKind::kCall
           : VirtualRootFrontierKind::kDispatch;
   item.vip_pc = site.vip_pc;
-  item.continuation_vip_pc = site.continuation_vip_pc;
   item.vip_symbolic = site.vip_symbolic;
-  item.exit_disposition = site.exit_disposition;
+  BoundaryFact fact;
+  fact.boundary_pc = site.target_pc;
+  fact.continuation_vip_pc = site.continuation_vip_pc;
+  fact.continuation_slot_id = site.continuation_slot_id;
+  fact.continuation_stack_cell_id = site.continuation_stack_cell_id;
+  fact.exit_disposition =
+      boundaryDispositionFromVirtualExitDisposition(site.exit_disposition);
+  fact.is_vm_enter = site.exit_disposition == VirtualExitDisposition::kVmEnter;
+  fact.is_nested_vm_enter =
+      site.exit_disposition == VirtualExitDisposition::kNestedVmEnter;
+  fact.kind =
+      fact.is_nested_vm_enter ? BoundaryKind::kNestedVmEnterBoundary
+                              : (fact.is_vm_enter
+                                     ? BoundaryKind::kVmEnterBoundary
+                                     : (site.exit_disposition ==
+                                                VirtualExitDisposition::
+                                                    kVmExitTerminal
+                                            ? BoundaryKind::kTerminalBoundary
+                                            : BoundaryKind::kContinuation));
+  item.boundary = fact;
   item.identity = unresolvedExitIdentity(site);
   item.status = site.completeness == ExitCompleteness::kInvalidated
                     ? FrontierWorkStatus::kInvalidated
                     : FrontierWorkStatus::kPending;
+  classifyContinuationCandidate(item);
   return item;
 }
 
@@ -299,11 +393,12 @@ FrontierWorkItem makeClosureFrontierWorkItem(
       closure_item.source_kind == OutputRootClosureSourceKind::kConstantDispatchTarget
           ? VirtualRootFrontierKind::kDispatch
           : VirtualRootFrontierKind::kCall;
-  item.continuation_vip_pc = closure_item.continuation_vip_pc;
   item.vip_symbolic = closure_item.vip_symbolic;
-  item.exit_disposition = closure_item.exit_disposition;
+  item.boundary = closure_item.boundary;
+  item.executable_target = closure_item.executable_target;
   item.identity = "closure:" + closure_item.identity;
   item.status = FrontierWorkStatus::kPending;
+  classifyContinuationCandidate(item);
   return item;
 }
 
@@ -315,14 +410,25 @@ FrontierWorkItem frontierWorkItemFromEdgeFact(const SessionEdgeFact &edge) {
   item.target_pc = edge.target_pc;
   item.root_frontier_kind = edge.root_frontier_kind;
   item.vip_pc = edge.vip_pc;
-  item.continuation_vip_pc = edge.continuation_vip_pc;
   item.vip_symbolic = edge.vip_symbolic;
-  item.exit_disposition = edge.exit_disposition;
+  item.boundary = edge.boundary;
+  item.executable_target = edge.executable_target;
+  item.continuation_confidence = edge.continuation_confidence;
+  item.continuation_liveness = edge.continuation_liveness;
+  item.scheduling_class = edge.scheduling_class;
+  item.continuation_rationale = edge.continuation_rationale;
   item.kind = edge.kind;
   item.status = edge.status;
   item.retry_count = edge.retry_count;
   item.failure_reason = edge.failure_reason;
   item.identity = edge.identity;
+  if (edge.continuation_proof) {
+    item.continuation_confidence = edge.continuation_proof->confidence;
+    item.continuation_liveness = edge.continuation_proof->liveness;
+    item.scheduling_class = edge.continuation_proof->scheduling_class;
+    if (!edge.continuation_proof->rationale.empty())
+      item.continuation_rationale = edge.continuation_proof->rationale;
+  }
   return item;
 }
 
@@ -334,9 +440,13 @@ void syncEdgeFactFromFrontierWorkItem(SessionEdgeFact &edge,
   edge.target_pc = item.target_pc;
   edge.root_frontier_kind = item.root_frontier_kind;
   edge.vip_pc = item.vip_pc;
-  edge.continuation_vip_pc = item.continuation_vip_pc;
   edge.vip_symbolic = item.vip_symbolic;
-  edge.exit_disposition = item.exit_disposition;
+  edge.boundary = item.boundary;
+  edge.executable_target = item.executable_target;
+  edge.continuation_confidence = item.continuation_confidence;
+  edge.continuation_liveness = item.continuation_liveness;
+  edge.scheduling_class = item.scheduling_class;
+  edge.continuation_rationale = item.continuation_rationale;
   edge.kind = item.kind;
   edge.status = item.status;
   edge.retry_count = item.retry_count;
@@ -344,9 +454,216 @@ void syncEdgeFactFromFrontierWorkItem(SessionEdgeFact &edge,
   edge.is_dirty = false;
 }
 
-llvm::stable_hash handlerFingerprint(const llvm::Function &F) {
-  return llvm::StructuralHash(F, /*DetailedHash=*/true);
+ContinuationProvenance classifyContinuationProvenance(
+    const FrontierWorkItem &item) {
+  if (item.boundary) {
+    switch (boundaryDisposition(item.boundary)) {
+      case VirtualExitDisposition::kVmEnter:
+      case VirtualExitDisposition::kNestedVmEnter:
+        return ContinuationProvenance::kVmEnterBoundary;
+      case VirtualExitDisposition::kVmExitTerminal:
+        return ContinuationProvenance::kTerminalBoundary;
+      case VirtualExitDisposition::kVmExitNativeCallReenter:
+      case VirtualExitDisposition::kVmExitNativeExecUnknownReturn:
+        return ContinuationProvenance::kNativeBoundary;
+      case VirtualExitDisposition::kUnknown:
+      case VirtualExitDisposition::kStayInVm:
+        break;
+    }
+  }
+  if (item.executable_target) {
+    if (item.executable_target->exact_fallthrough_target)
+      return ContinuationProvenance::kExactFallthrough;
+    if (item.executable_target->invalidated_executable_entry)
+      return ContinuationProvenance::kInvalidatedExecutableEntry;
+    return ContinuationProvenance::kExecutablePlaceholder;
+  }
+  if (item.identity.find("closure:") == 0)
+    return ContinuationProvenance::kSelectorDerived;
+  return ContinuationProvenance::kUnknown;
 }
+
+ContinuationResolutionKind classifyContinuationResolutionKind(
+    const ContinuationCandidate &candidate) {
+  switch (candidate.provenance) {
+    case ContinuationProvenance::kExactFallthrough:
+      return ContinuationResolutionKind::kExactFallthrough;
+    case ContinuationProvenance::kInvalidatedExecutableEntry:
+      return ContinuationResolutionKind::kInvalidatedExecutableEntry;
+    case ContinuationProvenance::kNativeBoundary:
+    case ContinuationProvenance::kVmEnterBoundary:
+      return ContinuationResolutionKind::kBoundaryModeled;
+    case ContinuationProvenance::kTerminalBoundary:
+      return ContinuationResolutionKind::kTerminalModeled;
+    case ContinuationProvenance::kSelectorDerived:
+      return ContinuationResolutionKind::kQuarantinedSelectorArm;
+    case ContinuationProvenance::kExecutablePlaceholder:
+      if (candidate.canonical_owner_pc)
+        return ContinuationResolutionKind::kCanonicalOwnerRedirect;
+      if (candidate.confidence == ContinuationConfidence::kTrusted)
+        return ContinuationResolutionKind::kTrustedEntry;
+      break;
+    case ContinuationProvenance::kUnknown:
+      break;
+  }
+  if (candidate.confidence == ContinuationConfidence::kTrusted)
+    return ContinuationResolutionKind::kTrustedEntry;
+  if (candidate.scheduling_class == FrontierSchedulingClass::kTerminalModeled)
+    return ContinuationResolutionKind::kTerminalModeled;
+  return ContinuationResolutionKind::kUnknown;
+}
+
+ContinuationImportDisposition classifyContinuationImportDisposition(
+    const ContinuationCandidate &candidate,
+    ContinuationResolutionKind resolution_kind) {
+  if (candidate.liveness == ContinuationLiveness::kQuarantined)
+    return ContinuationImportDisposition::kDeferred;
+  switch (resolution_kind) {
+    case ContinuationResolutionKind::kExactFallthrough:
+    case ContinuationResolutionKind::kTrustedEntry:
+    case ContinuationResolutionKind::kCanonicalOwnerRedirect:
+    case ContinuationResolutionKind::kBoundaryModeled:
+      return ContinuationImportDisposition::kImportable;
+    case ContinuationResolutionKind::kInvalidatedExecutableEntry:
+      return candidate.confidence == ContinuationConfidence::kTrusted
+                 ? ContinuationImportDisposition::kRetryable
+                 : ContinuationImportDisposition::kRejected;
+    case ContinuationResolutionKind::kQuarantinedSelectorArm:
+      return ContinuationImportDisposition::kDeferred;
+    case ContinuationResolutionKind::kTerminalModeled:
+      return ContinuationImportDisposition::kRetryable;
+    case ContinuationResolutionKind::kUnknown:
+      break;
+  }
+  if (candidate.confidence == ContinuationConfidence::kWeak)
+    return ContinuationImportDisposition::kRetryable;
+  return ContinuationImportDisposition::kRejected;
+}
+
+ContinuationProof buildContinuationProof(const ContinuationCandidate &candidate) {
+  ContinuationProof proof;
+  proof.edge_identity = candidate.edge_identity;
+  proof.raw_target_pc = candidate.raw_target_pc.value_or(0);
+  proof.effective_target_pc = candidate.effective_target_pc;
+  proof.canonical_owner_pc = candidate.canonical_owner_pc;
+  proof.source_handler_name = candidate.source_handler_name;
+  proof.provenance = candidate.provenance;
+  proof.confidence = candidate.confidence;
+  proof.liveness = candidate.liveness;
+  proof.scheduling_class = candidate.scheduling_class;
+  proof.is_trusted_entry =
+      candidate.confidence == ContinuationConfidence::kTrusted;
+  if (candidate.executable_target) {
+    proof.is_exact_fallthrough =
+        candidate.executable_target->exact_fallthrough_target;
+    proof.is_invalidated_entry =
+        candidate.executable_target->invalidated_executable_entry;
+    proof.invalidated_entry_source_pc =
+        candidate.executable_target->invalidated_entry_source_pc;
+    proof.invalidated_entry_failed_pc =
+        candidate.executable_target->invalidated_entry_failed_pc;
+  }
+  proof.resolution_kind = classifyContinuationResolutionKind(candidate);
+  proof.import_disposition =
+      classifyContinuationImportDisposition(candidate, proof.resolution_kind);
+  switch (proof.resolution_kind) {
+    case ContinuationResolutionKind::kExactFallthrough:
+    case ContinuationResolutionKind::kTrustedEntry:
+    case ContinuationResolutionKind::kCanonicalOwnerRedirect:
+      proof.selected_root_import_class =
+          ChildImportClass::kTrustedTerminalEntry;
+      break;
+    case ContinuationResolutionKind::kBoundaryModeled:
+      proof.selected_root_import_class = ChildImportClass::kBoundaryModeledChild;
+      break;
+    case ContinuationResolutionKind::kTerminalModeled:
+      proof.selected_root_import_class = ChildImportClass::kTerminalOnlyUnknown;
+      break;
+    default:
+      break;
+  }
+  proof.rationale = candidate.rationale;
+  return proof;
+}
+
+void classifyContinuationCandidate(FrontierWorkItem &item) {
+  const auto provenance = classifyContinuationProvenance(item);
+  switch (provenance) {
+    case ContinuationProvenance::kExactFallthrough:
+      item.continuation_confidence = ContinuationConfidence::kTrusted;
+      item.continuation_liveness = ContinuationLiveness::kLive;
+      item.scheduling_class = FrontierSchedulingClass::kTrustedLive;
+      item.continuation_rationale = "exact_fallthrough";
+      return;
+    case ContinuationProvenance::kNativeBoundary:
+    case ContinuationProvenance::kVmEnterBoundary:
+      item.continuation_confidence = ContinuationConfidence::kTrusted;
+      item.continuation_liveness = ContinuationLiveness::kLive;
+      item.scheduling_class = FrontierSchedulingClass::kNativeOrVmEnterBoundary;
+      item.continuation_rationale = toString(provenance);
+      return;
+    case ContinuationProvenance::kTerminalBoundary:
+      item.continuation_confidence = ContinuationConfidence::kWeak;
+      item.continuation_liveness = ContinuationLiveness::kUnknown;
+      item.scheduling_class = FrontierSchedulingClass::kTerminalModeled;
+      item.continuation_rationale = "terminal_boundary";
+      return;
+    case ContinuationProvenance::kInvalidatedExecutableEntry:
+      item.continuation_confidence = ContinuationConfidence::kDeadArmSuspect;
+      item.continuation_liveness = ContinuationLiveness::kQuarantined;
+      item.scheduling_class =
+          FrontierSchedulingClass::kQuarantinedSelectorArm;
+      item.continuation_rationale = "invalidated_executable_entry";
+      return;
+    case ContinuationProvenance::kSelectorDerived:
+      item.continuation_confidence = ContinuationConfidence::kDeadArmSuspect;
+      item.continuation_liveness = ContinuationLiveness::kQuarantined;
+      item.scheduling_class =
+          FrontierSchedulingClass::kQuarantinedSelectorArm;
+      item.continuation_rationale = "selector_derived";
+      return;
+    case ContinuationProvenance::kExecutablePlaceholder:
+      item.continuation_confidence = item.executable_target &&
+                                             item.executable_target
+                                                 ->canonical_owner_pc.has_value()
+                                         ? ContinuationConfidence::kTrusted
+                                         : ContinuationConfidence::kWeak;
+      item.continuation_liveness =
+          item.continuation_confidence == ContinuationConfidence::kTrusted
+              ? ContinuationLiveness::kLive
+              : ContinuationLiveness::kUnknown;
+      item.scheduling_class =
+          item.continuation_confidence == ContinuationConfidence::kTrusted
+              ? FrontierSchedulingClass::kTrustedLive
+              : FrontierSchedulingClass::kWeakExecutable;
+      item.continuation_rationale = "executable_placeholder";
+      return;
+    case ContinuationProvenance::kUnknown:
+      break;
+  }
+  item.continuation_confidence = ContinuationConfidence::kWeak;
+  item.continuation_liveness = ContinuationLiveness::kUnknown;
+  item.scheduling_class = FrontierSchedulingClass::kWeakExecutable;
+  item.continuation_rationale = "generic_continuation";
+}
+
+struct SessionGraphRefreshSummary {
+  unsigned dirty_edge_facts = 0;
+  unsigned dirty_boundary_facts = 0;
+  unsigned dirty_root_slices = 0;
+  unsigned dirty_regions = 0;
+  unsigned rebuilt_boundary_facts = 0;
+  unsigned rebuilt_root_slices = 0;
+  unsigned rebuilt_regions = 0;
+};
+
+std::optional<ContinuationCandidate> continuationCandidateFromEdge(
+    const SessionEdgeFact &edge);
+ProtectorModel buildProtectorModelFromSession(
+    const DevirtualizationSession &session);
+void applyProtectorModelToSession(DevirtualizationSession &session,
+                                  const ProtectorModel &model);
+void classifyContinuationCandidate(FrontierWorkItem &item);
 
 bool isImportedVmEnterChildFunction(const llvm::Function &F, uint64_t target_pc) {
   if (F.isDeclaration())
@@ -398,39 +715,102 @@ void collectDirtyFunctionsAndSites(DevirtualizationSession &session,
 void refreshHandlerLocalFacts(DevirtualizationSession &session,
                               const llvm::Module &M) {
   auto &graph = session.graph;
+  const bool incremental_refresh = !graph.handler_nodes.empty();
   std::set<std::string> live_names;
-  for (const auto &F : M) {
-    if (!isTrackedLiftUnit(F) && !F.hasFnAttribute("omill.output_root") &&
-        !F.hasFnAttribute("omill.closed_root_slice_root")) {
-      continue;
+  std::vector<std::string> refresh_names;
+  if (incremental_refresh) {
+    refresh_names.reserve(graph.handler_nodes.size() + graph.dirty_function_names.size());
+    for (const auto &[name, _] : graph.handler_nodes) {
+      (void)_;
+      refresh_names.push_back(name);
+      live_names.insert(name);
     }
+    for (const auto &name : graph.dirty_function_names) {
+      if (live_names.insert(name).second)
+        refresh_names.push_back(name);
+    }
+  }
+
+  auto refresh_node_from_function = [&](const llvm::Function &F) {
     const std::string name = F.getName().str();
     live_names.insert(name);
     auto *node = &graph.handler_nodes[name];
+    const llvm::stable_hash new_fingerprint =
+        virtual_model::detail::summaryRelevantFunctionFingerprint(F);
+    const bool fingerprint_changed = node->fingerprint != new_fingerprint;
     node->function_name = name;
     node->entry_va = extractLiftUnitVA(F);
-    node->fingerprint = handlerFingerprint(F);
+    node->fingerprint = new_fingerprint;
     node->is_defined = !F.isDeclaration();
     node->is_output_root = F.hasFnAttribute("omill.output_root");
     node->is_closed_root_slice_root =
         F.hasFnAttribute("omill.closed_root_slice_root");
     node->is_specialized = F.hasFnAttribute("omill.virtual_specialized");
     node->is_dirty = graph.dirty_function_names.count(name) != 0;
-    if (node->entry_va)
-      graph.dirty_root_vas.insert(*node->entry_va);
-  }
-
-  for (auto it = graph.handler_nodes.begin(); it != graph.handler_nodes.end();) {
-    if (live_names.count(it->first) != 0) {
-      ++it;
-      continue;
+    node->is_preferred_seed = F.hasFnAttribute("omill.output_root") ||
+                              F.hasFnAttribute("omill.virtual_specialized") ||
+                              F.hasFnAttribute("omill.closed_root_slice_root") ||
+                              F.hasFnAttribute("omill.vm_wrapper") ||
+                              F.hasFnAttribute("omill.vm_newly_lifted") ||
+                              F.hasFnAttribute("omill.newly_lifted") ||
+                              F.getFnAttribute("omill.vm_demerged_clone")
+                                  .isValid() ||
+                              F.getFnAttribute("omill.vm_outlined_virtual_call")
+                                  .isValid();
+    node->is_initial_seed = virtual_model::detail::isVirtualModelInitialSeedFunction(F);
+    node->is_code_bearing = virtual_model::detail::isVirtualModelCodeBearingFunction(F);
+    if (node->is_defined) {
+      if (!node->local_summary.has_value() || node->is_dirty ||
+          fingerprint_changed ||
+          node->local_summary->function_name != name ||
+          node->local_summary->entry_va != node->entry_va) {
+        node->local_summary = virtual_model::detail::summarizeFunction(
+            const_cast<llvm::Function &>(F));
+      }
+    } else {
+      node->local_summary.reset();
     }
-    it = graph.handler_nodes.erase(it);
+    if (node->entry_va &&
+        (node->is_dirty || fingerprint_changed ||
+         graph.root_slices_by_va.count(*node->entry_va) == 0))
+      graph.dirty_root_vas.insert(*node->entry_va);
+  };
+
+  if (incremental_refresh) {
+    std::set<std::string> refreshed_names;
+    for (const auto &name : refresh_names) {
+      if (!refreshed_names.insert(name).second)
+        continue;
+      auto *F = M.getFunction(name);
+      if (!F || !isSessionGraphTrackedFunction(*F)) {
+        graph.handler_nodes.erase(name);
+        continue;
+      }
+      refresh_node_from_function(*F);
+    }
+  } else {
+    for (const auto &F : M) {
+      if (!isSessionGraphTrackedFunction(F))
+        continue;
+      refresh_node_from_function(F);
+    }
+
+    for (auto it = graph.handler_nodes.begin(); it != graph.handler_nodes.end();) {
+      if (live_names.count(it->first) != 0) {
+        ++it;
+        continue;
+      }
+      it = graph.handler_nodes.erase(it);
+    }
   }
 }
 
-void refreshSessionEdgesAndFrontier(DevirtualizationSession &session) {
+SessionGraphRefreshSummary refreshSessionEdgesAndFrontier(
+    DevirtualizationSession &session) {
   auto &graph = session.graph;
+  SessionGraphRefreshSummary summary;
+  std::set<std::string> active_unresolved_edges;
+  std::set<uint64_t> dirty_boundary_targets;
   for (const auto &site : session.unresolved_exits) {
     if (!site.target_pc)
       continue;
@@ -440,27 +820,82 @@ void refreshSessionEdgesAndFrontier(DevirtualizationSession &session) {
       continue;
     }
     FrontierWorkItem work_item = makeFrontierWorkItem(site);
-    auto [it, inserted] =
-        graph.edge_facts_by_identity.emplace(work_item.identity, SessionEdgeFact{});
+    active_unresolved_edges.insert(work_item.identity);
+    auto it = graph.edge_facts_by_identity.find(work_item.identity);
+    bool inserted = false;
+    if (it == graph.edge_facts_by_identity.end()) {
+      const auto stable_key = frontierStableSiteKey(work_item);
+      it = llvm::find_if(graph.edge_facts_by_identity, [&](const auto &entry) {
+        return edgeStableSiteKey(entry.second) == stable_key;
+      });
+      if (it != graph.edge_facts_by_identity.end()) {
+        SessionEdgeFact preserved = std::move(it->second);
+        graph.edge_facts_by_identity.erase(it);
+        auto inserted_it = graph.edge_facts_by_identity.emplace(
+            work_item.identity, std::move(preserved));
+        it = inserted_it.first;
+        it->second.identity = work_item.identity;
+      } else {
+        auto inserted_it = graph.edge_facts_by_identity.emplace(
+            work_item.identity, SessionEdgeFact{});
+        it = inserted_it.first;
+        inserted = true;
+      }
+    }
     auto &edge = it->second;
+    const auto old_target_pc = edge.target_pc;
+    const auto preserved_kind = edge.kind;
+    const auto preserved_status = edge.status;
+    const auto preserved_retry_count = edge.retry_count;
+    const auto preserved_failure_reason = edge.failure_reason;
+    bool edge_dirty = false;
     if (inserted) {
       edge.identity = work_item.identity;
-      edge.is_dirty = true;
+      edge_dirty = true;
     } else if (edge.target_pc != work_item.target_pc ||
-               edge.continuation_vip_pc != work_item.continuation_vip_pc ||
-               edge.exit_disposition != work_item.exit_disposition ||
+               edge.boundary != work_item.boundary ||
                edge.vip_pc != work_item.vip_pc ||
                edge.vip_symbolic != work_item.vip_symbolic) {
-      edge.is_dirty = true;
+      edge_dirty = true;
     }
+    const bool preserve_frontier_outcome =
+        !inserted && edge.target_pc == work_item.target_pc &&
+        edge.status != FrontierWorkStatus::kPending &&
+        edge.status != FrontierWorkStatus::kInvalidated &&
+        work_item.status != FrontierWorkStatus::kInvalidated;
     syncEdgeFactFromFrontierWorkItem(edge, work_item);
-    edge.is_dirty = edge.is_dirty || inserted ||
+    if (!inserted && (!edge_dirty || preserve_frontier_outcome)) {
+      edge.kind = preserved_kind;
+      edge.status = preserved_status;
+      edge.retry_count = preserved_retry_count;
+      edge.failure_reason = preserved_failure_reason;
+    }
+    edge.is_dirty = edge_dirty || inserted ||
                     session.graph.dirty_function_names.count(edge.owner_function) !=
                         0;
     edge.from_unresolved_exit = true;
+    if (edge.is_dirty) {
+      ++summary.dirty_edge_facts;
+      if (old_target_pc && old_target_pc != edge.target_pc)
+        dirty_boundary_targets.insert(*old_target_pc);
+      if (edge.target_pc)
+        dirty_boundary_targets.insert(*edge.target_pc);
+    }
   }
 
-  graph.boundary_facts_by_target.clear();
+  for (auto it = graph.edge_facts_by_identity.begin();
+       it != graph.edge_facts_by_identity.end();) {
+    if (!it->second.from_unresolved_exit ||
+        active_unresolved_edges.count(it->first) != 0) {
+      ++it;
+      continue;
+    }
+    if (it->second.target_pc)
+      dirty_boundary_targets.insert(*it->second.target_pc);
+    it = graph.edge_facts_by_identity.erase(it);
+  }
+
+  std::set<uint64_t> active_boundary_targets;
   for (const auto &[identity, edge] : graph.edge_facts_by_identity) {
     (void)identity;
     if (!edge.target_pc)
@@ -470,20 +905,49 @@ void refreshSessionEdgesAndFrontier(DevirtualizationSession &session) {
         edge.kind != FrontierWorkKind::kVmEnterBoundary) {
       continue;
     }
-    auto &boundary = graph.boundary_facts_by_target[*edge.target_pc];
-    boundary.target_pc = *edge.target_pc;
-    boundary.kind = edge.kind;
-    boundary.exit_disposition = edge.exit_disposition;
-    boundary.is_dirty = boundary.is_dirty || edge.is_dirty;
+    active_boundary_targets.insert(*edge.target_pc);
+    if (edge.is_dirty)
+      dirty_boundary_targets.insert(*edge.target_pc);
   }
+
+  for (auto it = graph.boundary_facts_by_target.begin();
+       it != graph.boundary_facts_by_target.end();) {
+    if (active_boundary_targets.count(it->first) != 0) {
+      ++it;
+      continue;
+    }
+    it = graph.boundary_facts_by_target.erase(it);
+  }
+
+  summary.dirty_boundary_facts =
+      static_cast<unsigned>(dirty_boundary_targets.size());
+  for (uint64_t target_pc : dirty_boundary_targets) {
+    auto edge_it = llvm::find_if(graph.edge_facts_by_identity, [&](const auto &entry) {
+      const auto &edge = entry.second;
+      return edge.target_pc && *edge.target_pc == target_pc &&
+             (edge.kind == FrontierWorkKind::kNativeCallBoundary ||
+              edge.kind == FrontierWorkKind::kTerminalBoundary ||
+              edge.kind == FrontierWorkKind::kVmEnterBoundary);
+    });
+    if (edge_it == graph.edge_facts_by_identity.end())
+      continue;
+    auto &boundary = graph.boundary_facts_by_target[target_pc];
+    boundary.target_pc = target_pc;
+    boundary.kind = edge_it->second.kind;
+    boundary.boundary = edge_it->second.boundary;
+    boundary.is_dirty = true;
+    ++summary.rebuilt_boundary_facts;
+  }
+
+  return summary;
 }
 
-void refreshDerivedViewsAndLoweringInputs(DevirtualizationSession &session,
-                                          const llvm::Module &M) {
+SessionGraphRefreshSummary refreshDerivedViewsAndLoweringInputs(
+    DevirtualizationSession &session, const llvm::Module &M) {
   auto &graph = session.graph;
-  graph.root_slices_by_va.clear();
-  graph.region_nodes_by_entry_pc.clear();
-
+  SessionGraphRefreshSummary summary;
+  std::set<uint64_t> active_root_vas;
+  std::set<uint64_t> dirty_root_vas = graph.dirty_root_vas;
   for (const auto &[name, node] : graph.handler_nodes) {
     (void)name;
     if (!node.entry_va)
@@ -492,91 +956,168 @@ void refreshDerivedViewsAndLoweringInputs(DevirtualizationSession &session,
         llvm::find(session.root_slice, *node.entry_va) == session.root_slice.end()) {
       continue;
     }
-    auto &slice = graph.root_slices_by_va[*node.entry_va];
-    slice.root_va = *node.entry_va;
-    slice.root_function = node.function_name;
-    slice.is_dirty = node.is_dirty;
-    slice.reachable_handler_names.clear();
-    slice.frontier_edge_identities.clear();
-    slice.reachable_handler_names.push_back(node.function_name);
+    active_root_vas.insert(*node.entry_va);
+    if (node.is_dirty || graph.root_slices_by_va.count(*node.entry_va) == 0)
+      dirty_root_vas.insert(*node.entry_va);
   }
+  summary.dirty_root_slices = static_cast<unsigned>(dirty_root_vas.size());
 
   for (const auto &[identity, edge] : graph.edge_facts_by_identity) {
+    (void)identity;
     auto handler_it = graph.handler_nodes.find(edge.owner_function);
-    if (handler_it != graph.handler_nodes.end() && handler_it->second.entry_va) {
-      auto root_it = graph.root_slices_by_va.find(*handler_it->second.entry_va);
-      if (root_it != graph.root_slices_by_va.end()) {
-        root_it->second.frontier_edge_identities.push_back(identity);
-        if (!edge.owner_function.empty())
-          root_it->second.reachable_handler_names.push_back(edge.owner_function);
-      }
-    }
-    if (edge.kind == FrontierWorkKind::kVmEnterBoundary && edge.target_pc) {
-      auto &region = graph.region_nodes_by_entry_pc[*edge.target_pc];
-      region.entry_pc = *edge.target_pc;
-      region.kind = SessionRegionKind::kNestedVmEnter;
-      region.status = SessionRegionStatus::kPending;
-      region.is_dirty = region.is_dirty || edge.is_dirty;
-      region.frontier_edge_identities.push_back(identity);
-      if (handler_it != graph.handler_nodes.end())
-        region.parent_entry_pc = handler_it->second.entry_va;
-      region.parent_target_pc = edge.target_pc;
-
-      if (auto imported_it =
-              session.imported_vm_enter_child_roots.find(*edge.target_pc);
-          imported_it != session.imported_vm_enter_child_roots.end()) {
-        region.status = SessionRegionStatus::kImported;
-        region.imported_root_function = imported_it->second;
-      } else {
-        for (const auto &F : M) {
-          if (!isImportedVmEnterChildFunction(F, *edge.target_pc))
-            continue;
-          region.status = SessionRegionStatus::kImported;
-          region.imported_root_function = F.getName().str();
-          break;
-        }
-      }
-      if (region.status != SessionRegionStatus::kImported &&
-          session.attempted_vm_enter_child_import_pcs.count(*edge.target_pc) != 0) {
-        region.status = SessionRegionStatus::kBlocked;
-        if (region.failure_reason.empty())
-          region.failure_reason = "child_import_not_materialized";
-      }
+    if (handler_it != graph.handler_nodes.end() && handler_it->second.entry_va &&
+        active_root_vas.count(*handler_it->second.entry_va) != 0 && edge.is_dirty) {
+      dirty_root_vas.insert(*handler_it->second.entry_va);
     }
   }
 
-  for (auto &[target_pc, boundary] : graph.boundary_facts_by_target) {
-    auto &mutable_module = const_cast<llvm::Module &>(M);
-    if (auto *fn = findStructuralCodeTargetFunctionByPC(mutable_module, target_pc))
-      boundary.declaration_name = fn->getName().str();
-    else if (auto *fn = findLiftedOrBlockFunctionByPC(mutable_module, target_pc))
-      boundary.declaration_name = fn->getName().str();
+  for (auto it = graph.root_slices_by_va.begin();
+       it != graph.root_slices_by_va.end();) {
+    if (active_root_vas.count(it->first) != 0) {
+      ++it;
+      continue;
+    }
+    it = graph.root_slices_by_va.erase(it);
   }
 
-  for (auto &[root_va, slice] : graph.root_slices_by_va) {
-    (void)root_va;
-    std::sort(slice.reachable_handler_names.begin(),
-              slice.reachable_handler_names.end());
-    slice.reachable_handler_names.erase(
-        std::unique(slice.reachable_handler_names.begin(),
-                    slice.reachable_handler_names.end()),
-        slice.reachable_handler_names.end());
-    slice.is_closed = llvm::all_of(
-        slice.frontier_edge_identities, [&](const std::string &identity) {
+  for (uint64_t root_va : dirty_root_vas) {
+    auto handler_it = llvm::find_if(graph.handler_nodes, [&](const auto &entry) {
+      return entry.second.entry_va && *entry.second.entry_va == root_va &&
+             (entry.second.is_output_root || entry.second.is_closed_root_slice_root ||
+              llvm::find(session.root_slice, root_va) != session.root_slice.end());
+    });
+    if (handler_it == graph.handler_nodes.end())
+      continue;
+    SessionRootSlice rebuilt;
+    rebuilt.root_va = root_va;
+    rebuilt.root_function = handler_it->second.function_name;
+    rebuilt.is_dirty = handler_it->second.is_dirty;
+    rebuilt.reachable_handler_names.push_back(handler_it->second.function_name);
+    for (const auto &[identity, edge] : graph.edge_facts_by_identity) {
+      auto owner_it = graph.handler_nodes.find(edge.owner_function);
+      if (owner_it == graph.handler_nodes.end() || !owner_it->second.entry_va ||
+          *owner_it->second.entry_va != root_va) {
+        continue;
+      }
+      rebuilt.frontier_edge_identities.push_back(identity);
+      if (!edge.owner_function.empty())
+        rebuilt.reachable_handler_names.push_back(edge.owner_function);
+    }
+    std::sort(rebuilt.reachable_handler_names.begin(),
+              rebuilt.reachable_handler_names.end());
+    rebuilt.reachable_handler_names.erase(
+        std::unique(rebuilt.reachable_handler_names.begin(),
+                    rebuilt.reachable_handler_names.end()),
+        rebuilt.reachable_handler_names.end());
+    rebuilt.is_closed = llvm::all_of(
+        rebuilt.frontier_edge_identities, [&](const std::string &identity) {
           auto it = graph.edge_facts_by_identity.find(identity);
           if (it == graph.edge_facts_by_identity.end())
             return true;
           return it->second.status != FrontierWorkStatus::kPending &&
                  it->second.status != FrontierWorkStatus::kInvalidated;
         });
+    graph.root_slices_by_va[root_va] = std::move(rebuilt);
+    ++summary.rebuilt_root_slices;
   }
+
+  std::set<uint64_t> active_region_targets;
+  std::set<uint64_t> dirty_region_targets;
+  for (const auto &[identity, edge] : graph.edge_facts_by_identity) {
+    (void)identity;
+    if (edge.kind != FrontierWorkKind::kVmEnterBoundary || !edge.target_pc)
+      continue;
+    active_region_targets.insert(*edge.target_pc);
+    if (edge.is_dirty || graph.region_nodes_by_entry_pc.count(*edge.target_pc) == 0)
+      dirty_region_targets.insert(*edge.target_pc);
+  }
+
+  for (const auto &[target_pc, _] : session.imported_vm_enter_child_roots)
+    dirty_region_targets.insert(target_pc);
+  for (uint64_t target_pc : session.attempted_vm_enter_child_import_pcs)
+    dirty_region_targets.insert(target_pc);
+  summary.dirty_regions = static_cast<unsigned>(dirty_region_targets.size());
+
+  for (auto it = graph.region_nodes_by_entry_pc.begin();
+       it != graph.region_nodes_by_entry_pc.end();) {
+    if (active_region_targets.count(it->first) != 0) {
+      ++it;
+      continue;
+    }
+    it = graph.region_nodes_by_entry_pc.erase(it);
+  }
+
+  for (uint64_t target_pc : dirty_region_targets) {
+    if (active_region_targets.count(target_pc) == 0)
+      continue;
+    SessionRegionNode rebuilt;
+    rebuilt.entry_pc = target_pc;
+    rebuilt.kind = SessionRegionKind::kNestedVmEnter;
+    rebuilt.status = SessionRegionStatus::kPending;
+    for (const auto &[identity, edge] : graph.edge_facts_by_identity) {
+      if (edge.kind != FrontierWorkKind::kVmEnterBoundary || !edge.target_pc ||
+          *edge.target_pc != target_pc) {
+        continue;
+      }
+      rebuilt.is_dirty = rebuilt.is_dirty || edge.is_dirty;
+      rebuilt.frontier_edge_identities.push_back(identity);
+      auto handler_it = graph.handler_nodes.find(edge.owner_function);
+      if (handler_it != graph.handler_nodes.end())
+        rebuilt.parent_entry_pc = handler_it->second.entry_va;
+      rebuilt.parent_target_pc = edge.target_pc;
+    }
+
+    if (auto imported_it = session.imported_vm_enter_child_roots.find(target_pc);
+        imported_it != session.imported_vm_enter_child_roots.end()) {
+      rebuilt.status = SessionRegionStatus::kImported;
+      rebuilt.imported_root_function = imported_it->second;
+    } else {
+      for (const auto &F : M) {
+        if (!isImportedVmEnterChildFunction(F, target_pc))
+          continue;
+        rebuilt.status = SessionRegionStatus::kImported;
+        rebuilt.imported_root_function = F.getName().str();
+        break;
+      }
+    }
+    if (rebuilt.status != SessionRegionStatus::kImported &&
+        session.attempted_vm_enter_child_import_pcs.count(target_pc) != 0) {
+      rebuilt.status = SessionRegionStatus::kBlocked;
+      if (rebuilt.failure_reason.empty())
+        rebuilt.failure_reason = "child_import_not_materialized";
+    }
+    graph.region_nodes_by_entry_pc[target_pc] = std::move(rebuilt);
+    ++summary.rebuilt_regions;
+  }
+
+  for (auto &[target_pc, boundary] : graph.boundary_facts_by_target) {
+    if (!boundary.is_dirty && boundary.declaration_name.has_value())
+      continue;
+    auto &mutable_module = const_cast<llvm::Module &>(M);
+    if (auto *fn = findStructuralCodeTargetFunctionByPC(mutable_module, target_pc))
+      boundary.declaration_name = fn->getName().str();
+    else if (auto *fn = findLiftedOrBlockFunctionByPC(mutable_module, target_pc))
+      boundary.declaration_name = fn->getName().str();
+    boundary.is_dirty = false;
+  }
+  return summary;
 }
 
 void publishSessionGraphProjectionImpl(const llvm::Module &M,
                                        const SessionGraphState &state) {
   SessionGraphProjectionCacheEntry entry;
   entry.module_fingerprint = llvm::StructuralHash(M);
+  entry.projection_serial = nextSessionGraphProjectionSerial();
   entry.state = state;
+  auto &mutable_module = const_cast<llvm::Module &>(M);
+  auto *named =
+      mutable_module.getOrInsertNamedMetadata(kSessionGraphProjectionSerialMetadata);
+  named->clearOperands();
+  named->addOperand(llvm::MDTuple::get(
+      mutable_module.getContext(),
+      {llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+          llvm::Type::getInt64Ty(mutable_module.getContext()),
+          entry.projection_serial))}));
   sessionGraphProjectionCache()[&M] = std::move(entry);
 }
 
@@ -586,7 +1127,22 @@ const SessionGraphState *findSessionGraphProjectionImpl(
   auto it = cache.find(&M);
   if (it == cache.end())
     return nullptr;
-  if (it->second.module_fingerprint != llvm::StructuralHash(M)) {
+  if (it->second.module_fingerprint != llvm::StructuralHash(M) ||
+      moduleSessionGraphProjectionSerial(M) != it->second.projection_serial) {
+    cache.erase(it);
+    return nullptr;
+  }
+  return &it->second.state;
+}
+
+SessionGraphState *findMutableSessionGraphProjectionImpl(llvm::Module &M) {
+  auto &cache = sessionGraphProjectionCache();
+  auto it = cache.find(&M);
+  if (it == cache.end())
+    return nullptr;
+  const llvm::stable_hash fingerprint = llvm::StructuralHash(M);
+  if (it->second.module_fingerprint != fingerprint ||
+      moduleSessionGraphProjectionSerial(M) != it->second.projection_serial) {
     cache.erase(it);
     return nullptr;
   }
@@ -596,17 +1152,195 @@ const SessionGraphState *findSessionGraphProjectionImpl(
 void refreshSessionGraphState(DevirtualizationSession &session,
                               const llvm::Module &M) {
   collectDirtyFunctionsAndSites(session, M);
+  session.latest_round.dirty_handler_nodes =
+      static_cast<unsigned>(session.graph.dirty_function_names.size());
   refreshHandlerLocalFacts(session, M);
-  refreshSessionEdgesAndFrontier(session);
-  refreshDerivedViewsAndLoweringInputs(session, M);
+  auto edge_summary = refreshSessionEdgesAndFrontier(session);
+  auto derived_summary = refreshDerivedViewsAndLoweringInputs(session, M);
+  session.latest_round.dirty_edge_facts = edge_summary.dirty_edge_facts;
+  session.latest_round.dirty_boundary_facts =
+      edge_summary.dirty_boundary_facts;
+  session.latest_round.dirty_root_slices = derived_summary.dirty_root_slices;
+  session.latest_round.dirty_regions = derived_summary.dirty_regions;
+  session.latest_round.rebuilt_boundary_facts =
+      edge_summary.rebuilt_boundary_facts;
+  session.latest_round.rebuilt_root_slices =
+      derived_summary.rebuilt_root_slices;
+  session.latest_round.rebuilt_regions = derived_summary.rebuilt_regions;
+  session.protector_model = buildProtectorModelFromSession(session);
+  applyProtectorModelToSession(session, session.protector_model);
   publishSessionGraphProjectionImpl(M, session.graph);
+}
+
+std::optional<ContinuationCandidate> continuationCandidateFromEdge(
+    const SessionEdgeFact &edge) {
+  if (!edge.target_pc)
+    return std::nullopt;
+  ContinuationCandidate candidate;
+  candidate.edge_identity = edge.identity;
+  candidate.source_handler_name = edge.owner_function;
+  candidate.raw_target_pc = edge.target_pc;
+  candidate.executable_target = edge.executable_target;
+  candidate.boundary = edge.boundary;
+  candidate.provenance = [&]() {
+    FrontierWorkItem item = frontierWorkItemFromEdgeFact(edge);
+    return classifyContinuationProvenance(item);
+  }();
+  candidate.confidence = edge.continuation_confidence;
+  candidate.liveness = edge.continuation_liveness;
+  candidate.scheduling_class = edge.scheduling_class;
+  candidate.rationale = edge.continuation_rationale;
+  if (edge.executable_target) {
+    candidate.effective_target_pc = edge.executable_target->effective_target_pc;
+    candidate.canonical_owner_pc = edge.executable_target->canonical_owner_pc;
+  }
+  if (edge.continuation_proof)
+    candidate.proof = edge.continuation_proof;
+  return candidate;
+}
+
+ProtectorModel buildProtectorModelFromSession(
+    const DevirtualizationSession &session) {
+  ProtectorModel model;
+  std::map<std::string, std::vector<size_t>> candidate_indices_by_site;
+  for (const auto &[identity, edge] : session.graph.edge_facts_by_identity) {
+    (void)identity;
+    auto candidate = continuationCandidateFromEdge(edge);
+    if (!candidate)
+      continue;
+    model.continuation_candidates.push_back(*candidate);
+    std::string site_key = edge.owner_function + ":" +
+                           std::to_string(edge.site_index) + ":";
+    if (edge.site_pc)
+      site_key += llvm::utohexstr(*edge.site_pc);
+    candidate_indices_by_site[site_key].push_back(
+        model.continuation_candidates.size() - 1);
+    if (candidate->liveness == ContinuationLiveness::kQuarantined) {
+      model.selector_outcomes_by_edge[candidate->edge_identity] =
+          SelectorOutcome{candidate->edge_identity, candidate->raw_target_pc,
+                          candidate->confidence, candidate->liveness,
+                          candidate->rationale};
+    }
+  }
+
+  for (const auto &[site_key, indices] : candidate_indices_by_site) {
+    (void)site_key;
+    if (indices.size() < 2)
+      continue;
+
+    bool has_trusted_structural_target = false;
+    for (size_t index : indices) {
+      const auto &candidate = model.continuation_candidates[index];
+      if (candidate.provenance == ContinuationProvenance::kExactFallthrough ||
+          candidate.provenance == ContinuationProvenance::kNativeBoundary ||
+          candidate.provenance == ContinuationProvenance::kVmEnterBoundary ||
+          candidate.scheduling_class == FrontierSchedulingClass::kTrustedLive) {
+        has_trusted_structural_target = true;
+        break;
+      }
+    }
+    if (!has_trusted_structural_target)
+      continue;
+
+    for (size_t index : indices) {
+      auto &candidate = model.continuation_candidates[index];
+      if (candidate.provenance == ContinuationProvenance::kExactFallthrough ||
+          candidate.provenance == ContinuationProvenance::kNativeBoundary ||
+          candidate.provenance == ContinuationProvenance::kVmEnterBoundary) {
+        candidate.confidence = ContinuationConfidence::kTrusted;
+        candidate.liveness = ContinuationLiveness::kLive;
+        candidate.scheduling_class = FrontierSchedulingClass::kTrustedLive;
+        if (candidate.rationale.empty())
+          candidate.rationale = "trusted_structural_target";
+        continue;
+      }
+      if (candidate.provenance == ContinuationProvenance::kSelectorDerived ||
+          candidate.provenance ==
+              ContinuationProvenance::kInvalidatedExecutableEntry ||
+          candidate.provenance ==
+              ContinuationProvenance::kExecutablePlaceholder) {
+        candidate.confidence = ContinuationConfidence::kDeadArmSuspect;
+        candidate.liveness = ContinuationLiveness::kQuarantined;
+        candidate.scheduling_class =
+            FrontierSchedulingClass::kQuarantinedSelectorArm;
+        candidate.rationale = "selector_sibling_of_trusted_target";
+        model.selector_outcomes_by_edge[candidate.edge_identity] =
+            SelectorOutcome{candidate.edge_identity, candidate.raw_target_pc,
+                            candidate.confidence, candidate.liveness,
+                            candidate.rationale};
+      }
+    }
+  }
+
+  for (auto &candidate : model.continuation_candidates)
+    candidate.proof = buildContinuationProof(candidate);
+
+  for (const auto &[root_va, slice] : session.graph.root_slices_by_va) {
+    HandlerRegion region;
+    region.id = "root:0x" + llvm::utohexstr(root_va);
+    region.root_va = root_va;
+    region.handler_names = slice.reachable_handler_names;
+    if (!slice.root_function.empty())
+      region.entry_handler_names.push_back(slice.root_function);
+    region.frontier_edge_identities = slice.frontier_edge_identities;
+    for (const auto &[entry_pc, node] : session.graph.region_nodes_by_entry_pc) {
+      if (node.parent_entry_pc && *node.parent_entry_pc == root_va)
+        region.child_entry_pcs.push_back(entry_pc);
+    }
+    model.handler_regions.push_back(std::move(region));
+  }
+
+  std::map<std::string, DispatcherFamily> families_by_anchor;
+  for (const auto &candidate : model.continuation_candidates) {
+    if (candidate.provenance != ContinuationProvenance::kSelectorDerived &&
+        candidate.provenance != ContinuationProvenance::kExactFallthrough &&
+        candidate.provenance !=
+            ContinuationProvenance::kInvalidatedExecutableEntry) {
+      continue;
+    }
+    auto &family = families_by_anchor[candidate.source_handler_name];
+    family.anchor_handler_name = candidate.source_handler_name;
+    family.id = "dispatcher:" + candidate.source_handler_name;
+    family.handler_names.push_back(candidate.source_handler_name);
+    family.continuation_edge_identities.push_back(candidate.edge_identity);
+  }
+  for (auto &[anchor, family] : families_by_anchor) {
+    (void)anchor;
+    std::sort(family.handler_names.begin(), family.handler_names.end());
+    family.handler_names.erase(
+        std::unique(family.handler_names.begin(), family.handler_names.end()),
+        family.handler_names.end());
+    std::sort(family.continuation_edge_identities.begin(),
+              family.continuation_edge_identities.end());
+    family.continuation_edge_identities.erase(
+        std::unique(family.continuation_edge_identities.begin(),
+                    family.continuation_edge_identities.end()),
+        family.continuation_edge_identities.end());
+    model.dispatcher_families.push_back(std::move(family));
+  }
+
+  return model;
+}
+
+void applyProtectorModelToSession(DevirtualizationSession &session,
+                                  const ProtectorModel &model) {
+  for (const auto &candidate : model.continuation_candidates) {
+    auto it = session.graph.edge_facts_by_identity.find(candidate.edge_identity);
+    if (it == session.graph.edge_facts_by_identity.end())
+      continue;
+    it->second.continuation_confidence = candidate.confidence;
+    it->second.continuation_liveness = candidate.liveness;
+    it->second.scheduling_class = candidate.scheduling_class;
+    it->second.continuation_rationale = candidate.rationale;
+    it->second.continuation_proof = candidate.proof;
+  }
 }
 
 bool looksLikeNativeCallBoundary(uint64_t target_pc,
                                  const FrontierCallbacks &callbacks) {
   if (!callbacks.read_target_bytes)
     return false;
-  uint8_t bytes[32] = {};
+  uint8_t bytes[96] = {};
   if (!callbacks.read_target_bytes(target_pc, bytes, sizeof(bytes)))
     return false;
   const bool looks_like_x64_prologue =
@@ -615,6 +1349,7 @@ bool looksLikeNativeCallBoundary(uint64_t target_pc,
       (bytes[0] == 0x40 && bytes[1] == 0x53) ||
       (bytes[0] == 0x55 && bytes[1] == 0x48 && bytes[2] == 0x8B);
   unsigned stack_setup_ops = 0;
+  bool saw_pushfq = false;
   for (unsigned i = 0; i < 12 && i < sizeof(bytes); ++i) {
     switch (bytes[i]) {
       case 0x50:
@@ -636,23 +1371,24 @@ bool looksLikeNativeCallBoundary(uint64_t target_pc,
       case 0x9C:
       case 0x9D:
         ++stack_setup_ops;
+        saw_pushfq = saw_pushfq || bytes[i] == 0x9C || bytes[i] == 0x9D;
         break;
       default:
         break;
     }
   }
 
-  bool saw_early_direct_call = false;
-  for (unsigned i = 0; i + 4 < sizeof(bytes) && i < 24; ++i) {
-    if (bytes[i] == 0xE8) {
-      saw_early_direct_call = true;
-      break;
+    bool saw_early_direct_call = false;
+    for (unsigned i = 0; i + 4 < sizeof(bytes) && i < 96; ++i) {
+      if (bytes[i] == 0xE8) {
+        saw_early_direct_call = true;
+        break;
+      }
     }
-  }
-  if (!saw_early_direct_call)
-    return false;
-  return looks_like_x64_prologue || stack_setup_ops >= 4 ||
-         bytes[0] == 0xE8;
+    if (!saw_early_direct_call)
+      return false;
+    return looks_like_x64_prologue || stack_setup_ops >= 4 || bytes[0] == 0xE8 ||
+           (saw_pushfq && stack_setup_ops >= 2);
 }
 
 bool looksLikeNativeFunctionEntry(uint64_t target_pc,
@@ -682,8 +1418,30 @@ bool looksLikeNativeFunctionEntry(uint64_t target_pc,
     return false;
   };
 
-  if (looks_like_prologue_at(0))
+  auto has_early_unconditional_transfer = [&](unsigned limit) {
+    for (unsigned i = 0; i < limit && i < sizeof(bytes); ++i) {
+      if (bytes[i] == 0xE8)
+        return false;
+      if (bytes[i] == 0xC3 || bytes[i] == 0xC2 || bytes[i] == 0xE9 ||
+          bytes[i] == 0xEB) {
+        return true;
+      }
+      if (bytes[i] == 0xFF && i + 1 < sizeof(bytes)) {
+        const uint8_t reg = (bytes[i + 1] >> 3) & 0x7u;
+        // Indirect calls can still be a legitimate prologue-shaped native
+        // entry; early indirect jumps are the shape we want to reject here.
+        if (reg == 4u || reg == 5u)
+          return true;
+      }
+    }
+    return false;
+  };
+
+  if (looks_like_prologue_at(0)) {
+    if (has_early_unconditional_transfer(24))
+      return false;
     return true;
+  }
 
   for (unsigned i = 1; i + 3 < sizeof(bytes) && i < 48; ++i) {
     if (!looks_like_prologue_at(i))
@@ -775,6 +1533,59 @@ bool looksLikeTerminalBoundarySnippet(uint64_t target_pc,
   return false;
 }
 
+bool looksLikeJunkExecutableSnippet(uint64_t target_pc,
+                                    const FrontierCallbacks &callbacks) {
+  if (!callbacks.read_target_bytes)
+    return false;
+  uint8_t bytes[16] = {};
+  if (!callbacks.read_target_bytes(target_pc, bytes, sizeof(bytes)))
+    return false;
+  if (looksLikeVmEnterBoundary(target_pc, callbacks) ||
+      looksLikeNativeCallBoundary(target_pc, callbacks) ||
+      looksLikeNativeFunctionEntry(target_pc, callbacks) ||
+      looksLikeTerminalBoundarySnippet(target_pc, callbacks)) {
+    return false;
+  }
+
+  auto is_suspicious = [](uint8_t byte) {
+    switch (byte) {
+      case 0x60:  // pusha (invalid in x64 long mode)
+      case 0x61:  // popa (invalid in x64 long mode)
+      case 0x62:  // legacy bound/EVEX lead, very unlikely entry here
+      case 0xC8:  // enter
+      case 0xCA:  // lret imm16
+      case 0xCB:  // lret
+      case 0xCE:  // into / invalid in x64
+      case 0xCF:  // iret
+      case 0xE4:
+      case 0xE5:
+      case 0xE6:
+      case 0xE7:
+      case 0xEC:
+      case 0xED:
+      case 0xEE:
+      case 0xEF:  // in/out I/O instructions
+      case 0xF4:  // hlt
+      case 0xFA:  // cli
+      case 0xFB:  // sti
+        return true;
+      default:
+        return false;
+    }
+  };
+
+  unsigned suspicious = 0;
+  for (unsigned i = 0; i < sizeof(bytes); ++i) {
+    if (bytes[i] == 0xE8 || bytes[i] == 0xE9 || bytes[i] == 0xEB ||
+        bytes[i] == 0xC3 || bytes[i] == 0xC2) {
+      break;
+    }
+    if (is_suspicious(bytes[i]))
+      ++suspicious;
+  }
+  return suspicious >= 2;
+}
+
 bool looksLikeNonEntryExecutableSnippet(uint64_t target_pc,
                                         const FrontierCallbacks &callbacks) {
   if (!callbacks.read_target_bytes)
@@ -785,7 +1596,8 @@ bool looksLikeNonEntryExecutableSnippet(uint64_t target_pc,
   if (looksLikeVmEnterBoundary(target_pc, callbacks) ||
       looksLikeNativeCallBoundary(target_pc, callbacks) ||
       looksLikeNativeFunctionEntry(target_pc, callbacks) ||
-      looksLikeTerminalBoundarySnippet(target_pc, callbacks)) {
+      looksLikeTerminalBoundarySnippet(target_pc, callbacks) ||
+      looksLikeJunkExecutableSnippet(target_pc, callbacks)) {
     return false;
   }
 
@@ -799,6 +1611,17 @@ bool looksLikeNonEntryExecutableSnippet(uint64_t target_pc,
     }
   }
   return false;
+}
+
+bool isExactX86DirectCallFallthrough(uint64_t target_pc,
+                                     const FrontierCallbacks &callbacks) {
+  if (!callbacks.read_target_bytes || target_pc < 5)
+    return false;
+  uint8_t bytes[5] = {};
+  const uint64_t call_pc = target_pc - 5;
+  if (!callbacks.read_target_bytes(call_pc, bytes, sizeof(bytes)))
+    return false;
+  return bytes[0] == 0xE8;
 }
 
 struct NativeBoundaryDecodeSummary {
@@ -842,8 +1665,11 @@ llvm::Function *getOrCreateDirectNativeTargetDecl(llvm::Module &M,
     callee = llvm::Function::Create(fn_ty, llvm::Function::ExternalLinkage,
                                     name, M);
   }
-  callee->addFnAttr("omill.native_boundary_pc", llvm::utohexstr(boundary_pc));
-  callee->addFnAttr("omill.native_direct_target_pc", llvm::utohexstr(target_pc));
+  BoundaryFact fact;
+  fact.boundary_pc = boundary_pc;
+  fact.native_target_pc = target_pc;
+  fact.kind = BoundaryKind::kNativeBoundary;
+  writeBoundaryFact(*callee, fact);
   return callee;
 }
 
@@ -979,28 +1805,23 @@ llvm::Function *getOrInsertNativeBoundaryDecl(llvm::Module &M,
                                       liftedFunctionName(*item.target_pc), M);
   (void)materializeNativeBoundaryReenterStub(*decl, item, callbacks,
                                              native_summary);
-  decl->addFnAttr("omill.native_boundary_pc", llvm::utohexstr(*item.target_pc));
-  decl->addFnAttr("omill.virtual_exit_disposition",
-                  item.exit_disposition ==
-                          VirtualExitDisposition::kVmExitNativeCallReenter
-                      ? "vm_exit_native_call_reenter"
-                      : "vm_exit_native_exec_unknown_return");
-  if (native_summary.direct_call_target_pc) {
-    decl->addFnAttr("omill.virtual_exit_native_target_pc",
-                    llvm::utohexstr(*native_summary.direct_call_target_pc));
-  }
-  if (item.continuation_vip_pc) {
-    decl->addFnAttr("omill.virtual_exit_continuation_vip",
-                    llvm::utohexstr(*item.continuation_vip_pc));
-  }
-  if (native_summary.continuation_pc) {
-    decl->addFnAttr("omill.virtual_exit_continuation_pc",
-                    llvm::utohexstr(*native_summary.continuation_pc));
-  }
-  if (native_summary.has_direct_call_fallthrough)
-    decl->addFnAttr("omill.virtual_exit_partial", "1");
-  if (item.exit_disposition == VirtualExitDisposition::kVmExitNativeCallReenter)
-    decl->addFnAttr("omill.virtual_exit_reenters_vm", "1");
+  BoundaryFact fact = item.boundary.value_or(BoundaryFact{});
+  fact.boundary_pc = item.target_pc;
+  if (native_summary.direct_call_target_pc)
+    fact.native_target_pc = *native_summary.direct_call_target_pc;
+  if (native_summary.continuation_pc)
+    fact.continuation_pc = *native_summary.continuation_pc;
+  if (auto vip_pc = boundaryContinuationVipPc(item.boundary))
+    fact.continuation_vip_pc = vip_pc;
+  fact.is_partial_exit = native_summary.has_direct_call_fallthrough;
+  fact.reenters_vm =
+      boundaryDisposition(item.boundary) ==
+      VirtualExitDisposition::kVmExitNativeCallReenter;
+  fact.exit_disposition =
+      fact.reenters_vm ? BoundaryDisposition::kVmExitNativeCallReenter
+                       : BoundaryDisposition::kVmExitNativeExecUnknownReturn;
+  fact.kind = BoundaryKind::kNativeBoundary;
+  writeBoundaryFact(*decl, fact);
   return decl;
 }
 
@@ -1037,8 +1858,13 @@ llvm::Function *getOrInsertExecutableTargetFunction(
   auto *function = llvm::Function::Create(
       fn_ty, llvm::Function::ExternalLinkage,
       "omill_executable_target_" + llvm::utohexstr(*item.target_pc), M);
-  function->addFnAttr("omill.executable_target_pc",
-                      llvm::utohexstr(*item.target_pc));
+  if (item.executable_target) {
+    writeExecutableTargetFact(*function, *item.executable_target);
+  } else {
+    ExecutableTargetFact fact;
+    fact.raw_target_pc = *item.target_pc;
+    writeExecutableTargetFact(*function, fact);
+  }
   if (item.site_pc) {
     function->addFnAttr("omill.virtual_exit_site_pc",
                         llvm::utohexstr(*item.site_pc));
@@ -1047,10 +1873,8 @@ llvm::Function *getOrInsertExecutableTargetFunction(
     function->addFnAttr("omill.virtual_exit_vip",
                         llvm::utohexstr(*item.vip_pc));
   }
-  if (item.continuation_vip_pc) {
-    function->addFnAttr("omill.virtual_exit_continuation_vip",
-                        llvm::utohexstr(*item.continuation_vip_pc));
-  }
+  if (item.boundary)
+    writeBoundaryFact(*function, *item.boundary);
   return function;
 }
 
@@ -1061,48 +1885,42 @@ void annotateNativeBoundaryFunction(llvm::Function &function,
     return;
   const auto native_summary =
       decodeNativeBoundarySummary(*item.target_pc, callbacks);
-  function.addFnAttr("omill.native_boundary_pc",
-                     llvm::utohexstr(*item.target_pc));
-  function.addFnAttr("omill.virtual_exit_disposition",
-                     item.exit_disposition ==
-                             VirtualExitDisposition::kVmExitNativeCallReenter
-                         ? "vm_exit_native_call_reenter"
-                         : "vm_exit_native_exec_unknown_return");
-  if (native_summary.direct_call_target_pc) {
-    function.addFnAttr("omill.virtual_exit_native_target_pc",
-                       llvm::utohexstr(*native_summary.direct_call_target_pc));
-  }
-  if (item.continuation_vip_pc) {
-    function.addFnAttr("omill.virtual_exit_continuation_vip",
-                       llvm::utohexstr(*item.continuation_vip_pc));
-  }
-  if (native_summary.continuation_pc) {
-    function.addFnAttr("omill.virtual_exit_continuation_pc",
-                       llvm::utohexstr(*native_summary.continuation_pc));
-  }
-  if (native_summary.has_direct_call_fallthrough)
-    function.addFnAttr("omill.virtual_exit_partial", "1");
-  if (item.exit_disposition == VirtualExitDisposition::kVmExitNativeCallReenter)
-    function.addFnAttr("omill.virtual_exit_reenters_vm", "1");
+  BoundaryFact fact = item.boundary.value_or(BoundaryFact{});
+  fact.boundary_pc = item.target_pc;
+  if (native_summary.direct_call_target_pc)
+    fact.native_target_pc = *native_summary.direct_call_target_pc;
+  if (native_summary.continuation_pc)
+    fact.continuation_pc = *native_summary.continuation_pc;
+  if (auto vip_pc = boundaryContinuationVipPc(item.boundary))
+    fact.continuation_vip_pc = vip_pc;
+  fact.is_partial_exit = native_summary.has_direct_call_fallthrough;
+  fact.reenters_vm =
+      boundaryDisposition(item.boundary) ==
+      VirtualExitDisposition::kVmExitNativeCallReenter;
+  fact.exit_disposition =
+      fact.reenters_vm ? BoundaryDisposition::kVmExitNativeCallReenter
+                       : BoundaryDisposition::kVmExitNativeExecUnknownReturn;
+  fact.kind = BoundaryKind::kNativeBoundary;
+  writeBoundaryFact(function, fact);
 }
 
 void annotateVmEnterBoundaryFunction(llvm::Function &function,
                                      const FrontierWorkItem &item) {
   if (!item.target_pc)
     return;
-  function.addFnAttr("omill.native_boundary_pc",
-                     llvm::utohexstr(*item.target_pc));
-  function.addFnAttr("omill.vm_enter_target_pc",
-                     llvm::utohexstr(*item.target_pc));
-  function.addFnAttr(
-      "omill.virtual_exit_disposition",
-      item.exit_disposition == VirtualExitDisposition::kNestedVmEnter
-          ? "nested_vm_enter"
-          : "vm_enter");
-  if (item.continuation_vip_pc) {
-    function.addFnAttr("omill.virtual_exit_continuation_vip",
-                       llvm::utohexstr(*item.continuation_vip_pc));
-  }
+  BoundaryFact fact = item.boundary.value_or(BoundaryFact{});
+  fact.boundary_pc = item.target_pc;
+  fact.is_nested_vm_enter =
+      boundaryDisposition(item.boundary) == VirtualExitDisposition::kNestedVmEnter;
+  fact.is_vm_enter = !fact.is_nested_vm_enter;
+  fact.exit_disposition =
+      fact.is_nested_vm_enter ? BoundaryDisposition::kNestedVmEnter
+                              : BoundaryDisposition::kVmEnter;
+  fact.kind = fact.is_nested_vm_enter ? BoundaryKind::kNestedVmEnterBoundary
+                                      : BoundaryKind::kVmEnterBoundary;
+  if (auto vip_pc = boundaryContinuationVipPc(item.boundary))
+    fact.continuation_vip_pc = vip_pc;
+  writeBoundaryFact(function, fact);
 }
 
 FrontierWorkKind classifyFrontierWorkItem(const FrontierWorkItem &item,
@@ -1110,16 +1928,21 @@ FrontierWorkKind classifyFrontierWorkItem(const FrontierWorkItem &item,
   if (!item.target_pc)
     return FrontierWorkKind::kUnknownExecutableTarget;
   const uint64_t target_pc = *item.target_pc;
-  if (item.exit_disposition == VirtualExitDisposition::kVmEnter ||
-      item.exit_disposition == VirtualExitDisposition::kNestedVmEnter) {
+  const auto *fact = item.executable_target ? &*item.executable_target : nullptr;
+  const VirtualExitDisposition exit_disposition =
+      boundaryDisposition(item.boundary);
+  const uint64_t effective_target_pc =
+      fact && fact->effective_target_pc ? *fact->effective_target_pc : target_pc;
+  if (exit_disposition == VirtualExitDisposition::kVmEnter ||
+      exit_disposition == VirtualExitDisposition::kNestedVmEnter) {
     return FrontierWorkKind::kVmEnterBoundary;
   }
-  if (item.exit_disposition == VirtualExitDisposition::kVmExitTerminal) {
+  if (exit_disposition == VirtualExitDisposition::kVmExitTerminal &&
+      !(fact && fact->invalidated_executable_entry)) {
     return FrontierWorkKind::kTerminalBoundary;
   }
-  if (item.exit_disposition ==
-          VirtualExitDisposition::kVmExitNativeCallReenter ||
-      item.exit_disposition ==
+  if (exit_disposition == VirtualExitDisposition::kVmExitNativeCallReenter ||
+      exit_disposition ==
           VirtualExitDisposition::kVmExitNativeExecUnknownReturn) {
     return FrontierWorkKind::kNativeCallBoundary;
   }
@@ -1129,13 +1952,28 @@ FrontierWorkKind classifyFrontierWorkItem(const FrontierWorkItem &item,
   }
   if (callbacks.has_defined_target && callbacks.has_defined_target(target_pc))
     return FrontierWorkKind::kLiftableBlock;
+  if (effective_target_pc != target_pc && callbacks.has_defined_target &&
+      callbacks.has_defined_target(effective_target_pc)) {
+    return FrontierWorkKind::kLiftableBlock;
+  }
   if (looksLikeVmEnterBoundary(target_pc, callbacks))
     return FrontierWorkKind::kVmEnterBoundary;
   if (!callbacks.is_executable_target ||
       !callbacks.is_executable_target(target_pc)) {
     return FrontierWorkKind::kTerminalBoundary;
   }
+  if (((fact && fact->exact_fallthrough_target) ||
+       (!(fact && fact->invalidated_executable_entry) &&
+        callbacks.can_decode_target &&
+        callbacks.can_decode_target(target_pc) &&
+        isExactX86DirectCallFallthrough(target_pc, callbacks))) &&
+      callbacks.can_decode_target &&
+      callbacks.can_decode_target(effective_target_pc)) {
+    return FrontierWorkKind::kLiftableBlock;
+  }
   if (looksLikeTerminalBoundarySnippet(target_pc, callbacks))
+    return FrontierWorkKind::kTerminalBoundary;
+  if (looksLikeJunkExecutableSnippet(target_pc, callbacks))
     return FrontierWorkKind::kTerminalBoundary;
   if (looksLikeNativeCallBoundary(target_pc, callbacks))
     return FrontierWorkKind::kNativeCallBoundary;
@@ -1143,7 +1981,10 @@ FrontierWorkKind classifyFrontierWorkItem(const FrontierWorkItem &item,
     return FrontierWorkKind::kNativeCallBoundary;
   if (looksLikeNonEntryExecutableSnippet(target_pc, callbacks))
     return FrontierWorkKind::kUnknownExecutableTarget;
-  if (callbacks.can_decode_target && callbacks.can_decode_target(target_pc))
+  if (fact && fact->invalidated_executable_entry)
+    return FrontierWorkKind::kUnknownExecutableTarget;
+  if (callbacks.can_decode_target &&
+      callbacks.can_decode_target(effective_target_pc))
     return FrontierWorkKind::kLiftableBlock;
   return FrontierWorkKind::kUnknownExecutableTarget;
 }
@@ -1169,16 +2010,26 @@ void mergeFrontierItems(
     }
     auto &edge = existing->second;
     const bool changed = edge.target_pc != item.target_pc ||
-                         edge.exit_disposition != item.exit_disposition ||
-                         edge.continuation_vip_pc != item.continuation_vip_pc ||
+                         edge.executable_target != item.executable_target ||
+                         edge.boundary != item.boundary ||
                          edge.vip_pc != item.vip_pc ||
                          edge.vip_symbolic != item.vip_symbolic;
+    const auto preserved_kind = edge.kind;
+    const auto preserved_status = edge.status;
+    const auto preserved_retry_count = edge.retry_count;
+    const auto preserved_failure_reason = edge.failure_reason;
     if (edge.status == FrontierWorkStatus::kInvalidated || changed) {
       edge.status = FrontierWorkStatus::kPending;
       edge.failure_reason.clear();
       edge.is_dirty = true;
     }
     syncEdgeFactFromFrontierWorkItem(edge, item);
+    if (edge.status != FrontierWorkStatus::kInvalidated && !changed) {
+      edge.kind = preserved_kind;
+      edge.status = preserved_status;
+      edge.retry_count = preserved_retry_count;
+      edge.failure_reason = preserved_failure_reason;
+    }
     edge.from_output_root_closure =
         edge.from_output_root_closure || item.identity.find("closure:") == 0;
     edge.from_vm_continuation =
@@ -1189,6 +2040,8 @@ void mergeFrontierItems(
 }
 
 void refreshFrontierCompatibilityViews(DevirtualizationSession &session) {
+  const bool debug_frontier =
+      (std::getenv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS") != nullptr);
   session.discovered_frontier_work_items.clear();
   session.late_frontier_work_items.clear();
   session.discovered_frontier_identities.clear();
@@ -1211,6 +2064,50 @@ void refreshFrontierCompatibilityViews(DevirtualizationSession &session) {
       session.late_frontier_identities.push_back(item.identity);
       if (item.target_pc)
         session.late_frontier.push_back(*item.target_pc);
+    }
+  }
+
+  auto scheduling_rank = [](FrontierSchedulingClass scheduling_class) {
+    switch (scheduling_class) {
+      case FrontierSchedulingClass::kTrustedLive:
+        return 0;
+      case FrontierSchedulingClass::kWeakExecutable:
+        return 1;
+      case FrontierSchedulingClass::kNativeOrVmEnterBoundary:
+        return 2;
+      case FrontierSchedulingClass::kTerminalModeled:
+        return 3;
+      case FrontierSchedulingClass::kQuarantinedSelectorArm:
+        return 4;
+    }
+    return 99;
+  };
+  std::stable_sort(
+      session.late_frontier_work_items.begin(),
+      session.late_frontier_work_items.end(),
+      [&](const FrontierWorkItem &lhs, const FrontierWorkItem &rhs) {
+        return scheduling_rank(lhs.scheduling_class) <
+               scheduling_rank(rhs.scheduling_class);
+      });
+  session.late_frontier_identities.clear();
+  session.late_frontier.clear();
+  for (const auto &item : session.late_frontier_work_items) {
+    session.late_frontier_identities.push_back(item.identity);
+    if (item.target_pc)
+      session.late_frontier.push_back(*item.target_pc);
+  }
+
+  if (debug_frontier) {
+    for (const auto &[identity, item] : session.frontier_work_by_identity) {
+      llvm::errs() << "[frontier-refresh] id=" << identity;
+      if (item.target_pc)
+        llvm::errs() << " target=0x" << llvm::utohexstr(*item.target_pc);
+      llvm::errs() << " kind=" << toString(item.kind)
+                   << " status=" << toString(item.status)
+                   << " sched=" << static_cast<int>(item.scheduling_class);
+      if (!item.failure_reason.empty())
+        llvm::errs() << " reason=" << item.failure_reason;
+      llvm::errs() << "\n";
     }
   }
 }
@@ -1266,6 +2163,13 @@ std::vector<UnresolvedExitSite> collectUnresolvedExitSites(
     } else if (prior.continuation_vip_pc != site.continuation_vip_pc) {
       site.completeness = ExitCompleteness::kInvalidated;
       site.evidence.invalidation_reason = "continuation_vip_changed";
+    } else if (prior.continuation_slot_id != site.continuation_slot_id) {
+      site.completeness = ExitCompleteness::kInvalidated;
+      site.evidence.invalidation_reason = "continuation_slot_changed";
+    } else if (prior.continuation_stack_cell_id !=
+               site.continuation_stack_cell_id) {
+      site.completeness = ExitCompleteness::kInvalidated;
+      site.evidence.invalidation_reason = "continuation_stack_cell_changed";
     } else if (prior.vip_symbolic != site.vip_symbolic) {
       site.completeness = ExitCompleteness::kInvalidated;
       site.evidence.invalidation_reason = "vip_symbolic_changed";
@@ -1277,6 +2181,30 @@ std::vector<UnresolvedExitSite> collectUnresolvedExitSites(
       site.completeness = ExitCompleteness::kInvalidated;
       site.evidence.invalidation_reason = "resolved_target_missing";
     }
+  };
+
+  auto carryForwardDerivedBoundaryState = [&](UnresolvedExitSite &site,
+                                              bool has_explicit_boundary_fact) {
+    if (has_explicit_boundary_fact)
+      return;
+    const auto key = unresolvedExitStableSiteKey(site);
+    auto it = previous_index.find(key);
+    if (it == previous_index.end())
+      return;
+    const auto &prior = it->second;
+    if (prior.target_pc != site.target_pc)
+      return;
+    if ((site.exit_disposition == VirtualExitDisposition::kUnknown ||
+         site.exit_disposition == VirtualExitDisposition::kStayInVm) &&
+        prior.exit_disposition != VirtualExitDisposition::kUnknown) {
+      site.exit_disposition = prior.exit_disposition;
+    }
+    if (!site.continuation_vip_pc)
+      site.continuation_vip_pc = prior.continuation_vip_pc;
+    if (!site.continuation_slot_id)
+      site.continuation_slot_id = prior.continuation_slot_id;
+    if (!site.continuation_stack_cell_id)
+      site.continuation_stack_cell_id = prior.continuation_stack_cell_id;
   };
 
   for (const auto &F : M) {
@@ -1310,20 +2238,22 @@ std::vector<UnresolvedExitSite> collectUnresolvedExitSites(
             site.vip_symbolic = true;
           }
         }
-        if (auto attr_disposition = parseVirtualExitDisposition(*CB)) {
-          site.exit_disposition = *attr_disposition;
+        const auto boundary_fact = readBoundaryFact(*CB);
+        if (boundary_fact) {
+          site.exit_disposition =
+              virtualExitDispositionFromBoundaryDisposition(
+                  boundary_fact->exit_disposition);
+          site.continuation_vip_pc = boundary_fact->continuation_vip_pc;
+          site.continuation_slot_id = boundary_fact->continuation_slot_id;
+          site.continuation_stack_cell_id =
+              boundary_fact->continuation_stack_cell_id;
         } else {
           site.exit_disposition =
               site.kind == UnresolvedExitKind::kDispatchCall
                   ? VirtualExitDisposition::kVmExitNativeCallReenter
                   : VirtualExitDisposition::kStayInVm;
         }
-        site.continuation_vip_pc = parseOptionalHexAttr(
-            CB->getFnAttr("omill.virtual_exit_continuation_vip"));
-        if (!site.continuation_vip_pc) {
-          site.continuation_vip_pc = parseOptionalHexAttr(
-              CB->getFnAttr("omill.virtual_exit_continuation_pc"));
-        }
+        carryForwardDerivedBoundaryState(site, boundary_fact.has_value());
         site.completeness =
             site.target_pc && hasKnownMaterializedTarget(M, *site.target_pc)
                 ? ExitCompleteness::kComplete
@@ -1552,8 +2482,11 @@ void linkFrontierItemToUnresolvedExit(DevirtualizationSession &session,
   for (auto &site : session.unresolved_exits) {
     if (!matches(site))
       continue;
-    site.exit_disposition = item.exit_disposition;
-    site.continuation_vip_pc = item.continuation_vip_pc;
+    site.exit_disposition = boundaryDisposition(item.boundary);
+    site.continuation_vip_pc = boundaryContinuationVipPc(item.boundary);
+    site.continuation_slot_id = boundaryContinuationSlotId(item.boundary);
+    site.continuation_stack_cell_id =
+        boundaryContinuationStackCellId(item.boundary);
     site.vip_pc = item.vip_pc;
     site.vip_symbolic = item.vip_symbolic;
     site.completeness = item.status == FrontierWorkStatus::kLifted ||
@@ -1573,9 +2506,12 @@ void linkFrontierItemToUnresolvedExit(DevirtualizationSession &session,
   site.site_pc = item.site_pc;
   site.target_pc = item.target_pc;
   site.vip_pc = item.vip_pc;
-  site.continuation_vip_pc = item.continuation_vip_pc;
+  site.continuation_vip_pc = boundaryContinuationVipPc(item.boundary);
+  site.continuation_slot_id = boundaryContinuationSlotId(item.boundary);
+  site.continuation_stack_cell_id =
+      boundaryContinuationStackCellId(item.boundary);
   site.vip_symbolic = item.vip_symbolic;
-  site.exit_disposition = item.exit_disposition;
+  site.exit_disposition = boundaryDisposition(item.boundary);
   site.completeness = item.status == FrontierWorkStatus::kLifted ||
                               item.status == FrontierWorkStatus::kSkippedMaterialized
                           ? ExitCompleteness::kComplete
@@ -1656,6 +2592,10 @@ const SessionGraphState *findSessionGraphProjection(const llvm::Module &M) {
   return findSessionGraphProjectionImpl(M);
 }
 
+SessionGraphState *findMutableSessionGraphProjection(llvm::Module &M) {
+  return findMutableSessionGraphProjectionImpl(M);
+}
+
 DevirtualizationOrchestrator::DevirtualizationOrchestrator(
     DevirtualizationPolicy policy,
     std::shared_ptr<IterativeLiftingSession> session)
@@ -1733,7 +2673,7 @@ DevirtualizationExecutionPlan DevirtualizationOrchestrator::buildExecutionPlan(
   session_.discovered_root_pcs = plan.detection.seed_roots;
   refreshSessionCoreState(session_, M);
   mergeFrontierItems(session_, collectFrontierWorkItems(session_.unresolved_exits));
-  refreshDerivedViewsAndLoweringInputs(session_, M);
+  refreshSessionGraphState(session_, M);
   refreshFrontierCompatibilityViews(session_);
 
   if (!plan.enable_devirtualization)
@@ -1748,7 +2688,7 @@ DevirtualizationExecutionPlan DevirtualizationOrchestrator::buildExecutionPlan(
 void DevirtualizationOrchestrator::refreshSessionState(const llvm::Module &M) {
   refreshSessionCoreState(session_, M);
   mergeFrontierItems(session_, collectFrontierWorkItems(session_.unresolved_exits));
-  refreshDerivedViewsAndLoweringInputs(session_, M);
+  refreshSessionGraphState(session_, M);
   refreshFrontierCompatibilityViews(session_);
 }
 
@@ -1810,6 +2750,8 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::discoverFrontierWork(
   }
 
   refreshDerivedViewsAndLoweringInputs(session_, M);
+  session_.protector_model = buildProtectorModelFromSession(session_);
+  applyProtectorModelToSession(session_, session_.protector_model);
   refreshFrontierCompatibilityViews(session_);
   summary.pending =
       static_cast<unsigned>(session_.late_frontier_work_items.size());
@@ -1824,18 +2766,65 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
   const bool debug_frontier =
       (std::getenv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS") != nullptr);
   const bool recovery_mode = isTerminalBoundaryRecoveryModeEnabled();
+  const bool enable_quarantined_frontier_exploration =
+      envFlagEnabled("OMILL_ENABLE_QUARANTINED_FRONTIER_EXPLORATION");
+  session_.protector_model = buildProtectorModelFromSession(session_);
+  applyProtectorModelToSession(session_, session_.protector_model);
   std::vector<std::string> identities;
   identities.reserve(session_.late_frontier_work_items.size());
   for (const auto &item : session_.late_frontier_work_items)
     identities.push_back(item.identity);
+  auto scheduling_rank = [&](const std::string &identity) {
+    auto it = session_.graph.edge_facts_by_identity.find(identity);
+    if (it == session_.graph.edge_facts_by_identity.end())
+      return 99;
+    switch (it->second.scheduling_class) {
+      case FrontierSchedulingClass::kTrustedLive:
+        return 0;
+      case FrontierSchedulingClass::kWeakExecutable:
+        return 1;
+      case FrontierSchedulingClass::kNativeOrVmEnterBoundary:
+        return 2;
+      case FrontierSchedulingClass::kTerminalModeled:
+        return 3;
+      case FrontierSchedulingClass::kQuarantinedSelectorArm:
+        return 4;
+    }
+    return 99;
+  };
+  std::stable_sort(identities.begin(), identities.end(),
+                   [&](const std::string &lhs, const std::string &rhs) {
+                     return scheduling_rank(lhs) < scheduling_rank(rhs);
+                   });
+  const bool has_non_quarantined_pending =
+      llvm::any_of(identities, [&](const std::string &identity) {
+        auto it = session_.graph.edge_facts_by_identity.find(identity);
+        if (it == session_.graph.edge_facts_by_identity.end())
+          return false;
+        return it->second.scheduling_class !=
+                   FrontierSchedulingClass::kQuarantinedSelectorArm &&
+               (it->second.status == FrontierWorkStatus::kPending ||
+                it->second.status == FrontierWorkStatus::kInvalidated);
+      });
 
   for (const auto &identity : identities) {
     auto edge_it = session_.graph.edge_facts_by_identity.find(identity);
     if (edge_it == session_.graph.edge_facts_by_identity.end())
       continue;
     auto item = frontierWorkItemFromEdgeFact(edge_it->second);
+    classifyContinuationCandidate(item);
     if (!item.target_pc)
       continue;
+    if (!enable_quarantined_frontier_exploration &&
+        has_non_quarantined_pending &&
+        item.scheduling_class ==
+            FrontierSchedulingClass::kQuarantinedSelectorArm) {
+      item.failure_reason = "quarantined_selector_arm_deferred";
+      item.continuation_rationale = "deferred_until_trusted_progress_stalls";
+      syncEdgeFactFromFrontierWorkItem(edge_it->second, item);
+      summary.notes.push_back("deferred_quarantined:" + item.identity);
+      continue;
+    }
     const uint64_t target_pc = *item.target_pc;
     if (debug_frontier) {
       llvm::errs() << "[frontier-advance] begin id=" << item.identity
@@ -1866,7 +2855,10 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
         switch (item.kind) {
           case FrontierWorkKind::kTerminalBoundary:
             item.status = FrontierWorkStatus::kClassifiedTerminal;
-            item.exit_disposition = VirtualExitDisposition::kVmExitTerminal;
+            if (!item.boundary)
+              item.boundary = BoundaryFact{};
+            item.boundary->exit_disposition = BoundaryDisposition::kVmExitTerminal;
+            item.boundary->kind = BoundaryKind::kTerminalBoundary;
             item.failure_reason = "non_liftable_terminal_boundary";
             ++summary.classified_terminal;
             summary.changed = true;
@@ -1874,8 +2866,12 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
             return true;
           case FrontierWorkKind::kVmEnterBoundary:
             item.status = FrontierWorkStatus::kClassifiedVmEnter;
-            if (item.exit_disposition == VirtualExitDisposition::kUnknown)
-              item.exit_disposition = VirtualExitDisposition::kVmEnter;
+            if (!item.boundary)
+              item.boundary = BoundaryFact{};
+            if (boundaryDisposition(item.boundary) == VirtualExitDisposition::kUnknown)
+              item.boundary->exit_disposition = BoundaryDisposition::kVmEnter;
+            item.boundary->is_vm_enter = true;
+            item.boundary->kind = BoundaryKind::kVmEnterBoundary;
             if (auto *function = getOrInsertVmEnterBoundaryFunction(M, item))
               annotateVmEnterBoundaryFunction(*function, item);
             item.failure_reason = "vm_entry_boundary";
@@ -1884,13 +2880,16 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
             linkFrontierItemToUnresolvedExit(session_, item);
             return true;
           case FrontierWorkKind::kNativeCallBoundary:
-            if (item.exit_disposition == VirtualExitDisposition::kUnknown ||
-                item.exit_disposition == VirtualExitDisposition::kStayInVm) {
-              item.exit_disposition =
-                  item.continuation_vip_pc
-                      ? VirtualExitDisposition::kVmExitNativeCallReenter
-                      : VirtualExitDisposition::kVmExitNativeExecUnknownReturn;
+            if (!item.boundary)
+              item.boundary = BoundaryFact{};
+            if (boundaryDisposition(item.boundary) == VirtualExitDisposition::kUnknown ||
+                boundaryDisposition(item.boundary) == VirtualExitDisposition::kStayInVm) {
+              item.boundary->exit_disposition =
+                  boundaryContinuationVipPc(item.boundary)
+                      ? BoundaryDisposition::kVmExitNativeCallReenter
+                      : BoundaryDisposition::kVmExitNativeExecUnknownReturn;
             }
+            item.boundary->kind = BoundaryKind::kNativeBoundary;
             if (debug_frontier) {
               llvm::errs() << "[frontier-advance] native-boundary-decl id="
                            << item.identity << " target=0x"
@@ -1919,7 +2918,7 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
             linkFrontierItemToUnresolvedExit(session_, item);
             return true;
           case FrontierWorkKind::kUnknownExecutableTarget:
-            if (auto *function = getOrInsertExecutableTargetFunction(M, item)) {
+            if (getOrInsertExecutableTargetFunction(M, item)) {
               item.status = FrontierWorkStatus::kSkippedMaterialized;
               item.failure_reason = "executable_target_declared";
               ++summary.skipped_materialized;
@@ -2125,7 +3124,8 @@ VmEnterChildImportSummary DevirtualizationOrchestrator::importNestedVmEnterChild
 
     auto *placeholder = findStructuralCodeTargetFunctionByPC(M, target_pc);
     if (!placeholder || !placeholder->isDeclaration() ||
-        !placeholder->hasFnAttribute("omill.vm_enter_target_pc")) {
+        !readBoundaryFact(*placeholder).has_value() ||
+        !readBoundaryFact(*placeholder)->is_vm_enter) {
       continue;
     }
 
@@ -2250,6 +3250,67 @@ std::string DevirtualizationOrchestrator::summarizeFrontierAdvance(
           ",failed_lift=" + llvm::Twine(summary.failed_lift) +
           ",skipped=" + llvm::Twine(summary.skipped_materialized))
       .str();
+}
+
+ProtectorModel DevirtualizationOrchestrator::buildProtectorModel() const {
+  return buildProtectorModelFromSession(session_);
+}
+
+ProtectorValidationReport DevirtualizationOrchestrator::buildProtectorValidationReport(
+    const llvm::Module &M) const {
+  ProtectorValidationReport report;
+  report.model = buildProtectorModel();
+  auto bump = [&](ProtectorValidationIssueClass klass) {
+    ++report.counts_by_class[toString(klass)];
+  };
+
+  for (const auto &candidate : report.model.continuation_candidates) {
+    if (candidate.liveness == ContinuationLiveness::kQuarantined) {
+      ProtectorValidationIssue issue;
+      issue.issue_class =
+          ProtectorValidationIssueClass::kQuarantinedSelectorArm;
+      issue.edge_identity = candidate.edge_identity;
+      issue.caller_name = candidate.source_handler_name;
+      issue.message = candidate.rationale;
+      report.issues.push_back(std::move(issue));
+      bump(ProtectorValidationIssueClass::kQuarantinedSelectorArm);
+      continue;
+    }
+    if (candidate.provenance == ContinuationProvenance::kTerminalBoundary) {
+      ProtectorValidationIssue issue;
+      issue.issue_class = ProtectorValidationIssueClass::kTerminalEdge;
+      issue.edge_identity = candidate.edge_identity;
+      issue.caller_name = candidate.source_handler_name;
+      issue.message = candidate.rationale;
+      report.issues.push_back(std::move(issue));
+      bump(ProtectorValidationIssueClass::kTerminalEdge);
+      continue;
+    }
+    if (candidate.provenance == ContinuationProvenance::kNativeBoundary ||
+        candidate.provenance == ContinuationProvenance::kVmEnterBoundary) {
+      ProtectorValidationIssue issue;
+      issue.issue_class =
+          ProtectorValidationIssueClass::kNativeOrVmEnterBoundary;
+      issue.edge_identity = candidate.edge_identity;
+      issue.caller_name = candidate.source_handler_name;
+      issue.message = candidate.rationale;
+      report.issues.push_back(std::move(issue));
+      bump(ProtectorValidationIssueClass::kNativeOrVmEnterBoundary);
+    }
+  }
+
+  for (const auto &F : M) {
+    if (F.isDeclaration() && F.getName().starts_with("__remill_")) {
+      ProtectorValidationIssue issue;
+      issue.issue_class = ProtectorValidationIssueClass::kRemillRuntimeLeak;
+      issue.callee_name = F.getName().str();
+      issue.message = "reachable runtime decl requires caller-path validation";
+      report.issues.push_back(std::move(issue));
+      bump(ProtectorValidationIssueClass::kRemillRuntimeLeak);
+    }
+  }
+
+  return report;
 }
 
 std::vector<std::string> DevirtualizationOrchestrator::collectInvariantViolations(

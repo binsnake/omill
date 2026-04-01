@@ -252,6 +252,34 @@ static bool isDispatchIntrinsic(const llvm::Function &F) {
   return isDispatchIntrinsicName(F.getName());
 }
 
+bool isVirtualModelAnalysisHelperFunction(const llvm::Function &F) {
+  if (F.isDeclaration() || F.hasFnAttribute("omill.localized_continuation_shim"))
+    return false;
+  if (F.hasFnAttribute("omill.vm_handler") || isCallSiteHelper(F))
+    return true;
+  if (F.getName().starts_with("helper_"))
+    return true;
+
+  for (const auto &BB : F) {
+    for (const auto &I : BB) {
+      const auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+      if (!call)
+        continue;
+      const auto *callee = call->getCalledFunction();
+      if (!callee)
+        continue;
+      if (isDispatchIntrinsic(*callee) || isBoundaryFunction(*callee) ||
+          isRemillReadMemoryIntrinsic(*callee) ||
+          isRemillWriteMemoryIntrinsic(*callee) ||
+          isRemillTerminalControlIntrinsic(*callee)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 static void collectExprReferencedStackCells(
     const VirtualValueExpr &expr,
     std::vector<VirtualStackCellSummary> &cells) {

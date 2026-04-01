@@ -1,4 +1,7 @@
-add_executable(omill-lift main.cpp)
+add_executable(omill-lift
+  main.cpp
+  RuntimeAdapters.cpp
+)
 
 target_link_libraries(omill-lift
   PRIVATE

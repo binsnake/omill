@@ -160,4 +160,47 @@ std::string renderVirtualValueExpr(const VirtualValueExpr &expr) {
   return "unknown";
 }
 
+std::string renderVirtualIncomingContextSourceKind(
+    VirtualIncomingContextSourceKind kind) {
+  switch (kind) {
+    case VirtualIncomingContextSourceKind::kDirectCallsite:
+      return "direct_callsite";
+    case VirtualIncomingContextSourceKind::kEntryPrelude:
+      return "entry_prelude";
+    case VirtualIncomingContextSourceKind::kLocalizedCallee:
+      return "localized_callee";
+  }
+  return "direct_callsite";
+}
+
+static std::string renderVirtualIncomingContextArm(
+    const VirtualIncomingContextArm &arm, const char *label, unsigned id) {
+  std::ostringstream os;
+  os << label << "[" << id << "] from " << arm.edge_identity << " ("
+     << renderVirtualIncomingContextSourceKind(arm.source_kind);
+  if (!arm.source_handler_name.empty())
+    os << ", handler=" << arm.source_handler_name;
+  os << ", site=" << arm.source_site_index << ") = "
+     << renderVirtualValueExpr(arm.value);
+  return os.str();
+}
+
+std::string renderVirtualIncomingSlotPhi(const VirtualIncomingSlotPhi &phi) {
+  std::ostringstream os;
+  os << "slot[" << phi.slot_id << "] merged="
+     << renderVirtualValueExpr(phi.merged_value);
+  for (const auto &arm : phi.arms)
+    os << " ; " << renderVirtualIncomingContextArm(arm, "slot", phi.slot_id);
+  return os.str();
+}
+
+std::string renderVirtualIncomingStackPhi(const VirtualIncomingStackPhi &phi) {
+  std::ostringstream os;
+  os << "cell[" << phi.cell_id << "] merged="
+     << renderVirtualValueExpr(phi.merged_value);
+  for (const auto &arm : phi.arms)
+    os << " ; " << renderVirtualIncomingContextArm(arm, "cell", phi.cell_id);
+  return os.str();
+}
+
 }  // namespace omill

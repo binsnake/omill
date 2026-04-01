@@ -24,6 +24,7 @@ namespace omill::virtual_model::detail {
 void summarizeDispatchSuccessors(llvm::Module &M,
                                  ::omill::VirtualMachineModel &model,
                                  const ::omill::BinaryMemoryMap &binary_memory);
+llvm::stable_hash summaryRelevantFunctionFingerprint(const llvm::Function &F);
 VirtualValueExpr constantExpr(uint64_t value, unsigned bits);
 bool collectEvaluatedValueChoices(
     const VirtualValueExpr &expr, const std::vector<VirtualSlotFact> &facts,
@@ -578,8 +579,311 @@ TEST_F(VirtualMachineModelTest,
   auto model = runAnalysis(*M);
   EXPECT_TRUE(model.telemetry().dirty_scope_requested);
   EXPECT_TRUE(model.telemetry().session_graph_handler_scope_used);
+  EXPECT_TRUE(model.telemetry().selected_handler_iteration_used);
   EXPECT_NE(model.lookupHandler("sub_401000"), nullptr);
   EXPECT_EQ(model.lookupHandler("sub_401100"), nullptr);
+}
+
+TEST_F(VirtualMachineModelTest,
+       ExplicitDirtySeedScopeUsesSessionGraphDirectCalleeClosure) {
+  auto M = createModule();
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *handler_ty = llvm::FunctionType::get(void_ty, {ptr_ty, i64_ty, ptr_ty},
+                                             false);
+
+  auto *dirty_root = llvm::Function::Create(handler_ty,
+                                            llvm::Function::ExternalLinkage,
+                                            "sub_401000", *M);
+  dirty_root->addFnAttr("omill.output_root");
+  dirty_root->addFnAttr("omill.vm_newly_lifted");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", dirty_root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+
+  auto *helper = llvm::Function::Create(handler_ty,
+                                        llvm::Function::ExternalLinkage,
+                                        "blk_401120", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", helper);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+
+  omill::SessionGraphState graph;
+  {
+    omill::SessionHandlerNode dirty_node;
+    dirty_node.function_name = "sub_401000";
+    dirty_node.entry_va = 0x401000ULL;
+    dirty_node.fingerprint =
+        omill::virtual_model::detail::summaryRelevantFunctionFingerprint(
+            *dirty_root);
+    dirty_node.is_defined = true;
+    dirty_node.is_output_root = true;
+    dirty_node.is_dirty = true;
+    omill::VirtualHandlerSummary summary;
+    summary.function_name = "sub_401000";
+    summary.entry_va = 0x401000ULL;
+    summary.is_output_root = true;
+    summary.direct_callees.push_back("blk_401120");
+    dirty_node.local_summary = std::move(summary);
+    graph.handler_nodes.emplace(dirty_node.function_name, std::move(dirty_node));
+  }
+  {
+    omill::SessionHandlerNode helper_node;
+    helper_node.function_name = "blk_401120";
+    helper_node.entry_va = 0x401120ULL;
+    helper_node.fingerprint =
+        omill::virtual_model::detail::summaryRelevantFunctionFingerprint(*helper);
+    helper_node.is_defined = true;
+    omill::VirtualHandlerSummary summary;
+    summary.function_name = "blk_401120";
+    summary.entry_va = 0x401120ULL;
+    helper_node.local_summary = std::move(summary);
+    graph.handler_nodes.emplace(helper_node.function_name, std::move(helper_node));
+  }
+  graph.dirty_function_names.insert("sub_401000");
+  publishSessionGraphProjection(*M, graph);
+
+  auto model = runAnalysis(*M);
+  EXPECT_TRUE(model.telemetry().dirty_scope_requested);
+  EXPECT_TRUE(model.telemetry().session_graph_handler_scope_used);
+  EXPECT_TRUE(model.telemetry().session_graph_direct_callee_projection_used);
+  EXPECT_NE(model.lookupHandler("sub_401000"), nullptr);
+  EXPECT_NE(model.lookupHandler("blk_401120"), nullptr);
+}
+
+TEST_F(VirtualMachineModelTest,
+       PreferredSeedFallbackUsesSessionGraphHandlerMetadata) {
+  auto M = createModule();
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *handler_ty = llvm::FunctionType::get(void_ty, {ptr_ty, i64_ty, ptr_ty},
+                                             false);
+
+  auto *custom = llvm::Function::Create(handler_ty, llvm::Function::ExternalLinkage,
+                                        "custom_handler", *M);
+  custom->addFnAttr("omill.vm_newly_lifted");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", custom);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+
+  omill::SessionGraphState graph;
+  omill::SessionHandlerNode node;
+  node.function_name = "custom_handler";
+  node.fingerprint =
+      omill::virtual_model::detail::summaryRelevantFunctionFingerprint(*custom);
+  node.is_defined = true;
+  node.is_preferred_seed = true;
+  node.is_code_bearing = true;
+  {
+    omill::VirtualHandlerSummary summary;
+    summary.function_name = "custom_handler";
+    node.local_summary = std::move(summary);
+  }
+  graph.handler_nodes.emplace(node.function_name, std::move(node));
+  graph.dirty_function_names.insert("custom_handler");
+  publishSessionGraphProjection(*M, graph);
+
+  auto model = runAnalysis(*M);
+  EXPECT_TRUE(model.telemetry().dirty_scope_requested);
+  EXPECT_TRUE(model.telemetry().session_graph_seed_projection_used);
+  EXPECT_NE(model.lookupHandler("custom_handler"), nullptr);
+  EXPECT_EQ(model.telemetry().seed_handler_count, 1u);
+}
+
+TEST_F(VirtualMachineModelTest,
+       ProjectsHandlerLocalFactsFromSessionGraphWhenAvailable) {
+  auto M = createModule();
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *handler_ty = llvm::FunctionType::get(void_ty, {ptr_ty, i64_ty, ptr_ty},
+                                             false);
+
+  auto *root = llvm::Function::Create(handler_ty, llvm::Function::ExternalLinkage,
+                                      "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+
+  omill::SessionGraphState graph;
+  omill::SessionHandlerNode root_node;
+  root_node.function_name = "sub_401000";
+  root_node.entry_va = 0x401000ULL;
+  root_node.fingerprint =
+      omill::virtual_model::detail::summaryRelevantFunctionFingerprint(*root);
+  root_node.is_defined = true;
+  root_node.is_output_root = true;
+  {
+    omill::VirtualHandlerSummary summary;
+    summary.function_name = "sub_401000";
+    summary.entry_va = 0x401000ULL;
+    summary.is_output_root = true;
+    summary.is_candidate = true;
+    summary.direct_callees.push_back("blk_401120");
+    summary.state_slots.push_back(omill::VirtualStateSlotSummary{
+        "state", 8, 64, 1, 1, false, false, std::nullopt});
+    root_node.local_summary = std::move(summary);
+  }
+  graph.handler_nodes.emplace(root_node.function_name, std::move(root_node));
+  graph.dirty_function_names.insert("sub_401000");
+  publishSessionGraphProjection(*M, graph);
+
+  auto model = runAnalysis(*M);
+  EXPECT_TRUE(model.telemetry().session_graph_handler_projection_used);
+  auto *handler = model.lookupHandler("sub_401000");
+  ASSERT_NE(handler, nullptr);
+  EXPECT_TRUE(handler->is_candidate);
+  ASSERT_EQ(handler->direct_callees.size(), 1u);
+  EXPECT_EQ(handler->direct_callees[0], "blk_401120");
+  ASSERT_EQ(handler->state_slots.size(), 1u);
+  EXPECT_EQ(handler->state_slots[0].base_name, "state");
+  EXPECT_EQ(handler->state_slots[0].offset, 8);
+}
+
+TEST_F(VirtualMachineModelTest,
+       ProjectsPropagationFactsFromSessionGraphWhenAvailable) {
+  auto M = createModule();
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *handler_ty = llvm::FunctionType::get(void_ty, {ptr_ty, i64_ty, ptr_ty},
+                                             false);
+
+  auto *root = llvm::Function::Create(handler_ty, llvm::Function::ExternalLinkage,
+                                      "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+
+  omill::SessionGraphState graph;
+  omill::SessionHandlerNode root_node;
+  root_node.function_name = "sub_401000";
+  root_node.entry_va = 0x401000ULL;
+  root_node.fingerprint =
+      omill::virtual_model::detail::summaryRelevantFunctionFingerprint(*root);
+  root_node.is_defined = true;
+  root_node.is_output_root = true;
+  {
+    omill::VirtualHandlerSummary summary;
+    summary.function_name = "sub_401000";
+    summary.entry_va = 0x401000ULL;
+    summary.is_output_root = true;
+    summary.state_slots.push_back(omill::VirtualStateSlotSummary{
+        "state", 8, 64, 1, 1, false, false, std::nullopt});
+    root_node.local_summary = std::move(summary);
+  }
+  root_node.incoming_facts.push_back(
+      omill::VirtualSlotFact{0, omill::virtual_model::detail::constantExpr(0x10, 64)});
+  omill::VirtualIncomingSlotPhi incoming_phi;
+  incoming_phi.slot_id = 0;
+  incoming_phi.merged_value =
+      omill::virtual_model::detail::constantExpr(0x10, 64);
+  incoming_phi.arms.push_back(omill::VirtualIncomingContextArm{
+      "sub_401000:callsite:0:sub_401000",
+      omill::VirtualIncomingContextSourceKind::kDirectCallsite,
+      "sub_401000",
+      0,
+      omill::virtual_model::detail::constantExpr(0x10, 64)});
+  root_node.incoming_slot_phis.push_back(std::move(incoming_phi));
+  root_node.outgoing_facts.push_back(
+      omill::VirtualSlotFact{0, omill::virtual_model::detail::constantExpr(0x20, 64)});
+  graph.handler_nodes.emplace(root_node.function_name, std::move(root_node));
+  graph.dirty_function_names.insert("sub_401000");
+  publishSessionGraphProjection(*M, graph);
+
+  auto model = runAnalysis(*M);
+  EXPECT_TRUE(model.telemetry().session_graph_handler_projection_used);
+  EXPECT_TRUE(model.telemetry().session_graph_propagation_projection_used);
+  auto *handler = model.lookupHandler("sub_401000");
+  ASSERT_NE(handler, nullptr);
+  ASSERT_EQ(handler->incoming_facts.size(), 1u);
+  ASSERT_EQ(handler->outgoing_facts.size(), 1u);
+  ASSERT_EQ(handler->incoming_slot_phis.size(), 1u);
+  ASSERT_EQ(handler->incoming_slot_phis.front().arms.size(), 1u);
+  EXPECT_EQ(handler->incoming_slot_phis.front().arms.front().edge_identity,
+            "sub_401000:callsite:0:sub_401000");
+  ASSERT_TRUE(handler->incoming_facts[0].value.constant.has_value());
+  ASSERT_TRUE(handler->outgoing_facts[0].value.constant.has_value());
+  EXPECT_EQ(*handler->incoming_facts[0].value.constant, 0x10ULL);
+  EXPECT_EQ(*handler->outgoing_facts[0].value.constant, 0x20ULL);
+}
+
+TEST_F(VirtualMachineModelTest,
+       ProjectsCanonicalStateFromSessionGraphWhenAvailable) {
+  auto M = createModule();
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *handler_ty = llvm::FunctionType::get(void_ty, {ptr_ty, i64_ty, ptr_ty},
+                                             false);
+
+  auto *root = llvm::Function::Create(handler_ty, llvm::Function::ExternalLinkage,
+                                      "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+
+  omill::SessionGraphState graph;
+  omill::SessionHandlerNode root_node;
+  root_node.function_name = "sub_401000";
+  root_node.entry_va = 0x401000ULL;
+  root_node.fingerprint =
+      omill::virtual_model::detail::summaryRelevantFunctionFingerprint(*root);
+  root_node.is_defined = true;
+  root_node.is_output_root = true;
+  {
+    omill::VirtualHandlerSummary summary;
+    summary.function_name = "sub_401000";
+    summary.entry_va = 0x401000ULL;
+    summary.is_output_root = true;
+    omill::VirtualStateSlotSummary slot;
+    slot.base_name = "state";
+    slot.offset = 8;
+    slot.width = 64;
+    slot.loads = 1;
+    slot.stores = 1;
+    slot.canonical_id = 0;
+    summary.state_slots.push_back(slot);
+    summary.live_in_slot_ids.push_back(0);
+    summary.written_slot_ids.push_back(0);
+    root_node.local_summary = std::move(summary);
+  }
+  graph.canonical_slots.push_back(
+      omill::VirtualStateSlotInfo{0, "state", 8, 64, false, false, {"sub_401000"}});
+  graph.handler_nodes.emplace(root_node.function_name, std::move(root_node));
+  graph.dirty_function_names.insert("sub_401000");
+  publishSessionGraphProjection(*M, graph);
+
+  auto model = runAnalysis(*M);
+  EXPECT_TRUE(model.telemetry().session_graph_canonical_state_projection_used);
+  auto *slot = model.lookupSlot(0);
+  ASSERT_NE(slot, nullptr);
+  EXPECT_EQ(slot->base_name, "state");
+  EXPECT_EQ(slot->offset, 8);
+  auto *handler = model.lookupHandler("sub_401000");
+  ASSERT_NE(handler, nullptr);
+  ASSERT_EQ(handler->state_slots.size(), 1u);
+  ASSERT_TRUE(handler->state_slots[0].canonical_id.has_value());
+  EXPECT_EQ(*handler->state_slots[0].canonical_id, 0u);
+  ASSERT_EQ(handler->live_in_slot_ids.size(), 1u);
+  EXPECT_EQ(handler->live_in_slot_ids[0], 0u);
 }
 
 TEST_F(VirtualMachineModelTest,
@@ -614,25 +918,37 @@ TEST_F(VirtualMachineModelTest,
     edge.identity = "sub_401000:0:call::401220";
     edge.owner_function = "sub_401000";
     edge.site_index = 0;
+    edge.vip_pc = 0x401210ULL;
     edge.target_pc = 0x401220ULL;
     edge.root_frontier_kind = omill::VirtualRootFrontierKind::kCall;
     edge.kind = omill::FrontierWorkKind::kVmEnterBoundary;
     edge.status = omill::FrontierWorkStatus::kClassifiedVmEnter;
-    edge.exit_disposition = omill::VirtualExitDisposition::kNestedVmEnter;
+    edge.boundary = omill::BoundaryFact{};
+    edge.boundary->boundary_pc = 0x401220ULL;
+    edge.boundary->kind = omill::BoundaryKind::kNestedVmEnterBoundary;
+    edge.boundary->exit_disposition = omill::BoundaryDisposition::kNestedVmEnter;
+    edge.boundary->is_nested_vm_enter = true;
     graph.edge_facts_by_identity.emplace(edge.identity, std::move(edge));
   }
   {
     omill::SessionBoundaryFact boundary;
     boundary.target_pc = 0x401220ULL;
     boundary.kind = omill::FrontierWorkKind::kVmEnterBoundary;
-    boundary.exit_disposition = omill::VirtualExitDisposition::kNestedVmEnter;
+    boundary.boundary = omill::BoundaryFact{};
+    boundary.boundary->boundary_pc = 0x401220ULL;
+    boundary.boundary->kind = omill::BoundaryKind::kNestedVmEnterBoundary;
+    boundary.boundary->exit_disposition =
+        omill::BoundaryDisposition::kNestedVmEnter;
+    boundary.boundary->is_nested_vm_enter = true;
     boundary.declaration_name = "omill_vm_enter_target_401220";
     graph.boundary_facts_by_target.emplace(boundary.target_pc, std::move(boundary));
   }
+  graph.dirty_function_names.insert("sub_401000");
   publishSessionGraphProjection(*M, graph);
 
   auto model = runAnalysis(*M);
   EXPECT_TRUE(model.telemetry().session_graph_boundary_projection_used);
+  EXPECT_TRUE(model.telemetry().session_graph_vip_projection_used);
   auto *boundary = model.lookupBoundary("omill_vm_enter_target_401220");
   ASSERT_NE(boundary, nullptr);
   EXPECT_EQ(boundary->kind, omill::VirtualBoundaryKind::kProtectedEntryStub);
@@ -640,6 +956,8 @@ TEST_F(VirtualMachineModelTest,
 
   auto *handler = model.lookupHandler("sub_401000");
   ASSERT_NE(handler, nullptr);
+  ASSERT_TRUE(handler->canonical_vip.resolved_pc.has_value());
+  EXPECT_EQ(*handler->canonical_vip.resolved_pc, 0x401210ULL);
   ASSERT_EQ(handler->callsites.size(), 1u);
   EXPECT_EQ(handler->callsites[0].resolved_target_pc, 0x401220ULL);
   ASSERT_TRUE(handler->callsites[0].target_function_name.has_value());
@@ -685,6 +1003,7 @@ TEST_F(VirtualMachineModelTest,
     region.imported_root_function = "tbrec_sub_401330";
     graph.region_nodes_by_entry_pc.emplace(region.entry_pc, std::move(region));
   }
+  graph.dirty_function_names.insert("sub_401000");
   publishSessionGraphProjection(*M, graph);
 
   auto model = runAnalysis(*M);
@@ -1072,6 +1391,14 @@ TEST_F(VirtualMachineModelTest,
   auto *callee_summary = model.lookupHandler("sub_180004520");
   ASSERT_NE(callee_summary, nullptr);
   ASSERT_EQ(callee_summary->incoming_facts.size(), 1u);
+  ASSERT_EQ(callee_summary->incoming_slot_phis.size(), 1u);
+  ASSERT_EQ(callee_summary->incoming_slot_phis.front().slot_id,
+            callee_summary->incoming_facts.front().slot_id);
+  ASSERT_EQ(callee_summary->incoming_slot_phis.front().arms.size(), 2u);
+  EXPECT_EQ(callee_summary->incoming_slot_phis.front().arms[0].edge_identity,
+            "sub_180004500:callsite:0:sub_180004520");
+  EXPECT_EQ(callee_summary->incoming_slot_phis.front().arms[1].edge_identity,
+            "sub_180004510:callsite:0:sub_180004520");
   EXPECT_EQ(
       omill::renderVirtualValueExpr(callee_summary->incoming_facts.front().value),
       "phi(0x4010, 0x4020)");
@@ -1079,6 +1406,129 @@ TEST_F(VirtualMachineModelTest,
   EXPECT_EQ(
       omill::renderVirtualValueExpr(callee_summary->outgoing_facts.front().value),
       "phi(0x4010, 0x4020)");
+}
+
+TEST_F(VirtualMachineModelTest,
+       PreservesDistinctIncomingPhiArmsEvenWhenMergedValueCollapses) {
+  auto M = createModule();
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+  auto *i8_ty = llvm::Type::getInt8Ty(Ctx);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *handler_ty = llvm::FunctionType::get(void_ty, {ptr_ty, i64_ty, ptr_ty},
+                                             false);
+  auto *callee = llvm::Function::Create(handler_ty,
+                                        llvm::Function::ExternalLinkage,
+                                        "sub_180004560", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", callee);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+
+  for (llvm::StringRef caller_name : {"sub_180004540", "sub_180004550"}) {
+    auto *caller = llvm::Function::Create(handler_ty,
+                                          llvm::Function::ExternalLinkage,
+                                          caller_name, *M);
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", caller);
+    llvm::IRBuilder<> B(entry);
+    auto *state = caller->getArg(0);
+    auto *slot = B.CreateGEP(i8_ty, state, B.getInt64(0x190));
+    B.CreateStore(B.getInt64(0x4040), slot);
+    B.CreateCall(handler_ty, callee, {state, caller->getArg(1), caller->getArg(2)});
+    B.CreateRetVoid();
+  }
+
+  auto model = runAnalysis(*M);
+  auto *callee_summary = model.lookupHandler("sub_180004560");
+  ASSERT_NE(callee_summary, nullptr);
+  ASSERT_EQ(callee_summary->incoming_facts.size(), 1u);
+  EXPECT_EQ(
+      omill::renderVirtualValueExpr(callee_summary->incoming_facts.front().value),
+      "0x4040");
+  ASSERT_EQ(callee_summary->incoming_slot_phis.size(), 1u);
+  ASSERT_EQ(callee_summary->incoming_slot_phis.front().arms.size(), 2u);
+  EXPECT_EQ(callee_summary->incoming_slot_phis.front().arms[0].edge_identity,
+            "sub_180004540:callsite:0:sub_180004560");
+  EXPECT_EQ(callee_summary->incoming_slot_phis.front().arms[1].edge_identity,
+            "sub_180004550:callsite:0:sub_180004560");
+}
+
+TEST_F(VirtualMachineModelTest,
+       ResolvesDispatchFromIncomingPhiFactsPerPredecessor) {
+  auto M = createModule();
+  auto *void_ty = llvm::Type::getVoidTy(Ctx);
+  auto *i8_ty = llvm::Type::getInt8Ty(Ctx);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *dispatch_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *dispatch = llvm::Function::Create(dispatch_ty,
+                                          llvm::Function::ExternalLinkage,
+                                          "__omill_dispatch_jump", *M);
+
+  auto *handler_ty = llvm::FunctionType::get(void_ty, {ptr_ty, i64_ty, ptr_ty},
+                                             false);
+  auto *target_a = llvm::Function::Create(handler_ty,
+                                          llvm::Function::ExternalLinkage,
+                                          "blk_180004630", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target_a);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+  auto *target_b = llvm::Function::Create(handler_ty,
+                                          llvm::Function::ExternalLinkage,
+                                          "blk_180004640", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", target_b);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRetVoid();
+  }
+
+  auto *callee = llvm::Function::Create(handler_ty,
+                                        llvm::Function::ExternalLinkage,
+                                        "sub_180004620", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", callee);
+    llvm::IRBuilder<> B(entry);
+    auto *state = callee->getArg(0);
+    auto *slot = B.CreateGEP(i8_ty, state, B.getInt64(0x190));
+    auto *target = B.CreateLoad(i64_ty, slot);
+    B.CreateCall(dispatch_ty, dispatch, {state, target, callee->getArg(2)});
+    B.CreateRetVoid();
+  }
+
+  auto build_caller = [&](llvm::StringRef name, uint64_t pc) {
+    auto *caller = llvm::Function::Create(handler_ty,
+                                          llvm::Function::ExternalLinkage,
+                                          name, *M);
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", caller);
+    llvm::IRBuilder<> B(entry);
+    auto *state = caller->getArg(0);
+    auto *slot = B.CreateGEP(i8_ty, state, B.getInt64(0x190));
+    B.CreateStore(B.getInt64(pc), slot);
+    B.CreateCall(handler_ty, callee,
+                 {state, caller->getArg(1), caller->getArg(2)});
+    B.CreateRetVoid();
+  };
+  build_caller("sub_180004600", 0x180004630ULL);
+  build_caller("sub_180004610", 0x180004640ULL);
+
+  auto model = runAnalysis(*M);
+  auto *callee_summary = model.lookupHandler("sub_180004620");
+  ASSERT_NE(callee_summary, nullptr);
+  ASSERT_EQ(callee_summary->incoming_slot_phis.size(), 1u);
+  ASSERT_EQ(callee_summary->dispatches.size(), 1u);
+  EXPECT_EQ(callee_summary->dispatches.front().specialized_target_source,
+            omill::VirtualDispatchResolutionSource::kIncomingPhiFacts);
+  ASSERT_EQ(callee_summary->dispatches.front().successors.size(), 2u);
+  EXPECT_EQ(callee_summary->dispatches.front().successors[0].target_pc,
+            0x180004630ULL);
+  EXPECT_EQ(callee_summary->dispatches.front().successors[1].target_pc,
+            0x180004640ULL);
 }
 
 TEST_F(VirtualMachineModelTest,
@@ -1747,7 +2197,7 @@ TEST_F(VirtualMachineModelTest,
   EXPECT_EQ(slice->frontier_edges.front().kind,
             omill::VirtualRootFrontierKind::kDispatch);
   EXPECT_EQ(slice->frontier_edges.front().reason,
-            "dispatch_target_nearby_unlifted");
+            "dispatch_target_desynchronized");
   ASSERT_TRUE(slice->frontier_edges.front().target_pc.has_value());
   EXPECT_EQ(*slice->frontier_edges.front().target_pc, 0x180012D05ULL);
   ASSERT_TRUE(slice->frontier_edges.front().canonical_target_va.has_value());
@@ -2233,6 +2683,22 @@ TEST_F(VirtualMachineModelTest,
   EXPECT_EQ(root_summary->dispatches.front().successors.front().target_pc,
             0x180009320ULL);
   EXPECT_FALSE(root_summary->outgoing_stack_facts.empty());
+  EXPECT_TRUE(std::any_of(
+      model.stackCells().begin(), model.stackCells().end(),
+      [](const omill::VirtualStackCellInfo &cell) {
+        return cell.base_offset == 0x908 && cell.cell_offset == 0 &&
+               cell.width == 8;
+      }));
+  EXPECT_TRUE(std::all_of(
+      root_summary->outgoing_stack_facts.begin(),
+      root_summary->outgoing_stack_facts.end(),
+      [&](const omill::VirtualStackFact &fact) {
+        return std::any_of(
+            model.stackCells().begin(), model.stackCells().end(),
+            [&](const omill::VirtualStackCellInfo &cell) {
+              return cell.id == fact.cell_id;
+            });
+      }));
   EXPECT_TRUE(std::any_of(root_summary->outgoing_stack_facts.begin(),
                           root_summary->outgoing_stack_facts.end(),
                           [](const omill::VirtualStackFact &fact) {
@@ -2341,6 +2807,16 @@ TEST_F(VirtualMachineModelTest,
       [](const omill::VirtualStackFact &fact) {
         return omill::renderVirtualValueExpr(fact.value).find("arg1+0x908") !=
                std::string::npos;
+      }));
+  EXPECT_TRUE(std::all_of(
+      root_summary->outgoing_stack_facts.begin(),
+      root_summary->outgoing_stack_facts.end(),
+      [&](const omill::VirtualStackFact &fact) {
+        return std::any_of(
+            model.stackCells().begin(), model.stackCells().end(),
+            [&](const omill::VirtualStackCellInfo &cell) {
+              return cell.id == fact.cell_id;
+            });
       }));
 }
 
@@ -4498,7 +4974,7 @@ TEST_F(VirtualMachineModelTest,
   EXPECT_FALSE(
       summary->callsites.front().recovered_target_function_name.has_value());
   EXPECT_EQ(summary->callsites.front().unresolved_reason,
-            "call_target_nearby_unlifted");
+            "call_target_desynchronized");
 
   auto *slice = model.lookupRootSlice(0x18000D800ULL);
   ASSERT_NE(slice, nullptr);
@@ -4506,7 +4982,7 @@ TEST_F(VirtualMachineModelTest,
   EXPECT_EQ(slice->frontier_edges.front().kind,
             omill::VirtualRootFrontierKind::kCall);
   EXPECT_EQ(slice->frontier_edges.front().reason,
-            "call_target_nearby_unlifted");
+            "call_target_desynchronized");
   ASSERT_TRUE(slice->frontier_edges.front().target_pc.has_value());
   EXPECT_EQ(*slice->frontier_edges.front().target_pc, 0x18000D105ULL);
   ASSERT_TRUE(slice->frontier_edges.front().canonical_target_va.has_value());
@@ -5446,7 +5922,8 @@ TEST_F(VirtualMachineModelTest,
       [](const omill::VirtualRootSliceSummary::FrontierEdge &edge) {
         return edge.kind == omill::VirtualRootFrontierKind::kCall &&
                (edge.reason == "call_target_undecodable" ||
-                edge.reason == "call_target_nearby_unlifted") &&
+                edge.reason == "call_target_nearby_unlifted" ||
+                edge.reason == "call_target_desynchronized") &&
                edge.target_pc.has_value() &&
                *edge.target_pc == 0x180011FFFULL;
       });
@@ -6216,6 +6693,70 @@ TEST_F(VirtualMachineModelTest,
 }
 
 TEST_F(VirtualMachineModelTest,
+       ClosesRootSliceWhenNativeReentryReturnsToInitialRspSlot) {
+  auto M = createModule();
+  addMinimalX86FlagStateTypes(*M);
+  auto *i8_ty = llvm::Type::getInt8Ty(Ctx);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+  auto *calli_ty = llvm::FunctionType::get(
+      ptr_ty, {ptr_ty, ptr_ty, i64_ty, ptr_ty, i64_ty, ptr_ty}, false);
+  auto *calli = llvm::Function::Create(
+      calli_ty, llvm::Function::ExternalLinkage,
+      "_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_", *M);
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::Function::ExternalLinkage,
+                                      "sub_180021100", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *sp_slot = B.CreateGEP(i8_ty, root->getArg(0), B.getInt64(0x908));
+    auto *next_pc = B.CreateAlloca(i64_ty, nullptr, "NEXT_PC");
+    B.CreateStore(B.getInt64(0x200000ULL), sp_slot);
+    auto *initial_sp = B.CreateLoad(i64_ty, sp_slot);
+    auto *continuation_ptr = B.CreateIntToPtr(initial_sp, ptr_ty);
+    B.CreateCall(calli, {root->getArg(2), root->getArg(0),
+                         B.getInt64(0x180031000ULL), next_pc,
+                         B.getInt64(0x180021180ULL), continuation_ptr});
+    auto *reenter_sp = B.CreateAdd(initial_sp, B.getInt64(16));
+    B.CreateStore(reenter_sp, sp_slot);
+    B.CreateRet(root->getArg(0));
+  }
+
+  omill::BinaryMemoryMap map;
+  map.setImageBase(0x180020000ULL);
+  std::array<uint8_t, 16> native_code = {0x48, 0x89, 0xC8, 0xC3};
+  map.addRegion(0x180031000ULL, native_code.data(), native_code.size(),
+                /*read_only=*/false, /*executable=*/true);
+
+  auto model = runAnalysis(*M, std::move(map));
+  auto *summary = model.lookupHandler("sub_180021100");
+  ASSERT_NE(summary, nullptr);
+  ASSERT_EQ(summary->callsites.size(), 1u);
+  const auto &callsite = summary->callsites.front();
+  EXPECT_EQ(callsite.exit.disposition,
+            omill::VirtualExitDisposition::kVmExitNativeCallReenter);
+  ASSERT_TRUE(callsite.continuation_stack_cell_id.has_value());
+  auto cell_it = std::find_if(
+      model.stackCells().begin(), model.stackCells().end(),
+      [&](const omill::VirtualStackCellInfo &cell) {
+        return cell.id == *callsite.continuation_stack_cell_id;
+      });
+  ASSERT_NE(cell_it, model.stackCells().end());
+  EXPECT_EQ(cell_it->base_offset, 0x908);
+  EXPECT_EQ(cell_it->cell_offset, 0);
+
+  auto *slice = model.lookupRootSlice(0x180021100ULL);
+  ASSERT_NE(slice, nullptr);
+  EXPECT_TRUE(slice->is_closed);
+  EXPECT_TRUE(slice->frontier_edges.empty());
+}
+
+TEST_F(VirtualMachineModelTest,
        CarriesVipAndExitDispositionIntoBoundaryFrontierEdges) {
   auto M = createModule();
   auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
@@ -6329,12 +6870,26 @@ TEST_F(VirtualMachineModelTest,
   ASSERT_EQ(vm_enter_summary->callsites.size(), 1u);
   EXPECT_EQ(vm_enter_summary->callsites.front().exit.disposition,
             omill::VirtualExitDisposition::kVmEnter);
+  ASSERT_TRUE(vm_enter_summary->callsites.front().exit.continuation_vip.slot_id
+                  .has_value());
+  auto *vm_enter_slot = model.lookupSlot(
+      *vm_enter_summary->callsites.front().exit.continuation_vip.slot_id);
+  ASSERT_NE(vm_enter_slot, nullptr);
+  EXPECT_EQ(vm_enter_slot->base_name, "RETURN_PC");
+  EXPECT_EQ(vm_enter_slot->offset, 0);
 
   auto *nested_summary = model.lookupHandler("sub_180023100");
   ASSERT_NE(nested_summary, nullptr);
   ASSERT_EQ(nested_summary->callsites.size(), 1u);
   EXPECT_EQ(nested_summary->callsites.front().exit.disposition,
             omill::VirtualExitDisposition::kNestedVmEnter);
+  ASSERT_TRUE(nested_summary->callsites.front().exit.continuation_vip.slot_id
+                  .has_value());
+  auto *nested_slot = model.lookupSlot(
+      *nested_summary->callsites.front().exit.continuation_vip.slot_id);
+  ASSERT_NE(nested_slot, nullptr);
+  EXPECT_EQ(nested_slot->base_name, "RETURN_PC");
+  EXPECT_EQ(nested_slot->offset, 0);
 }
 
 TEST_F(VirtualMachineModelTest,

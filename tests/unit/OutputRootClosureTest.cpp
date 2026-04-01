@@ -1,4 +1,5 @@
 #include "omill/Devirtualization/OutputRootClosure.h"
+#include "omill/Devirtualization/ExecutableTargetFact.h"
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
@@ -145,8 +146,11 @@ TEST(OutputRootClosureTest, ProducesTypedWorkItemsForConstantJumpTargets) {
                            return item.target_pc == 0x180001020u &&
                                   item.source_kind ==
                                       omill::OutputRootClosureSourceKind::kConstantCodeTarget &&
-                                  item.exit_disposition ==
-                                      omill::VirtualExitDisposition::kVmExitNativeExecUnknownReturn;
+                                  item.boundary.has_value() &&
+                                  omill::virtualExitDispositionFromBoundaryDisposition(
+                                      item.boundary->exit_disposition) ==
+                                      omill::VirtualExitDisposition::
+                                          kVmExitNativeExecUnknownReturn;
                          });
   ASSERT_NE(it, items.end());
   EXPECT_EQ(it->owner_function, "sub_180001850");
@@ -237,6 +241,126 @@ TEST(OutputRootClosureTest,
                                       omill::OutputRootClosureSourceKind::kConstantCodeTarget;
                          });
   ASSERT_NE(it, items.end());
+}
+
+TEST(OutputRootClosureTest,
+     IncludesMissingBlockHandlerTargetsAsTerminalClosureWork) {
+  llvm::LLVMContext ctx;
+  llvm::Module module("test", ctx);
+
+  auto *ptr_ty = llvm::PointerType::getUnqual(ctx);
+  auto *i64_ty = llvm::Type::getInt64Ty(ctx);
+  auto *lifted_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+
+  auto *root = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage, "sub_180001850", module);
+  root->addFnAttr("omill.output_root");
+  auto *entry = llvm::BasicBlock::Create(ctx, "entry", root);
+  llvm::IRBuilder<> builder(entry);
+
+  auto *missing_handler_ty =
+      llvm::FunctionType::get(builder.getVoidTy(), {i64_ty}, false);
+  auto *missing_handler = llvm::Function::Create(
+      missing_handler_ty, llvm::GlobalValue::ExternalLinkage,
+      "__omill_missing_block_handler", module);
+
+  auto args = root->args().begin();
+  llvm::Value *state = &*args++;
+  llvm::Value *pc = &*args++;
+  llvm::Value *memory = &*args++;
+  (void)state;
+  (void)pc;
+  builder.CreateCall(missing_handler, {llvm::ConstantInt::get(i64_ty, 0x1800018BB)});
+  builder.CreateRet(memory);
+
+  auto items = omill::collectOutputRootClosureWorkItems(
+      module,
+      [&](uint64_t target) {
+        return target >= 0x180001000 && target < 0x180002000;
+      },
+      [&](uint64_t) { return false; },
+      [&](uint64_t target) { return target; },
+      /*include_defined_targets=*/false);
+
+  auto it = std::find_if(items.begin(), items.end(),
+                         [](const omill::OutputRootClosureWorkItem &item) {
+                           return item.target_pc == 0x1800018BBu &&
+                                  item.source_kind ==
+                                      omill::OutputRootClosureSourceKind::kMissingBlockHandlerTarget &&
+                                  item.boundary.has_value() &&
+                                  omill::virtualExitDispositionFromBoundaryDisposition(
+                                      item.boundary->exit_disposition) ==
+                                      omill::VirtualExitDisposition::kVmExitTerminal;
+                         });
+  ASSERT_NE(it, items.end());
+  EXPECT_EQ(it->owner_function, "sub_180001850");
+}
+
+TEST(OutputRootClosureTest,
+     IncludesInvalidatedExecutableMissingBlockTargetsAsTypedClosureWork) {
+  llvm::LLVMContext ctx;
+  llvm::Module module("test", ctx);
+
+  auto *ptr_ty = llvm::PointerType::getUnqual(ctx);
+  auto *i64_ty = llvm::Type::getInt64Ty(ctx);
+  auto *lifted_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+
+  auto *root = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage, "sub_180001850", module);
+  root->addFnAttr("omill.output_root");
+  auto *entry = llvm::BasicBlock::Create(ctx, "entry", root);
+  llvm::IRBuilder<> builder(entry);
+
+  auto *missing_handler_ty =
+      llvm::FunctionType::get(builder.getVoidTy(), {i64_ty}, false);
+  auto *missing_handler = llvm::Function::Create(
+      missing_handler_ty, llvm::GlobalValue::ExternalLinkage,
+      "__omill_missing_block_handler", module);
+
+  auto *call = builder.CreateCall(
+      missing_handler, {llvm::ConstantInt::get(i64_ty, 0x1800B5B30)});
+  call->setMetadata(
+      "omill.invalidated_executable_entry",
+      llvm::MDTuple::get(
+          ctx, {llvm::ConstantAsMetadata::get(
+                    llvm::ConstantInt::get(llvm::Type::getInt1Ty(ctx), 1))}));
+  call->setMetadata(
+      "omill.invalidated_entry_source_pc",
+      llvm::MDTuple::get(
+          ctx, {llvm::ConstantAsMetadata::get(
+                    llvm::ConstantInt::get(i64_ty, 0x1800B5B30))}));
+  call->setMetadata(
+      "omill.invalidated_entry_failed_pc",
+      llvm::MDTuple::get(
+          ctx, {llvm::ConstantAsMetadata::get(
+                    llvm::ConstantInt::get(i64_ty, 0x1800B5B3A))}));
+  builder.CreateRet(root->getArg(2));
+
+  auto items = omill::collectOutputRootClosureWorkItems(
+      module,
+      [&](uint64_t target) {
+        return target >= 0x180000000 && target < 0x180200000;
+      },
+      [&](uint64_t) { return false; },
+      [&](uint64_t target) { return target; },
+      /*include_defined_targets=*/false);
+
+  auto it = std::find_if(items.begin(), items.end(),
+                         [](const omill::OutputRootClosureWorkItem &item) {
+                           return item.target_pc == 0x1800B5B30u &&
+                                  item.source_kind ==
+                                      omill::OutputRootClosureSourceKind::
+                                          kInvalidatedExecutableTarget;
+                         });
+  ASSERT_NE(it, items.end());
+  ASSERT_TRUE(it->executable_target.has_value());
+  EXPECT_TRUE(it->executable_target->invalidated_executable_entry);
+  ASSERT_TRUE(it->executable_target->invalidated_entry_source_pc.has_value());
+  ASSERT_TRUE(it->executable_target->invalidated_entry_failed_pc.has_value());
+  EXPECT_EQ(*it->executable_target->invalidated_entry_source_pc, 0x1800B5B30u);
+  EXPECT_EQ(*it->executable_target->invalidated_entry_failed_pc, 0x1800B5B3Au);
 }
 
 TEST(OutputRootClosureTest,
@@ -369,7 +493,9 @@ TEST(OutputRootClosureTest,
   auto it = std::find_if(items.begin(), items.end(),
                          [](const omill::OutputRootClosureWorkItem &item) {
                            return item.target_pc == 0x1801F7733u &&
-                                  item.exit_disposition ==
+                                  item.boundary.has_value() &&
+                                  omill::virtualExitDispositionFromBoundaryDisposition(
+                                      item.boundary->exit_disposition) ==
                                       omill::VirtualExitDisposition::kNestedVmEnter;
                          });
   ASSERT_NE(it, items.end());
@@ -420,7 +546,9 @@ TEST(OutputRootClosureTest,
   auto it = std::find_if(items.begin(), items.end(),
                          [](const omill::OutputRootClosureWorkItem &item) {
                            return item.target_pc == 0x1801F7733u &&
-                                  item.exit_disposition ==
+                                  item.boundary.has_value() &&
+                                  omill::virtualExitDispositionFromBoundaryDisposition(
+                                      item.boundary->exit_disposition) ==
                                       omill::VirtualExitDisposition::kNestedVmEnter;
                          });
   ASSERT_NE(it, items.end());

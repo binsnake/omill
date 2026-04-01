@@ -3,8 +3,14 @@ add_library(omill STATIC
   Arch/ArchABI.cpp
 
   # Devirtualization
+  Devirtualization/BinaryRegionReconstructor.cpp
+  Devirtualization/BoundaryFact.cpp
+  Devirtualization/ContinuationResolver.cpp
+  Devirtualization/ExecutableTargetFact.cpp
   Devirtualization/Orchestrator.cpp
   Devirtualization/OutputRootClosure.cpp
+  Devirtualization/ProtectorModel.cpp
+  Devirtualization/Runtime.cpp
   Remill/Normalization.cpp
 
   # Utils
@@ -15,6 +21,7 @@ add_library(omill STATIC
   Tools/LiftRunContract.cpp
 
   # Analysis
+  Analysis/BinaryRegion.cpp
   Analysis/TargetArchAnalysis.cpp
   Analysis/CallGraphAnalysis.cpp
   Analysis/LiftedFunctionMap.cpp
@@ -37,7 +44,8 @@ add_library(omill STATIC
   Analysis/VirtualModel/Replay.cpp
   Analysis/VirtualModel/Regions.cpp
   Analysis/VirtualModel/Render.cpp
-      Analysis/VirtualModel/RootSlices.cpp
+  Analysis/VirtualModel/RootSlices.cpp
+  Analysis/VirtualModel/StackModel.cpp
       Analysis/VirtualModel/StackFactTracker.cpp
       Analysis/VirtualModel/StateFacts.cpp
       Analysis/VirtualModel/Specialization.cpp
@@ -166,6 +174,7 @@ endif()
 # Ported remill TraceLifter + BlockLifter (only when remill is available)
 if(OMILL_ENABLE_REMILL)
   target_sources(omill PRIVATE
+    BC/LiftTargetPolicy.cpp
     BC/TraceLifter.cpp
     BC/BlockLifter.cpp
   )

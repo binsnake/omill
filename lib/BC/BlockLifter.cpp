@@ -5,6 +5,7 @@
 
 #include "omill/BC/BlockLifter.h"
 
+#include "omill/Devirtualization/ExecutableTargetFact.h"
 #include "omill/Utils/LiftedNames.h"
 
 #include <llvm/IR/BasicBlock.h>
@@ -55,6 +56,30 @@ llvm::Module *BlockManager::GetLiftedBlockModule() {
   return nullptr;
 }
 
+static void annotateLiftTargetDecisionMetadata(llvm::CallInst &call,
+                                               const LiftTargetDecision &decision);
+
+LiftTargetDecision BlockManager::ResolveLiftTarget(uint64_t, uint64_t raw_target_pc,
+                                                   LiftTargetEdgeKind) {
+  LiftTargetDecision decision;
+  decision.raw_target_pc = raw_target_pc;
+  decision.effective_target_pc = raw_target_pc;
+  decision.classification = LiftTargetClassification::kLiftableEntry;
+  decision.trust = LiftTargetTrust::kTrustedEntry;
+  return decision;
+}
+
+DecodeFailureDecision BlockManager::ResolveDecodeFailure(
+    uint64_t source_addr, uint64_t failed_pc, const DecodeFailureContext &) {
+  DecodeFailureDecision decision;
+  decision.source_pc = source_addr;
+  decision.failed_pc = failed_pc;
+  decision.action = DecodeFailureAction::kRedirectToTarget;
+  decision.target = ResolveLiftTarget(
+      source_addr, failed_pc, LiftTargetEdgeKind::kDecodeFailureContinuation);
+  return decision;
+}
+
 void BlockManager::ForEachDevirtualizedTarget(
     const remill::Instruction &,
     std::function<void(uint64_t, DevirtualizedTargetKind)>) {
@@ -92,6 +117,12 @@ class BlockLifter::Impl {
                            llvm::Function *target_fn,
                            uint64_t target_pc);
 
+  /// Emit a musttail call to the missing-block intrinsic with a specific PC.
+  llvm::CallInst *EmitMusttailToMissingBlock(llvm::BasicBlock *from_bb,
+                                             uint64_t target_pc,
+                                             const LiftTargetDecision *decision =
+                                                 nullptr);
+
   /// Emit a call to the configured unresolved jump dispatcher.
   void EmitDispatchJump(llvm::BasicBlock *bb);
 
@@ -99,7 +130,17 @@ class BlockLifter::Impl {
   /// the fall-through block.
   void EmitDispatchCallAndFallthrough(llvm::BasicBlock *bb,
                                       uint64_t fallthrough_pc,
+                                      const LiftTargetDecision &fallthrough_decision,
                                       llvm::SmallVectorImpl<uint64_t> &targets);
+
+  void EmitDecisionEdge(llvm::BasicBlock *from_bb, uint64_t raw_target_pc,
+                        const LiftTargetDecision &decision,
+                        llvm::SmallVectorImpl<uint64_t> &discovered_targets);
+
+  void EmitDecisionEdgeWithMemory(
+      llvm::BasicBlock *from_bb, uint64_t raw_target_pc,
+      const LiftTargetDecision &decision, llvm::Value *memory_value,
+      llvm::SmallVectorImpl<uint64_t> &discovered_targets);
 
   const remill::Arch *const arch;
   const remill::IntrinsicTable *intrinsics;
@@ -172,8 +213,8 @@ llvm::Function *BlockLifter::Impl::GetOrDeclareBlockFunction(uint64_t addr) {
 // ---------------------------------------------------------------------------
 
 void BlockLifter::Impl::EmitMusttailToBlock(llvm::BasicBlock *from_bb,
-                                             llvm::Function *target_fn,
-                                             uint64_t target_pc) {
+                                            llvm::Function *target_fn,
+                                            uint64_t target_pc) {
   auto *func = from_bb->getParent();
   auto *state_ptr = remill::NthArgument(func, remill::kStatePointerArgNum);
   auto *mem_ptr = remill::NthArgument(func, remill::kMemoryPointerArgNum);
@@ -184,6 +225,38 @@ void BlockLifter::Impl::EmitMusttailToBlock(llvm::BasicBlock *from_bb,
                              {state_ptr, pc_val, mem_ptr});
   call->setTailCallKind(llvm::CallInst::TCK_MustTail);
   ir.CreateRet(call);
+}
+
+llvm::CallInst *BlockLifter::Impl::EmitMusttailToMissingBlock(
+    llvm::BasicBlock *from_bb, uint64_t target_pc,
+    const LiftTargetDecision *decision) {
+  auto *func = from_bb->getParent();
+  auto *state_ptr = remill::NthArgument(func, remill::kStatePointerArgNum);
+  auto *mem_ptr = remill::NthArgument(func, remill::kMemoryPointerArgNum);
+
+  llvm::IRBuilder<> ir(from_bb);
+  auto *pc_val = llvm::ConstantInt::get(word_type, target_pc);
+  auto *call = ir.CreateCall(intrinsics->missing_block->getFunctionType(),
+                             intrinsics->missing_block,
+                             {state_ptr, pc_val, mem_ptr});
+  if (decision)
+    annotateLiftTargetDecisionMetadata(*call, *decision);
+  call->setTailCallKind(llvm::CallInst::TCK_MustTail);
+  ir.CreateRet(call);
+  return call;
+}
+
+static void ClearBasicBlockInstructions(llvm::BasicBlock *bb) {
+  while (!bb->empty()) {
+    bb->back().dropAllReferences();
+    bb->back().eraseFromParent();
+  }
+}
+
+static void annotateLiftTargetDecisionMetadata(llvm::CallInst &call,
+                                               const LiftTargetDecision &decision) {
+  if (auto fact = executableTargetFactFromDecision(decision))
+    writeExecutableTargetFact(call, *fact);
 }
 
 void BlockLifter::Impl::EmitDispatchJump(llvm::BasicBlock *bb) {
@@ -208,6 +281,7 @@ void BlockLifter::Impl::EmitDispatchJump(llvm::BasicBlock *bb) {
 void BlockLifter::Impl::EmitDispatchCallAndFallthrough(
     llvm::BasicBlock *bb,
     uint64_t fallthrough_pc,
+    const LiftTargetDecision &fallthrough_decision,
     llvm::SmallVectorImpl<uint64_t> &targets) {
   auto *func = bb->getParent();
   auto *state_ptr = remill::NthArgument(func, remill::kStatePointerArgNum);
@@ -226,13 +300,52 @@ void BlockLifter::Impl::EmitDispatchCallAndFallthrough(
   auto *call_result = ir.CreateCall(dispatch, {state_ptr, call_pc, mem_ptr});
 
   // The call returns Memory*.  Now musttail to the fall-through block.
-  targets.push_back(fallthrough_pc);
-  auto *ft_fn = GetOrDeclareBlockFunction(fallthrough_pc);
-  auto *ft_pc = llvm::ConstantInt::get(word_type, fallthrough_pc);
-  auto *ft_call = ir.CreateCall(ft_fn->getFunctionType(), ft_fn,
-                                {state_ptr, ft_pc, call_result});
-  ft_call->setTailCallKind(llvm::CallInst::TCK_MustTail);
-  ir.CreateRet(ft_call);
+  EmitDecisionEdgeWithMemory(bb, fallthrough_pc, fallthrough_decision,
+                             call_result, targets);
+}
+
+void BlockLifter::Impl::EmitDecisionEdge(
+    llvm::BasicBlock *from_bb, uint64_t raw_target_pc,
+    const LiftTargetDecision &decision,
+    llvm::SmallVectorImpl<uint64_t> &discovered_targets) {
+  if (decision.shouldLift() && decision.effective_target_pc) {
+    discovered_targets.push_back(*decision.effective_target_pc);
+    auto *target_fn = GetOrDeclareBlockFunction(*decision.effective_target_pc);
+    EmitMusttailToBlock(from_bb, target_fn, *decision.effective_target_pc);
+    return;
+  }
+  EmitMusttailToMissingBlock(from_bb, raw_target_pc, &decision);
+}
+
+void BlockLifter::Impl::EmitDecisionEdgeWithMemory(
+    llvm::BasicBlock *from_bb, uint64_t raw_target_pc,
+    const LiftTargetDecision &decision, llvm::Value *memory_value,
+    llvm::SmallVectorImpl<uint64_t> &discovered_targets) {
+  if (decision.shouldLift() && decision.effective_target_pc) {
+    auto *func = from_bb->getParent();
+    auto *state_ptr = remill::NthArgument(func, remill::kStatePointerArgNum);
+    llvm::IRBuilder<> ir(from_bb);
+    discovered_targets.push_back(*decision.effective_target_pc);
+    auto *target_fn = GetOrDeclareBlockFunction(*decision.effective_target_pc);
+    auto *ft_pc =
+        llvm::ConstantInt::get(word_type, *decision.effective_target_pc);
+    auto *ft_call = ir.CreateCall(target_fn->getFunctionType(), target_fn,
+                                  {state_ptr, ft_pc, memory_value});
+    ft_call->setTailCallKind(llvm::CallInst::TCK_MustTail);
+    ir.CreateRet(ft_call);
+    return;
+  }
+
+  auto *func = from_bb->getParent();
+  auto *state_ptr = remill::NthArgument(func, remill::kStatePointerArgNum);
+  llvm::IRBuilder<> ir(from_bb);
+  auto *pc_val = llvm::ConstantInt::get(word_type, raw_target_pc);
+  auto *call = ir.CreateCall(intrinsics->missing_block->getFunctionType(),
+                             intrinsics->missing_block,
+                             {state_ptr, pc_val, memory_value});
+  annotateLiftTargetDecisionMetadata(*call, decision);
+  call->setTailCallKind(llvm::CallInst::TCK_MustTail);
+  ir.CreateRet(call);
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +395,8 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
   auto *current_block = body;
   uint64_t current_pc = addr;
   bool lift_crashed = false;
+  bool invalidated_block_entry = false;
+  std::optional<LiftTargetDecision> invalidated_block_decision;
   __try {
     while (true) {
     // No executable bytes?
@@ -297,6 +412,36 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
     if (!decode_ok) {
       llvm::errs() << "omill: BlockLifter: decode failed at 0x"
                    << llvm::Twine::utohexstr(current_pc) << "\n";
+      auto failure_decision = manager.ResolveDecodeFailure(
+          addr, current_pc,
+            DecodeFailureContext{
+                LiftTargetEdgeKind::kDecodeFailureContinuation});
+      if (failure_decision.action == DecodeFailureAction::kInvalidateEntry) {
+        discovered_targets.clear();
+        for (auto it = func->begin(), end = func->end(); it != end; ++it) {
+          ClearBasicBlockInstructions(&*it);
+        }
+        invalidated_block_entry = true;
+        invalidated_block_decision = failure_decision.target;
+        current_block = &func->getEntryBlock();
+        EmitMusttailToMissingBlock(current_block, addr,
+                                   &failure_decision.target);
+        break;
+      }
+      if (failure_decision.action == DecodeFailureAction::kRedirectToTarget &&
+          failure_decision.target.effective_target_pc &&
+          *failure_decision.target.effective_target_pc != addr) {
+        EmitDecisionEdge(current_block, current_pc, failure_decision.target,
+                         discovered_targets);
+      } else if (failure_decision.action ==
+                 DecodeFailureAction::kMaterializeExecutablePlaceholder) {
+        EmitMusttailToMissingBlock(current_block, current_pc,
+                                   &failure_decision.target);
+      } else {
+        remill::AddTerminatingTailCall(current_block, intrinsics->missing_block,
+                                       *intrinsics);
+      }
+      break;
     }
 
     auto lift_status =
@@ -359,9 +504,10 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
       case remill::Instruction::kCategoryDirectJump: {
         try_add_delay_slot(true, current_block);
         auto target = inst.branch_taken_pc;
-        discovered_targets.push_back(target);
-        auto *target_fn = GetOrDeclareBlockFunction(target);
-        EmitMusttailToBlock(current_block, target_fn, target);
+        auto target_decision = manager.ResolveLiftTarget(
+            current_pc, target, LiftTargetEdgeKind::kDirectJump);
+        EmitDecisionEdge(current_block, target, target_decision,
+                         discovered_targets);
         goto done;
       }
 
@@ -373,7 +519,15 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
         manager.ForEachDevirtualizedTarget(
             inst,
             [&](uint64_t target, DevirtualizedTargetKind) {
-              discovered_targets.push_back(target);
+              auto decision = manager.ResolveLiftTarget(
+                  current_pc, target, LiftTargetEdgeKind::kIndirectTarget);
+              if (decision.shouldLift() && decision.effective_target_pc) {
+                discovered_targets.push_back(*decision.effective_target_pc);
+              } else if (decision.effective_target_pc) {
+                discovered_targets.push_back(*decision.effective_target_pc);
+              } else if (decision.raw_target_pc) {
+                discovered_targets.push_back(decision.raw_target_pc);
+              }
             });
         goto done;
       }
@@ -381,12 +535,10 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
       case remill::Instruction::kCategoryConditionalBranch: {
         auto taken_pc = inst.branch_taken_pc;
         auto not_taken_pc = inst.branch_not_taken_pc;
-
-        discovered_targets.push_back(taken_pc);
-        discovered_targets.push_back(not_taken_pc);
-
-        auto *taken_fn = GetOrDeclareBlockFunction(taken_pc);
-        auto *not_taken_fn = GetOrDeclareBlockFunction(not_taken_pc);
+        auto taken_target = manager.ResolveLiftTarget(
+            current_pc, taken_pc, LiftTargetEdgeKind::kConditionalTaken);
+        auto not_taken_target = manager.ResolveLiftTarget(
+            current_pc, not_taken_pc, LiftTargetEdgeKind::kConditionalNotTaken);
 
         auto *taken_bb = llvm::BasicBlock::Create(context, "taken", func);
         auto *not_taken_bb =
@@ -417,8 +569,9 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
                                    current_block);
         }
 
-        EmitMusttailToBlock(taken_bb, taken_fn, taken_pc);
-        EmitMusttailToBlock(not_taken_bb, not_taken_fn, not_taken_pc);
+        EmitDecisionEdge(taken_bb, taken_pc, taken_target, discovered_targets);
+        EmitDecisionEdge(not_taken_bb, not_taken_pc, not_taken_target,
+                         discovered_targets);
         goto done;
       }
 
@@ -426,11 +579,19 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
         try_add_delay_slot(true, current_block);
         auto call_target = inst.branch_taken_pc;
         auto fallthrough = inst.branch_not_taken_pc;
+        auto fallthrough_target = manager.ResolveLiftTarget(
+            current_pc, fallthrough, LiftTargetEdgeKind::kCallFallthrough);
+        auto call_target_decision = manager.ResolveLiftTarget(
+            current_pc, call_target, LiftTargetEdgeKind::kDirectCallTarget);
 
         // Emit: dispatch_call(state, call_target_pc, mem)
         // Then: musttail call @blk_<fallthrough>(state, fallthrough_pc, result)
         {
-          auto *pc_val = llvm::ConstantInt::get(word_type, call_target);
+          const uint64_t call_pc =
+              call_target_decision.effective_target_pc
+                  ? *call_target_decision.effective_target_pc
+                  : call_target;
+          auto *pc_val = llvm::ConstantInt::get(word_type, call_pc);
           auto *lifted_fn_ty = func->getFunctionType();
           auto dispatch = module->getOrInsertFunction(
               canonicalDispatchIntrinsicName(DispatchIntrinsicKind::kCall,
@@ -449,13 +610,9 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
           ir.CreateStore(ir.CreateLoad(word_type, ret_pc_ref), next_pc_ref);
 
           // Musttail to fall-through block.
-          discovered_targets.push_back(fallthrough);
-          auto *ft_fn = GetOrDeclareBlockFunction(fallthrough);
-          auto *ft_pc = llvm::ConstantInt::get(word_type, fallthrough);
-          auto *ft_call = ir.CreateCall(ft_fn->getFunctionType(), ft_fn,
-                                        {sp, ft_pc, call_result});
-          ft_call->setTailCallKind(llvm::CallInst::TCK_MustTail);
-          ir.CreateRet(ft_call);
+          EmitDecisionEdgeWithMemory(current_block, fallthrough,
+                                     fallthrough_target, call_result,
+                                     discovered_targets);
         }
         goto done;
       }
@@ -463,6 +620,8 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
       case remill::Instruction::kCategoryIndirectFunctionCall: {
         try_add_delay_slot(true, current_block);
         auto fallthrough = inst.branch_not_taken_pc;
+        auto fallthrough_target = manager.ResolveLiftTarget(
+            current_pc, fallthrough, LiftTargetEdgeKind::kCallFallthrough);
 
         // Load call target from NEXT_PC (set by instruction semantics).
         auto *call_pc =
@@ -486,13 +645,9 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
         ir.CreateStore(ir.CreateLoad(word_type, ret_pc_ref), next_pc_ref);
 
         // Musttail to fall-through block.
-        discovered_targets.push_back(fallthrough);
-        auto *ft_fn = GetOrDeclareBlockFunction(fallthrough);
-        auto *ft_pc = llvm::ConstantInt::get(word_type, fallthrough);
-        auto *ft_call = ir.CreateCall(ft_fn->getFunctionType(), ft_fn,
-                                      {sp, ft_pc, call_result});
-        ft_call->setTailCallKind(llvm::CallInst::TCK_MustTail);
-        ir.CreateRet(ft_call);
+        EmitDecisionEdgeWithMemory(current_block, fallthrough,
+                                   fallthrough_target, call_result,
+                                   discovered_targets);
         goto done;
       }
 
@@ -505,7 +660,8 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
 
       case remill::Instruction::kCategoryConditionalFunctionReturn: {
         auto not_taken_pc = inst.branch_not_taken_pc;
-        discovered_targets.push_back(not_taken_pc);
+        auto not_taken_target = manager.ResolveLiftTarget(
+            current_pc, not_taken_pc, LiftTargetEdgeKind::kConditionalNotTaken);
 
         auto *ret_bb = llvm::BasicBlock::Create(context, "do_ret", func);
         auto *cont_bb = llvm::BasicBlock::Create(context, "no_ret", func);
@@ -530,20 +686,23 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
 
         remill::AddTerminatingTailCall(ret_bb, intrinsics->function_return,
                                        *intrinsics);
-        auto *cont_fn = GetOrDeclareBlockFunction(not_taken_pc);
-        EmitMusttailToBlock(cont_bb, cont_fn, not_taken_pc);
+        EmitDecisionEdge(cont_bb, not_taken_pc, not_taken_target,
+                         discovered_targets);
         goto done;
       }
 
       case remill::Instruction::kCategoryConditionalDirectFunctionCall: {
         auto call_target = inst.branch_taken_pc;
         auto fallthrough = inst.branch_not_taken_pc;
-        discovered_targets.push_back(fallthrough);
+        auto fallthrough_target = manager.ResolveLiftTarget(
+            current_pc, fallthrough, LiftTargetEdgeKind::kCallFallthrough);
+        auto call_target_decision = manager.ResolveLiftTarget(
+            current_pc, call_target, LiftTargetEdgeKind::kDirectCallTarget);
 
         if (call_target == fallthrough) {
           // Degenerate: call target == fall-through.  Just go to fall-through.
-          auto *ft_fn = GetOrDeclareBlockFunction(fallthrough);
-          EmitMusttailToBlock(current_block, ft_fn, fallthrough);
+          EmitDecisionEdge(current_block, fallthrough, fallthrough_target,
+                           discovered_targets);
           goto done;
         }
 
@@ -572,7 +731,11 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
 
         // do_call_bb: dispatch_call + musttail to fall-through
         {
-          auto *pc_val = llvm::ConstantInt::get(word_type, call_target);
+          const uint64_t dispatch_pc =
+              call_target_decision.effective_target_pc
+                  ? *call_target_decision.effective_target_pc
+                  : call_target;
+          auto *pc_val = llvm::ConstantInt::get(word_type, dispatch_pc);
           auto *lifted_fn_ty = func->getFunctionType();
           auto dispatch = module->getOrInsertFunction(
               canonicalDispatchIntrinsicName(DispatchIntrinsicKind::kCall,
@@ -591,25 +754,21 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
               remill::LoadNextProgramCounterRef(do_call_bb);
           ir.CreateStore(ir.CreateLoad(word_type, ret_pc_ref), next_pc_ref);
 
-          auto *ft_fn = GetOrDeclareBlockFunction(fallthrough);
-          auto *ft_pc = llvm::ConstantInt::get(word_type, fallthrough);
-          auto *ft_call = ir.CreateCall(ft_fn->getFunctionType(), ft_fn,
-                                        {sp, ft_pc, call_result});
-          ft_call->setTailCallKind(llvm::CallInst::TCK_MustTail);
-          ir.CreateRet(ft_call);
+          EmitDecisionEdgeWithMemory(do_call_bb, fallthrough,
+                                     fallthrough_target, call_result,
+                                     discovered_targets);
         }
 
         // skip_bb: musttail to fall-through directly
-        {
-          auto *ft_fn = GetOrDeclareBlockFunction(fallthrough);
-          EmitMusttailToBlock(skip_bb, ft_fn, fallthrough);
-        }
+        EmitDecisionEdge(skip_bb, fallthrough, fallthrough_target,
+                         discovered_targets);
         goto done;
       }
 
       case remill::Instruction::kCategoryConditionalIndirectFunctionCall: {
         auto fallthrough = inst.branch_not_taken_pc;
-        discovered_targets.push_back(fallthrough);
+        auto fallthrough_target = manager.ResolveLiftTarget(
+            current_pc, fallthrough, LiftTargetEdgeKind::kCallFallthrough);
 
         auto *do_call_bb =
             llvm::BasicBlock::Create(context, "do_icall", func);
@@ -656,25 +815,21 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
               remill::LoadNextProgramCounterRef(do_call_bb);
           ir.CreateStore(ir.CreateLoad(word_type, ret_pc_ref), next_pc_ref);
 
-          auto *ft_fn = GetOrDeclareBlockFunction(fallthrough);
-          auto *ft_pc = llvm::ConstantInt::get(word_type, fallthrough);
-          auto *ft_call = ir.CreateCall(ft_fn->getFunctionType(), ft_fn,
-                                        {sp, ft_pc, call_result});
-          ft_call->setTailCallKind(llvm::CallInst::TCK_MustTail);
-          ir.CreateRet(ft_call);
+          EmitDecisionEdgeWithMemory(do_call_bb, fallthrough,
+                                     fallthrough_target, call_result,
+                                     discovered_targets);
         }
 
         // skip_bb: musttail to fall-through directly
-        {
-          auto *ft_fn = GetOrDeclareBlockFunction(fallthrough);
-          EmitMusttailToBlock(skip_bb, ft_fn, fallthrough);
-        }
+        EmitDecisionEdge(skip_bb, fallthrough, fallthrough_target,
+                         discovered_targets);
         goto done;
       }
 
       case remill::Instruction::kCategoryConditionalIndirectJump: {
         auto not_taken_pc = inst.branch_not_taken_pc;
-        discovered_targets.push_back(not_taken_pc);
+        auto not_taken_target = manager.ResolveLiftTarget(
+            current_pc, not_taken_pc, LiftTargetEdgeKind::kConditionalNotTaken);
 
         auto *do_jump_bb =
             llvm::BasicBlock::Create(context, "do_ijmp", func);
@@ -701,8 +856,8 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
         }
 
         EmitDispatchJump(do_jump_bb);
-        auto *cont_fn = GetOrDeclareBlockFunction(not_taken_pc);
-        EmitMusttailToBlock(cont_bb, cont_fn, not_taken_pc);
+        EmitDecisionEdge(cont_bb, not_taken_pc, not_taken_target,
+                         discovered_targets);
         goto done;
       }
 
@@ -715,7 +870,8 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
 
       case remill::Instruction::kCategoryConditionalAsyncHyperCall: {
         auto next_pc = inst.next_pc;
-        discovered_targets.push_back(next_pc);
+        auto next_target = manager.ResolveLiftTarget(
+            current_pc, next_pc, LiftTargetEdgeKind::kTraceNext);
 
         auto *do_hyper =
             llvm::BasicBlock::Create(context, "do_hyper", func);
@@ -729,8 +885,7 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
         remill::AddTerminatingTailCall(do_hyper,
                                        intrinsics->async_hyper_call,
                                        *intrinsics);
-        auto *cont_fn = GetOrDeclareBlockFunction(next_pc);
-        EmitMusttailToBlock(cont_bb, cont_fn, next_pc);
+        EmitDecisionEdge(cont_bb, next_pc, next_target, discovered_targets);
         goto done;
       }
     }
@@ -755,8 +910,15 @@ done:
   // Seal any unterminated blocks.
   for (auto &bb : *func) {
     if (!bb.getTerminator()) {
-      remill::AddTerminatingTailCall(&bb, intrinsics->missing_block,
-                                     *intrinsics);
+      if (invalidated_block_entry) {
+        EmitMusttailToMissingBlock(
+            &bb, addr,
+            invalidated_block_decision ? &*invalidated_block_decision
+                                       : nullptr);
+      } else {
+        remill::AddTerminatingTailCall(&bb, intrinsics->missing_block,
+                                       *intrinsics);
+      }
     }
   }
 

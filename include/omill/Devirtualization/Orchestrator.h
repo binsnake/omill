@@ -14,6 +14,9 @@
 
 #include "omill/Analysis/IterativeLiftingSession.h"
 #include "omill/Analysis/VirtualModel/Types.h"
+#include "omill/Devirtualization/BoundaryFact.h"
+#include "omill/Devirtualization/ExecutableTargetFact.h"
+#include "omill/Devirtualization/ProtectorModel.h"
 #include "omill/Omill.h"
 #include "omill/Remill/Normalization.h"
 
@@ -181,6 +184,8 @@ struct UnresolvedExitSite {
   std::optional<uint64_t> target_pc;
   std::optional<uint64_t> vip_pc;
   std::optional<uint64_t> continuation_vip_pc;
+  std::optional<unsigned> continuation_slot_id;
+  std::optional<unsigned> continuation_stack_cell_id;
   bool vip_symbolic = false;
   VirtualExitDisposition exit_disposition = VirtualExitDisposition::kUnknown;
   ExitEvidence evidence;
@@ -194,9 +199,16 @@ struct FrontierWorkItem {
   VirtualRootFrontierKind root_frontier_kind =
       VirtualRootFrontierKind::kDispatch;
   std::optional<uint64_t> vip_pc;
-  std::optional<uint64_t> continuation_vip_pc;
   bool vip_symbolic = false;
-  VirtualExitDisposition exit_disposition = VirtualExitDisposition::kUnknown;
+  std::optional<BoundaryFact> boundary;
+  std::optional<ExecutableTargetFact> executable_target;
+  ContinuationConfidence continuation_confidence =
+      ContinuationConfidence::kWeak;
+  ContinuationLiveness continuation_liveness =
+      ContinuationLiveness::kUnknown;
+  FrontierSchedulingClass scheduling_class =
+      FrontierSchedulingClass::kWeakExecutable;
+  std::string continuation_rationale;
   FrontierWorkKind kind = FrontierWorkKind::kUnknownExecutableTarget;
   FrontierWorkStatus status = FrontierWorkStatus::kPending;
   unsigned retry_count = 0;
@@ -213,6 +225,18 @@ struct SessionHandlerNode {
   bool is_closed_root_slice_root = false;
   bool is_specialized = false;
   bool is_dirty = false;
+  bool is_preferred_seed = false;
+  bool is_initial_seed = false;
+  bool is_code_bearing = false;
+  std::optional<VirtualHandlerSummary> local_summary;
+  std::vector<VirtualArgumentFact> incoming_argument_facts;
+  std::vector<VirtualIncomingSlotPhi> incoming_slot_phis;
+  std::vector<VirtualSlotFact> incoming_facts;
+  std::vector<VirtualSlotFact> outgoing_facts;
+  std::vector<VirtualIncomingStackPhi> incoming_stack_phis;
+  std::vector<VirtualStackFact> incoming_stack_facts;
+  std::vector<VirtualStackFact> outgoing_stack_facts;
+  bool stack_memory_budget_exceeded = false;
 };
 
 struct SessionEdgeFact {
@@ -224,9 +248,17 @@ struct SessionEdgeFact {
   VirtualRootFrontierKind root_frontier_kind =
       VirtualRootFrontierKind::kDispatch;
   std::optional<uint64_t> vip_pc;
-  std::optional<uint64_t> continuation_vip_pc;
   bool vip_symbolic = false;
-  VirtualExitDisposition exit_disposition = VirtualExitDisposition::kUnknown;
+  std::optional<BoundaryFact> boundary;
+  std::optional<ExecutableTargetFact> executable_target;
+  std::optional<ContinuationProof> continuation_proof;
+  ContinuationConfidence continuation_confidence =
+      ContinuationConfidence::kWeak;
+  ContinuationLiveness continuation_liveness =
+      ContinuationLiveness::kUnknown;
+  FrontierSchedulingClass scheduling_class =
+      FrontierSchedulingClass::kWeakExecutable;
+  std::string continuation_rationale;
   FrontierWorkKind kind = FrontierWorkKind::kUnknownExecutableTarget;
   FrontierWorkStatus status = FrontierWorkStatus::kPending;
   unsigned retry_count = 0;
@@ -240,7 +272,7 @@ struct SessionEdgeFact {
 struct SessionBoundaryFact {
   uint64_t target_pc = 0;
   FrontierWorkKind kind = FrontierWorkKind::kUnknownExecutableTarget;
-  VirtualExitDisposition exit_disposition = VirtualExitDisposition::kUnknown;
+  std::optional<BoundaryFact> boundary;
   std::optional<std::string> declaration_name;
   bool is_dirty = false;
 };
@@ -272,6 +304,8 @@ struct SessionGraphState {
   std::map<uint64_t, SessionBoundaryFact> boundary_facts_by_target;
   std::map<uint64_t, SessionRootSlice> root_slices_by_va;
   std::map<uint64_t, SessionRegionNode> region_nodes_by_entry_pc;
+  std::vector<VirtualStateSlotInfo> canonical_slots;
+  std::vector<VirtualStackCellInfo> canonical_stack_cells;
   std::set<std::string> dirty_function_names;
   std::set<std::string> dirty_edge_identities;
   std::set<uint64_t> dirty_root_vas;
@@ -283,8 +317,23 @@ struct FrontierCallbacks {
   std::function<uint64_t(uint64_t)> normalize_target_pc;
   std::function<bool(uint64_t)> is_executable_target;
   std::function<bool(uint64_t)> is_protected_boundary;
+  std::function<bool(uint64_t)> is_exact_call_fallthrough_target;
   std::function<bool(uint64_t)> can_decode_target;
   std::function<bool(uint64_t, uint8_t *, size_t)> read_target_bytes;
+  struct DecodedTargetSummary {
+    uint64_t pc = 0;
+    uint64_t next_pc = 0;
+    std::optional<uint64_t> branch_taken_pc;
+    std::optional<uint64_t> branch_not_taken_pc;
+    bool is_control_flow = false;
+    bool is_conditional = false;
+    bool is_call = false;
+    bool is_return = false;
+    bool is_indirect = false;
+    bool is_terminal = false;
+  };
+  std::function<std::optional<DecodedTargetSummary>(uint64_t)>
+      decode_target_summary;
 };
 
 struct FrontierAdvanceSummary {
@@ -376,6 +425,14 @@ struct DevirtualizationRoundTelemetry {
   unsigned normalization_failures = 0;
   unsigned dispatches_materialized = 0;
   unsigned leaked_runtime_artifacts = 0;
+  unsigned dirty_handler_nodes = 0;
+  unsigned dirty_edge_facts = 0;
+  unsigned dirty_boundary_facts = 0;
+  unsigned dirty_root_slices = 0;
+  unsigned dirty_regions = 0;
+  unsigned rebuilt_boundary_facts = 0;
+  unsigned rebuilt_root_slices = 0;
+  unsigned rebuilt_regions = 0;
 };
 
 struct DevirtualizationSession {
@@ -399,6 +456,7 @@ struct DevirtualizationSession {
   std::vector<UnresolvedExitSite> unresolved_exits;
   std::map<NormalizedLiftUnitCacheKey, NormalizedLiftUnitCacheEntry>
       normalized_unit_cache;
+  ProtectorModel protector_model;
   DevirtualizationRoundTelemetry latest_round;
   std::vector<DevirtualizationEpochSummary> epochs;
 };
@@ -453,6 +511,9 @@ class DevirtualizationOrchestrator {
   bool hasBlockingUnstableFrontierState(const llvm::Module &M) const;
   std::string summarizeFrontierAdvance(
       const FrontierAdvanceSummary &summary) const;
+  ProtectorModel buildProtectorModel() const;
+  ProtectorValidationReport buildProtectorValidationReport(
+      const llvm::Module &M) const;
 
   std::vector<std::string> collectInvariantViolations(
       const llvm::Module &M, DevirtualizationOutputMode mode) const;
@@ -482,5 +543,6 @@ const char *toString(FrontierWorkStatus status);
 void publishSessionGraphProjection(const llvm::Module &M,
                                    const SessionGraphState &state);
 const SessionGraphState *findSessionGraphProjection(const llvm::Module &M);
+SessionGraphState *findMutableSessionGraphProjection(llvm::Module &M);
 
 }  // namespace omill

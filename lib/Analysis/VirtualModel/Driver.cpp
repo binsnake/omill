@@ -2,6 +2,7 @@
 
 #include <llvm/Support/raw_ostream.h>
 
+#include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/StructuralHash.h>
@@ -20,6 +21,26 @@
 namespace omill {
 
 namespace {
+
+constexpr const char *kVirtualModelCacheSerialFlag =
+    "omill.virtual_model_cache_serial";
+
+uint64_t nextVirtualModelCacheSerial() {
+  static uint64_t serial = 1;
+  return serial++;
+}
+
+uint64_t ensureVirtualModelCacheSerial(llvm::Module &M) {
+  if (auto *flag = M.getModuleFlag(kVirtualModelCacheSerialFlag)) {
+    if (auto *value =
+            llvm::mdconst::dyn_extract_or_null<llvm::ConstantInt>(flag)) {
+      return value->getZExtValue();
+    }
+  }
+  const uint64_t serial = nextVirtualModelCacheSerial();
+  M.addModuleFlag(llvm::Module::Warning, kVirtualModelCacheSerialFlag, serial);
+  return serial;
+}
 
 static bool vmModelImportDebugEnabled() {
   const char *v = std::getenv("OMILL_DEBUG_VIRTUAL_MODEL_IMPORT");
@@ -144,6 +165,39 @@ static llvm::stable_hash rootSliceSummaryFingerprint(
                                      handler.callsites.size());
     hash = llvm::stable_hash_combine(hash, handler.called_boundaries.size(),
                                      handler.direct_callees.size());
+    for (const auto &callee_name : handler.direct_callees) {
+      hash = llvm::stable_hash_combine(hash, llvm::stable_hash_name(callee_name));
+    }
+    for (const auto &callsite : handler.callsites) {
+      hash = llvm::stable_hash_combine(
+          hash, callsite.resolved_target_pc.value_or(0),
+          callsite.recovered_entry_pc.value_or(0),
+          callsite.continuation_pc.value_or(0));
+      hash = llvm::stable_hash_combine(
+          hash, llvm::stable_hash_name(callsite.unresolved_reason),
+          llvm::stable_hash_name(callsite.target_function_name.value_or("")),
+          llvm::stable_hash_name(
+              callsite.recovered_target_function_name.value_or("")));
+      hash = llvm::stable_hash_combine(
+          hash, callsite.is_executable_in_image ? 1u : 0u,
+          callsite.is_decodable_entry ? 1u : 0u,
+          static_cast<unsigned>(callsite.exit.disposition));
+    }
+    for (const auto &dispatch : handler.dispatches) {
+      hash = llvm::stable_hash_combine(
+          hash, llvm::stable_hash_name(dispatch.unresolved_reason),
+          static_cast<unsigned>(dispatch.successors.size()));
+      for (const auto &successor : dispatch.successors) {
+        hash = llvm::stable_hash_combine(
+            hash, successor.target_pc,
+            successor.canonical_boundary_target_va.value_or(0));
+        hash = llvm::stable_hash_combine(
+            hash, llvm::stable_hash_name(successor.target_function_name.value_or("")),
+            llvm::stable_hash_name(successor.boundary_name.value_or("")));
+        hash = llvm::stable_hash_combine(
+            hash, static_cast<unsigned>(successor.kind));
+      }
+    }
   }
 
   return hash;
@@ -198,7 +252,10 @@ static void projectRootSlicesFromSessionGraph(
       frontier.reason = projectedRootFrontierReason(edge);
       frontier.target_pc = edge.target_pc;
       frontier.vip_pc = edge.vip_pc;
-      frontier.exit_disposition = edge.exit_disposition;
+      frontier.exit_disposition = edge.boundary
+                                      ? virtualExitDispositionFromBoundaryDisposition(
+                                            edge.boundary->exit_disposition)
+                                      : VirtualExitDisposition::kUnknown;
       auto boundary_it = edge.target_pc
                              ? graph.boundary_facts_by_target.find(*edge.target_pc)
                              : graph.boundary_facts_by_target.end();
@@ -237,13 +294,34 @@ static VirtualValueExpr constantPcExpr(std::optional<uint64_t> pc) {
 
 static void applyProjectedExitSummary(VirtualExitSummary &exit,
                                       const SessionEdgeFact &edge) {
-  exit.disposition = edge.exit_disposition;
-  exit.continuation_vip.resolved_pc = edge.continuation_vip_pc;
+  const auto disposition =
+      edge.boundary
+          ? virtualExitDispositionFromBoundaryDisposition(
+                edge.boundary->exit_disposition)
+          : VirtualExitDisposition::kUnknown;
+  const auto continuation_vip_pc =
+      edge.boundary ? edge.boundary->continuation_vip_pc : std::nullopt;
+  const auto continuation_pc =
+      edge.boundary ? edge.boundary->continuation_pc : std::nullopt;
+  exit.disposition = disposition;
+  exit.continuation_vip.resolved_pc = continuation_vip_pc;
+  exit.continuation_vip.slot_id =
+      edge.boundary ? edge.boundary->continuation_slot_id : std::nullopt;
+  exit.continuation_vip.stack_cell_id =
+      edge.boundary ? edge.boundary->continuation_stack_cell_id : std::nullopt;
+  if (exit.continuation_vip.stack_cell_id) {
+    exit.continuation_vip.source_kind =
+        VirtualInstructionPointerSourceKind::kStackCell;
+  } else if (exit.continuation_vip.slot_id) {
+    exit.continuation_vip.source_kind =
+        VirtualInstructionPointerSourceKind::kNamedSlot;
+  }
   exit.continuation_vip.symbolic =
-      !edge.continuation_vip_pc.has_value() && edge.vip_symbolic;
-  exit.continuation_pc = edge.continuation_vip_pc;
+      !continuation_vip_pc.has_value() && edge.vip_symbolic;
+  exit.continuation_pc =
+      continuation_pc.has_value() ? continuation_pc : continuation_vip_pc;
 
-  switch (edge.exit_disposition) {
+  switch (disposition) {
     case VirtualExitDisposition::kVmExitTerminal:
       exit.is_full_exit = true;
       break;
@@ -383,7 +461,16 @@ static bool projectFlowFactsFromSessionGraph(const SessionGraphState &graph,
     callsite.specialized_target = callsite.target;
     callsite.resolved_target_pc = edge.target_pc;
     callsite.recovered_entry_pc = edge.target_pc;
-    callsite.continuation_pc = edge.continuation_vip_pc;
+    callsite.continuation_pc = edge.boundary
+                                   ? (edge.boundary->continuation_pc
+                                          ? edge.boundary->continuation_pc
+                                          : edge.boundary->continuation_vip_pc)
+                                   : std::nullopt;
+    callsite.continuation_slot_id =
+        edge.boundary ? edge.boundary->continuation_slot_id : std::nullopt;
+    callsite.continuation_stack_cell_id =
+        edge.boundary ? edge.boundary->continuation_stack_cell_id
+                      : std::nullopt;
     callsite.vip.resolved_pc = edge.vip_pc;
     callsite.vip.symbolic = !edge.vip_pc.has_value() && edge.vip_symbolic;
     callsite.is_executable_in_image = edge.target_pc.has_value();
@@ -416,6 +503,154 @@ static bool projectFlowFactsFromSessionGraph(const SessionGraphState &graph,
   }
 
   return changed;
+}
+
+static bool projectVipFactsFromSessionGraph(const SessionGraphState &graph,
+                                            VirtualMachineModel &model) {
+  bool changed = false;
+  std::map<std::string, VirtualHandlerSummary *> handlers_by_name;
+  for (auto &handler : model.mutableHandlers())
+    handlers_by_name.emplace(handler.function_name, &handler);
+
+  for (const auto &[identity, edge] : graph.edge_facts_by_identity) {
+    (void)identity;
+    auto handler_it = handlers_by_name.find(edge.owner_function);
+    if (handler_it == handlers_by_name.end())
+      continue;
+    auto &handler = *handler_it->second;
+    if (edge.vip_pc.has_value()) {
+      if (!handler.canonical_vip.resolved_pc.has_value() ||
+          *handler.canonical_vip.resolved_pc == *edge.vip_pc) {
+        handler.canonical_vip.resolved_pc = edge.vip_pc;
+        handler.canonical_vip.symbolic = false;
+        changed = true;
+      }
+    } else if (edge.vip_symbolic && !handler.canonical_vip.resolved_pc.has_value() &&
+               !handler.canonical_vip.symbolic) {
+      handler.canonical_vip.symbolic = true;
+      changed = true;
+    }
+  }
+
+  return changed;
+}
+
+static bool projectCanonicalStateFromSessionGraph(const SessionGraphState &graph,
+                                                  VirtualMachineModel &model) {
+  if (graph.canonical_slots.empty() && graph.canonical_stack_cells.empty())
+    return false;
+  model.mutableSlots() = graph.canonical_slots;
+  model.mutableStackCells() = graph.canonical_stack_cells;
+  return true;
+}
+
+static void publishCanonicalStateToSessionGraph(llvm::Module &M,
+                                                const VirtualMachineModel &model) {
+  auto *graph = findMutableSessionGraphProjection(M);
+  if (!graph)
+    return;
+  graph->canonical_slots = model.slots().vec();
+  graph->canonical_stack_cells = model.stackCells().vec();
+  for (const auto &handler : model.handlers()) {
+    auto node_it = graph->handler_nodes.find(handler.function_name);
+    if (node_it == graph->handler_nodes.end() ||
+        !node_it->second.local_summary.has_value()) {
+      continue;
+    }
+    auto &summary = *node_it->second.local_summary;
+    summary.is_candidate = handler.is_candidate;
+    summary.state_slots = handler.state_slots;
+    summary.stack_cells = handler.stack_cells;
+    summary.state_transfers = handler.state_transfers;
+    summary.stack_transfers = handler.stack_transfers;
+    summary.live_in_slot_ids = handler.live_in_slot_ids;
+    summary.written_slot_ids = handler.written_slot_ids;
+    summary.live_in_stack_cell_ids = handler.live_in_stack_cell_ids;
+    summary.written_stack_cell_ids = handler.written_stack_cell_ids;
+    summary.specialization_facts = handler.specialization_facts;
+    summary.specialization_stack_facts = handler.specialization_stack_facts;
+    summary.incoming_argument_facts = handler.incoming_argument_facts;
+    summary.incoming_slot_phis = handler.incoming_slot_phis;
+    summary.has_unsupported_stack_memory = handler.has_unsupported_stack_memory;
+    summary.incoming_stack_phis = handler.incoming_stack_phis;
+    summary.stack_memory_budget_exceeded = handler.stack_memory_budget_exceeded;
+  }
+}
+
+static unsigned projectPropagationFactsFromSessionGraph(
+    const SessionGraphState &graph, VirtualMachineModel &model) {
+  unsigned projected = 0;
+  for (auto &handler : model.mutableHandlers()) {
+    auto node_it = graph.handler_nodes.find(handler.function_name);
+    if (node_it == graph.handler_nodes.end())
+      continue;
+    const auto &node = node_it->second;
+    const bool has_propagated_facts =
+        !node.incoming_slot_phis.empty() ||
+        !node.incoming_facts.empty() || !node.outgoing_facts.empty() ||
+        !node.incoming_stack_phis.empty() ||
+        !node.incoming_stack_facts.empty() || !node.outgoing_stack_facts.empty() ||
+        !node.incoming_argument_facts.empty() ||
+        node.stack_memory_budget_exceeded;
+    if (node.fingerprint == 0 || !has_propagated_facts) {
+      continue;
+    }
+    handler.incoming_argument_facts = node.incoming_argument_facts;
+    handler.incoming_slot_phis = node.incoming_slot_phis;
+    handler.incoming_facts = node.incoming_facts;
+    handler.outgoing_facts = node.outgoing_facts;
+    handler.incoming_stack_phis = node.incoming_stack_phis;
+    handler.incoming_stack_facts = node.incoming_stack_facts;
+    handler.outgoing_stack_facts = node.outgoing_stack_facts;
+    handler.stack_memory_budget_exceeded = node.stack_memory_budget_exceeded;
+    ++projected;
+  }
+  return projected;
+}
+
+static void publishPropagationFactsToSessionGraph(llvm::Module &M,
+                                                  const VirtualMachineModel &model) {
+  auto *graph = findMutableSessionGraphProjection(M);
+  if (!graph)
+    return;
+  for (const auto &handler : model.handlers()) {
+    auto node_it = graph->handler_nodes.find(handler.function_name);
+    if (node_it == graph->handler_nodes.end())
+      continue;
+    auto &node = node_it->second;
+    node.incoming_argument_facts = handler.incoming_argument_facts;
+    node.incoming_slot_phis = handler.incoming_slot_phis;
+    node.incoming_facts = handler.incoming_facts;
+    node.outgoing_facts = handler.outgoing_facts;
+    node.incoming_stack_phis = handler.incoming_stack_phis;
+    node.incoming_stack_facts = handler.incoming_stack_facts;
+    node.outgoing_stack_facts = handler.outgoing_stack_facts;
+    node.stack_memory_budget_exceeded = handler.stack_memory_budget_exceeded;
+    if (node.local_summary.has_value()) {
+      node.local_summary->incoming_argument_facts = handler.incoming_argument_facts;
+      node.local_summary->incoming_slot_phis = handler.incoming_slot_phis;
+      node.local_summary->incoming_facts = handler.incoming_facts;
+      node.local_summary->outgoing_facts = handler.outgoing_facts;
+      node.local_summary->incoming_stack_phis = handler.incoming_stack_phis;
+      node.local_summary->incoming_stack_facts = handler.incoming_stack_facts;
+      node.local_summary->outgoing_stack_facts = handler.outgoing_stack_facts;
+      node.local_summary->stack_memory_budget_exceeded =
+          handler.stack_memory_budget_exceeded;
+    }
+  }
+}
+
+static bool projectHandlerLocalSummaryFromSessionGraph(
+    const SessionGraphState &graph, llvm::StringRef function_name,
+    llvm::stable_hash fingerprint, VirtualHandlerSummary &summary) {
+  auto node_it = graph.handler_nodes.find(function_name.str());
+  if (node_it == graph.handler_nodes.end())
+    return false;
+  const auto &node = node_it->second;
+  if (!node.local_summary.has_value() || node.fingerprint != fingerprint)
+    return false;
+  summary = *node.local_summary;
+  return true;
 }
 
 static bool projectRegionsFromSessionGraph(const SessionGraphState &graph,
@@ -528,38 +763,75 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
   auto &module_cache = virtualModelSummaryCaches()[&M];
   const llvm::stable_hash module_fingerprint =
       llvm::StructuralHash(M, /*DetailedHash=*/true);
-  if (module_cache.module_fingerprint != module_fingerprint) {
-    module_cache = CachedModuleHandlerSummaryState{};
+  const uint64_t module_instance_serial = ensureVirtualModelCacheSerial(M);
+  if (module_cache.module_fingerprint != module_fingerprint ||
+      module_cache.module_instance_serial != module_instance_serial) {
+    module_cache = virtual_model::detail::CachedModuleHandlerSummaryState{};
     module_cache.module_fingerprint = module_fingerprint;
+    module_cache.module_instance_serial = module_instance_serial;
   }
   const auto *session_graph = findSessionGraphProjection(M);
   auto &telemetry = model.mutableTelemetry();
-
-  for (auto &F : M) {
-    if (!isBoundaryFunction(F))
-      continue;
-
-    VirtualBoundaryInfo info;
-    info.name = F.getName().str();
-    info.kind = classifyBoundaryKind(F);
-    uint64_t entry_va = extractEntryVA(F.getName());
-    if (entry_va != 0)
-      info.entry_va = entry_va;
-    if (auto attr_entry = extractHexAttr(F, "omill.boundary_entry_va"))
-      info.entry_va = attr_entry;
-    info.target_va = extractHexAttr(F, "omill.boundary_target_va");
-    model.boundaries_.push_back(std::move(info));
+  bool explicit_dirty_scope =
+      session_graph && !session_graph->dirty_function_names.empty();
+  if (!explicit_dirty_scope) {
+    for (auto &F : M) {
+      if (F.isDeclaration())
+        continue;
+      if (hasExplicitDirtyVirtualModelSeedAttr(F)) {
+        explicit_dirty_scope = true;
+        break;
+      }
+    }
   }
-  if (session_graph) {
+  const bool can_use_session_graph_projection =
+      session_graph && explicit_dirty_scope;
+
+  if (can_use_session_graph_projection &&
+      !session_graph->boundary_facts_by_target.empty()) {
     telemetry.session_graph_boundary_projection_used =
         projectBoundariesFromSessionGraph(*session_graph, model);
+  } else {
+    for (auto &F : M) {
+      if (!isBoundaryFunction(F))
+        continue;
+
+      VirtualBoundaryInfo info;
+      info.name = F.getName().str();
+      info.kind = classifyBoundaryKind(F);
+      uint64_t entry_va = extractEntryVA(F.getName());
+      if (entry_va != 0)
+        info.entry_va = entry_va;
+      if (auto attr_entry = extractHexAttr(F, "omill.boundary_entry_va"))
+        info.entry_va = attr_entry;
+      info.target_va = extractHexAttr(F, "omill.boundary_target_va");
+      model.boundaries_.push_back(std::move(info));
+    }
   }
 
   auto get_direct_callees = [&](llvm::Function &F)
       -> const llvm::SmallVector<std::string, 8> & {
+    std::string function_name = F.getName().str();
+    if (can_use_session_graph_projection) {
+      auto node_it = session_graph->handler_nodes.find(function_name);
+      if (node_it != session_graph->handler_nodes.end()) {
+        const auto &node = node_it->second;
+        llvm::stable_hash fingerprint = summaryRelevantFunctionFingerprint(F);
+        if (node.local_summary.has_value() && node.fingerprint == fingerprint) {
+          llvm::SmallVector<std::string, 8> callees;
+          callees.append(node.local_summary->direct_callees.begin(),
+                         node.local_summary->direct_callees.end());
+          auto inserted = module_cache.direct_callees.insert_or_assign(
+              function_name,
+              CachedDirectCalleeEntry{llvm::StructuralHash(F, /*DetailedHash=*/true),
+                                      std::move(callees)});
+          telemetry.session_graph_direct_callee_projection_used = true;
+          return inserted.first->second.callees;
+        }
+      }
+    }
     llvm::stable_hash fingerprint =
         llvm::StructuralHash(F, /*DetailedHash=*/true);
-    std::string function_name = F.getName().str();
     auto cache_it = module_cache.direct_callees.find(function_name);
     if (cache_it != module_cache.direct_callees.end() &&
         cache_it->second.fingerprint == fingerprint) {
@@ -637,28 +909,41 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
           InterestingWorkItem{std::move(key), helper_depth, code_bearing_depth});
   };
   const bool closed_slice_scope = isClosedRootSliceScopedModule(M);
-  bool explicit_dirty_scope = false;
-  for (auto &F : M) {
-    if (F.isDeclaration())
-      continue;
-    if (hasExplicitDirtyVirtualModelSeedAttr(F)) {
-      explicit_dirty_scope = true;
-      break;
-    }
-  }
   telemetry.dirty_scope_requested = explicit_dirty_scope;
   if (explicit_dirty_scope)
     telemetry.scope_reason = "explicit_dirty_seed_attr";
+  auto enqueue_session_graph_handlers = [&](auto &&predicate) {
+    if (!can_use_session_graph_projection)
+      return false;
+    bool enqueued = false;
+    for (const auto &[name, node] : session_graph->handler_nodes) {
+      if (!predicate(node))
+        continue;
+      auto *F = M.getFunction(name);
+      if (!F || F->isDeclaration())
+        continue;
+      enqueue_interesting(F->getName(), /*helper_depth=*/0,
+                          /*code_bearing_depth=*/0);
+      enqueued = true;
+    }
+    if (enqueued)
+      telemetry.session_graph_seed_projection_used = true;
+    return enqueued;
+  };
   bool session_graph_handler_scope_used = false;
-  if (session_graph) {
+  if (can_use_session_graph_projection) {
     if (explicit_dirty_scope && !session_graph->dirty_function_names.empty()) {
+      bool session_graph_dirty_seed_used = false;
       for (const auto &dirty_name : session_graph->dirty_function_names) {
         auto *dirty_fn = M.getFunction(dirty_name);
         if (!dirty_fn || dirty_fn->isDeclaration())
           continue;
         enqueue_interesting(dirty_fn->getName(), /*helper_depth=*/0,
                             /*code_bearing_depth=*/0);
+        session_graph_dirty_seed_used = true;
       }
+      if (session_graph_dirty_seed_used)
+        telemetry.session_graph_seed_projection_used = true;
     }
     session_graph_handler_scope_used = !interesting_handlers.empty();
     if (session_graph_handler_scope_used) {
@@ -702,44 +987,66 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
     }
   }
   if (closed_slice_scope && !session_graph_handler_scope_used) {
-    for (auto &F : M) {
-      if (F.isDeclaration() || !isClosedRootSliceFunction(F) ||
-          !isVirtualModelCodeBearingFunction(F)) {
-        continue;
+    if (!enqueue_session_graph_handlers([&](const SessionHandlerNode &node) {
+          if (!node.is_code_bearing ||
+              (!node.is_output_root && !node.is_closed_root_slice_root))
+            return false;
+          if (!explicit_dirty_scope)
+            return true;
+          return node.is_output_root || node.is_closed_root_slice_root ||
+                 node.is_specialized || node.is_dirty;
+        })) {
+      for (auto &F : M) {
+        if (F.isDeclaration() || !isClosedRootSliceFunction(F) ||
+            !isVirtualModelCodeBearingFunction(F)) {
+          continue;
+        }
+        if (explicit_dirty_scope && !F.hasFnAttribute("omill.output_root") &&
+            !F.hasFnAttribute("omill.closed_root_slice_root") &&
+            !F.hasFnAttribute("omill.virtual_specialized") &&
+            !hasExplicitDirtyVirtualModelSeedAttr(F)) {
+          continue;
+        }
+        enqueue_interesting(F.getName(), /*helper_depth=*/0,
+                            /*code_bearing_depth=*/0);
       }
-      if (explicit_dirty_scope && !F.hasFnAttribute("omill.output_root") &&
-          !F.hasFnAttribute("omill.closed_root_slice_root") &&
-          !F.hasFnAttribute("omill.virtual_specialized") &&
-          !hasExplicitDirtyVirtualModelSeedAttr(F)) {
-        continue;
-      }
-      enqueue_interesting(F.getName(), /*helper_depth=*/0,
-                          /*code_bearing_depth=*/0);
     }
   }
   if (interesting_handlers.empty() && !session_graph_handler_scope_used) {
-    for (auto &F : M) {
-      if (F.isDeclaration() ||
-          F.hasFnAttribute("omill.localized_continuation_shim") ||
-          !hasPreferredVirtualModelSeedAttr(F)) {
-        continue;
+    if (!enqueue_session_graph_handlers([&](const SessionHandlerNode &node) {
+          if (!node.is_preferred_seed)
+            return false;
+          if (!explicit_dirty_scope)
+            return true;
+          return node.is_output_root || node.is_closed_root_slice_root ||
+                 node.is_dirty;
+        })) {
+      for (auto &F : M) {
+        if (F.isDeclaration() ||
+            F.hasFnAttribute("omill.localized_continuation_shim") ||
+            !hasPreferredVirtualModelSeedAttr(F)) {
+          continue;
+        }
+        if (explicit_dirty_scope && !F.hasFnAttribute("omill.output_root") &&
+            !F.hasFnAttribute("omill.closed_root_slice_root") &&
+            !hasExplicitDirtyVirtualModelSeedAttr(F)) {
+          continue;
+        }
+        enqueue_interesting(F.getName(), /*helper_depth=*/0,
+                            /*code_bearing_depth=*/0);
       }
-      if (explicit_dirty_scope && !F.hasFnAttribute("omill.output_root") &&
-          !F.hasFnAttribute("omill.closed_root_slice_root") &&
-          !hasExplicitDirtyVirtualModelSeedAttr(F)) {
-        continue;
-      }
-      enqueue_interesting(F.getName(), /*helper_depth=*/0,
-                          /*code_bearing_depth=*/0);
     }
   }
   if (interesting_handlers.empty() && !explicit_dirty_scope &&
       !session_graph_handler_scope_used) {
-    for (auto &F : M) {
-      if (!isVirtualModelInitialSeedFunction(F))
-        continue;
-      enqueue_interesting(F.getName(), /*helper_depth=*/0,
-                          /*code_bearing_depth=*/0);
+    if (!enqueue_session_graph_handlers(
+            [&](const SessionHandlerNode &node) { return node.is_initial_seed; })) {
+      for (auto &F : M) {
+        if (!isVirtualModelInitialSeedFunction(F))
+          continue;
+        enqueue_interesting(F.getName(), /*helper_depth=*/0,
+                            /*code_bearing_depth=*/0);
+      }
     }
   } else if (interesting_handlers.empty() && explicit_dirty_scope &&
              !session_graph_handler_scope_used) {
@@ -802,7 +1109,8 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
       const bool callee_code_bearing =
           callee && isVirtualModelCodeBearingFunction(*callee);
       const bool callee_vm_helper =
-          callee && callee->hasFnAttribute("omill.vm_handler");
+          callee &&
+          virtual_model::detail::isVirtualModelAnalysisHelperFunction(*callee);
       if (!callee_code_bearing && !callee_vm_helper &&
           !(callee && virtual_model::detail::isCallSiteHelper(*callee))) {
         continue;
@@ -822,6 +1130,71 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
       enqueue_interesting(callee_name, next_helper_depth,
                           next_code_bearing_depth);
     }
+
+    for (auto &BB : *current_fn) {
+      for (auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+        if (!call)
+          continue;
+        auto *callee = call->getCalledFunction();
+        if (!callee || !virtual_model::detail::isCallSiteHelper(*callee) ||
+            call->arg_size() < 3) {
+          continue;
+        }
+        auto *target_pc = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(2));
+        if (!target_pc)
+          continue;
+        uint64_t target_va = target_pc->getZExtValue();
+        auto enqueue_callsite_target = [&](llvm::StringRef name) {
+          if (auto *target = M.getFunction(name);
+              target && !target->isDeclaration()) {
+            enqueue_interesting(target->getName(), /*helper_depth=*/0,
+                                /*code_bearing_depth=*/0);
+            return true;
+          }
+          return false;
+        };
+        if (!enqueue_callsite_target(liftedFunctionName(target_va))) {
+          auto block_name =
+              (llvm::Twine("blk_") + llvm::Twine::utohexstr(target_va)).str();
+          if (!enqueue_callsite_target(block_name)) {
+            auto trace_block_name =
+                (llvm::Twine("block_") + llvm::Twine::utohexstr(target_va)).str();
+            enqueue_callsite_target(trace_block_name);
+          }
+        }
+      }
+    }
+
+    uint64_t current_entry_va = extractEntryVA(current_fn->getName());
+    if (current_entry_va == 0)
+      current_entry_va = extractBlockPC(current_fn->getName());
+    if (current_entry_va != 0) {
+      if (auto prelude = virtual_model::detail::detectEntryPreludeDirectCall(
+              binary_memory, current_entry_va)) {
+        auto enqueue_prelude_target = [&](llvm::StringRef name) {
+          if (auto *target = M.getFunction(name);
+              target && !target->isDeclaration()) {
+            enqueue_interesting(target->getName(), /*helper_depth=*/0,
+                                /*code_bearing_depth=*/0);
+            return true;
+          }
+          return false;
+        };
+        if (!enqueue_prelude_target(liftedFunctionName(prelude->target_pc))) {
+          auto block_name =
+              (llvm::Twine("blk_") + llvm::Twine::utohexstr(prelude->target_pc))
+                  .str();
+          if (!enqueue_prelude_target(block_name)) {
+            auto trace_block_name =
+                (llvm::Twine("block_") +
+                 llvm::Twine::utohexstr(prelude->target_pc))
+                    .str();
+            enqueue_prelude_target(trace_block_name);
+          }
+        }
+      }
+    }
   }
 
   vmModelStageDebugLog("run: summarize-handlers-begin");
@@ -831,29 +1204,50 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
   unsigned summarized_handlers = 0;
   unsigned cached_summary_hits = 0;
   unsigned cached_summary_misses = 0;
-  for (auto &F : M) {
-    if (F.isDeclaration())
-      continue;
-    if (F.hasFnAttribute("omill.localized_continuation_shim"))
-      continue;
-    if (!interesting_handlers.empty() &&
-        !interesting_handlers.count(F.getName().str())) {
-      continue;
+  unsigned session_graph_handler_projection_hits = 0;
+  std::vector<llvm::Function *> functions_to_summarize;
+  if (!interesting_handlers.empty()) {
+    telemetry.selected_handler_iteration_used = true;
+    for (const auto &name : interesting_handlers) {
+      auto *F = M.getFunction(name);
+      if (!F)
+        continue;
+      functions_to_summarize.push_back(F);
     }
+  } else {
+    for (auto &F : M)
+      functions_to_summarize.push_back(&F);
+  }
+  for (auto *F : functions_to_summarize) {
+    if (!F)
+      continue;
+    if (F->isDeclaration())
+      continue;
+    if (F->hasFnAttribute("omill.localized_continuation_shim"))
+      continue;
     if ((summarized_handlers % 64u) == 0u) {
       vmModelStageDebugLog(
-          (llvm::Twine("run: summarizing ") + F.getName()).str());
+          (llvm::Twine("run: summarizing ") + F->getName()).str());
     }
-    std::string function_name = F.getName().str();
+    std::string function_name = F->getName().str();
     live_summary_names.insert(function_name);
-    llvm::stable_hash fingerprint = summaryRelevantFunctionFingerprint(F);
+    llvm::stable_hash fingerprint = summaryRelevantFunctionFingerprint(*F);
     auto cache_it = summary_cache.summaries.find(function_name);
-    if (cache_it != summary_cache.summaries.end() &&
-        cache_it->second.fingerprint == fingerprint) {
+    VirtualHandlerSummary summary;
+    if (can_use_session_graph_projection &&
+        projectHandlerLocalSummaryFromSessionGraph(*session_graph, function_name,
+                                                  fingerprint, summary)) {
+      summary_cache.summaries[function_name] =
+          CachedHandlerSummaryEntry{fingerprint, summary};
+      model.handlers_.push_back(std::move(summary));
+      ++cached_summary_hits;
+      ++session_graph_handler_projection_hits;
+    } else if (cache_it != summary_cache.summaries.end() &&
+               cache_it->second.fingerprint == fingerprint) {
       model.handlers_.push_back(cache_it->second.summary);
       ++cached_summary_hits;
     } else {
-      auto summary = summarizeFunction(F);
+      summary = summarizeFunction(*F);
       summary_cache.summaries[function_name] =
           CachedHandlerSummaryEntry{fingerprint, summary};
       model.handlers_.push_back(std::move(summary));
@@ -883,16 +1277,29 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
   vmModelStageDebugLog("run: summarize-handlers-cache hits=" +
                        llvm::Twine(cached_summary_hits).str() + " misses=" +
                        llvm::Twine(cached_summary_misses).str());
+  if (session_graph_handler_projection_hits != 0) {
+    vmModelStageDebugLog("run: summarize-handlers-session-graph hits=" +
+                         llvm::Twine(session_graph_handler_projection_hits).str());
+    telemetry.session_graph_handler_projection_used = true;
+  }
   telemetry.summarized_handlers = summarized_handlers;
   telemetry.cached_summary_hits = cached_summary_hits;
   telemetry.cached_summary_misses = cached_summary_misses;
   const bool session_graph_flow_projection_used =
-      session_graph && !session_graph->edge_facts_by_identity.empty() &&
+      can_use_session_graph_projection &&
+      !session_graph->edge_facts_by_identity.empty() &&
       projectFlowFactsFromSessionGraph(*session_graph, model);
 
   vmModelStageDebugLog("run: canonicalize-begin");
   const auto canonicalize_begin = std::chrono::steady_clock::now();
-  canonicalizeVirtualState(model);
+  if (can_use_session_graph_projection &&
+      projectCanonicalStateFromSessionGraph(*session_graph, model)) {
+    vmModelStageDebugLog("run: canonicalize-session-graph projection");
+    telemetry.session_graph_canonical_state_projection_used = true;
+  } else {
+    canonicalizeVirtualState(model);
+    publishCanonicalStateToSessionGraph(M, model);
+  }
   vmModelStageDebugLog("run: canonicalize-done ms=" +
                        llvm::Twine(elapsedMilliseconds(
                            canonicalize_begin,
@@ -900,7 +1307,19 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
                            .str());
   vmModelStageDebugLog("run: propagate-begin");
   const auto propagate_begin = std::chrono::steady_clock::now();
-  propagateVirtualStateFacts(M, model, binary_memory, &module_cache);
+  unsigned session_graph_propagation_projection_count = 0;
+  if (can_use_session_graph_projection) {
+    session_graph_propagation_projection_count =
+        projectPropagationFactsFromSessionGraph(*session_graph, model);
+  }
+  if (session_graph_propagation_projection_count == model.handlers().size() &&
+      !model.handlers().empty()) {
+    vmModelStageDebugLog("run: propagate-session-graph projection");
+    telemetry.session_graph_propagation_projection_used = true;
+  } else {
+    propagateVirtualStateFacts(M, model, binary_memory, &module_cache);
+    publishPropagationFactsToSessionGraph(M, model);
+  }
   vmModelStageDebugLog("run: propagate-done ms=" +
                        llvm::Twine(elapsedMilliseconds(
                            propagate_begin, std::chrono::steady_clock::now()))
@@ -908,7 +1327,8 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
   vmModelStageDebugLog("run: regions-begin");
   const auto regions_begin = std::chrono::steady_clock::now();
   const bool session_graph_region_projection_used =
-      session_graph && projectRegionsFromSessionGraph(*session_graph, model);
+      can_use_session_graph_projection &&
+      projectRegionsFromSessionGraph(*session_graph, model);
   if (!session_graph_region_projection_used) {
     summarizeVirtualRegions(model, binary_memory);
   } else {
@@ -920,7 +1340,16 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
                            .str());
   vmModelStageDebugLog("run: vip-begin");
   const auto vip_begin = std::chrono::steady_clock::now();
-  summarizeVirtualInstructionPointers(M, model, binary_memory);
+  const bool session_graph_vip_projection_used =
+      session_graph_flow_projection_used &&
+      can_use_session_graph_projection &&
+      projectVipFactsFromSessionGraph(*session_graph, model);
+  if (!session_graph_vip_projection_used) {
+    summarizeVirtualInstructionPointers(M, model, binary_memory);
+  } else {
+    vmModelStageDebugLog("run: vip-session-graph projection");
+    telemetry.session_graph_vip_projection_used = true;
+  }
   vmModelStageDebugLog("run: vip-done ms=" +
                        llvm::Twine(elapsedMilliseconds(
                            vip_begin, std::chrono::steady_clock::now()))
@@ -974,7 +1403,9 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
                            .str());
   vmModelStageDebugLog("run: root-slices-begin");
   const auto root_slices_begin = std::chrono::steady_clock::now();
-  if (const auto *session_graph = findSessionGraphProjection(M);
+  if (const auto *session_graph =
+          can_use_session_graph_projection ? findSessionGraphProjection(M)
+                                           : nullptr;
       session_graph && !session_graph->root_slices_by_va.empty()) {
     projectRootSlicesFromSessionGraph(*session_graph, model);
     telemetry.session_graph_projection_used = true;

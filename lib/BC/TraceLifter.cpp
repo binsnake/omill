@@ -14,6 +14,7 @@
 
 #include "omill/BC/TraceLifter.h"
 
+#include "omill/Devirtualization/ExecutableTargetFact.h"
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
@@ -35,6 +36,17 @@
 #include <sstream>
 
 namespace omill {
+
+namespace {
+
+static void annotateLiftTargetDecisionMetadata(llvm::CallInst &call,
+                                               const LiftTargetDecision &decision) {
+  if (auto fact = executableTargetFactFromDecision(decision))
+    writeExecutableTargetFact(call, *fact);
+}
+
+using DecoderWorkList = std::set<uint64_t>;  // Ordered for determinism.
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // TraceManager default implementations
@@ -62,13 +74,31 @@ std::string TraceManager::TraceName(uint64_t addr) {
   return ss.str();
 }
 
+LiftTargetDecision TraceManager::ResolveLiftTarget(uint64_t, uint64_t raw_target_pc,
+                                                   LiftTargetEdgeKind) {
+  LiftTargetDecision decision;
+  decision.raw_target_pc = raw_target_pc;
+  decision.effective_target_pc = raw_target_pc;
+  decision.classification = LiftTargetClassification::kLiftableEntry;
+  decision.trust = LiftTargetTrust::kTrustedEntry;
+  return decision;
+}
+
+DecodeFailureDecision TraceManager::ResolveDecodeFailure(
+    uint64_t source_addr, uint64_t failed_pc, const DecodeFailureContext &) {
+  DecodeFailureDecision decision;
+  decision.source_pc = source_addr;
+  decision.failed_pc = failed_pc;
+  decision.action = DecodeFailureAction::kRedirectToTarget;
+  decision.target = ResolveLiftTarget(
+      source_addr, failed_pc,
+      LiftTargetEdgeKind::kDecodeFailureContinuation);
+  return decision;
+}
+
 // ---------------------------------------------------------------------------
 // TraceLifter::Impl
 // ---------------------------------------------------------------------------
-
-namespace {
-using DecoderWorkList = std::set<uint64_t>;  // Ordered for determinism.
-}  // namespace
 
 class TraceLifter::Impl {
  public:
@@ -99,21 +129,52 @@ class TraceLifter::Impl {
     return block;
   }
 
-  llvm::BasicBlock *GetOrCreateBranchTakenBlock() {
-    inst_work_list.insert(inst.branch_taken_pc);
-    return GetOrCreateBlock(inst.branch_taken_pc);
+  llvm::BasicBlock *GetOrCreateMissingBlock(
+      uint64_t block_pc, const LiftTargetDecision *decision = nullptr) {
+    auto *bb = llvm::BasicBlock::Create(context, "", func);
+    auto *state_ptr = remill::NthArgument(func, remill::kStatePointerArgNum);
+    auto *mem_ptr = remill::NthArgument(func, remill::kMemoryPointerArgNum);
+    llvm::IRBuilder<> ir(bb);
+    auto *pc_val = llvm::ConstantInt::get(word_type, block_pc);
+    auto *call = ir.CreateCall(intrinsics->missing_block->getFunctionType(),
+                               intrinsics->missing_block,
+                               {state_ptr, pc_val, mem_ptr});
+    if (decision)
+      annotateLiftTargetDecisionMetadata(*call, *decision);
+    call->setTailCallKind(llvm::CallInst::TCK_MustTail);
+    ir.CreateRet(call);
+    return bb;
   }
 
-  llvm::BasicBlock *GetOrCreateBranchNotTakenBlock() {
+  llvm::BasicBlock *GetOrCreateTargetBlock(const LiftTargetDecision &decision) {
+    if (decision.shouldLift() && decision.effective_target_pc) {
+      inst_work_list.insert(*decision.effective_target_pc);
+      return GetOrCreateBlock(*decision.effective_target_pc);
+    }
+    return GetOrCreateMissingBlock(decision.raw_target_pc, &decision);
+  }
+
+  llvm::BasicBlock *GetOrCreateResolvedTargetBlock(
+      uint64_t source_pc, uint64_t block_pc, LiftTargetEdgeKind edge_kind) {
+    return GetOrCreateTargetBlock(
+        manager.ResolveLiftTarget(source_pc, block_pc, edge_kind));
+  }
+
+  llvm::BasicBlock *GetOrCreateBranchTakenBlock(uint64_t source_pc) {
+    return GetOrCreateResolvedTargetBlock(source_pc, inst.branch_taken_pc,
+                                          LiftTargetEdgeKind::kConditionalTaken);
+  }
+
+  llvm::BasicBlock *GetOrCreateBranchNotTakenBlock(uint64_t source_pc) {
     assert(inst.branch_not_taken_pc != 0 &&
            "branch_not_taken_pc must be non-zero");
-    inst_work_list.insert(inst.branch_not_taken_pc);
-    return GetOrCreateBlock(inst.branch_not_taken_pc);
+    return GetOrCreateResolvedTargetBlock(source_pc, inst.branch_not_taken_pc,
+                                          LiftTargetEdgeKind::kConditionalNotTaken);
   }
 
-  llvm::BasicBlock *GetOrCreateNextBlock() {
-    inst_work_list.insert(inst.next_pc);
-    return GetOrCreateBlock(inst.next_pc);
+  llvm::BasicBlock *GetOrCreateNextBlock(uint64_t source_pc) {
+    return GetOrCreateResolvedTargetBlock(source_pc, inst.next_pc,
+                                          LiftTargetEdgeKind::kTraceNext);
   }
 
   uint64_t PopTraceAddress() {
@@ -366,6 +427,33 @@ bool TraceLifter::Impl::Lift(
         llvm::errs() << "omill: TraceLifter: decode failed at entry 0x"
                      << llvm::Twine::utohexstr(inst_addr) << "\n";
       }
+      if (!decode_ok) {
+        auto failure_decision = manager.ResolveDecodeFailure(
+            trace_addr, inst_addr,
+            DecodeFailureContext{
+                LiftTargetEdgeKind::kDecodeFailureContinuation});
+        if (failure_decision.action == DecodeFailureAction::kRedirectToTarget) {
+          auto *target_block = GetOrCreateTargetBlock(failure_decision.target);
+          if (target_block != block) {
+            llvm::BranchInst::Create(target_block, block);
+          } else {
+            remill::AddTerminatingTailCall(block, intrinsics->missing_block,
+                                           *intrinsics);
+          }
+        } else if (failure_decision.action ==
+                       DecodeFailureAction::kInvalidateEntry ||
+                   failure_decision.action ==
+                       DecodeFailureAction::kMaterializeExecutablePlaceholder) {
+          llvm::BranchInst::Create(
+              GetOrCreateMissingBlock(failure_decision.target.raw_target_pc,
+                                      &failure_decision.target),
+              block);
+        } else {
+          remill::AddTerminatingTailCall(block, intrinsics->missing_block,
+                                         *intrinsics);
+        }
+        continue;
+      }
 
       auto lift_status =
           inst.GetLifter()->LiftIntoBlock(inst, block, state_ptr);
@@ -421,12 +509,15 @@ bool TraceLifter::Impl::Lift(
 
         case remill::Instruction::kCategoryNormal:
         case remill::Instruction::kCategoryNoOp:
-          llvm::BranchInst::Create(GetOrCreateNextBlock(), block);
+          llvm::BranchInst::Create(GetOrCreateNextBlock(inst_addr), block);
           break;
 
         case remill::Instruction::kCategoryDirectJump:
           try_add_delay_slot(true, block);
-          llvm::BranchInst::Create(GetOrCreateBranchTakenBlock(), block);
+          llvm::BranchInst::Create(GetOrCreateResolvedTargetBlock(
+                                       inst_addr, inst.branch_taken_pc,
+                                       LiftTargetEdgeKind::kDirectJump),
+                                   block);
           break;
 
         case remill::Instruction::kCategoryIndirectJump: {
@@ -459,7 +550,8 @@ bool TraceLifter::Impl::Lift(
               remill::LoadNextProgramCounterRef(fall_through_block);
           llvm::IRBuilder<> ir(fall_through_block);
           ir.CreateStore(ir.CreateLoad(word_type, ret_pc_ref), next_pc_ref);
-          ir.CreateBr(GetOrCreateBranchNotTakenBlock());
+          ir.CreateBr(
+              GetOrCreateBranchNotTakenBlock(inst_addr));
 
           remill::AddCall(block, intrinsics->function_call, *intrinsics);
           llvm::BranchInst::Create(fall_through_block, block);
@@ -469,7 +561,7 @@ bool TraceLifter::Impl::Lift(
 
         case remill::Instruction::kCategoryConditionalIndirectFunctionCall: {
           auto taken_block = llvm::BasicBlock::Create(context, "", func);
-          auto not_taken_block = GetOrCreateBranchNotTakenBlock();
+          auto not_taken_block = GetOrCreateBranchNotTakenBlock(inst_addr);
           const auto orig_not_taken_block = not_taken_block;
 
           if (try_delay) {
@@ -499,9 +591,16 @@ bool TraceLifter::Impl::Lift(
         direct_func_call:
           try_add_delay_slot(true, block);
           if (inst.branch_not_taken_pc != inst.branch_taken_pc) {
-            trace_work_list.insert(inst.branch_taken_pc);
-            auto target_trace = get_trace_decl(inst.branch_taken_pc);
-            remill::AddCall(block, target_trace, *intrinsics);
+            auto target_decision = manager.ResolveLiftTarget(
+                inst_addr, inst.branch_taken_pc,
+                LiftTargetEdgeKind::kDirectCallTarget);
+            if (target_decision.shouldLift() &&
+                target_decision.effective_target_pc) {
+              trace_work_list.insert(*target_decision.effective_target_pc);
+              auto target_trace =
+                  get_trace_decl(*target_decision.effective_target_pc);
+              remill::AddCall(block, target_trace, *intrinsics);
+            }
           }
 
           const auto ret_pc_ref =
@@ -510,7 +609,7 @@ bool TraceLifter::Impl::Lift(
               remill::LoadNextProgramCounterRef(block);
           llvm::IRBuilder<> ir(block);
           ir.CreateStore(ir.CreateLoad(word_type, ret_pc_ref), next_pc_ref);
-          ir.CreateBr(GetOrCreateBranchNotTakenBlock());
+          ir.CreateBr(GetOrCreateBranchNotTakenBlock(inst_addr));
           continue;
         }
 
@@ -520,7 +619,7 @@ bool TraceLifter::Impl::Lift(
           }
 
           auto taken_block = llvm::BasicBlock::Create(context, "", func);
-          auto not_taken_block = GetOrCreateBranchNotTakenBlock();
+          auto not_taken_block = GetOrCreateBranchNotTakenBlock(inst_addr);
           const auto orig_not_taken_block = not_taken_block;
 
           if (try_delay) {
@@ -533,11 +632,17 @@ bool TraceLifter::Impl::Lift(
           llvm::BranchInst::Create(taken_block, not_taken_block,
                                    remill::LoadBranchTaken(block), block);
 
-          trace_work_list.insert(inst.branch_taken_pc);
-          auto target_trace = get_trace_decl(inst.branch_taken_pc);
-
           remill::AddCall(taken_block, intrinsics->function_call, *intrinsics);
-          remill::AddCall(taken_block, target_trace, *intrinsics);
+          auto target_decision = manager.ResolveLiftTarget(
+              inst_addr, inst.branch_taken_pc,
+              LiftTargetEdgeKind::kDirectCallTarget);
+          if (target_decision.shouldLift() &&
+              target_decision.effective_target_pc) {
+            trace_work_list.insert(*target_decision.effective_target_pc);
+            auto target_trace =
+                get_trace_decl(*target_decision.effective_target_pc);
+            remill::AddCall(taken_block, target_trace, *intrinsics);
+          }
 
           const auto ret_pc_ref =
               remill::LoadReturnProgramCounterRef(taken_block);
@@ -552,7 +657,7 @@ bool TraceLifter::Impl::Lift(
 
         case remill::Instruction::kCategoryConditionalAsyncHyperCall: {
           auto do_hyper_call = llvm::BasicBlock::Create(context, "", func);
-          llvm::BranchInst::Create(do_hyper_call, GetOrCreateNextBlock(),
+          llvm::BranchInst::Create(do_hyper_call, GetOrCreateNextBlock(inst_addr),
                                    remill::LoadBranchTaken(block), block);
           block = do_hyper_call;
           remill::AddCall(block, intrinsics->async_hyper_call, *intrinsics);
@@ -569,7 +674,8 @@ bool TraceLifter::Impl::Lift(
             auto eq = ir.CreateICmpEQ(pc, ret_pc);
             auto unexpected_ret_pc =
                 llvm::BasicBlock::Create(context, "", func);
-            ir.CreateCondBr(eq, GetOrCreateNextBlock(), unexpected_ret_pc);
+            ir.CreateCondBr(eq, GetOrCreateNextBlock(inst_addr),
+                            unexpected_ret_pc);
             remill::AddTerminatingTailCall(
                 unexpected_ret_pc, intrinsics->missing_block, *intrinsics);
           } while (false);
@@ -583,7 +689,7 @@ bool TraceLifter::Impl::Lift(
 
         case remill::Instruction::kCategoryConditionalFunctionReturn: {
           auto taken_block = llvm::BasicBlock::Create(context, "", func);
-          auto not_taken_block = GetOrCreateBranchNotTakenBlock();
+          auto not_taken_block = GetOrCreateBranchNotTakenBlock(inst_addr);
           const auto orig_not_taken_block = not_taken_block;
 
           if (try_delay) {
@@ -604,8 +710,8 @@ bool TraceLifter::Impl::Lift(
         }
 
         case remill::Instruction::kCategoryConditionalBranch: {
-          auto taken_block = GetOrCreateBranchTakenBlock();
-          auto not_taken_block = GetOrCreateBranchNotTakenBlock();
+          auto taken_block = GetOrCreateBranchTakenBlock(inst_addr);
+          auto not_taken_block = GetOrCreateBranchNotTakenBlock(inst_addr);
 
           if (try_delay) {
             auto new_taken_block =
@@ -630,7 +736,7 @@ bool TraceLifter::Impl::Lift(
 
         case remill::Instruction::kCategoryConditionalIndirectJump: {
           auto taken_block = llvm::BasicBlock::Create(context, "", func);
-          auto not_taken_block = GetOrCreateBranchNotTakenBlock();
+          auto not_taken_block = GetOrCreateBranchNotTakenBlock(inst_addr);
           const auto orig_not_taken_block = not_taken_block;
 
           if (try_delay) {

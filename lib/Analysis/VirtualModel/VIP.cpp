@@ -75,21 +75,23 @@ static VirtualValueExpr unknownVipExpr() {
 
 static std::optional<uint64_t> resolveExprFromSummary(
     const VirtualValueExpr &expr, const VirtualHandlerSummary &summary) {
-  struct FactStateRef {
-    llvm::ArrayRef<VirtualSlotFact> slots;
-    llvm::ArrayRef<VirtualStackFact> stack;
-  };
-
-  const FactStateRef states[] = {
-      {summary.outgoing_facts, summary.outgoing_stack_facts},
-      {summary.outgoing_facts, summary.incoming_stack_facts},
-      {summary.incoming_facts, summary.outgoing_stack_facts},
-      {summary.incoming_facts, summary.incoming_stack_facts},
-  };
-
-  for (const auto &state : states) {
-    if (auto resolved = evaluateVirtualExpr(expr, state.slots, state.stack))
+  if (auto resolved =
+          evaluateVirtualExpr(expr, summary.outgoing_facts,
+                              summary.outgoing_stack_facts)) {
+    return resolved;
+  }
+  for (const auto &state : expandIncomingContextStates(summary)) {
+    if (auto resolved =
+            evaluateVirtualExpr(expr, state.slot_facts, state.stack_facts)) {
       return resolved;
+    }
+  }
+  if (summary.incoming_slot_phis.empty() && summary.incoming_stack_phis.empty()) {
+    if (auto resolved =
+            evaluateVirtualExpr(expr, summary.incoming_facts,
+                                summary.incoming_stack_facts)) {
+      return resolved;
+    }
   }
   return std::nullopt;
 }
@@ -138,6 +140,93 @@ static VirtualInstructionPointerSummary buildContinuationVip(
   vip.resolved_pc = continuation_pc;
   vip.source_kind = VirtualInstructionPointerSourceKind::kNamedSlot;
   return vip;
+}
+
+struct ContinuationLocationSummary {
+  std::optional<unsigned> slot_id;
+  std::optional<unsigned> stack_cell_id;
+};
+
+static bool exprReferencesSlotId(const VirtualValueExpr &expr,
+                                 unsigned slot_id) {
+  if (expr.slot_id && *expr.slot_id == slot_id)
+    return true;
+  return llvm::any_of(expr.operands, [&](const VirtualValueExpr &operand) {
+    return exprReferencesSlotId(operand, slot_id);
+  });
+}
+
+static ContinuationLocationSummary inferContinuationLocationFromSummary(
+    const VirtualHandlerSummary &summary, std::optional<uint64_t> continuation_pc) {
+  ContinuationLocationSummary location;
+  location.slot_id = lookupNamedSummarySlotId(summary, "RETURN_PC");
+
+  if (continuation_pc) {
+    auto stack_it = llvm::find_if(
+        summary.outgoing_stack_facts, [&](const VirtualStackFact &fact) {
+          return fact.value.constant && *fact.value.constant == *continuation_pc;
+        });
+    if (stack_it != summary.outgoing_stack_facts.end())
+      location.stack_cell_id = stack_it->cell_id;
+  }
+
+  if (!location.stack_cell_id && location.slot_id) {
+    auto stack_it = llvm::find_if(
+        summary.outgoing_stack_facts, [&](const VirtualStackFact &fact) {
+          return exprReferencesSlotId(fact.value, *location.slot_id);
+        });
+    if (stack_it != summary.outgoing_stack_facts.end())
+      location.stack_cell_id = stack_it->cell_id;
+  }
+
+  return location;
+}
+
+static ContinuationLocationSummary inferContinuationLocationFromCallsite(
+    const VirtualHandlerSummary &summary, const VirtualCallSiteSummary &callsite) {
+  auto location =
+      inferContinuationLocationFromSummary(summary, callsite.continuation_pc);
+  if (callsite.continuation_slot_id)
+    location.slot_id = callsite.continuation_slot_id;
+  if (callsite.continuation_stack_cell_id)
+    location.stack_cell_id = callsite.continuation_stack_cell_id;
+  const auto matches_continuation = [&](const VirtualValueExpr &expr) {
+    if (callsite.continuation_pc && expr.constant &&
+        *expr.constant == *callsite.continuation_pc) {
+      return true;
+    }
+    return location.slot_id &&
+           exprReferencesSlotId(expr, *location.slot_id);
+  };
+
+  auto stack_it = llvm::find_if(callsite.return_stack_facts,
+                                [&](const VirtualStackFact &fact) {
+                                  return matches_continuation(fact.value);
+                                });
+  if (stack_it != callsite.return_stack_facts.end())
+    location.stack_cell_id = stack_it->cell_id;
+
+  auto slot_it = llvm::find_if(callsite.return_slot_facts,
+                               [&](const VirtualSlotFact &fact) {
+                                 return matches_continuation(fact.value);
+                               });
+  if (slot_it != callsite.return_slot_facts.end())
+    location.slot_id = slot_it->slot_id;
+
+  return location;
+}
+
+static void applyContinuationLocation(VirtualInstructionPointerSummary &vip,
+                                      const ContinuationLocationSummary &location) {
+  if (location.slot_id)
+    vip.slot_id = location.slot_id;
+  if (location.stack_cell_id)
+    vip.stack_cell_id = location.stack_cell_id;
+  if (location.stack_cell_id) {
+    vip.source_kind = VirtualInstructionPointerSourceKind::kStackCell;
+  } else if (location.slot_id) {
+    vip.source_kind = VirtualInstructionPointerSourceKind::kNamedSlot;
+  }
 }
 
 static std::pair<VirtualExitStackDeltaKind, std::optional<int64_t>>
@@ -209,6 +298,9 @@ static VirtualExitSummary classifyDispatchExit(
   exit.stack_delta_bytes = stack_delta_bytes;
   exit.continuation_pc = resolveReturnPcFromSummary(summary);
   exit.continuation_vip = buildContinuationVip(exit.continuation_pc);
+  applyContinuationLocation(
+      exit.continuation_vip,
+      inferContinuationLocationFromSummary(summary, exit.continuation_pc));
 
   if (llvm::any_of(dispatch.successors, [](const VirtualDispatchSuccessorSummary &s) {
         return s.kind == VirtualSuccessorKind::kLiftedHandler ||
@@ -271,6 +363,9 @@ static VirtualExitSummary classifyCallsiteExit(
   exit.stack_delta_bytes = stack_delta_bytes;
   exit.continuation_pc = callsite.continuation_pc;
   exit.continuation_vip = buildContinuationVip(callsite.continuation_pc);
+  applyContinuationLocation(exit.continuation_vip,
+                            inferContinuationLocationFromCallsite(summary,
+                                                                 callsite));
 
   const auto effective_target_pc =
       callsite.resolved_target_pc ? callsite.resolved_target_pc

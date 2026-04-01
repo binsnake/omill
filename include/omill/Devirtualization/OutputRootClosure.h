@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "omill/Analysis/VirtualModel/Types.h"
+#include "omill/Devirtualization/BoundaryFact.h"
+#include "omill/Devirtualization/ExecutableTargetFact.h"
 
 namespace llvm {
 class Module;
@@ -23,6 +25,8 @@ enum class OutputRootClosureSourceKind {
   kConstantCodeTarget,
   kConstantCalliTarget,
   kConstantDispatchTarget,
+  kMissingBlockHandlerTarget,
+  kInvalidatedExecutableTarget,
   kAnnotatedVmContinuationTarget,
   kVmUnresolvedContinuationTarget,
 };
@@ -32,11 +36,11 @@ struct OutputRootClosureWorkItem {
   unsigned site_index = 0;
   std::optional<uint64_t> site_pc;
   uint64_t target_pc = 0;
-  std::optional<uint64_t> continuation_vip_pc;
   bool vip_symbolic = false;
-  VirtualExitDisposition exit_disposition = VirtualExitDisposition::kUnknown;
   OutputRootClosureSourceKind source_kind =
       OutputRootClosureSourceKind::kConstantCodeTarget;
+  std::optional<BoundaryFact> boundary;
+  std::optional<ExecutableTargetFact> executable_target;
   std::string identity;
 };
 
