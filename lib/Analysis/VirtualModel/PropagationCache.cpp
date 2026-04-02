@@ -25,6 +25,10 @@ static VirtualStateSlotSummary stableSlotSummaryForInfo(
 static VirtualStackCellSummary stableStackCellSummaryForInfo(
     const VirtualStackCellInfo &cell) {
   VirtualStackCellSummary summary;
+  summary.owner_slot_id = cell.owner_slot_id;
+  summary.owner_kind = cell.owner_kind;
+  summary.derived_from_owner_slot_id = cell.derived_from_owner_slot_id;
+  summary.owner_constant_delta = cell.owner_constant_delta;
   summary.base_name = cell.base_name;
   summary.base_offset = cell.base_offset;
   summary.base_width = cell.base_width;

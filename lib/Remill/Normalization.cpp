@@ -63,6 +63,9 @@ unsigned countLiveDeclarations(const llvm::Module &M,
   return count;
 }
 
+// Intentional compatibility boundary: keep canonicalization of legacy
+// __omill_dispatch_* spellings fenced here so driver/runtime cleanup does not
+// need to carry legacy dispatch-name conditionals.
 struct CanonicalizeLegacyDispatchPass
     : llvm::PassInfoMixin<CanonicalizeLegacyDispatchPass> {
   llvm::PreservedAnalyses run(llvm::Module &M,

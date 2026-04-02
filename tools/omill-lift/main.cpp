@@ -6,13 +6,6 @@
 #include <llvm/IR/ValueHandle.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/AsmParser/Parser.h>
-#include <llvm/BinaryFormat/COFF.h>
-#include <llvm/BinaryFormat/Magic.h>
-#include <llvm/BinaryFormat/MachO.h>
-#include <llvm/Object/COFF.h>
-#include <llvm/Object/MachO.h>
-#include <llvm/Object/MachOUniversal.h>
-#include <llvm/Object/ObjectFile.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Passes/StandardInstrumentations.h>
 #include <llvm/Linker/Linker.h>
@@ -51,8 +44,6 @@
 #include <remill/BC/Util.h>
 #include <remill/OS/OS.h>
 
-#include <llvm/Support/Win64EH.h>
-
 #include "omill/Support/MemoryLimit.h"
 #include "omill/Arch/ArchABI.h"
 #include "omill/Analysis/BinaryMemoryMap.h"
@@ -81,6 +72,7 @@
 #include "omill/Utils/LiftedNames.h"
 #include "omill/Utils/ProtectedBoundaryUtils.h"
 #include "omill/Utils/StateFieldMap.h"
+#include "InputLoader.h"
 #include "RuntimeAdapters.h"
 
 #include <algorithm>
@@ -433,15 +425,7 @@ void dumpModuleIfEnvEnabled(llvm::Module &M, const char *env_name,
     M.print(os, nullptr);
 }
 
-void dumpTextIfEnvEnabled(llvm::StringRef text, const char *env_name,
-                          llvm::StringRef path) {
-  if (!parseBoolEnv(env_name).value_or(false))
-    return;
-  std::error_code ec;
-  llvm::raw_fd_ostream os(path, ec, llvm::sys::fs::OF_Text);
-  if (!ec)
-    os << text;
-}
+
 
 void appendDebugMarker(const char *message) {
   const char *path = std::getenv("OMILL_DEBUG_MARKER_FILE");
@@ -610,33 +594,7 @@ std::optional<uint64_t> parseHexFieldFromLine(llvm::StringRef line,
   return value;
 }
 
-bool hasUnresolvedOutputRootPcCall(const llvm::Function &F) {
-  if (F.isDeclaration())
-    return false;
 
-  for (const auto &BB : F) {
-    for (const auto &I : BB) {
-      auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
-      if (!call || call->getCalledFunction())
-        continue;
-
-      auto *called = call->getCalledOperand()->stripPointerCasts();
-      auto *i2p = llvm::dyn_cast<llvm::IntToPtrInst>(called);
-      if (!i2p)
-        continue;
-
-      auto *pc_like = i2p->getOperand(0)->stripPointerCasts();
-      if (!pc_like->hasName())
-        continue;
-
-      auto name = pc_like->getName();
-      if (name.contains("pc.canonical") || name.contains("pc.norm"))
-        return true;
-    }
-  }
-
-  return false;
-}
 
 bool hasUnresolvedLiftedControlTransferInFunction(const llvm::Function &F) {
   if (F.isDeclaration())
@@ -829,245 +787,6 @@ TerminalBoundaryRecoveryModelSummary parseTerminalBoundaryRecoveryModelSummary(
     summary.frontiers.push_back(std::move(frontier));
   }
   return summary;
-}
-
-static llvm::SmallVector<std::string, 16>
-parseClosedRootSliceHandlerNames(llvm::StringRef model_text, uint64_t root_pc) {
-  llvm::SmallVector<std::string, 16> handler_names;
-  llvm::StringSet<> seen_names;
-  llvm::SmallVector<llvm::StringRef, 128> lines;
-  model_text.split(lines, '\n');
-  const std::string prefix =
-      (llvm::Twine("root-slice root=0x") + llvm::utohexstr(root_pc)).str();
-  bool saw_matching_root = false;
-  auto add_name = [&](llvm::StringRef name) {
-    auto trimmed_name = name.trim();
-    if (trimmed_name.empty())
-      return;
-    if (!seen_names.insert(trimmed_name).second)
-      return;
-    handler_names.push_back(trimmed_name.str());
-  };
-  bool in_root_block = false;
-  for (auto line : lines) {
-    auto trimmed = line.trim();
-    if (trimmed.starts_with(prefix)) {
-      in_root_block = true;
-      saw_matching_root = true;
-      continue;
-    }
-    if (in_root_block && trimmed.starts_with("slice-handler ")) {
-      add_name(trimmed.drop_front(strlen("slice-handler ")));
-      continue;
-    }
-    if (saw_matching_root &&
-        trimmed.starts_with("diag localized-continuation-shim ")) {
-      if (auto fn = parseQuotedAttrValueFromLine(trimmed, "fn")) {
-        add_name(*fn);
-        continue;
-      }
-      constexpr llvm::StringLiteral pattern = "fn=";
-      size_t pos = trimmed.find(pattern);
-      if (pos != llvm::StringRef::npos) {
-        pos += pattern.size();
-        size_t end = pos;
-        while (end < trimmed.size() && !llvm::isSpace(trimmed[end]))
-          ++end;
-        add_name(trimmed.slice(pos, end));
-      }
-      continue;
-    }
-    if (saw_matching_root &&
-        trimmed.starts_with("diag localized-continuation-call-edge ")) {
-      for (llvm::StringRef attr : {"caller", "callee"}) {
-        if (auto name = parseQuotedAttrValueFromLine(trimmed, attr)) {
-          add_name(*name);
-          continue;
-        }
-        std::string pattern = (llvm::Twine(attr) + "=").str();
-        size_t pos = trimmed.find(pattern);
-        if (pos == llvm::StringRef::npos)
-          continue;
-        pos += pattern.size();
-        size_t end = pos;
-        while (end < trimmed.size() && !llvm::isSpace(trimmed[end]))
-          ++end;
-        add_name(trimmed.slice(pos, end));
-      }
-      continue;
-    }
-    if (saw_matching_root && trimmed.starts_with("diag lifted target=")) {
-      size_t arrow = trimmed.rfind("->");
-      if (arrow != llvm::StringRef::npos) {
-        add_name(trimmed.drop_front(arrow + 2));
-      }
-      continue;
-    }
-    if (!in_root_block)
-      continue;
-    if (trimmed.starts_with("frontier ")) {
-      continue;
-    }
-    if (trimmed.starts_with("region ") || trimmed.starts_with("root-slice ") ||
-        trimmed.starts_with("slot ") || trimmed.starts_with("handler ") ||
-        trimmed.empty()) {
-      in_root_block = false;
-    }
-  }
-  return handler_names;
-}
-
-static std::optional<uint64_t>
-parseSyntheticBlockLikePcFromName(llvm::StringRef name) {
-  if (auto pc = omill::extractEntryVA(name))
-    return pc;
-  for (llvm::StringRef prefix : {"blk_", "sub_", "block_", "vm_entry_"}) {
-    if (!name.starts_with(prefix))
-      continue;
-    llvm::StringRef suffix = name.drop_front(prefix.size());
-    size_t end = 0;
-    while (end < suffix.size() && llvm::isHexDigit(suffix[end]))
-      ++end;
-    if (end == 0)
-      continue;
-    uint64_t pc = 0;
-    if (!suffix.take_front(end).getAsInteger(16, pc))
-      return pc;
-  }
-  return std::nullopt;
-}
-
-static llvm::SmallVector<uint64_t, 16>
-parseLocalizedContinuationCalleePcs(llvm::StringRef model_text,
-                                    uint64_t root_pc) {
-  llvm::SmallVector<uint64_t, 16> callee_pcs;
-  llvm::DenseSet<uint64_t> seen_pcs;
-  llvm::StringSet<> slice_handlers;
-  for (const auto &name : parseClosedRootSliceHandlerNames(model_text, root_pc))
-    slice_handlers.insert(name);
-  if (slice_handlers.empty())
-    return callee_pcs;
-
-  auto parseBareAttr = [&](llvm::StringRef line,
-                           llvm::StringRef attr) -> llvm::StringRef {
-    if (auto quoted = parseQuotedAttrValueFromLine(line, attr))
-      return *quoted;
-    std::string pattern = (llvm::Twine(attr) + "=").str();
-    size_t pos = line.find(pattern);
-    if (pos == llvm::StringRef::npos)
-      return {};
-    pos += pattern.size();
-    size_t end = pos;
-    while (end < line.size() && !llvm::isSpace(line[end]))
-      ++end;
-    return line.slice(pos, end);
-  };
-
-  llvm::SmallVector<llvm::StringRef, 128> lines;
-  model_text.split(lines, '\n');
-  for (auto line : lines) {
-    auto trimmed = line.trim();
-    if (!trimmed.starts_with("diag localized-continuation-call-edge "))
-      continue;
-    llvm::StringRef caller = parseBareAttr(trimmed, "caller");
-    llvm::StringRef callee = parseBareAttr(trimmed, "callee");
-    if (caller.empty() || callee.empty())
-      continue;
-    if (!slice_handlers.count(caller))
-      continue;
-    auto callee_pc = parseSyntheticBlockLikePcFromName(callee);
-    if (!callee_pc || *callee_pc == root_pc)
-      continue;
-    if (!seen_pcs.insert(*callee_pc).second)
-      continue;
-    callee_pcs.push_back(*callee_pc);
-  }
-  return callee_pcs;
-}
-
-static llvm::SmallVector<uint64_t, 16>
-parseRootSliceFrontierTargetPcs(llvm::StringRef model_text, uint64_t root_pc) {
-  llvm::SmallVector<uint64_t, 16> target_pcs;
-  llvm::DenseSet<uint64_t> seen_pcs;
-  llvm::SmallVector<llvm::StringRef, 128> lines;
-  model_text.split(lines, '\n');
-
-  bool in_root_block = false;
-  auto add_pc = [&](llvm::StringRef value) {
-    if (value.empty())
-      return;
-    if (value.consume_front("0x"))
-      ;
-    uint64_t pc = 0;
-    if (value.getAsInteger(16, pc))
-      return;
-    if (seen_pcs.insert(pc).second)
-      target_pcs.push_back(pc);
-  };
-
-  for (auto line : lines) {
-    auto trimmed = line.trim();
-    if (trimmed.starts_with("root-slice root=")) {
-      in_root_block = false;
-      auto root_value = parseQuotedAttrValueFromLine(trimmed, "root");
-      llvm::StringRef root_text;
-      if (root_value) {
-        root_text = *root_value;
-      } else {
-        constexpr llvm::StringLiteral pattern = "root=";
-        size_t pos = trimmed.find(pattern);
-        if (pos != llvm::StringRef::npos) {
-          pos += pattern.size();
-          size_t end = pos;
-          while (end < trimmed.size() && !llvm::isSpace(trimmed[end]))
-            ++end;
-          root_text = trimmed.slice(pos, end);
-        }
-      }
-      uint64_t parsed_root = 0;
-      if (!root_text.empty()) {
-        if (root_text.consume_front("0x"))
-          ;
-        if (!root_text.getAsInteger(16, parsed_root) && parsed_root == root_pc)
-          in_root_block = true;
-      }
-      continue;
-    }
-    if (!in_root_block)
-      continue;
-    if (trimmed.starts_with("frontier ")) {
-      if (!trimmed.contains("kind=dispatch"))
-        continue;
-      if (auto canonical = parseQuotedAttrValueFromLine(trimmed, "canonical")) {
-        add_pc(*canonical);
-        continue;
-      }
-      if (auto target = parseQuotedAttrValueFromLine(trimmed, "target")) {
-        add_pc(*target);
-        continue;
-      }
-      for (llvm::StringRef attr : {"canonical", "target"}) {
-        std::string pattern = (llvm::Twine(attr) + "=").str();
-        size_t pos = trimmed.find(pattern);
-        if (pos == llvm::StringRef::npos)
-          continue;
-        pos += pattern.size();
-        size_t end = pos;
-        while (end < trimmed.size() && !llvm::isSpace(trimmed[end]))
-          ++end;
-        add_pc(trimmed.slice(pos, end));
-        if (!target_pcs.empty() && seen_pcs.contains(target_pcs.back()))
-          break;
-      }
-      continue;
-    }
-    if (trimmed.starts_with("region ") || trimmed.starts_with("root-slice ") ||
-        trimmed.starts_with("slot ") || trimmed.starts_with("handler ") ||
-        trimmed.empty()) {
-      in_root_block = false;
-    }
-  }
-  return target_pcs;
 }
 
 static bool isTerminalRecoveryFrontierReason(llvm::StringRef reason) {
@@ -1489,18 +1208,72 @@ static llvm::json::Array jsonExecutedRecoveryActionArray(
   return arr;
 }
 
+static llvm::json::Array jsonBoundaryRecoveryActionArray(
+    const std::vector<omill::BoundaryTailRecoveryAction> &actions) {
+  llvm::json::Array arr;
+  for (const auto &action : actions) {
+    llvm::json::Object obj;
+    obj["kind"] = omill::toString(action.kind);
+    obj["target_pc"] = hexString(action.target_pc);
+    if (action.continuation_pc)
+      obj["continuation_pc"] = hexString(*action.continuation_pc);
+    obj["source_label"] = action.source_label;
+    obj["reason"] = action.reason;
+    obj["expected_outcome"] = action.expected_outcome;
+    arr.push_back(std::move(obj));
+  }
+  return arr;
+}
+
+static llvm::json::Array jsonBoundaryRecoveryResultArray(
+    const std::vector<omill::BoundaryTailRecoveryActionResult> &results) {
+  llvm::json::Array arr;
+  for (const auto &result : results) {
+    llvm::json::Object obj;
+    obj["kind"] = omill::toString(result.kind);
+    obj["target_pc"] = hexString(result.target_pc);
+    if (result.continuation_pc)
+      obj["continuation_pc"] = hexString(*result.continuation_pc);
+    obj["attempted"] = result.attempted;
+    obj["disposition"] = omill::toString(result.disposition);
+    obj["detail"] = result.detail;
+    obj["module_changed"] = result.module_changed;
+    arr.push_back(std::move(obj));
+  }
+  return arr;
+}
+
 static llvm::json::Object jsonRecoveryQualitySummary(
     const omill::RecoveryQualitySummary &summary) {
   llvm::json::Object obj;
   obj["structurally_closed"] = summary.structurally_closed;
   obj["functionally_recovered"] = summary.functionally_recovered;
   obj["dispatcher_heavy"] = summary.dispatcher_heavy;
+  obj["dispatcher_shell"] = summary.dispatcher_shell;
+  obj["modeled_intra_owner_continuations"] =
+      jsonPcArray(summary.modeled_intra_owner_continuations);
+  obj["lifted_intra_owner_continuations"] =
+      jsonPcArray(summary.lifted_intra_owner_continuations);
+  obj["modeled_pc_relative_return_thunks"] =
+      jsonPcArray(summary.modeled_pc_relative_return_thunks);
+  obj["modeled_controlled_returns"] =
+      jsonPcArray(summary.modeled_controlled_returns);
+  obj["controlled_return_unresolved"] =
+      jsonPcArray(summary.controlled_return_unresolved);
+  obj["lifted_controlled_return_continuations"] =
+      jsonPcArray(summary.lifted_controlled_return_continuations);
   obj["terminal_modeled_targets"] =
       jsonPcArray(summary.terminal_modeled_targets);
   obj["terminal_modeled_children"] =
       jsonPcArray(summary.terminal_modeled_children);
+  obj["terminal_modeled_boundaries"] =
+      jsonPcArray(summary.terminal_modeled_boundaries);
   obj["modeled_reentry_boundaries"] =
       jsonPcArray(summary.modeled_reentry_boundaries);
+  obj["lifted_boundary_continuations"] =
+      jsonPcArray(summary.lifted_boundary_continuations);
+  obj["lowering_helper_callees"] =
+      jsonStringArray(summary.lowering_helper_callees);
   obj["accepted_external_leaf_calls"] =
       jsonStringArray(summary.accepted_external_leaf_calls);
   obj["hard_rejected_targets"] =
@@ -1530,6 +1303,8 @@ static void emitRuntimeArtifactBundleEvents(
     payload["remill_runtime_callees"] =
         jsonStringArray(bundle.remill_runtime_callees);
     payload["external_callees"] = jsonStringArray(bundle.external_callees);
+    payload["lowering_helper_callees"] =
+        jsonStringArray(bundle.lowering_helper_callees);
     payload["imported_targets"] = jsonPcArray(bundle.imported_targets);
     payload["rejected_imports"] =
         jsonRejectedImportArray(bundle.rejected_imports);
@@ -1541,6 +1316,10 @@ static void emitRuntimeArtifactBundleEvents(
         jsonPlannedRecoveryActionArray(bundle.planned_recovery_actions);
     payload["executed_recovery_actions"] =
         jsonExecutedRecoveryActionArray(bundle.executed_recovery_actions);
+    payload["boundary_recovery_actions"] =
+        jsonBoundaryRecoveryActionArray(bundle.boundary_recovery_actions);
+    payload["boundary_recovery_results"] =
+        jsonBoundaryRecoveryResultArray(bundle.boundary_recovery_results);
     payload["recovery_quality"] =
         jsonRecoveryQualitySummary(bundle.recovery_quality);
     payload["notes"] = jsonStringArray(bundle.notes);
@@ -1693,6 +1472,11 @@ static bool writeRuntimeArtifactReport(
              (final_bundle.recovery_quality.dispatcher_heavy ? "true"
                                                              : "false"))
                 .str());
+    appendReportLine(
+        os, (llvm::Twine("  Dispatcher Shell: ") +
+             (final_bundle.recovery_quality.dispatcher_shell ? "true"
+                                                             : "false"))
+                .str());
     appendReportStringList(os, "  Final Output Roots:",
                            final_bundle.output_root_names);
     appendReportPcList(os, "  Final Executable Placeholders:",
@@ -1706,11 +1490,39 @@ static bool writeRuntimeArtifactReport(
     appendReportPcList(os, "  Imported Targets Across Rounds:", imported_targets,
                        2);
     appendReportPcListWithEmpty(
+        os, "  Modeled Intra-Owner Continuations:",
+        final_bundle.recovery_quality.modeled_intra_owner_continuations, 2);
+    appendReportPcListWithEmpty(
+        os, "  Lifted Intra-Owner Continuations:",
+        final_bundle.recovery_quality.lifted_intra_owner_continuations, 2);
+    appendReportPcListWithEmpty(
+        os, "  Modeled PC-Relative Return Thunks:",
+        final_bundle.recovery_quality.modeled_pc_relative_return_thunks, 2);
+    appendReportPcListWithEmpty(
+        os, "  Modeled Controlled Returns:",
+        final_bundle.recovery_quality.modeled_controlled_returns, 2);
+    appendReportPcListWithEmpty(
+        os, "  Controlled Return Unresolved:",
+        final_bundle.recovery_quality.controlled_return_unresolved, 2);
+    appendReportPcListWithEmpty(
+        os, "  Lifted Controlled Return Continuations:",
+        final_bundle.recovery_quality.lifted_controlled_return_continuations,
+        2);
+    appendReportPcListWithEmpty(
         os, "  Terminal Modeled Imported Targets:",
         final_bundle.recovery_quality.terminal_modeled_children, 2);
     appendReportPcListWithEmpty(
+        os, "  Terminal Modeled Boundaries:",
+        final_bundle.recovery_quality.terminal_modeled_boundaries, 2);
+    appendReportPcListWithEmpty(
         os, "  Modeled Reentry Boundaries:",
         final_bundle.recovery_quality.modeled_reentry_boundaries, 2);
+    appendReportPcListWithEmpty(
+        os, "  Lifted Boundary Continuations:",
+        final_bundle.recovery_quality.lifted_boundary_continuations, 2);
+    appendReportStringList(os, "  Lowering Helper Callees:",
+                           final_bundle.recovery_quality.lowering_helper_callees,
+                           2);
     appendReportStringList(os, "  Accepted External Leaf Calls:",
                            final_bundle.recovery_quality
                                .accepted_external_leaf_calls,
@@ -1738,6 +1550,22 @@ static bool writeRuntimeArtifactReport(
         appendReportLine(
             os, (llvm::Twine("    target=") + hexString(action.target_pc) +
                  " disposition=" + omill::toString(action.disposition) +
+                 " attempted=" + (action.attempted ? "true" : "false") +
+                 (action.detail.empty() ? "" : " detail=" + action.detail))
+                    .str());
+      }
+    } else {
+      appendReportLine(os, "    <none>");
+    }
+    appendReportLine(os, "  Boundary Tail Recovery Outcomes:");
+    if (!final_bundle.boundary_recovery_results.empty()) {
+      for (const auto &action : final_bundle.boundary_recovery_results) {
+        appendReportLine(
+            os, (llvm::Twine("    target=") + hexString(action.target_pc) +
+                 " disposition=" + omill::toString(action.disposition) +
+                 (action.continuation_pc
+                      ? " continuation=" + hexString(*action.continuation_pc)
+                      : "") +
                  " attempted=" + (action.attempted ? "true" : "false") +
                  (action.detail.empty() ? "" : " detail=" + action.detail))
                     .str());
@@ -1787,17 +1615,47 @@ static bool writeRuntimeArtifactReport(
         os, (llvm::Twine("  Dispatcher Heavy: ") +
              (bundle.recovery_quality.dispatcher_heavy ? "true" : "false"))
                 .str());
+    appendReportLine(
+        os, (llvm::Twine("  Dispatcher Shell: ") +
+             (bundle.recovery_quality.dispatcher_shell ? "true" : "false"))
+                .str());
     appendReportStringList(os, "  Output Roots:", bundle.output_root_names);
     appendReportPcList(os, "  Executable Placeholders:",
                        bundle.executable_placeholder_targets, 2);
     appendReportPcList(os, "  Native Boundaries:", bundle.native_boundary_targets,
                        2);
     appendReportPcListWithEmpty(
+        os, "  Modeled Intra-Owner Continuations:",
+        bundle.recovery_quality.modeled_intra_owner_continuations, 2);
+    appendReportPcListWithEmpty(
+        os, "  Lifted Intra-Owner Continuations:",
+        bundle.recovery_quality.lifted_intra_owner_continuations, 2);
+    appendReportPcListWithEmpty(
+        os, "  Modeled PC-Relative Return Thunks:",
+        bundle.recovery_quality.modeled_pc_relative_return_thunks, 2);
+    appendReportPcListWithEmpty(
+        os, "  Modeled Controlled Returns:",
+        bundle.recovery_quality.modeled_controlled_returns, 2);
+    appendReportPcListWithEmpty(
+        os, "  Controlled Return Unresolved:",
+        bundle.recovery_quality.controlled_return_unresolved, 2);
+    appendReportPcListWithEmpty(
+        os, "  Lifted Controlled Return Continuations:",
+        bundle.recovery_quality.lifted_controlled_return_continuations, 2);
+    appendReportPcListWithEmpty(
         os, "  Terminal Modeled Targets:",
         bundle.recovery_quality.terminal_modeled_children, 2);
     appendReportPcListWithEmpty(
+        os, "  Terminal Modeled Boundaries:",
+        bundle.recovery_quality.terminal_modeled_boundaries, 2);
+    appendReportPcListWithEmpty(
         os, "  Modeled Reentry Boundaries:",
         bundle.recovery_quality.modeled_reentry_boundaries, 2);
+    appendReportPcListWithEmpty(
+        os, "  Lifted Boundary Continuations:",
+        bundle.recovery_quality.lifted_boundary_continuations, 2);
+    appendReportStringList(os, "  Lowering Helper Callees:",
+                           bundle.recovery_quality.lowering_helper_callees, 2);
     appendReportStringList(os, "  Accepted External Leaf Calls:",
                            bundle.recovery_quality.accepted_external_leaf_calls,
                            2);
@@ -1903,6 +1761,41 @@ static bool writeRuntimeArtifactReport(
             os, (llvm::Twine("    target=") + hexString(action.target_pc) +
                  " kind=" + omill::toString(action.kind) +
                  " disposition=" + omill::toString(action.disposition) +
+                 " attempted=" + (action.attempted ? "true" : "false") +
+                 " changed=" + (action.module_changed ? "true" : "false") +
+                 (action.detail.empty() ? "" : " detail=" + action.detail))
+                    .str());
+      }
+    }
+    if (!bundle.boundary_recovery_actions.empty()) {
+      appendReportLine(os, "  Boundary Tail Recovery Plan:");
+      for (const auto &action : bundle.boundary_recovery_actions) {
+        appendReportLine(
+            os, (llvm::Twine("    target=") + hexString(action.target_pc) +
+                 " kind=" + omill::toString(action.kind) +
+                 (action.continuation_pc
+                      ? " continuation=" + hexString(*action.continuation_pc)
+                      : "") +
+                 (action.reason.empty() ? "" : " reason=" + action.reason))
+                    .str());
+        if (!action.expected_outcome.empty()) {
+          appendReportLine(
+              os, (llvm::Twine("      expected_outcome=") +
+                   action.expected_outcome)
+                      .str());
+        }
+      }
+    }
+    if (!bundle.boundary_recovery_results.empty()) {
+      appendReportLine(os, "  Boundary Tail Recovery Outcomes:");
+      for (const auto &action : bundle.boundary_recovery_results) {
+        appendReportLine(
+            os, (llvm::Twine("    target=") + hexString(action.target_pc) +
+                 " kind=" + omill::toString(action.kind) +
+                 " disposition=" + omill::toString(action.disposition) +
+                 (action.continuation_pc
+                      ? " continuation=" + hexString(*action.continuation_pc)
+                      : "") +
                  " attempted=" + (action.attempted ? "true" : "false") +
                  " changed=" + (action.module_changed ? "true" : "false") +
                  (action.detail.empty() ? "" : " detail=" + action.detail))
@@ -2147,519 +2040,6 @@ private:
   const omill::BinaryMemoryMap *lift_target_policy_memory_map_ = nullptr;
   omill::TargetArch lift_target_policy_arch_ = omill::TargetArch::kX86_64;
 };
-
-struct SectionInfo {
-  uint64_t va;
-  size_t size;
-  size_t storage_index;  // index into section_storage
-  std::string segment_name;
-  std::string section_name;
-};
-
-struct PEInfo {
-  std::deque<std::vector<uint8_t>> section_storage;
-  omill::BinaryMemoryMap memory_map;
-  omill::ExceptionInfo exception_info;
-  std::vector<SectionInfo> code_sections;
-  std::vector<uint64_t> discovered_function_starts;
-  std::vector<uint64_t> exported_function_starts;
-  std::deque<std::vector<uint8_t>> synthetic_dc_storage;
-  uint64_t image_base = 0;
-  bool is_macho = false;
-};
-
-static bool sectionContainsVA(const SectionInfo &section, uint64_t va) {
-  return va >= section.va && va < (section.va + section.size);
-}
-
-static bool matchesSectionName(const SectionInfo &section,
-                               llvm::StringRef requested_name) {
-  if (requested_name == section.section_name)
-    return true;
-  if (!section.segment_name.empty() &&
-      requested_name ==
-          (Twine(section.segment_name) + "," + section.section_name).str()) {
-    return true;
-  }
-  return false;
-}
-
-static const SectionInfo *findCodeSection(const PEInfo &pe, uint64_t va) {
-  for (const auto &section : pe.code_sections) {
-    if (sectionContainsVA(section, va))
-      return &section;
-  }
-  return nullptr;
-}
-
-static const SectionInfo *findCodeSectionByName(const PEInfo &pe,
-                                                llvm::StringRef name) {
-  for (const auto &section : pe.code_sections) {
-    if (matchesSectionName(section, name))
-      return &section;
-  }
-  return nullptr;
-}
-
-static std::vector<uint64_t> collectBatchFunctionStarts(const PEInfo &pe) {
-  std::vector<uint64_t> starts;
-  if (pe.is_macho) {
-    starts = pe.discovered_function_starts;
-  } else {
-    starts.reserve(pe.exception_info.entries().size());
-    for (const auto &entry : pe.exception_info.entries())
-      starts.push_back(entry.begin_va);
-  }
-
-  llvm::sort(starts);
-  starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
-  return starts;
-}
-
-/// Parse .pdata (exception table) from a PE binary.
-/// Populates exception_info with RUNTIME_FUNCTION entries that have
-/// language-specific exception handlers.
-void parsePData(const object::COFFObjectFile &coff, uint64_t image_base,
-                omill::ExceptionInfo &exception_info) {
-  const object::data_directory *dd = coff.getDataDirectory(COFF::EXCEPTION_TABLE);
-  if (!dd || dd->RelativeVirtualAddress == 0 || dd->Size == 0)
-    return;
-
-  uintptr_t table_ptr = 0;
-  if (auto err = coff.getRvaPtr(dd->RelativeVirtualAddress, table_ptr)) {
-    consumeError(std::move(err));
-    return;
-  }
-
-  unsigned num_entries = dd->Size / sizeof(Win64EH::RuntimeFunction);
-  auto *entries = reinterpret_cast<const Win64EH::RuntimeFunction *>(table_ptr);
-
-  for (unsigned i = 0; i < num_entries; ++i) {
-    uint32_t begin_rva = entries[i].StartAddress;
-    uint32_t end_rva = entries[i].EndAddress;
-    uint32_t unwind_rva = entries[i].UnwindInfoOffset;
-
-    if (begin_rva == 0 && end_rva == 0)
-      continue;
-
-    // Follow unwind info chain to find the exception handler.
-    uint64_t handler_va = 0;
-    uint64_t handler_data_va = 0;
-    uint32_t current_unwind_rva = unwind_rva;
-
-    for (unsigned depth = 0; depth < 16; ++depth) {
-      uintptr_t unwind_ptr = 0;
-      if (auto err = coff.getRvaPtr(current_unwind_rva, unwind_ptr)) {
-        consumeError(std::move(err));
-        break;
-      }
-
-      auto *uwi =
-          reinterpret_cast<const Win64EH::UnwindInfo *>(unwind_ptr);
-      uint8_t flags = uwi->getFlags();
-
-      if (flags & Win64EH::UNW_ExceptionHandler) {
-        uint32_t handler_rva = uwi->getLanguageSpecificHandlerOffset();
-        handler_va = image_base + handler_rva;
-
-        // HandlerData follows the handler RVA in the language-specific data.
-        auto *lsd = reinterpret_cast<const support::ulittle32_t *>(
-            uwi->getLanguageSpecificData());
-        // lsd[0] = handler RVA, lsd[1] = handler data RVA
-        uint32_t data_rva = lsd[1];
-        if (data_rva != 0)
-          handler_data_va = image_base + data_rva;
-        break;
-      }
-
-      if (flags & Win64EH::UNW_ChainInfo) {
-        // Follow chain to next RUNTIME_FUNCTION.
-        auto *chained = uwi->getChainedFunctionEntry();
-        current_unwind_rva = chained->UnwindInfoOffset;
-        continue;
-      }
-
-      // No handler, no chain — done.
-      break;
-    }
-
-    exception_info.addEntry({image_base + begin_rva, image_base + end_rva,
-                             handler_va, handler_data_va, 0, 0});
-  }
-}
-
-bool loadPE(StringRef path, PEInfo &out) {
-  out.is_macho = false;
-  auto buf_or_err = MemoryBuffer::getFile(path);
-  if (!buf_or_err) {
-    errs() << "Cannot open " << path << ": "
-           << buf_or_err.getError().message() << "\n";
-    return false;
-  }
-
-  auto obj_or_err = object::COFFObjectFile::create(
-      (*buf_or_err)->getMemBufferRef());
-  if (!obj_or_err) {
-    errs() << "Not a valid COFF/PE: "
-           << toString(obj_or_err.takeError()) << "\n";
-    return false;
-  }
-  auto &coff = **obj_or_err;
-  out.image_base = coff.getImageBase();
-
-  // Parse IAT: map each import's IAT slot VA to its module+function name.
-  for (const auto &dir : coff.import_directories()) {
-    StringRef dll_name;
-    if (dir.getName(dll_name))
-      continue;
-
-    // Get IAT RVA from the raw import directory entry.
-    const object::coff_import_directory_table_entry *raw_entry = nullptr;
-    if (dir.getImportTableEntry(raw_entry) || !raw_entry)
-      continue;
-    uint32_t iat_rva = raw_entry->ImportAddressTableRVA;
-
-    unsigned idx = 0;
-    for (auto sym : dir.imported_symbols()) {
-      StringRef sym_name;
-      if (!sym.getSymbolName(sym_name)) {
-        uint64_t iat_va = out.image_base + iat_rva + idx * 8;
-        out.memory_map.addImport(iat_va, dll_name.str(), sym_name.str());
-      }
-      ++idx;
-    }
-  }
-
-  for (const auto &exp : coff.export_directories()) {
-    bool is_forwarder = false;
-    if (auto err = exp.isForwarder(is_forwarder)) {
-      consumeError(std::move(err));
-      continue;
-    }
-    if (is_forwarder)
-      continue;
-
-    uint32_t export_rva = 0;
-    if (auto err = exp.getExportRVA(export_rva)) {
-      consumeError(std::move(err));
-      continue;
-    }
-    if (!export_rva)
-      continue;
-
-    out.exported_function_starts.push_back(out.image_base + export_rva);
-  }
-  llvm::sort(out.exported_function_starts);
-  out.exported_function_starts.erase(
-      std::unique(out.exported_function_starts.begin(),
-                  out.exported_function_starts.end()),
-      out.exported_function_starts.end());
-
-  // Determine image size from PE optional header.
-  uint64_t image_size = 0;
-  if (auto *pe32p = coff.getPE32PlusHeader())
-    image_size = pe32p->SizeOfImage;
-  else if (auto *pe32 = coff.getPE32Header())
-    image_size = pe32->SizeOfImage;
-  out.memory_map.setImageBase(out.image_base);
-  out.memory_map.setImageSize(image_size);
-
-  // Check for suspicious preferred base (anti-analysis defense).
-  if (out.memory_map.isSuspiciousImageBase()) {
-    errs() << "WARNING: suspicious preferred image base 0x"
-           << Twine::utohexstr(out.image_base)
-           << " — ASLR will likely produce a non-zero delta.\n"
-           << "         Relocated constants in the binary may be unreliable.\n";
-  }
-
-  // Parse .reloc (base relocations) for relocation-aware constant folding.
-  for (const auto &reloc : coff.base_relocs()) {
-    uint8_t type = 0;
-    uint32_t rva = 0;
-    if (auto err = reloc.getType(type)) {
-      consumeError(std::move(err));
-      continue;
-    }
-    if (auto err = reloc.getRVA(rva)) {
-      consumeError(std::move(err));
-      continue;
-    }
-
-    uint8_t reloc_size = 0;
-    if (type == COFF::IMAGE_REL_BASED_DIR64)
-      reloc_size = 8;
-    else if (type == COFF::IMAGE_REL_BASED_HIGHLOW)
-      reloc_size = 4;
-    else
-      continue;  // Skip padding (ABSOLUTE) and exotic types.
-
-    out.memory_map.addRelocation(out.image_base + rva, reloc_size);
-  }
-  out.memory_map.finalizeRelocations();
-
-  for (const auto &sec : coff.sections()) {
-    auto contents_or_err = sec.getContents();
-    if (!contents_or_err) { consumeError(contents_or_err.takeError()); continue; }
-    StringRef contents = *contents_or_err;
-
-    uint64_t va = sec.getAddress();
-    size_t idx = out.section_storage.size();
-    out.section_storage.emplace_back(
-        reinterpret_cast<const uint8_t *>(contents.data()),
-        reinterpret_cast<const uint8_t *>(contents.data()) + contents.size());
-    auto &stored = out.section_storage.back();
-    const auto *coff_sec = coff.getCOFFSection(sec);
-    bool read_only = true;
-    if (coff_sec && (coff_sec->Characteristics & COFF::IMAGE_SCN_MEM_WRITE))
-      read_only = false;
-    bool executable = coff_sec &&
-                      (coff_sec->Characteristics &
-                       (COFF::IMAGE_SCN_CNT_CODE |
-                        COFF::IMAGE_SCN_MEM_EXECUTE));
-    out.memory_map.addRegion(va, stored.data(), stored.size(), read_only,
-                             executable);
-
-    // Track all executable sections for the trace manager.
-    Expected<StringRef> name_or = sec.getName();
-    std::string section_name;
-    if (name_or)
-      section_name = name_or->str();
-    else
-      consumeError(name_or.takeError());
-    if (coff_sec && (coff_sec->Characteristics &
-                     (COFF::IMAGE_SCN_CNT_CODE | COFF::IMAGE_SCN_MEM_EXECUTE))) {
-      out.code_sections.push_back({va, stored.size(), idx, "", section_name});
-    }
-  }
-
-  // Parse .pdata unconditionally (cheap); the flag controls usage.
-  parsePData(coff, out.image_base, out.exception_info);
-  out.exception_info.setImageBase(out.image_base);
-
-  // Create synthetic DISPATCHER_CONTEXT regions in BinaryMemoryMap.
-  // Each exception entry with HandlerData gets a synthetic DC at a unique
-  // address so ConstantMemoryFolding can resolve [R9+0x38] → HandlerData.
-  out.exception_info.buildSyntheticDCs(out.synthetic_dc_storage, out.memory_map,
-                                        out.image_base);
-
-  return true;
-}
-
-static void collectMachOFunctionStarts(object::MachOObjectFile &macho,
-                                       PEInfo &out) {
-  for (uint64_t start : macho.getFunctionStarts()) {
-    if (findCodeSection(out, start))
-      out.discovered_function_starts.push_back(start);
-  }
-
-  for (const auto &sym : macho.symbols()) {
-    auto type_or = sym.getType();
-    if (!type_or) {
-      consumeError(type_or.takeError());
-      continue;
-    }
-    if (*type_or != object::SymbolRef::ST_Function)
-      continue;
-
-    auto flags_or = sym.getFlags();
-    if (!flags_or) {
-      consumeError(flags_or.takeError());
-      continue;
-    }
-    if (*flags_or & object::BasicSymbolRef::SF_Undefined)
-      continue;
-
-    auto addr_or = sym.getAddress();
-    if (!addr_or) {
-      consumeError(addr_or.takeError());
-      continue;
-    }
-    if (*addr_or == 0)
-      continue;
-    if (findCodeSection(out, *addr_or))
-      out.discovered_function_starts.push_back(*addr_or);
-  }
-
-  llvm::sort(out.discovered_function_starts);
-  out.discovered_function_starts.erase(
-      std::unique(out.discovered_function_starts.begin(),
-                  out.discovered_function_starts.end()),
-      out.discovered_function_starts.end());
-}
-
-/// Helper: parse sections, imports, and relocations from a MachOObjectFile.
-static void parseMachOContents(object::MachOObjectFile &macho,
-                                PEInfo &out) {
-  // Use __TEXT segment vmaddr as image base.
-  uint64_t text_vmaddr = 0;
-  uint64_t max_addr = 0;
-  for (const auto &cmd : macho.load_commands()) {
-    if (cmd.C.cmd == MachO::LC_SEGMENT_64) {
-      auto seg = macho.getSegment64LoadCommand(cmd);
-      StringRef seg_name(seg.segname, strnlen(seg.segname, 16));
-      uint64_t end = seg.vmaddr + seg.vmsize;
-      if (end > max_addr) max_addr = end;
-      if (seg_name == "__TEXT" && text_vmaddr == 0)
-        text_vmaddr = seg.vmaddr;
-    }
-  }
-  out.image_base = text_vmaddr;
-  out.memory_map.setImageBase(text_vmaddr);
-  out.memory_map.setImageSize(
-      max_addr > text_vmaddr ? max_addr - text_vmaddr : 0);
-
-  // Parse sections.
-  for (const auto &sec : macho.sections()) {
-    auto contents_or = sec.getContents();
-    if (!contents_or) { consumeError(contents_or.takeError()); continue; }
-    StringRef contents = *contents_or;
-    uint64_t va = sec.getAddress();
-    size_t idx = out.section_storage.size();
-    out.section_storage.emplace_back(
-        reinterpret_cast<const uint8_t *>(contents.data()),
-        reinterpret_cast<const uint8_t *>(contents.data()) + contents.size());
-    auto &stored = out.section_storage.back();
-    auto name_or = sec.getName();
-    std::string section_name;
-    if (name_or)
-      section_name = name_or->str();
-    else
-      consumeError(name_or.takeError());
-    std::string seg_name =
-        macho.getSectionFinalSegmentName(sec.getRawDataRefImpl()).str();
-    bool read_only = !llvm::StringRef(seg_name).starts_with("__DATA");
-    bool executable = sec.isText() || section_name == "__stubs";
-    out.memory_map.addRegion(va, stored.data(), stored.size(), read_only,
-                             executable);
-    if (executable) {
-      out.code_sections.push_back(
-          {va, stored.size(), idx, seg_name, section_name});
-    }
-  }
-
-  collectMachOFunctionStarts(macho, out);
-
-  // Parse imports from bind opcodes.
-  // The ordinal maps to a library index via getLibraryShortNameByIndex().
-  {
-    Error err = Error::success();
-    for (const auto &entry : macho.bindTable(err)) {
-      uint64_t addr = entry.address();
-      StringRef sym = entry.symbolName();
-      if (sym.starts_with("_")) sym = sym.drop_front(1);
-      StringRef lib_name;
-      int ord = entry.ordinal();
-      if (ord > 0)
-        macho.getLibraryShortNameByIndex(ord - 1, lib_name);
-      out.memory_map.addImport(addr, lib_name.str(), sym.str());
-    }
-    if (err) consumeError(std::move(err));
-  }
-  {
-    Error err = Error::success();
-    for (const auto &entry : macho.lazyBindTable(err)) {
-      uint64_t addr = entry.address();
-      StringRef sym = entry.symbolName();
-      if (sym.starts_with("_")) sym = sym.drop_front(1);
-      StringRef lib_name;
-      int ord = entry.ordinal();
-      if (ord > 0)
-        macho.getLibraryShortNameByIndex(ord - 1, lib_name);
-      out.memory_map.addImport(addr, lib_name.str(), sym.str());
-    }
-    if (err) consumeError(std::move(err));
-  }
-
-  // Parse relocations from rebase opcodes.
-  {
-    Error err = Error::success();
-    for (const auto &entry : macho.rebaseTable(err)) {
-      out.memory_map.addRelocation(entry.address(), 8);
-    }
-    if (err) consumeError(std::move(err));
-  }
-  out.memory_map.finalizeRelocations();
-}
-
-/// Load a Mach-O binary (or extract arm64/x86_64 slice from a fat binary).
-/// Populates the PEInfo struct with code sections, imports, and relocations.
-/// Returns the detected remill arch name.
-bool loadMachO(StringRef path, PEInfo &out,
-               remill::ArchName &out_arch, remill::OSName &out_os) {
-  out.is_macho = true;
-  auto buf_or_err = MemoryBuffer::getFile(path);
-  if (!buf_or_err) {
-    errs() << "Cannot open " << path << ": "
-           << buf_or_err.getError().message() << "\n";
-    return false;
-  }
-
-  MemoryBufferRef mbr = (*buf_or_err)->getMemBufferRef();
-  auto magic = identify_magic(mbr.getBuffer());
-
-  // Handle fat/universal binaries — prefer arm64, fall back to x86_64.
-  if (magic == file_magic::macho_universal_binary) {
-    auto uni_or = object::MachOUniversalBinary::create(mbr);
-    if (!uni_or) {
-      errs() << "Invalid fat binary: " << toString(uni_or.takeError()) << "\n";
-      return false;
-    }
-    auto &uni = **uni_or;
-
-    const object::MachOUniversalBinary::ObjectForArch *arm64_slice = nullptr;
-    const object::MachOUniversalBinary::ObjectForArch *x64_slice = nullptr;
-    for (const auto &obj : uni.objects()) {
-      if (obj.getCPUType() == MachO::CPU_TYPE_ARM64)
-        arm64_slice = &obj;
-      else if (obj.getCPUType() == MachO::CPU_TYPE_X86_64)
-        x64_slice = &obj;
-    }
-    auto *chosen = arm64_slice ? arm64_slice : x64_slice;
-    if (!chosen) {
-      errs() << "Fat binary has no arm64 or x86_64 slice\n";
-      return false;
-    }
-    auto obj_or = chosen->getAsObjectFile();
-    if (!obj_or) {
-      errs() << "Cannot extract slice: " << toString(obj_or.takeError()) << "\n";
-      return false;
-    }
-    auto &macho = **obj_or;
-
-    if (chosen == arm64_slice) {
-      out_arch = remill::kArchAArch64LittleEndian;
-    } else {
-      out_arch = remill::kArchAMD64_AVX;
-    }
-    out_os = remill::kOSmacOS;
-
-    parseMachOContents(macho, out);
-    return true;
-  }
-
-  // Non-fat Mach-O: use ObjectFile factory for automatic parsing.
-  auto obj_or = object::ObjectFile::createMachOObjectFile(mbr);
-  if (!obj_or) {
-    errs() << "Not a valid Mach-O: " << toString(obj_or.takeError()) << "\n";
-    return false;
-  }
-  auto &macho = *llvm::cast<object::MachOObjectFile>(obj_or->get());
-
-  // Detect architecture from header.
-  auto header = macho.getHeader();
-  if (header.cputype == MachO::CPU_TYPE_ARM64) {
-    out_arch = remill::kArchAArch64LittleEndian;
-  } else if (header.cputype == MachO::CPU_TYPE_X86_64) {
-    out_arch = remill::kArchAMD64_AVX;
-  } else {
-    errs() << "Unsupported Mach-O CPU type: " << header.cputype << "\n";
-    return false;
-  }
-  out_os = remill::kOSmacOS;
-
-  parseMachOContents(macho, out);
-  return true;
-}
 
 struct ScanResult {
   uint64_t va;
@@ -3017,9 +2397,15 @@ int main(int argc, char **argv) {
   bool vm_mode = (vm_entry_va != 0);
   const bool has_external_vm_trace = VMTraceJSON.getNumOccurrences() > 0;
   const bool force_devirtualize = Devirtualize;
+  const bool env_generic_static_devirtualize =
+      parseBoolEnv("OMILL_GENERIC_STATIC_DEVIRT").value_or(false);
+  const bool env_verify_generic_static_devirtualize =
+      parseBoolEnv("OMILL_VERIFY_GENERIC_STATIC_DEVIRT").value_or(false);
+  const bool force_generic_static_devirtualize =
+      parseBoolEnv("OMILL_FORCE_GENERIC_STATIC_DEVIRT").value_or(false);
   bool use_block_lift_mode =
       BlockLift || force_devirtualize || GenericStaticDevirtualize ||
-      parseBoolEnv("OMILL_GENERIC_STATIC_DEVIRT").value_or(false);
+      env_generic_static_devirtualize;
   if (vm_mode) {
     // Default wrapper to func_va if not explicitly specified.
     if (vm_wrapper_va == 0)
@@ -3073,20 +2459,7 @@ int main(int argc, char **argv) {
                      {"base", ("0x" + Twine::utohexstr(BaseAddress)).str()}});
   } else {
     // Auto-detect binary format by peeking at the magic bytes.
-    bool is_macho = false;
-    {
-      auto probe_buf = MemoryBuffer::getFile(InputFilename);
-      if (!probe_buf) {
-        errs() << "Cannot open " << InputFilename << "\n";
-        return fail(1, "cannot open input file");
-      }
-      auto magic = identify_magic((*probe_buf)->getBuffer());
-      is_macho = (magic == file_magic::macho_object ||
-                  magic == file_magic::macho_executable ||
-                  magic == file_magic::macho_dynamically_linked_shared_lib ||
-                  magic == file_magic::macho_bundle ||
-                  magic == file_magic::macho_universal_binary);
-    }
+    bool is_macho = looksLikeMachOInput(InputFilename);
 
     if (is_macho) {
       if (!loadMachO(InputFilename, pe, detected_arch, detected_os))
@@ -5597,21 +4970,61 @@ int main(int argc, char **argv) {
       VerifyGenericStaticDevirtualization;
   devirtualization_request.force_devirtualize = force_devirtualize;
   devirtualization_request.auto_detect = true;
-  devirtualization_request.deprecated_block_lift = BlockLift;
-  devirtualization_request.deprecated_generic_static =
-      GenericStaticDevirtualize;
-  devirtualization_request.deprecated_vm_entry_mode = vm_mode;
   if (!batch_vas.empty()) {
     devirtualization_request.root_vas.assign(batch_vas.begin(), batch_vas.end());
   } else if (func_va != 0) {
     devirtualization_request.root_vas.push_back(func_va);
   }
 
+  const bool export_root_has_hidden_entry_seed_exprs =
+      batch_vas.empty() && func_va != 0 &&
+      !scanExportEntryHiddenSeedExprs(func_va).empty();
+  omill::DevirtualizationCompatInputs devirtualization_compat_inputs;
+  devirtualization_compat_inputs.requested_block_lift = BlockLift;
+  devirtualization_compat_inputs.requested_generic_static =
+      GenericStaticDevirtualize;
+  devirtualization_compat_inputs.requested_vm_entry_mode = vm_mode;
+  devirtualization_compat_inputs.env_generic_static =
+      env_generic_static_devirtualize;
+  devirtualization_compat_inputs.env_verify_generic_static =
+      env_verify_generic_static_devirtualize;
+  devirtualization_compat_inputs.env_force_generic_static =
+      force_generic_static_devirtualize;
+  devirtualization_compat_inputs.no_abi = NoABI;
+  devirtualization_compat_inputs.requested_root_is_export =
+      requested_root_is_export;
+  devirtualization_compat_inputs.export_root_has_hidden_entry_seed_exprs =
+      export_root_has_hidden_entry_seed_exprs;
+  devirtualization_compat_inputs.requested_root_rva = requested_root_rva;
+  devirtualization_compat_inputs.largest_executable_section_size =
+      largest_executable_section_size;
+  devirtualization_compat_inputs.executable_section_count =
+      executable_section_count;
+
   omill::DevirtualizationPolicy devirtualization_policy;
   omill::DevirtualizationOrchestrator devirtualization_orchestrator(
       devirtualization_policy, iterative_session);
   omill::DevirtualizationRuntime devirtualization_runtime(
       devirtualization_orchestrator);
+  auto classifyRuntimeRecoveryQuality = [&](const llvm::Module &M) {
+    return devirtualization_runtime.classifyRecoveryQuality(M);
+  };
+  auto classifySerializedRuntimeRecoveryQuality =
+      [&](const llvm::Module &M)
+      -> std::optional<omill::RecoveryQualitySummary> {
+    std::string ir_text;
+    llvm::raw_string_ostream os(ir_text);
+    M.print(os, nullptr);
+    os.flush();
+
+    llvm::LLVMContext verify_ctx;
+    llvm::SMDiagnostic parse_error;
+    auto verify_module =
+        llvm::parseAssemblyString(ir_text, parse_error, verify_ctx);
+    if (!verify_module || verifyModule(*verify_module, nullptr))
+      return std::nullopt;
+    return classifyRuntimeRecoveryQuality(*verify_module);
+  };
   auto emit_latest_devirtualization_epoch = [&](llvm::StringRef message) {
     const auto &epochs = devirtualization_orchestrator.session().epochs;
     if (epochs.empty())
@@ -5642,9 +5055,10 @@ int main(int argc, char **argv) {
       devirtualization_request.output_mode, /*changed=*/true,
       "initial lift complete");
   emit_latest_devirtualization_epoch("initial lift complete");
-  auto devirtualization_plan =
-      devirtualization_orchestrator.buildExecutionPlan(*module,
-                                                       devirtualization_request);
+  auto devirtualization_compat_plan =
+      devirtualization_orchestrator.buildDriverCompatPlan(
+          *module, devirtualization_request, devirtualization_compat_inputs);
+  const auto &devirtualization_plan = devirtualization_compat_plan.execution;
   devirtualization_orchestrator.recordEpoch(
       omill::DevirtualizationEpoch::kDetectionSeedExtraction, *module,
       devirtualization_request.output_mode, /*changed=*/false,
@@ -5675,14 +5089,22 @@ int main(int argc, char **argv) {
   if (devirtualization_plan.enable_devirtualization) {
     events.emitInfo("devirtualization_plan_selected",
                     "devirtualization plan selected",
-                    {{"use_block_lift",
-                      use_block_lift_mode ||
-                          devirtualization_plan.use_block_lift},
+                    {{"use_block_lift", devirtualization_compat_plan.use_block_lift},
                      {"use_generic_static",
-                      devirtualization_plan
-                          .use_generic_static_devirtualization},
+                      devirtualization_compat_plan.use_generic_static},
                      {"disable_legacy_vm_path",
-                      devirtualization_plan.disable_legacy_vm_path}});
+                      devirtualization_plan.disable_legacy_vm_path},
+                     {"export_root_fallback_mode",
+                      omill::toString(
+                          devirtualization_compat_plan.export_root_fallback_mode)},
+                     {"generic_static_reason",
+                      omill::toString(
+                          devirtualization_compat_plan.generic_static_reason)},
+                     {"always_inline_reason",
+                      omill::toString(
+                          devirtualization_compat_plan.always_inline_reason)},
+                     {"use_pre_abi_noabi_cleanup",
+                      devirtualization_compat_plan.use_pre_abi_noabi_cleanup}});
   }
 
   omill::PipelineOptions opts;
@@ -5697,84 +5119,58 @@ int main(int argc, char **argv) {
   opts.vm_devirtualize = vm_mode;
   opts.generic_static_devirtualize =
       force_devirtualize || GenericStaticDevirtualize ||
-      parseBoolEnv("OMILL_GENERIC_STATIC_DEVIRT").value_or(false);
+      env_generic_static_devirtualize;
   opts.verify_generic_static_devirtualization =
       VerifyGenericStaticDevirtualization ||
-      parseBoolEnv("OMILL_VERIFY_GENERIC_STATIC_DEVIRT").value_or(false);
-  devirtualization_orchestrator.applyExecutionPlan(devirtualization_plan, opts);
-  if (vm_mode && !opts.vm_devirtualize &&
-      devirtualization_plan.enable_devirtualization) {
+      env_verify_generic_static_devirtualize;
+  devirtualization_orchestrator.applyDriverCompatPlan(
+      devirtualization_compat_plan, opts);
+  if (devirtualization_compat_plan.suppress_legacy_vm_mode) {
     events.emitInfo("legacy_vm_mode_suppressed",
                     "legacy VM mode suppressed by devirtualization plan",
-                    {{"forced", force_devirtualize}});
+                    {{"forced", force_devirtualize},
+                     {"reason", omill::toString(
+                                    devirtualization_compat_plan
+                                        .legacy_vm_mode_reason)}});
   }
-  const bool generic_static_devirtualize_requested =
-      opts.generic_static_devirtualize;
-  const bool force_generic_static_devirtualize =
-      parseBoolEnv("OMILL_FORCE_GENERIC_STATIC_DEVIRT").value_or(false);
-  const bool known_unstable_large_default_export_root =
-      requested_root_is_export &&
-      largest_executable_section_size >= (1ull << 20) &&
-      (requested_root_rva == 0x2400 || requested_root_rva == 0x23F0);
-  const bool export_root_has_hidden_entry_seed_exprs =
-      batch_vas.empty() && func_va != 0 &&
-      !scanExportEntryHiddenSeedExprs(func_va).empty();
   const bool fast_plain_export_root_fallback =
-      opts.generic_static_devirtualize &&
-      omill::shouldUseFastPlainExportRootFallback(
-          opts.vm_devirtualize, requested_root_is_export, opts.use_block_lifting,
-          generic_static_devirtualize_requested,
-          force_generic_static_devirtualize,
-          largest_executable_section_size, executable_section_count) &&
-      !export_root_has_hidden_entry_seed_exprs;
+      devirtualization_compat_plan.export_root_fallback_mode ==
+      omill::DevirtualizationExportRootFallbackMode::kFastPlain;
   const bool stable_no_gsd_export_root_fallback =
-      opts.generic_static_devirtualize &&
-      omill::shouldUseStableNoGsdExportRootFallback(
-          opts.vm_devirtualize, requested_root_is_export,
-          opts.use_block_lifting,
-          generic_static_devirtualize_requested,
-          force_generic_static_devirtualize,
-          largest_executable_section_size) &&
-      known_unstable_large_default_export_root;
+      devirtualization_compat_plan.export_root_fallback_mode ==
+      omill::DevirtualizationExportRootFallbackMode::kStableLarge;
   if (fast_plain_export_root_fallback) {
-    opts.generic_static_devirtualize = false;
-    opts.verify_generic_static_devirtualization = false;
     errs() << "Generic static devirtualization skipped: using fast "
               "non-GSD path for a small plain export root\n";
     events.emitInfo("generic_static_devirtualization_skipped",
                     "generic static devirtualization skipped",
-                    {{"reason", "fast_plain_export_root_fallback"}});
+                    {{"reason", omill::toString(
+                                    devirtualization_compat_plan
+                                        .generic_static_reason)}});
   }
   if (!fast_plain_export_root_fallback && stable_no_gsd_export_root_fallback) {
-    opts.generic_static_devirtualize = false;
-    opts.verify_generic_static_devirtualization = false;
     errs() << "Generic static devirtualization skipped: using stable "
               "non-GSD export-root path for a large export root\n";
     events.emitInfo("generic_static_devirtualization_skipped",
                     "generic static devirtualization skipped",
-                    {{"reason", "stable_large_export_root_fallback"}});
+                    {{"reason", omill::toString(
+                                    devirtualization_compat_plan
+                                        .generic_static_reason)}});
   }
-  const bool root_local_generic_static_devirtualization_shape =
-      omill::moduleHasRootLocalGenericStaticDevirtualizationShape(*module);
   if (!fast_plain_export_root_fallback &&
-      !stable_no_gsd_export_root_fallback && opts.generic_static_devirtualize &&
-      omill::shouldAutoSkipGenericStaticDevirtualizationForRoot(
-          *module, opts.vm_devirtualize, requested_root_is_export,
-          force_generic_static_devirtualize,
-          root_local_generic_static_devirtualization_shape)) {
-    opts.generic_static_devirtualize = false;
-    opts.verify_generic_static_devirtualization = false;
+      !stable_no_gsd_export_root_fallback &&
+      !opts.generic_static_devirtualize &&
+      devirtualization_compat_plan.generic_static_reason ==
+          omill::DevirtualizationCompatReason::kNoVmLikeCandidates) {
     errs() << "Generic static devirtualization skipped: no VM-like candidates\n";
     events.emitInfo("generic_static_devirtualization_skipped",
                     "generic static devirtualization skipped",
-                    {{"reason", "no_vm_like_candidates"}});
+                    {{"reason", omill::toString(
+                                    devirtualization_compat_plan
+                                        .generic_static_reason)}});
   }
   const bool auto_skip_always_inline_for_internal_root =
-      omill::shouldAutoSkipAlwaysInlineForRoot(
-          opts.vm_devirtualize, requested_root_is_export,
-          generic_static_devirtualize_requested,
-          opts.generic_static_devirtualize,
-          root_local_generic_static_devirtualization_shape);
+      devirtualization_compat_plan.auto_skip_always_inline;
   std::unique_ptr<ScopedEnvOverride> auto_skip_always_inline_guard;
   if (auto_skip_always_inline_for_internal_root ||
       stable_no_gsd_export_root_fallback) {
@@ -5784,13 +5180,12 @@ int main(int argc, char **argv) {
               "root path\n";
     events.emitInfo("always_inliner_auto_suppressed",
                     "always-inliner suppressed after selecting stable root path",
-                    {{"reason", stable_no_gsd_export_root_fallback
-                                    ? "stable_large_export_root_fallback"
-                                    : "no_root_local_devirt_shape"}});
+                    {{"reason", omill::toString(
+                                    devirtualization_compat_plan
+                                        .always_inline_reason)}});
   }
   const bool use_pre_abi_noabi_cleanup =
-      !NoABI && opts.generic_static_devirtualize;
-  opts.no_abi_mode = NoABI || use_pre_abi_noabi_cleanup;
+      devirtualization_compat_plan.use_pre_abi_noabi_cleanup;
   if (!DumpVirtualModel.empty())
     setEnvIfUnset("OMILL_DUMP_VIRTUAL_MODEL", DumpVirtualModel.c_str());
   if (auto v = parseBoolEnv("OMILL_SKIP_BLOCK_MERGE"); v.value_or(false)) {
@@ -8350,246 +7745,6 @@ int main(int argc, char **argv) {
     }
   }
 
-  // VM target discovery loop: after the pipeline resolves dispatch targets,
-  // some are newly discovered (image_base + RVA where RVA wasn't in the
-  // original binary scan).  Lift these new targets and re-run the pipeline.
-  const bool allow_legacy_vm_discovery_loop =
-      vm_mode && !force_devirtualize && !GenericStaticDevirtualize &&
-      !opts.generic_static_devirtualize;
-  if (allow_legacy_vm_discovery_loop) {
-    for (unsigned vm_round = 0; vm_round < 4; ++vm_round) {
-      if (events.detailed()) {
-        events.emitInfo("vm_discovery_round_started", "vm discovery round started",
-                        {{"round", static_cast<int64_t>(vm_round + 1)}});
-      }
-      // Extract discovered dispatch targets from named metadata.
-      llvm::DenseSet<uint64_t> dispatch_targets;
-      if (auto *named_md =
-              module->getNamedMetadata("omill.vm_discovered_targets")) {
-        for (unsigned i = 0; i < named_md->getNumOperands(); ++i) {
-          auto *tuple = named_md->getOperand(i);
-          if (tuple->getNumOperands() == 0)
-            continue;
-          if (auto *cmd = llvm::dyn_cast<llvm::ConstantAsMetadata>(
-                  tuple->getOperand(0))) {
-            if (auto *ci =
-                    llvm::dyn_cast<llvm::ConstantInt>(cmd->getValue())) {
-              uint64_t va = ci->getZExtValue();
-              std::string name =
-                  "sub_" + llvm::Twine::utohexstr(va).str();
-              auto *existing = module->getFunction(name);
-              if (!existing || existing->isDeclaration())
-                dispatch_targets.insert(va);
-            }
-          }
-        }
-        // Remove so next round starts fresh.
-        module->eraseNamedMetadata(named_md);
-      }
-
-      // Scan for dispatch_call(state, ConstantInt(pc), mem) where pc
-      // points to unlifted code.  These are calls whose target was folded
-      // to a constant by GVN/InstCombine but wasn't in the module when
-      // LowerFunctionCall ran, so they went through the dispatch stub.
-      // RewriteLiftedCallsToNative (during ABI recovery) would turn them
-      // into inttoptr indirect calls; lifting them NOW lets that pass
-      // resolve them to direct calls instead.
-      llvm::DenseSet<uint64_t> call_targets;
-      auto findDispatchFunction = [&](bool want_jump) -> llvm::Function * {
-        for (auto &F : *module) {
-          if (want_jump ? omill::isDispatchJumpName(F.getName())
-                        : omill::isDispatchCallName(F.getName())) {
-            return &F;
-          }
-        }
-        return nullptr;
-      };
-      auto *dispatch_fn = findDispatchFunction(false);
-      auto *dispatch_jmp = findDispatchFunction(true);
-      auto scanDispatchUses = [&](llvm::Function *dispatcher) {
-        if (!dispatcher)
-          return;
-        for (auto *U : dispatcher->users()) {
-          auto *call = llvm::dyn_cast<llvm::CallInst>(U);
-          if (!call || call->arg_size() < 2)
-            continue;
-          auto *ci = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
-          if (!ci)
-            continue;
-          uint64_t target = ci->getZExtValue();
-          if (target == 0)
-            continue;
-          bool in_code = false;
-          if (RawBinary) {
-            in_code = (target >= BaseAddress &&
-                       target < BaseAddress + raw_code.size());
-          } else {
-            for (auto &sec : pe.code_sections) {
-              if (target >= sec.va && target < sec.va + sec.size) {
-                in_code = true;
-                break;
-              }
-            }
-          }
-          if (!in_code)
-            continue;
-          std::string name =
-              "sub_" + llvm::Twine::utohexstr(target).str();
-          auto *existing = module->getFunction(name);
-          if (!existing || existing->isDeclaration())
-            call_targets.insert(target);
-        }
-      };
-      scanDispatchUses(dispatch_fn);
-      scanDispatchUses(dispatch_jmp);
-      // Remove targets already covered by dispatch discovery.
-      for (uint64_t va : dispatch_targets)
-        call_targets.erase(va);
-
-      if (dispatch_targets.empty() && call_targets.empty())
-        break;
-
-      errs() << "VM discovery round " << (vm_round + 1) << ": "
-             << dispatch_targets.size() << " dispatch + "
-             << call_targets.size() << " call target(s)\n";
-      events.emitInfo("vm_discovery_targets", "vm discovery targets found",
-                      {{"round", static_cast<int64_t>(vm_round + 1)},
-                       {"dispatch_targets", static_cast<int64_t>(dispatch_targets.size())},
-                       {"call_targets", static_cast<int64_t>(call_targets.size())}});
-
-      // Snapshot existing functions before lifting so we can tag ALL new ones
-      // (not just the top-level targets) with omill.vm_newly_lifted.
-      // Without this, callee functions created by the lifter's graph walk
-      // miss Phase 1 intrinsic lowering (the scoped pipeline only processes
-      // functions with the newly_lifted attribute).
-      llvm::DenseSet<llvm::Function *> pre_lift_funcs;
-      for (auto &F : *module)
-        pre_lift_funcs.insert(&F);
-
-      // Lift dispatch targets as VM handlers.
-      unsigned lift_ok = 0, lift_fail = 0;
-      for (uint64_t va : dispatch_targets) {
-        if (lifter.Lift(va)) {
-          ++lift_ok;
-          std::string name =
-              "sub_" + llvm::Twine::utohexstr(va).str();
-          if (auto *fn = module->getFunction(name))
-            fn->addFnAttr("omill.vm_handler");
-        } else {
-          ++lift_fail;
-        }
-      }
-      // Lift call targets as regular functions (NOT vm_handler — they
-      // get _native wrappers via RecoverFunctionSignatures).
-      for (uint64_t va : call_targets) {
-        if (lifter.Lift(va))
-          ++lift_ok;
-        else
-          ++lift_fail;
-      }
-
-      // Tag ALL functions that were added by the lifter during this round.
-      for (auto &F : *module) {
-        if (!pre_lift_funcs.count(&F) && !F.isDeclaration())
-          F.addFnAttr("omill.vm_newly_lifted");
-      }
-
-      // Fix DeclareLiftedFunction naming collisions.
-      for (auto &F : llvm::make_early_inc_range(*module)) {
-        if (!F.isDeclaration())
-          continue;
-        auto fname = F.getName();
-        if (!fname.starts_with("sub_"))
-          continue;
-        for (int i = 1; i <= 20; ++i) {
-          std::string def_name = (fname + "." + Twine(i)).str();
-          if (auto *def = module->getFunction(def_name)) {
-            if (!def->isDeclaration()) {
-              F.replaceAllUsesWith(def);
-              F.eraseFromParent();
-              def->setName(fname);
-              break;
-            }
-          }
-        }
-      }
-      for (auto &F : llvm::make_early_inc_range(*module)) {
-        if (!F.isDeclaration())
-          continue;
-        auto fname = F.getName();
-        if (!fname.starts_with("sub_"))
-          continue;
-        size_t dot = fname.rfind('.');
-        if (dot == StringRef::npos || dot + 1 >= fname.size())
-          continue;
-        auto suffix = fname.drop_front(dot + 1);
-        unsigned clone_index = 0;
-        if (suffix.getAsInteger(10, clone_index))
-          continue;
-        std::string base_name = fname.take_front(dot).str();
-        if (auto *base = module->getFunction(base_name)) {
-          if (!base->isDeclaration()) {
-            F.replaceAllUsesWith(base);
-            F.eraseFromParent();
-          }
-        }
-      }
-
-      errs() << "  lifted " << lift_ok;
-      if (lift_fail > 0)
-        errs() << " (" << lift_fail << " failed)";
-      errs() << "\n";
-
-      if (lift_ok == 0)
-        break;
-
-      // Re-run the pipeline on the updated module.  Use a lightweight
-      // configuration that skips deobfuscation (Phase 5) and iterative
-      // target resolution (Phase 3.6) — the outer VM discovery loop
-      // handles the iteration, and deobf is deferred to post-ABI.
-      MAM.invalidate(*module, llvm::PreservedAnalyses::none());
-      {
-        omill::PipelineOptions vm_opts = opts;
-        vm_opts.deobfuscate = false;
-        vm_opts.resolve_indirect_targets = false;
-        vm_opts.interprocedural_const_prop = false;
-        vm_opts.scope_predicate = [](llvm::Function &F) {
-          return F.hasFnAttribute("omill.vm_newly_lifted");
-        };
-        ModulePassManager MPM;
-        omill::buildPipeline(MPM, vm_opts);
-        MPM.run(*module, MAM);
-        emitIterativeSessionEvents(events, iterative_session,
-                                   "vm-discovery-rerun");
-      }
-
-      // Clear the newly-lifted tags so next round starts fresh.
-      for (auto &F : *module) {
-        if (F.hasFnAttribute("omill.vm_newly_lifted"))
-          F.removeFnAttr("omill.vm_newly_lifted");
-      }
-
-      errs() << "  pipeline re-run complete\n";
-      events.emitInfo("vm_discovery_round_completed", "vm discovery round completed",
-                      {{"round", static_cast<int64_t>(vm_round + 1)},
-                       {"lifted", static_cast<int64_t>(lift_ok)},
-                       {"failed", static_cast<int64_t>(lift_fail)}});
-
-      // Checkpoint: save LL after each VM discovery round.
-      repairMalformedPHIs(*module);
-      {
-        std::string ckpt_name =
-            "vm_round_" + std::to_string(vm_round + 1) + ".ll";
-        std::error_code ec;
-        raw_fd_ostream os(ckpt_name, ec, sys::fs::OF_Text);
-        if (!ec) {
-          module->print(os, nullptr);
-          errs() << "  saved checkpoint: " << ckpt_name << "\n";
-        }
-      }
-    }
-  }
-
   std::optional<std::string> pre_abi_checkpoint_text;
   const bool enable_debug_sample_native_fixups =
       parseBoolEnv("OMILL_ENABLE_DEBUG_SAMPLE_NATIVE_FIXUPS")
@@ -8601,10 +7756,6 @@ int main(int argc, char **argv) {
     if (!opts.generic_static_devirtualize)
       restoreVMHandlerAttrs();
     appendDebugMarker("abi:after_restore_vm_attrs");
-
-    bool cached_recover_abi_text_valid = false;
-    std::string cached_recover_abi_text_input;
-    std::optional<std::string> cached_recover_abi_text_output;
 
     auto repairDeclaredContinuationWrappersInModule =
         [&](llvm::Module &M) -> unsigned {
@@ -8739,448 +7890,6 @@ int main(int argc, char **argv) {
       return rewritten;
     };
 
-    auto prepareIRTextForABIReplay =
-        [&](llvm::StringRef abi_input_ir) -> std::string {
-      llvm::SMDiagnostic parse_error;
-      auto replay_module =
-          llvm::parseAssemblyString(abi_input_ir, parse_error, ctx);
-      if (!replay_module)
-        return abi_input_ir.str();
-      unsigned rewritten =
-          repairDeclaredContinuationWrappersInModule(*replay_module);
-      if (rewritten == 0)
-        return abi_input_ir.str();
-      std::string repaired_ir;
-      llvm::raw_string_ostream os(repaired_ir);
-      replay_module->print(os, nullptr);
-      os.flush();
-      errs() << "[abi-prep] repaired-declared-continuation-wrappers="
-             << rewritten << "\n";
-      return repaired_ir;
-    };
-
-    auto runExternalRecoverABIText =
-        [&](llvm::StringRef abi_input_ir) -> std::optional<std::string> {
-      if (abi_input_ir.empty())
-        return std::nullopt;
-
-      std::string prepared_input_ir = prepareIRTextForABIReplay(abi_input_ir);
-      llvm::StringRef effective_input_ir(prepared_input_ir);
-      dumpTextIfEnvEnabled(effective_input_ir,
-                           "OMILL_DEBUG_DUMP_EXTERNAL_RECOVER_ABI_INPUT_IR",
-                           "external_recover_abi_input.ll");
-
-      if (cached_recover_abi_text_valid &&
-          effective_input_ir == cached_recover_abi_text_input) {
-        return cached_recover_abi_text_output;
-      }
-
-      llvm::SmallString<256> opt_path(argv[0]);
-      llvm::sys::path::remove_filename(opt_path);
-      llvm::sys::path::remove_filename(opt_path);
-      llvm::sys::path::append(opt_path, "omill-opt", "omill-opt.exe");
-      if (!llvm::sys::fs::exists(opt_path)) {
-        cached_recover_abi_text_input = effective_input_ir.str();
-        cached_recover_abi_text_output = std::nullopt;
-        cached_recover_abi_text_valid = true;
-        return std::nullopt;
-      }
-
-      llvm::SmallString<256> temp_in_path;
-      llvm::SmallString<256> temp_out_path;
-      if (llvm::sys::fs::createTemporaryFile("omill_pre_abi_replay_in", "ll",
-                                             temp_in_path)) {
-        cached_recover_abi_text_input = effective_input_ir.str();
-        cached_recover_abi_text_output = std::nullopt;
-        cached_recover_abi_text_valid = true;
-        return std::nullopt;
-      }
-      if (llvm::sys::fs::createTemporaryFile("omill_pre_abi_replay_out", "ll",
-                                             temp_out_path)) {
-        llvm::sys::fs::remove(temp_in_path);
-        cached_recover_abi_text_input = effective_input_ir.str();
-        cached_recover_abi_text_output = std::nullopt;
-        cached_recover_abi_text_valid = true;
-        return std::nullopt;
-      }
-
-      {
-        std::error_code ec;
-        llvm::raw_fd_ostream os(temp_in_path, ec, llvm::sys::fs::OF_Text);
-        if (ec) {
-          llvm::sys::fs::remove(temp_in_path);
-          llvm::sys::fs::remove(temp_out_path);
-          cached_recover_abi_text_input = effective_input_ir.str();
-          cached_recover_abi_text_output = std::nullopt;
-          cached_recover_abi_text_valid = true;
-          return std::nullopt;
-        }
-        os << effective_input_ir;
-      }
-
-      llvm::SmallVector<std::string, 8> arg_storage;
-      arg_storage.emplace_back(opt_path.str().str());
-      arg_storage.emplace_back("--only-recover-abi");
-      arg_storage.emplace_back(temp_in_path.str().str());
-      arg_storage.emplace_back("-o");
-      arg_storage.emplace_back(temp_out_path.str().str());
-
-      llvm::SmallVector<llvm::StringRef, 8> argv_refs;
-      for (const auto &arg : arg_storage)
-        argv_refs.push_back(arg);
-
-      std::string err_msg;
-      bool exec_failed = false;
-      int rc = llvm::sys::ExecuteAndWait(argv_refs.front(), argv_refs,
-                                         std::nullopt, {}, 180u, 0, &err_msg,
-                                         &exec_failed);
-      llvm::sys::fs::remove(temp_in_path);
-      if (rc != 0 || exec_failed) {
-        llvm::sys::fs::remove(temp_out_path);
-        cached_recover_abi_text_input = effective_input_ir.str();
-        cached_recover_abi_text_output = std::nullopt;
-        cached_recover_abi_text_valid = true;
-        return std::nullopt;
-      }
-
-      auto buf_or_err = llvm::MemoryBuffer::getFile(temp_out_path);
-      llvm::sys::fs::remove(temp_out_path);
-      cached_recover_abi_text_input = effective_input_ir.str();
-      cached_recover_abi_text_valid = true;
-      if (!buf_or_err) {
-        cached_recover_abi_text_output = std::nullopt;
-        return std::nullopt;
-      }
-      cached_recover_abi_text_output = (*buf_or_err)->getBuffer().str();
-      return cached_recover_abi_text_output;
-    };
-
-    auto runExternalRecoverABIFromCurrentModuleBitcode =
-        [&]() -> std::optional<std::string> {
-      llvm::SmallString<256> opt_path(argv[0]);
-      llvm::sys::path::remove_filename(opt_path);
-      llvm::sys::path::remove_filename(opt_path);
-      llvm::sys::path::append(opt_path, "omill-opt", "omill-opt.exe");
-      if (!llvm::sys::fs::exists(opt_path))
-        return std::nullopt;
-
-      llvm::SmallString<256> temp_in_path;
-      llvm::SmallString<256> temp_out_path;
-      if (llvm::sys::fs::createTemporaryFile("omill_pre_abi_replay_in", "bc",
-                                             temp_in_path))
-        return std::nullopt;
-      if (llvm::sys::fs::createTemporaryFile("omill_pre_abi_replay_out", "ll",
-                                             temp_out_path)) {
-        llvm::sys::fs::remove(temp_in_path);
-        return std::nullopt;
-      }
-
-      {
-        std::error_code ec;
-        llvm::raw_fd_ostream os(temp_in_path, ec, llvm::sys::fs::OF_None);
-        if (ec) {
-          llvm::sys::fs::remove(temp_in_path);
-          llvm::sys::fs::remove(temp_out_path);
-          return std::nullopt;
-        }
-        llvm::WriteBitcodeToFile(*module, os);
-      }
-
-      llvm::SmallVector<std::string, 8> arg_storage;
-      arg_storage.emplace_back(opt_path.str().str());
-      arg_storage.emplace_back("--only-recover-abi");
-      arg_storage.emplace_back(temp_in_path.str().str());
-      arg_storage.emplace_back("-o");
-      arg_storage.emplace_back(temp_out_path.str().str());
-
-      llvm::SmallVector<llvm::StringRef, 8> argv_refs;
-      for (const auto &arg : arg_storage)
-        argv_refs.push_back(arg);
-
-      std::string err_msg;
-      bool exec_failed = false;
-      int rc = llvm::sys::ExecuteAndWait(argv_refs.front(), argv_refs,
-                                         std::nullopt, {}, 180u, 0, &err_msg,
-                                         &exec_failed);
-      llvm::sys::fs::remove(temp_in_path);
-      if (rc != 0 || exec_failed) {
-        llvm::sys::fs::remove(temp_out_path);
-        return std::nullopt;
-      }
-
-      auto buf_or_err = llvm::MemoryBuffer::getFile(temp_out_path);
-      llvm::sys::fs::remove(temp_out_path);
-      if (!buf_or_err)
-        return std::nullopt;
-      return (*buf_or_err)->getBuffer().str();
-    };
-
-    auto buildFilteredABIRecoveryCheckpointText =
-        [&]() -> std::optional<std::string> {
-      if (countDefinedOutputRoots() > 1u)
-        return std::nullopt;
-
-      llvm::SmallPtrSet<const llvm::Function *, 32> kept_functions;
-      llvm::SmallVector<const llvm::Function *, 64> worklist;
-      auto seed_function = [&](const llvm::Function &F) {
-        if (F.isDeclaration())
-          return;
-        if (kept_functions.insert(&F).second)
-          worklist.push_back(&F);
-      };
-
-      for (const auto &F : *module) {
-        if (F.hasFnAttribute("omill.output_root") ||
-            F.hasFnAttribute("omill.closed_root_slice_root")) {
-          seed_function(F);
-        }
-      }
-      if (kept_functions.empty())
-        return std::nullopt;
-
-      llvm::SmallVector<const llvm::Function *, 64> root_layer(worklist.begin(),
-                                                               worklist.end());
-      for (const llvm::Function *F : root_layer) {
-        for (const auto &BB : *F) {
-          for (const auto &I : BB) {
-            const auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
-            if (!call)
-              continue;
-            const auto *callee = call->getCalledFunction();
-            if (!callee || callee->isDeclaration())
-              continue;
-            kept_functions.insert(callee);
-          }
-        }
-      }
-
-      llvm::ValueToValueMapTy VMap;
-      auto should_clone_def = [&](const llvm::GlobalValue *GV) -> bool {
-        if (const auto *F = llvm::dyn_cast<llvm::Function>(GV))
-          return F->isDeclaration() || kept_functions.contains(F);
-        return true;
-      };
-      auto filtered_module = llvm::CloneModule(*module, VMap, should_clone_def);
-      if (!filtered_module || verifyModule(*filtered_module, nullptr))
-        return std::nullopt;
-
-      std::string filtered_ir;
-      llvm::raw_string_ostream os(filtered_ir);
-      filtered_module->print(os, nullptr);
-      os.flush();
-      events.emitInfo("filtered_pre_abi_checkpoint_built",
-                      "filtered pre-ABI checkpoint built",
-                      {{"kept_functions",
-                        static_cast<int64_t>(kept_functions.size())},
-                       {"filtered_ir_bytes",
-                        static_cast<int64_t>(filtered_ir.size())}});
-      return filtered_ir;
-    };
-
-    auto requiresHiddenEntrySeedPreservation = [&]() {
-      for (auto &F : *module) {
-        if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
-          continue;
-        auto attr = F.getFnAttribute("omill.export_entry_seed_exprs");
-        if (attr.isValid() && attr.isStringAttribute() &&
-            !attr.getValueAsString().empty()) {
-          return true;
-        }
-      }
-      return false;
-    };
-
-    auto ensureRecoveredModuleHasOutputRoot =
-        [&](llvm::Module &M, uint64_t expected_root_va) -> llvm::Function * {
-      auto pickUnique = [](llvm::ArrayRef<llvm::Function *> candidates)
-          -> llvm::Function * {
-        return candidates.size() == 1 ? candidates.front() : nullptr;
-      };
-
-      std::string target_hex = llvm::utohexstr(expected_root_va);
-      llvm::SmallVector<llvm::Function *, 8> exact_target_roots;
-      llvm::SmallVector<llvm::Function *, 8> exact_target_lifted_roots;
-      llvm::SmallVector<llvm::Function *, 8> exact_target_native_roots;
-      llvm::SmallVector<llvm::Function *, 8> output_roots;
-      llvm::SmallVector<llvm::Function *, 8> lifted_functions;
-      llvm::SmallVector<llvm::Function *, 8> native_functions;
-      llvm::SmallVector<llvm::Function *, 8> defined_functions;
-      for (auto &F : M) {
-        if (F.isDeclaration())
-          continue;
-        defined_functions.push_back(&F);
-        if (F.hasFnAttribute("omill.output_root"))
-          output_roots.push_back(&F);
-        if (!F.getName().ends_with("_native"))
-          lifted_functions.push_back(&F);
-        if (F.getName().ends_with("_native"))
-          native_functions.push_back(&F);
-        if (expected_root_va == 0)
-          continue;
-        const bool is_exact_lifted =
-            (F.getName() == ("sub_" + target_hex)) ||
-            (F.getName() == ("blk_" + target_hex)) ||
-            (F.getName().contains(target_hex) &&
-             !F.getName().ends_with("_native"));
-        const bool is_exact_native =
-            (F.getName() == ("sub_" + target_hex + "_native")) ||
-            (F.getName() == ("blk_" + target_hex + "_native")) ||
-            (F.getName().contains(target_hex) &&
-             F.getName().ends_with("_native"));
-        if (is_exact_lifted)
-          exact_target_lifted_roots.push_back(&F);
-        if (is_exact_native)
-          exact_target_native_roots.push_back(&F);
-        if (is_exact_lifted || is_exact_native) {
-          exact_target_roots.push_back(&F);
-        }
-      }
-
-      llvm::Function *root = nullptr;
-      if (auto *F = pickUnique(exact_target_lifted_roots))
-        root = F;
-      else if (auto *F = pickUnique(exact_target_roots))
-        root = F;
-      else if (auto *F = pickUnique(output_roots))
-        root = F;
-      else if (auto *F = pickUnique(lifted_functions))
-        root = F;
-      else if (auto *F = pickUnique(native_functions))
-        root = F;
-      if (!root)
-        root = pickUnique(defined_functions);
-      if (!root)
-        return nullptr;
-      for (auto &F : M) {
-        if (&F == root)
-          continue;
-        F.removeFnAttr("omill.output_root");
-      }
-      root->addFnAttr("omill.output_root");
-      return root;
-    };
-
-    auto tryDirectReplayABIText = [&](llvm::StringRef abi_input_ir,
-                                      llvm::StringRef event_name,
-                                      llvm::StringRef event_message) -> bool {
-      auto replayed_text = runExternalRecoverABIText(abi_input_ir);
-      if (!replayed_text)
-        return false;
-
-      llvm::SMDiagnostic parse_error;
-      auto replayed_module =
-          llvm::parseAssemblyString(*replayed_text, parse_error, ctx);
-      if (!replayed_module)
-        return false;
-      if (verifyModule(*replayed_module, nullptr))
-        return false;
-      const bool requires_hidden_entry_seed_preservation =
-          requiresHiddenEntrySeedPreservation();
-
-      auto *resolved_root =
-          ensureRecoveredModuleHasOutputRoot(*replayed_module, func_va);
-      if (!resolved_root)
-        return false;
-      if (requires_hidden_entry_seed_preservation) {
-        auto attr = resolved_root->getFnAttribute("omill.export_entry_seed_exprs");
-        if (!attr.isValid() || !attr.isStringAttribute() ||
-            attr.getValueAsString().empty()) {
-          return false;
-        }
-      }
-
-      unsigned defined_output_roots = 0;
-      bool has_unresolved_output_control_transfer = false;
-      for (auto &F : *replayed_module) {
-        if (!F.hasFnAttribute("omill.output_root") || F.isDeclaration())
-          continue;
-        ++defined_output_roots;
-        if (hasUnresolvedLiftedControlTransferInClosure(F))
-          has_unresolved_output_control_transfer = true;
-      }
-      if (defined_output_roots == 0 || has_unresolved_output_control_transfer)
-        return false;
-
-      module = std::move(replayed_module);
-      MAM.invalidate(*module, llvm::PreservedAnalyses::none());
-      repairMalformedPHIs(*module);
-      errs() << "ABI recovery replayed from closed pre-ABI checkpoint\n";
-      events.emitInfo(event_name, event_message,
-                      {{"defined_output_roots",
-                        static_cast<int64_t>(defined_output_roots)}});
-      return true;
-    };
-
-    auto runExternalMainRootNoABIChildIR = [&]() -> std::optional<std::string> {
-      if (!use_pre_abi_noabi_cleanup || func_va == 0)
-        return std::nullopt;
-
-      llvm::SmallString<256> temp_ll_path;
-      if (llvm::sys::fs::createTemporaryFile("omill_main_root_noabi", "ll",
-                                             temp_ll_path)) {
-        return std::nullopt;
-      }
-
-      llvm::SmallVector<std::string, 16> arg_storage;
-      arg_storage.emplace_back(argv[0]);
-      arg_storage.emplace_back(InputFilename);
-      arg_storage.emplace_back("--va");
-      arg_storage.emplace_back(llvm::utohexstr(func_va));
-      if (opts.use_block_lifting)
-        arg_storage.emplace_back("--block-lift");
-      if (devirtualization_plan.enable_devirtualization)
-        arg_storage.emplace_back("--devirtualize");
-      if (opts.generic_static_devirtualize)
-        arg_storage.emplace_back("--generic-static-devirtualize");
-      arg_storage.emplace_back("--no-abi");
-      arg_storage.emplace_back("-o");
-      arg_storage.emplace_back(temp_ll_path.str().str());
-
-      llvm::SmallVector<llvm::StringRef, 16> argv_refs;
-      for (const auto &arg : arg_storage)
-        argv_refs.push_back(arg);
-
-      std::string err_msg;
-      bool exec_failed = false;
-      std::string recovery_root_va_text = llvm::utohexstr(func_va);
-      ScopedEnvOverride skip_nested_probe(
-          "OMILL_SKIP_TERMINAL_BOUNDARY_SIDE_PROBE", "1");
-      ScopedEnvOverride enable_late_output_target_rerun(
-          "OMILL_ENABLE_LATE_OUTPUT_ROOT_TARGET_RERUN", "1");
-      ScopedEnvOverride skip_late_boundary_rerun(
-          "OMILL_SKIP_LATE_TERMINAL_BOUNDARY_RERUN", "1");
-      ScopedEnvOverride enable_noabi_late_continuation_rerun(
-          "OMILL_ENABLE_NOABI_LATE_CONTINUATION_RERUN", "1");
-      ScopedEnvOverride enable_call_frontier_dispatch_override(
-          "OMILL_ENABLE_CALL_FRONTIER_DISPATCH_OVERRIDE", "1");
-      ScopedEnvOverride enable_terminal_boundary_recovery(
-          "OMILL_TERMINAL_BOUNDARY_RECOVERY", "1");
-      ScopedEnvOverride terminal_boundary_recovery_root(
-          "OMILL_TERMINAL_BOUNDARY_RECOVERY_ROOT_VA",
-          recovery_root_va_text.c_str());
-      ScopedEnvOverride terminal_boundary_recovery_max_reachable(
-          "OMILL_TERMINAL_BOUNDARY_RECOVERY_MAX_REACHABLE", "32");
-      ScopedEnvOverride terminal_boundary_recovery_max_iterations(
-          "OMILL_TERMINAL_BOUNDARY_RECOVERY_MAX_ITERATIONS", "14");
-      ScopedEnvOverride terminal_boundary_recovery_max_new_target_rounds(
-          "OMILL_TERMINAL_BOUNDARY_RECOVERY_MAX_NEW_TARGET_ROUNDS", "14");
-      int rc = llvm::sys::ExecuteAndWait(
-          argv_refs.front(), argv_refs, std::nullopt, {},
-          parseUnsignedEnv("OMILL_MAIN_ROOT_NOABI_CHILD_TIMEOUT_SECONDS")
-              .value_or(900u),
-          0, &err_msg, &exec_failed);
-      if (rc != 0 || exec_failed) {
-        llvm::sys::fs::remove(temp_ll_path);
-        return std::nullopt;
-      }
-
-      auto buf_or_err = llvm::MemoryBuffer::getFile(temp_ll_path);
-      llvm::sys::fs::remove(temp_ll_path);
-      if (!buf_or_err)
-        return std::nullopt;
-      return (*buf_or_err)->getBuffer().str();
-    };
-
     {
       unsigned rewritten_live_pre_abi =
           repairDeclaredContinuationWrappersInModule(*module);
@@ -9192,605 +7901,56 @@ int main(int argc, char **argv) {
       }
     }
 
-    auto moduleReadableEnoughForDirectWrite = [&](const llvm::Module &M) {
-      bool has_state_alloca = false;
-      bool has_large_stack_alloca = false;
-      bool uses_stacksave = false;
-      bool calls_local_lifted_helper = false;
-      unsigned defined_lifted_function_count = 0;
-      const auto &DL = M.getDataLayout();
-      for (auto &F : M) {
-        if (F.isDeclaration())
-          continue;
-        if ((F.getName().starts_with("sub_") || F.getName().starts_with("blk_") ||
-             F.getName().starts_with("block_")) &&
-            !F.getName().ends_with("_native")) {
-          ++defined_lifted_function_count;
-        }
-        for (auto &BB : F) {
-          for (auto &I : BB) {
-            if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
-              if (auto *allocated_struct =
-                      llvm::dyn_cast<llvm::StructType>(
-                          alloca->getAllocatedType());
-                  allocated_struct && allocated_struct->hasName() &&
-                  allocated_struct->getName() == "struct.State") {
-                has_state_alloca = true;
-              }
-              if (auto *AT =
-                      llvm::dyn_cast<llvm::ArrayType>(alloca->getAllocatedType())) {
-                if (DL.getTypeAllocSize(AT) >= 4096)
-                  has_large_stack_alloca = true;
-              }
-            }
-            auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
-            auto *callee = call ? call->getCalledFunction() : nullptr;
-            if (callee && callee->getName() == "llvm.stacksave.p0")
-              uses_stacksave = true;
-            if (callee && !callee->isDeclaration() &&
-                !callee->getName().ends_with("_native") &&
-                (callee->getName().starts_with("sub_") ||
-                 callee->getName().starts_with("blk_") ||
-                 callee->getName().starts_with("block_"))) {
-              calls_local_lifted_helper = true;
-            }
-          }
-        }
+    if (use_pre_abi_noabi_cleanup) {
+      // The pre-ABI generic cleanup reuses the safer no-ABI closed-slice path
+      // to flatten the slice before signature recovery. Clear the marker before
+      // ABI recovery so ABI-only rewrites do not inherit no-ABI mode.
+      module->setModuleFlag(llvm::Module::Override, "omill.no_abi_mode", 0u);
+    }
+    events.emitInfo("abi_recovery_started", "abi recovery started");
+    {
+      auto checkpoint_patch_targets = collectAllConstantMissingBlockTargets();
+      if (!checkpoint_patch_targets.empty()) {
+        llvm::SmallVector<uint64_t, 16> ordered_targets(
+            checkpoint_patch_targets.begin(), checkpoint_patch_targets.end());
+        llvm::sort(ordered_targets);
+        patchConstantMissingBlockCallsToLiftedTargets(
+            ordered_targets, "abi_pre_checkpoint_missing_block_patch",
+            "patched pre-ABI missing-block calls to lifted targets");
       }
-      return !has_state_alloca && !has_large_stack_alloca &&
-             !uses_stacksave && !calls_local_lifted_helper &&
-             defined_lifted_function_count == 0;
-    };
-
-    auto writeFinalOutputTextAndExit = [&](llvm::StringRef final_ir_text,
-                                           llvm::StringRef event_name,
-                                           llvm::StringRef event_message)
-        -> std::optional<int> {
-      llvm::LLVMContext verify_ctx;
-      llvm::SMDiagnostic parse_error;
-      auto verify_module =
-          llvm::parseAssemblyString(final_ir_text, parse_error, verify_ctx);
-      if (!verify_module || verifyModule(*verify_module, nullptr) ||
-          !moduleReadableEnoughForDirectWrite(*verify_module)) {
-        return std::nullopt;
-      }
-
-      std::error_code direct_ec;
-      events.emitInfo("output_write_started", "writing final output",
-                      {{"path", OutputFilename}});
-      ToolOutputFile direct_out(OutputFilename, direct_ec, sys::fs::OF_Text);
-      if (direct_ec) {
-        errs() << "Error opening output: " << direct_ec.message() << "\n";
-        return fail(1, "failed to open output file");
-      }
-      direct_out.os() << final_ir_text;
-      direct_out.keep();
-      events.emitInfo(event_name, event_message);
-      events.emitInfo("output_write_completed", "output write complete",
-                      {{"path", OutputFilename}});
-      events.emitTerminalSuccess(OutputFilename);
-      return 0;
-    };
-
-    const bool debug_small_replay =
-        parseBoolEnv("OMILL_DEBUG_SMALL_REPLAY").value_or(false);
-
-    const bool force_external_main_root_child_replay =
-        parseBoolEnv("OMILL_FORCE_MAIN_ROOT_NOABI_CHILD_REPLAY").value_or(false);
-    const bool enable_external_main_root_child_replay =
-        parseBoolEnv("OMILL_ENABLE_MAIN_ROOT_NOABI_CHILD_REPLAY")
-            .value_or(false);
-    const bool prefer_external_main_root_child_replay =
-        use_pre_abi_noabi_cleanup &&
-        !parseBoolEnv("OMILL_SKIP_MAIN_ROOT_NOABI_CHILD_REPLAY")
-             .value_or(false) &&
-        countDefinedOutputRoots() <= 1u &&
-        (force_external_main_root_child_replay ||
-         (enable_external_main_root_child_replay &&
-          moduleHasStructuralOutputFrontierArtifacts()));
-
-    if (prefer_external_main_root_child_replay) {
-      errs() << "Attempting external main-root no-ABI replay fallback\n";
-      events.emitInfo("main_root_noabi_child_replay_started",
-                      "external main-root no-ABI replay fallback started");
-      if (auto noabi_child_ir = runExternalMainRootNoABIChildIR()) {
-        events.emitInfo("main_root_noabi_child_completed",
-                        "external main-root no-ABI child completed");
-        dumpTextIfEnvEnabled(*noabi_child_ir,
-                             "OMILL_DEBUG_DUMP_MAIN_ROOT_NOABI_CHILD_IR",
-                             "main_root_noabi_child.ll");
-        if (auto replayed_text = runExternalRecoverABIText(*noabi_child_ir)) {
-          auto summary = parseTerminalBoundaryRecoveryIRSummary(*replayed_text);
-          const bool has_unresolved_pc_text =
-              replayed_text->find("pc.canonical") != std::string::npos ||
-              replayed_text->find("pc.norm") != std::string::npos;
-          const bool clean_text_fallback =
-              summary.has_output_root && !has_unresolved_pc_text &&
-              summary.metrics.dispatch_call == 0 &&
-              summary.metrics.dispatch_jump == 0 &&
-              summary.metrics.declare_blk == 0 &&
-              summary.metrics.missing_block_handler == 0;
-          if (clean_text_fallback) {
-            if (auto direct_exit = writeFinalOutputTextAndExit(
-                    *replayed_text,
-                    "abi_recovery_replayed_from_main_root_noabi_child",
-                    "ABI recovery replayed from external main-root no-ABI child")) {
-              return *direct_exit;
-            }
-          }
-          errs() << "External main-root no-ABI replay fallback rejected clean="
-                 << (clean_text_fallback ? 1 : 0) << "\n";
-          events.emitInfo("main_root_noabi_child_replay_rejected",
-                          "external main-root no-ABI replay fallback rejected",
-                          {{"clean_text_fallback",
-                            static_cast<int64_t>(clean_text_fallback ? 1 : 0)},
-                           {"dispatch_call",
-                            static_cast<int64_t>(summary.metrics.dispatch_call)},
-                           {"dispatch_jump",
-                            static_cast<int64_t>(summary.metrics.dispatch_jump)},
-                           {"declare_blk",
-                            static_cast<int64_t>(summary.metrics.declare_blk)},
-                           {"missing_block",
-                            static_cast<int64_t>(
-                                summary.metrics.missing_block_handler)}});
-        }
-      } else {
-        errs() << "External main-root no-ABI child failed\n";
-        events.emitInfo("main_root_noabi_child_failed",
-                        "external main-root no-ABI child failed");
+    }
+    appendDebugMarker("abi:before_repair_phis");
+    repairMalformedPHIs(*module);
+    appendDebugMarker("abi:after_repair_phis");
+    appendDebugMarker("abi:before_raw_checkpoint_print");
+    {
+      std::string checkpoint_ir;
+      llvm::raw_string_ostream checkpoint_os(checkpoint_ir);
+      module->print(checkpoint_os, nullptr);
+      checkpoint_os.flush();
+      pre_abi_checkpoint_text = std::move(checkpoint_ir);
+    }
+    appendDebugMarker("abi:after_raw_checkpoint_print");
+    {
+      std::error_code ec;
+      raw_fd_ostream os("before_abi.ll", ec, sys::fs::OF_Text);
+      if (!ec) {
+        os << *pre_abi_checkpoint_text;
+        errs() << "Saved before_abi.ll\n";
       }
     }
 
-    const bool force_direct_replay =
-        parseBoolEnv("OMILL_FORCE_PRE_ABI_DIRECT_REPLAY").value_or(false);
-    const bool skip_pre_abi_direct_replay_for_vm_like_root =
-        root_local_generic_static_devirtualization_shape &&
-        opts.generic_static_devirtualize;
-    const bool skip_pre_abi_direct_replay_for_hidden_entry_seeds =
-        export_root_has_hidden_entry_seed_exprs;
-    const bool skip_pre_abi_direct_replay =
-        skip_pre_abi_direct_replay_for_hidden_entry_seeds ||
-        skip_pre_abi_direct_replay_for_vm_like_root;
-    const bool prefer_direct_replay =
-        use_pre_abi_noabi_cleanup && force_direct_replay &&
-        !skip_pre_abi_direct_replay &&
-        !parseBoolEnv("OMILL_SKIP_PRE_ABI_DIRECT_REPLAY").value_or(false);
-
-    if (use_pre_abi_noabi_cleanup &&
-        parseBoolEnv("OMILL_FORCE_PRE_ABI_BITCODE_REPLAY").value_or(false) &&
-        countDefinedOutputRoots() <= 1u) {
-      appendDebugMarker("abi:before_bitcode_replay");
-      errs() << "Attempting pre-ABI bitcode replay fallback\n";
-      if (auto replayed_text = runExternalRecoverABIFromCurrentModuleBitcode()) {
-        appendDebugMarker("abi:after_bitcode_replay");
-        auto summary = parseTerminalBoundaryRecoveryIRSummary(*replayed_text);
-        const bool has_unresolved_pc_text =
-            replayed_text->find("pc.canonical") != std::string::npos ||
-            replayed_text->find("pc.norm") != std::string::npos;
-        const bool clean_text_fallback =
-            summary.has_output_root && !has_unresolved_pc_text &&
-            summary.metrics.dispatch_call == 0 &&
-            summary.metrics.dispatch_jump == 0 &&
-            summary.metrics.declare_blk == 0 &&
-            summary.metrics.missing_block_handler == 0;
-        errs() << "Pre-ABI bitcode replay fallback clean="
-               << (clean_text_fallback ? 1 : 0) << "\n";
-        if (clean_text_fallback) {
-          if (auto direct_exit = writeFinalOutputTextAndExit(
-                  *replayed_text,
-                  "abi_recovery_replayed_from_pre_abi_bitcode",
-                  "ABI recovery replayed from pre-ABI bitcode checkpoint")) {
-            return *direct_exit;
-          }
-        }
-      } else {
-        appendDebugMarker("abi:bitcode_replay_failed");
-        errs() << "Pre-ABI bitcode replay fallback failed\n";
-      }
-    }
-
-    if (prefer_direct_replay &&
-        tryDirectReplayABIText(*pre_abi_checkpoint_text,
-                               "abi_recovery_replayed_from_main_checkpoint",
-                               "ABI recovery replayed from main pre-ABI checkpoint")) {
-      appendDebugMarker("abi:after_prefer_direct_replay");
-      dumpModuleIfEnvEnabled(*module, "OMILL_DEBUG_DUMP_AFTER_ABI_CORE",
-                             "after_abi_core.ll");
-    } else {
-      appendDebugMarker("abi:before_live_abi_branch");
-      if (use_pre_abi_noabi_cleanup) {
-        // The pre-ABI generic cleanup reuses the safer no-ABI closed-slice path
-        // to flatten the slice before signature recovery. Clear the marker before
-        // ABI recovery so ABI-only rewrites do not inherit no-ABI mode.
-        module->setModuleFlag(llvm::Module::Override, "omill.no_abi_mode", 0u);
-      }
-      events.emitInfo("abi_recovery_started", "abi recovery started");
-      {
-        auto checkpoint_patch_targets = collectAllConstantMissingBlockTargets();
-        if (!checkpoint_patch_targets.empty()) {
-          llvm::SmallVector<uint64_t, 16> ordered_targets(
-              checkpoint_patch_targets.begin(), checkpoint_patch_targets.end());
-          llvm::sort(ordered_targets);
-          patchConstantMissingBlockCallsToLiftedTargets(
-              ordered_targets, "abi_pre_checkpoint_missing_block_patch",
-              "patched pre-ABI missing-block calls to lifted targets");
-        }
-      }
-      appendDebugMarker("abi:before_raw_checkpoint_print");
-      {
-        if (use_pre_abi_noabi_cleanup && countDefinedOutputRoots() <= 1u &&
-            !parseBoolEnv("OMILL_SKIP_FILTERED_PRE_ABI_CHECKPOINT")
-                 .value_or(false)) {
-          pre_abi_checkpoint_text = buildFilteredABIRecoveryCheckpointText();
-        }
-        if (!pre_abi_checkpoint_text) {
-          std::string checkpoint_ir;
-          llvm::raw_string_ostream checkpoint_os(checkpoint_ir);
-          module->print(checkpoint_os, nullptr);
-          checkpoint_os.flush();
-          pre_abi_checkpoint_text = std::move(checkpoint_ir);
-        }
-      }
-      appendDebugMarker("abi:after_raw_checkpoint_print");
-      {
-        std::error_code ec;
-        raw_fd_ostream os("before_abi.ll", ec, sys::fs::OF_Text);
-        if (!ec) {
-          os << *pre_abi_checkpoint_text;
-          errs() << "Saved before_abi.ll\n";
-        }
-      }
-      bool accepted_small_checkpoint_replay = false;
-      auto replayedModuleReadableEnoughForFastPlainFallback =
-          [&](const llvm::Module &M) {
-            if (!fast_plain_export_root_fallback)
-              return true;
-            bool has_state_alloca = false;
-            bool has_large_stack_alloca = false;
-            bool uses_stacksave = false;
-            bool calls_local_lifted_helper = false;
-            unsigned defined_lifted_function_count = 0;
-            const auto &DL = M.getDataLayout();
-            for (auto &F : M) {
-              if (F.isDeclaration())
-                continue;
-              if ((F.getName().starts_with("sub_") ||
-                   F.getName().starts_with("blk_") ||
-                   F.getName().starts_with("block_")) &&
-                  !F.getName().ends_with("_native")) {
-                ++defined_lifted_function_count;
-              }
-              for (auto &BB : F) {
-                for (auto &I : BB) {
-                  auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(&I);
-                  if (alloca) {
-                    auto *allocated_struct =
-                        llvm::dyn_cast<llvm::StructType>(
-                            alloca->getAllocatedType());
-                    if (allocated_struct && allocated_struct->hasName() &&
-                        allocated_struct->getName() == "struct.State") {
-                      has_state_alloca = true;
-                    }
-                    if (auto *AT = llvm::dyn_cast<llvm::ArrayType>(
-                            alloca->getAllocatedType())) {
-                      if (DL.getTypeAllocSize(AT) >= 4096)
-                        has_large_stack_alloca = true;
-                    }
-                  }
-                  auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
-                  auto *callee = call ? call->getCalledFunction() : nullptr;
-                  if (callee && callee->getName() == "llvm.stacksave.p0")
-                    uses_stacksave = true;
-                  if (callee && !callee->isDeclaration() &&
-                      !callee->getName().ends_with("_native") &&
-                      (callee->getName().starts_with("sub_") ||
-                       callee->getName().starts_with("blk_") ||
-                       callee->getName().starts_with("block_"))) {
-                    calls_local_lifted_helper = true;
-                  }
-                }
-              }
-            }
-            return !has_state_alloca && !has_large_stack_alloca &&
-                   !uses_stacksave && !calls_local_lifted_helper &&
-                   defined_lifted_function_count == 0;
-          };
-      constexpr size_t kMaxAutoDirectReplayCheckpointBytes = 32ull << 20;
-      if (pre_abi_checkpoint_text &&
-          pre_abi_checkpoint_text->size() <=
-              kMaxAutoDirectReplayCheckpointBytes &&
-          !skip_pre_abi_direct_replay &&
-          !parseBoolEnv("OMILL_SKIP_PRE_ABI_DIRECT_REPLAY").value_or(false)) {
-        if (debug_small_replay) {
-          errs() << "[small-replay] checkpoint-bytes="
-                 << pre_abi_checkpoint_text->size() << "\n";
-        }
-        if (auto replayed_text = runExternalRecoverABIText(*pre_abi_checkpoint_text)) {
-          const bool has_unresolved_pc_text =
-              replayed_text->find("pc.canonical") != std::string::npos ||
-              replayed_text->find("pc.norm") != std::string::npos;
-          llvm::SMDiagnostic parse_error;
-          auto replayed_module =
-              llvm::parseAssemblyString(*replayed_text, parse_error, ctx);
-          if (replayed_module && !verifyModule(*replayed_module, nullptr) &&
-              !has_unresolved_pc_text) {
-            auto ensureRecoveredModuleHasOutputRoot =
-                [&](llvm::Module &M,
-                    uint64_t expected_root_va) -> llvm::Function * {
-                  auto pickUnique =
-                      [](llvm::ArrayRef<llvm::Function *> candidates)
-                      -> llvm::Function * {
-                    return candidates.size() == 1 ? candidates.front()
-                                                  : nullptr;
-                  };
-
-                  std::string target_hex = llvm::utohexstr(expected_root_va);
-                  llvm::SmallVector<llvm::Function *, 8> exact_target_roots;
-                  llvm::SmallVector<llvm::Function *, 8> output_roots;
-                  llvm::SmallVector<llvm::Function *, 8> native_functions;
-                  llvm::SmallVector<llvm::Function *, 8> defined_functions;
-                  for (auto &F : M) {
-                    if (F.isDeclaration())
-                      continue;
-                    defined_functions.push_back(&F);
-                    if (F.hasFnAttribute("omill.output_root"))
-                      output_roots.push_back(&F);
-                    if (F.getName().ends_with("_native"))
-                      native_functions.push_back(&F);
-                    if (expected_root_va != 0 &&
-                        ((F.getName() == ("sub_" + target_hex + "_native")) ||
-                         (F.getName() ==
-                          ("blk_" + target_hex + "_native")) ||
-                         (F.getName().contains(target_hex) &&
-                          F.getName().ends_with("_native")))) {
-                      exact_target_roots.push_back(&F);
-                    }
-                  }
-
-                  llvm::Function *root = nullptr;
-                  if (auto *F = pickUnique(exact_target_roots))
-                    root = F;
-                  else if (auto *F = pickUnique(output_roots))
-                    root = F;
-                  else if (auto *F = pickUnique(native_functions))
-                    root = F;
-                  else if (auto *F = pickUnique(defined_functions))
-                    root = F;
-                  if (!root)
-                    return nullptr;
-                  for (auto &F : M) {
-                    if (&F == root)
-                      continue;
-                    F.removeFnAttr("omill.output_root");
-                  }
-                  root->addFnAttr("omill.output_root");
-                  return root;
-                };
-            if (!ensureRecoveredModuleHasOutputRoot(*replayed_module, func_va))
-              replayed_module.reset();
-          }
-          if (replayed_module && !verifyModule(*replayed_module, nullptr) &&
-              !has_unresolved_pc_text) {
-            unsigned defined_output_roots = 0;
-            bool has_dispatch = false;
-            bool has_missing_block_handler = false;
-            unsigned declared_blk_count = 0;
-            unsigned call_blk_count = 0;
-            bool has_state_alloca = false;
-            unsigned defined_lifted_function_count = 0;
-            for (auto &F : *replayed_module) {
-              if (!F.isDeclaration() && F.hasFnAttribute("omill.output_root"))
-                ++defined_output_roots;
-              if (omill::isDispatchIntrinsicName(F.getName())) {
-                has_dispatch |= !F.use_empty();
-              }
-              if (F.isDeclaration() &&
-                  (F.getName().starts_with("blk_") ||
-                   F.getName().starts_with("block_"))) {
-                ++declared_blk_count;
-              }
-              if (F.getName() == "__omill_missing_block_handler") {
-                has_missing_block_handler |= !F.use_empty();
-              }
-              if (F.isDeclaration())
-                continue;
-              if ((F.getName().starts_with("sub_") ||
-                   F.getName().starts_with("blk_") ||
-                   F.getName().starts_with("block_")) &&
-                  !F.getName().ends_with("_native")) {
-                ++defined_lifted_function_count;
-              }
-              for (auto &BB : F) {
-                for (auto &I : BB) {
-                  if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
-                    auto *allocated_type = alloca->getAllocatedType();
-                    auto *allocated_struct =
-                        llvm::dyn_cast<llvm::StructType>(allocated_type);
-                    if (allocated_struct &&
-                        allocated_struct->hasName() &&
-                        allocated_struct->getName() == "struct.State") {
-                      has_state_alloca = true;
-                    }
-                  }
-                  auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
-                  auto *callee = call ? call->getCalledFunction() : nullptr;
-                  if (callee &&
-                      (callee->getName().starts_with("blk_") ||
-                       callee->getName().starts_with("block_"))) {
-                    ++call_blk_count;
-                  }
-                }
-              }
-            }
-            if (debug_small_replay) {
-              errs() << "[small-replay] roots=" << defined_output_roots
-                     << " dispatch=" << (has_dispatch ? 1 : 0)
-                     << " missing=" << (has_missing_block_handler ? 1 : 0)
-                     << " state_alloca=" << (has_state_alloca ? 1 : 0)
-                     << " defined_lifted=" << defined_lifted_function_count
-                     << " declare_blk=" << declared_blk_count
-                     << " call_blk=" << call_blk_count << "\n";
-            }
-            const bool readable_enough_for_fast_plain_direct_replay =
-                replayedModuleReadableEnoughForFastPlainFallback(*replayed_module);
-            const bool structurally_clean_enough_for_direct_write =
-                defined_output_roots > 0 && !has_dispatch &&
-                !has_missing_block_handler &&
-                !has_state_alloca &&
-                defined_lifted_function_count == 0 &&
-                readable_enough_for_fast_plain_direct_replay &&
-                declared_blk_count <= 4u &&
-                call_blk_count <= 16u;
-            const bool structurally_small_enough_to_adopt =
-                defined_output_roots > 0 && !has_dispatch &&
-                !has_missing_block_handler &&
-                !has_state_alloca &&
-                readable_enough_for_fast_plain_direct_replay &&
-                declared_blk_count <= 16u &&
-                call_blk_count <= 32u;
-            if (structurally_clean_enough_for_direct_write ||
-                structurally_small_enough_to_adopt) {
-              if (debug_small_replay)
-                errs() << "[small-replay] adopted-for-post-cleanup\n";
-              module = std::move(replayed_module);
-              MAM.invalidate(*module, llvm::PreservedAnalyses::none());
-              repairMalformedPHIs(*module);
-              accepted_small_checkpoint_replay = true;
-              errs() << "ABI recovery adopted from small pre-ABI checkpoint\n";
-              events.emitInfo("abi_recovery_adopted_from_small_checkpoint",
-                              "ABI recovery adopted from small pre-ABI checkpoint",
-                              {{"defined_output_roots",
-                                static_cast<int64_t>(defined_output_roots)},
-                               {"declared_blk_count",
-                                static_cast<int64_t>(declared_blk_count)},
-                               {"call_blk_count",
-                                static_cast<int64_t>(call_blk_count)}});
-            }
-          } else if (debug_small_replay) {
-            errs() << "[small-replay] parse-or-verify-failed unresolved_pc="
-                   << (has_unresolved_pc_text ? 1 : 0) << "\n";
-          }
-        } else if (debug_small_replay) {
-          errs() << "[small-replay] external-recover-abi failed\n";
-        }
-      }
-      if (!accepted_small_checkpoint_replay &&
-          !skip_pre_abi_direct_replay &&
-          !parseBoolEnv("OMILL_SKIP_PRE_ABI_DIRECT_REPLAY").value_or(false)) {
-        if (auto replayed_text =
-                runExternalRecoverABIText(*pre_abi_checkpoint_text)) {
-          auto summary = parseTerminalBoundaryRecoveryIRSummary(*replayed_text);
-          const bool has_unresolved_pc_text =
-              replayed_text->find("pc.canonical") != std::string::npos ||
-              replayed_text->find("pc.norm") != std::string::npos;
-          const bool clean_text_fallback =
-              summary.has_output_root && !has_unresolved_pc_text &&
-              summary.metrics.dispatch_call == 0 &&
-              summary.metrics.dispatch_jump == 0 &&
-              summary.metrics.declare_blk == 0 &&
-              summary.metrics.missing_block_handler == 0;
-          if (clean_text_fallback) {
-            llvm::SMDiagnostic parse_error;
-            auto replayed_module =
-                llvm::parseAssemblyString(*replayed_text, parse_error, ctx);
-            if (replayed_module && !verifyModule(*replayed_module, nullptr) &&
-                replayedModuleReadableEnoughForFastPlainFallback(
-                    *replayed_module)) {
-              module = std::move(replayed_module);
-              MAM.invalidate(*module, llvm::PreservedAnalyses::none());
-              repairMalformedPHIs(*module);
-              errs() << "ABI recovery replayed from raw pre-ABI checkpoint\n";
-              events.emitInfo("abi_recovery_replayed_from_raw_pre_abi",
-                              "ABI recovery replayed from raw pre-ABI checkpoint",
-                              {{"defined_output_roots", 1}});
-            }
-          }
-        }
-      }
-      if (!accepted_small_checkpoint_replay) {
-        // Repair broken PHIs before saving checkpoint (otherwise LLVM parser
-        // rejects the LL on reload).
-        appendDebugMarker("abi:before_repair_phis");
-        repairMalformedPHIs(*module);
-        appendDebugMarker("abi:after_repair_phis");
-        {
-          std::string checkpoint_ir;
-          llvm::raw_string_ostream checkpoint_os(checkpoint_ir);
-          module->print(checkpoint_os, nullptr);
-          checkpoint_os.flush();
-          pre_abi_checkpoint_text = std::move(checkpoint_ir);
-        }
-      }
-      if (!accepted_small_checkpoint_replay &&
-          use_pre_abi_noabi_cleanup && countDefinedOutputRoots() <= 1u &&
-          !skip_pre_abi_direct_replay &&
-          !parseBoolEnv("OMILL_SKIP_PRE_ABI_DIRECT_REPLAY").value_or(false)) {
-        if (auto replayed_text =
-                runExternalRecoverABIText(*pre_abi_checkpoint_text)) {
-          auto summary = parseTerminalBoundaryRecoveryIRSummary(*replayed_text);
-          const bool has_unresolved_pc_text =
-              replayed_text->find("pc.canonical") != std::string::npos ||
-              replayed_text->find("pc.norm") != std::string::npos;
-          const bool clean_text_fallback =
-              summary.has_output_root && !has_unresolved_pc_text &&
-              summary.metrics.dispatch_call == 0 &&
-              summary.metrics.dispatch_jump == 0 &&
-              summary.metrics.declare_blk == 0 &&
-              summary.metrics.missing_block_handler == 0;
-          if (clean_text_fallback) {
-            llvm::SMDiagnostic parse_error;
-            auto replayed_module =
-                llvm::parseAssemblyString(*replayed_text, parse_error, ctx);
-            if (replayed_module && !verifyModule(*replayed_module, nullptr) &&
-                replayedModuleReadableEnoughForFastPlainFallback(
-                    *replayed_module)) {
-              module = std::move(replayed_module);
-              MAM.invalidate(*module, llvm::PreservedAnalyses::none());
-              repairMalformedPHIs(*module);
-              errs() << "ABI recovery replayed from pre-ABI checkpoint\n";
-              events.emitInfo("abi_recovery_replayed_from_pre_abi",
-                              "ABI recovery replayed from pre-ABI checkpoint",
-                              {{"defined_output_roots", 1}});
-            }
-          }
-        }
-      }
-      auto tryDirectReplayABIFromPreABICheckpoint = [&]() -> bool {
-        if (accepted_small_checkpoint_replay)
-          return true;
-        if (!use_pre_abi_noabi_cleanup)
-          return false;
-        if (!pre_abi_checkpoint_text || pre_abi_checkpoint_text->empty())
-          return false;
-        if (skip_pre_abi_direct_replay)
-          return false;
-        if (parseBoolEnv("OMILL_SKIP_PRE_ABI_DIRECT_REPLAY").value_or(false))
-          return false;
-        if (countDefinedOutputRoots() > 1u &&
-            !parseBoolEnv("OMILL_FORCE_PRE_ABI_DIRECT_REPLAY").value_or(false)) {
-          return false;
-        }
-
-        return tryDirectReplayABIText(*pre_abi_checkpoint_text,
-                                      "abi_recovery_replayed_from_pre_abi",
-                                      "ABI recovery replayed from pre-ABI checkpoint");
-      };
-
-      if (!tryDirectReplayABIFromPreABICheckpoint()) {
-        // ABI recovery relies on fresh module analyses. Reusing analysis state
-        // from the pre-ABI main pipeline can miscompile recovered roots, because
-        // the module shape changed substantially during lifting/devirtualization.
-        MAM.invalidate(*module, llvm::PreservedAnalyses::none());
-        ModulePassManager MPM;
-          omill::buildABIRecoveryPipeline(MPM, opts);
-        MPM.run(*module, MAM);
-        errs() << "ABI recovery complete\n";
-        events.emitInfo("abi_recovery_completed", "abi recovery completed");
-        dumpModuleIfEnvEnabled(*module, "OMILL_DEBUG_DUMP_AFTER_ABI_CORE",
-                               "after_abi_core.ll");
-      }
-    }
-
+    // ABI recovery relies on fresh module analyses. Reusing analysis state
+    // from the pre-ABI main pipeline can miscompile recovered roots, because
+    // the module shape changed substantially during lifting/devirtualization.
+    MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+    ModulePassManager MPM;
+    omill::buildABIRecoveryPipeline(MPM, opts);
+    MPM.run(*module, MAM);
+    errs() << "ABI recovery complete\n";
+    events.emitInfo("abi_recovery_completed", "abi recovery completed");
+    dumpModuleIfEnvEnabled(*module, "OMILL_DEBUG_DUMP_AFTER_ABI_CORE",
+                           "after_abi_core.ll");
     if (VerifyEach && verifyModule(*module, nullptr)) {
       errs() << "ERROR: module verification failed after ABI recovery\n";
       for (const auto &F : *module)
@@ -12749,8 +10909,15 @@ int main(int argc, char **argv) {
       parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false);
   bool module_invalid_before_late_cleanup =
       verifyModule(*module, debug_public_root_seeds ? &errs() : nullptr);
-  const bool allow_noabi_postmain_rounds = !module_invalid_before_late_cleanup;
-  const bool allow_abi_postmain_rounds = !module_invalid_before_late_cleanup;
+  const bool disable_recursive_output_recovery =
+      parseBoolEnv("OMILL_DISABLE_RECURSIVE_OUTPUT_RECOVERY")
+          .value_or(false);
+  const bool allow_noabi_postmain_rounds =
+      !module_invalid_before_late_cleanup &&
+      !disable_recursive_output_recovery;
+  const bool allow_abi_postmain_rounds =
+      !module_invalid_before_late_cleanup &&
+      !disable_recursive_output_recovery;
   if (module_invalid_before_late_cleanup) {
     errs() << "WARNING: module verification failed (use --verify-each to "
               "identify the culprit pass)\n";
@@ -12772,7 +10939,9 @@ int main(int argc, char **argv) {
 
   if (!module_invalid_before_late_cleanup && NoABI &&
       devirtualization_plan.enable_devirtualization &&
-      opts.require_remill_normalization) {
+      opts.require_remill_normalization &&
+      !parseBoolEnv("OMILL_SKIP_NOABI_FINAL_REMILL_NORMALIZATION")
+           .value_or(false)) {
     ModulePassManager MPM;
     omill::RemillNormalizationOrchestrator normalization;
     normalization.appendToPipeline(
@@ -13091,7 +11260,9 @@ int main(int argc, char **argv) {
   auto runTerminalBoundaryChildLift =
       [&](uint64_t target_pc, bool no_abi, bool enable_gsd,
           bool enable_recovery_mode,
-          bool dump_virtual_model) -> std::optional<TerminalBoundaryChildLiftResult> {
+          bool dump_virtual_model,
+          bool allow_recursive_output_recovery = false)
+          -> std::optional<TerminalBoundaryChildLiftResult> {
         SmallString<256> temp_ll_path;
         if (sys::fs::createTemporaryFile("omill_terminal_recovery", "ll",
                                          temp_ll_path)) {
@@ -13135,6 +11306,12 @@ int main(int argc, char **argv) {
             "OMILL_SKIP_LATE_OUTPUT_ROOT_TARGET_RERUN", "1");
         ScopedEnvOverride skip_late_boundary_rerun(
             "OMILL_SKIP_LATE_TERMINAL_BOUNDARY_RERUN", "1");
+        std::unique_ptr<ScopedEnvOverride> disable_recursive_output_recovery;
+        if (!allow_recursive_output_recovery) {
+          disable_recursive_output_recovery =
+              std::make_unique<ScopedEnvOverride>(
+                  "OMILL_DISABLE_RECURSIVE_OUTPUT_RECOVERY", "1");
+        }
         std::unique_ptr<ScopedEnvOverride> skip_always_inline;
         if (no_abi || enable_recovery_mode) {
           skip_always_inline = std::make_unique<ScopedEnvOverride>(
@@ -13145,6 +11322,8 @@ int main(int argc, char **argv) {
         std::unique_ptr<ScopedEnvOverride> recovery_max_reachable_guard;
         std::unique_ptr<ScopedEnvOverride> recovery_max_iterations_guard;
         std::unique_ptr<ScopedEnvOverride> recovery_max_target_rounds_guard;
+        std::unique_ptr<ScopedEnvOverride>
+            skip_noabi_final_remill_normalization_guard;
         std::unique_ptr<ScopedEnvOverride> dump_model_guard;
         std::unique_ptr<ScopedEnvOverride> skip_block_merge_guard;
         std::optional<std::string> recovery_root_value;
@@ -13170,6 +11349,9 @@ int main(int argc, char **argv) {
               std::make_unique<ScopedEnvOverride>(
                   "OMILL_TERMINAL_BOUNDARY_RECOVERY_MAX_NEW_TARGET_ROUNDS",
                   "6");
+          skip_noabi_final_remill_normalization_guard =
+              std::make_unique<ScopedEnvOverride>(
+                  "OMILL_SKIP_NOABI_FINAL_REMILL_NORMALIZATION", "1");
         }
         if (dump_virtual_model) {
           dump_model_guard = std::make_unique<ScopedEnvOverride>(
@@ -13189,7 +11371,9 @@ int main(int argc, char **argv) {
                  << " no_abi=" << (no_abi ? 1 : 0)
                  << " gsd=" << (enable_gsd ? 1 : 0)
                  << " recovery=" << (enable_recovery_mode ? 1 : 0)
-                 << " dump_model=" << (dump_virtual_model ? 1 : 0) << "\n";
+                 << " dump_model=" << (dump_virtual_model ? 1 : 0)
+                 << " allow_recursive_output_recovery="
+                 << (allow_recursive_output_recovery ? 1 : 0) << "\n";
         }
         int rc = llvm::sys::ExecuteAndWait(argv_refs.front(), argv_refs,
                                            std::nullopt, {}, timeout_seconds, 0,
@@ -13329,8 +11513,22 @@ int main(int argc, char **argv) {
                  name.starts_with("omill_native_boundary_") ||
                  name.starts_with("omill_vm_enter_boundary_");
         };
+        auto preserveExistingModeledBoundaryDeclAttrs =
+            [&](llvm::Function &decl, const llvm::Function &callee) {
+              if (!isAllowedModeledBoundaryDecl(decl.getName()) ||
+                  decl.getName() != callee.getName()) {
+                return false;
+              }
+              // Imported child closures may reference the same modeled boundary
+              // placeholder names as the parent module. Reuse the existing
+              // declaration, but keep its parent-owned boundary metadata.
+              decl.setCallingConv(callee.getCallingConv());
+              return true;
+            };
         llvm::StringSet<> allowed_decl_callees;
         for (const auto &name : import_plan.allowed_declaration_callees)
+          allowed_decl_callees.insert(name);
+        for (const auto &name : import_plan.lowering_helper_callees)
           allowed_decl_callees.insert(name);
 
         llvm::StringSet<> allowed_slice_names;
@@ -13458,6 +11656,9 @@ int main(int argc, char **argv) {
                     decl = llvm::Function::Create(
                         callee->getFunctionType(), callee->getLinkage(),
                         callee->getName(), *module);
+                    decl->copyAttributesFrom(callee);
+                  } else if (!preserveExistingModeledBoundaryDeclAttrs(
+                                 *decl, *callee)) {
                     decl->copyAttributesFrom(callee);
                   }
                   decl_map[GV] = decl;
@@ -13849,6 +12050,13 @@ int main(int argc, char **argv) {
         auto cloneFunctionClosure =
             [&](llvm::ArrayRef<llvm::Function *> sources,
                 llvm::Function &root) -> llvm::Function * {
+              auto isAllowedModeledBoundaryDecl = [&](llvm::StringRef name) {
+                return name.starts_with("omill_executable_target_") ||
+                       name.starts_with("omill_native_target_") ||
+                       name.starts_with("omill_vm_enter_target_") ||
+                       name.starts_with("omill_native_boundary_") ||
+                       name.starts_with("omill_vm_enter_boundary_");
+              };
               auto clearImportedRootOnlyAttrs = [&](llvm::Function &F) {
                 clearTerminalBoundaryAttrs(F);
                 F.removeFnAttr("omill.output_root");
@@ -13897,8 +12105,12 @@ int main(int argc, char **argv) {
                                 callee->getFunctionType(),
                                 callee->getLinkage(), callee->getName(),
                                 *module);
+                            decl->copyAttributesFrom(callee);
+                          } else if (!isAllowedModeledBoundaryDecl(
+                                         decl->getName()) ||
+                                     decl->getName() != callee->getName()) {
+                            decl->copyAttributesFrom(callee);
                           }
-                          decl->copyAttributesFrom(callee);
                           decl->setCallingConv(callee->getCallingConv());
                           decl_map[callee] = decl;
                         }
@@ -15020,41 +13232,6 @@ int main(int argc, char **argv) {
     return unresolved;
   };
 
-  auto collectOutputRootFunctionReturnLeaks = [&]() {
-    llvm::SmallVector<std::string, 8> leaked;
-    for (auto &F : *module) {
-      if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
-        continue;
-      llvm::SmallVector<llvm::Function *, 16> worklist = {&F};
-      llvm::SmallPtrSet<llvm::Function *, 16> visited;
-      while (!worklist.empty()) {
-        auto *current = worklist.pop_back_val();
-        if (!current || current->isDeclaration() ||
-            !visited.insert(current).second) {
-          continue;
-        }
-        bool has_return_intrinsic = false;
-        for (auto &BB : *current) {
-          for (auto &I : BB) {
-            auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
-            if (!CB)
-              continue;
-            if (auto *callee = CB->getCalledFunction()) {
-              if (!callee->isDeclaration())
-                worklist.push_back(callee);
-              if (callee->getName() == "__remill_function_return")
-                has_return_intrinsic = true;
-            }
-          }
-        }
-        if (has_return_intrinsic)
-          leaked.push_back(current->getName().str());
-      }
-    }
-    llvm::sort(leaked);
-    leaked.erase(std::unique(leaked.begin(), leaked.end()), leaked.end());
-    return leaked;
-  };
 
   auto annotateVmUnresolvedContinuationsInCurrentModule = [&]() {
     constexpr llvm::StringLiteral kCountAttr =
@@ -15243,906 +13420,43 @@ int main(int argc, char **argv) {
     return suspicious;
   };
 
-  auto collectLargeStackOutputRoots = [&]() {
-    llvm::SmallVector<std::string, 8> suspicious;
-    const auto &DL = module->getDataLayout();
-    for (auto &F : *module) {
-      if (!F.hasFnAttribute("omill.output_root") || F.isDeclaration())
-        continue;
-
-      bool has_large_stack_alloca = false;
-      bool uses_stacksave = false;
-      for (auto &BB : F) {
-        for (auto &I : BB) {
-          if (auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
-            if (auto *AT =
-                    llvm::dyn_cast<llvm::ArrayType>(AI->getAllocatedType())) {
-              auto bytes = DL.getTypeAllocSize(AT);
-              if (bytes >= 4096)
-                has_large_stack_alloca = true;
-            }
-          }
-          auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
-          auto *callee = CB ? CB->getCalledFunction() : nullptr;
-          if (callee && callee->getName() == "llvm.stacksave.p0")
-            uses_stacksave = true;
-        }
-      }
-
-      if (has_large_stack_alloca || uses_stacksave)
-        suspicious.push_back(F.getName().str());
-    }
-    return suspicious;
-  };
-
-  auto tryFastPlainNoBlockExportFallback =
-      [&](llvm::StringRef reason) -> std::optional<int> {
-        if (RawBinary || NoABI || !fast_plain_export_root_fallback ||
-            !opts.use_block_lifting ||
-            func_va == 0 || countDefinedOutputRoots() > 1u) {
-          return std::nullopt;
-        }
-
-        errs() << "Attempting plain no-block export fallback\n";
-        events.emitInfo("plain_no_block_export_fallback_started",
-                        "plain no-block export fallback started",
-                        {{"reason", reason}});
-
-        llvm::SmallString<256> temp_ll_path;
-        if (llvm::sys::fs::createTemporaryFile("omill_plain_export_noblock",
-                                               "ll", temp_ll_path)) {
-          return std::nullopt;
-        }
-
-        llvm::SmallVector<std::string, 16> arg_storage;
-        arg_storage.emplace_back(argv[0]);
-        arg_storage.emplace_back(InputFilename);
-        arg_storage.emplace_back("--va");
-        arg_storage.emplace_back(llvm::utohexstr(func_va));
-        arg_storage.emplace_back("-o");
-        arg_storage.emplace_back(temp_ll_path.str().str());
-
-        llvm::SmallVector<llvm::StringRef, 16> argv_refs;
-        for (const auto &arg : arg_storage)
-          argv_refs.push_back(arg);
-
-        std::string err_msg;
-        bool exec_failed = false;
-        {
-          ScopedEnvOverride skip_nested_probe(
-              "OMILL_SKIP_TERMINAL_BOUNDARY_SIDE_PROBE", "1");
-          ScopedEnvOverride skip_late_output_target(
-              "OMILL_SKIP_LATE_OUTPUT_ROOT_TARGET_RERUN", "1");
-          ScopedEnvOverride skip_late_boundary_rerun(
-              "OMILL_SKIP_LATE_TERMINAL_BOUNDARY_RERUN", "1");
-          int rc = llvm::sys::ExecuteAndWait(argv_refs.front(), argv_refs,
-                                             std::nullopt, {}, 180u, 0,
-                                             &err_msg, &exec_failed);
-          if (rc != 0 || exec_failed) {
-            llvm::sys::fs::remove(temp_ll_path);
-            return std::nullopt;
-          }
-        }
-
-        auto buf_or_err = llvm::MemoryBuffer::getFile(temp_ll_path);
-        llvm::sys::fs::remove(temp_ll_path);
-        if (!buf_or_err)
-          return std::nullopt;
-        auto child_text = (*buf_or_err)->getBuffer().str();
-        llvm::LLVMContext verify_ctx;
-        llvm::SMDiagnostic parse_error;
-        auto verify_module =
-            llvm::parseAssemblyString(child_text, parse_error, verify_ctx);
-        auto childModuleReadableEnoughForDirectWrite =
-            [&](const llvm::Module &M) {
-              bool has_state_alloca = false;
-              bool has_large_stack_alloca = false;
-              bool uses_stacksave = false;
-              bool calls_local_lifted_helper = false;
-              bool has_unresolved_lifted_control_transfer = false;
-              unsigned defined_lifted_function_count = 0;
-              const auto &DL = M.getDataLayout();
-              for (auto &F : M) {
-                if (F.isDeclaration())
-                  continue;
-                if (F.hasFnAttribute("omill.output_root") &&
-                    hasUnresolvedLiftedControlTransferInClosure(F)) {
-                  has_unresolved_lifted_control_transfer = true;
-                }
-                if ((F.getName().starts_with("sub_") ||
-                     F.getName().starts_with("blk_") ||
-                     F.getName().starts_with("block_")) &&
-                    !F.getName().ends_with("_native")) {
-                  ++defined_lifted_function_count;
-                }
-                for (auto &BB : F) {
-                  for (auto &I : BB) {
-                    if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
-                      if (auto *allocated_struct =
-                              llvm::dyn_cast<llvm::StructType>(
-                                  alloca->getAllocatedType());
-                          allocated_struct && allocated_struct->hasName() &&
-                          allocated_struct->getName() == "struct.State") {
-                        has_state_alloca = true;
-                      }
-                      if (auto *AT = llvm::dyn_cast<llvm::ArrayType>(
-                              alloca->getAllocatedType())) {
-                        if (DL.getTypeAllocSize(AT) >= 4096)
-                          has_large_stack_alloca = true;
-                      }
-                    }
-                    auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
-                    auto *callee = call ? call->getCalledFunction() : nullptr;
-                    if (callee && callee->getName() == "llvm.stacksave.p0")
-                      uses_stacksave = true;
-                    if (callee && !callee->isDeclaration() &&
-                        !callee->getName().ends_with("_native") &&
-                        (callee->getName().starts_with("sub_") ||
-                         callee->getName().starts_with("blk_") ||
-                         callee->getName().starts_with("block_"))) {
-                      calls_local_lifted_helper = true;
-                    }
-                  }
-                }
-              }
-              return !has_state_alloca && !has_large_stack_alloca &&
-                     !uses_stacksave && !calls_local_lifted_helper &&
-                     !has_unresolved_lifted_control_transfer &&
-                     defined_lifted_function_count == 0;
-            };
-        if (!verify_module || verifyModule(*verify_module, nullptr) ||
-            !childModuleReadableEnoughForDirectWrite(*verify_module)) {
-          return std::nullopt;
-        }
-
-        std::error_code direct_ec;
-        events.emitInfo("output_write_started", "writing final output",
-                        {{"path", OutputFilename}});
-        ToolOutputFile direct_out(OutputFilename, direct_ec,
-                                  sys::fs::OF_Text);
-        if (direct_ec) {
-          errs() << "Error opening output: " << direct_ec.message() << "\n";
-          return fail(1, "failed to open output file");
-        }
-        direct_out.os() << child_text;
-        direct_out.keep();
-        events.emitInfo("plain_no_block_export_fallback_applied",
-                        "plain no-block export fallback applied");
-        events.emitInfo("output_write_completed", "output write complete",
-                        {{"path", OutputFilename}});
-        events.emitTerminalSuccess(OutputFilename);
-        return 0;
-
-        return std::nullopt;
-      };
-
-  auto tryReplayABIFromPreABICheckpoint = [&]() -> bool {
-    if (RawBinary || NoABI || !use_pre_abi_noabi_cleanup)
+  auto tryAdoptTruthfulPreABICheckpoint = [&]() -> bool {
+    if (RawBinary || NoABI)
       return false;
     if (!pre_abi_checkpoint_text || pre_abi_checkpoint_text->empty())
       return false;
-    if (parseBoolEnv("OMILL_SKIP_PRE_ABI_REPLAY_FALLBACK").value_or(false))
-      return false;
-    if (countDefinedOutputRoots() > 1u)
-      return false;
-
-    auto replayed_ir = recoverABIForTerminalBoundaryIR(*pre_abi_checkpoint_text);
-    if (!replayed_ir)
-      return false;
 
     llvm::SMDiagnostic parse_error;
-    auto replayed_module =
-        llvm::parseAssemblyString(*replayed_ir, parse_error, ctx);
-    if (!replayed_module)
+    auto checkpoint_module =
+        llvm::parseAssemblyString(*pre_abi_checkpoint_text, parse_error, ctx);
+    if (!checkpoint_module)
       return false;
-    if (verifyModule(*replayed_module, nullptr))
+    if (verifyModule(*checkpoint_module, nullptr))
       return false;
-
-    unsigned defined_output_roots = 0;
-    bool has_unresolved_output_pc = false;
-    for (auto &F : *replayed_module) {
-      if (!F.hasFnAttribute("omill.output_root") || F.isDeclaration())
-        continue;
-      ++defined_output_roots;
-      if (hasUnresolvedOutputRootPcCall(F))
-        has_unresolved_output_pc = true;
+    bool has_output_root = false;
+    for (auto &F : *checkpoint_module) {
+      if (!F.isDeclaration() && F.hasFnAttribute("omill.output_root")) {
+        has_output_root = true;
+        break;
+      }
     }
-    if (defined_output_roots == 0 || has_unresolved_output_pc)
+    if (!has_output_root)
       return false;
 
-    module = std::move(replayed_module);
+    auto checkpoint_quality =
+        classifySerializedRuntimeRecoveryQuality(*checkpoint_module)
+            .value_or(classifyRuntimeRecoveryQuality(*checkpoint_module));
+    if (checkpoint_quality.dispatcher_shell)
+      return false;
+
+    module = std::move(checkpoint_module);
     MAM.invalidate(*module, llvm::PreservedAnalyses::none());
-    annotateOutputRootTerminalBoundaryProbeChains();
-    runFinalOutputCleanup();
+    annotateVmUnresolvedContinuationsInCurrentModule();
     annotateOutputRootTerminalBoundaryProbeChains();
     omill::refreshTerminalBoundaryRecoveryMetadata(*module);
     repairMalformedPHIs(*module);
-
-    events.emitInfo("pre_abi_replay_fallback_applied",
-                    "replayed ABI from pre-ABI closed checkpoint",
-                    {{"defined_output_roots",
-                      static_cast<int64_t>(defined_output_roots)}});
-    return true;
-  };
-
-  auto tryReplayABIFromExternalMainRootNoABIChild = [&]() -> bool {
-    if (RawBinary || NoABI || !use_pre_abi_noabi_cleanup || func_va == 0)
-      return false;
-    if (parseBoolEnv("OMILL_SKIP_MAIN_ROOT_NOABI_CHILD_REPLAY")
-            .value_or(false)) {
-      return false;
-    }
-
-    auto noabi_child = [&]() -> std::optional<TerminalBoundaryChildLiftResult> {
-      llvm::SmallString<256> temp_ll_path;
-      if (llvm::sys::fs::createTemporaryFile("omill_main_root_noabi", "ll",
-                                             temp_ll_path)) {
-        return std::nullopt;
-      }
-      llvm::SmallString<256> temp_model_path;
-      if (llvm::sys::fs::createTemporaryFile("omill_main_root_noabi", "model",
-                                             temp_model_path)) {
-        llvm::sys::fs::remove(temp_ll_path);
-        return std::nullopt;
-      }
-
-      llvm::SmallVector<std::string, 16> arg_storage;
-      arg_storage.emplace_back(argv[0]);
-      arg_storage.emplace_back(InputFilename);
-      arg_storage.emplace_back("--va");
-      arg_storage.emplace_back(llvm::utohexstr(func_va));
-      if (opts.use_block_lifting)
-        arg_storage.emplace_back("--block-lift");
-      if (devirtualization_plan.enable_devirtualization)
-        arg_storage.emplace_back("--devirtualize");
-      if (opts.generic_static_devirtualize)
-        arg_storage.emplace_back("--generic-static-devirtualize");
-      arg_storage.emplace_back("--no-abi");
-      arg_storage.emplace_back("-o");
-      arg_storage.emplace_back(temp_ll_path.str().str());
-
-      llvm::SmallVector<llvm::StringRef, 16> argv_refs;
-      for (const auto &arg : arg_storage)
-        argv_refs.push_back(arg);
-
-      std::string err_msg;
-      bool exec_failed = false;
-      std::string recovery_root_va_text = llvm::utohexstr(func_va);
-      ScopedEnvOverride skip_nested_probe(
-          "OMILL_SKIP_TERMINAL_BOUNDARY_SIDE_PROBE", "1");
-      ScopedEnvOverride skip_late_output_target(
-          "OMILL_SKIP_LATE_OUTPUT_ROOT_TARGET_RERUN", "1");
-      ScopedEnvOverride skip_late_boundary_rerun(
-          "OMILL_SKIP_LATE_TERMINAL_BOUNDARY_RERUN", "1");
-      ScopedEnvOverride enable_call_frontier_dispatch_override(
-          "OMILL_ENABLE_CALL_FRONTIER_DISPATCH_OVERRIDE", "1");
-      ScopedEnvOverride enable_terminal_boundary_recovery(
-          "OMILL_TERMINAL_BOUNDARY_RECOVERY", "1");
-      ScopedEnvOverride terminal_boundary_recovery_root(
-          "OMILL_TERMINAL_BOUNDARY_RECOVERY_ROOT_VA",
-          recovery_root_va_text.c_str());
-      ScopedEnvOverride terminal_boundary_recovery_max_reachable(
-          "OMILL_TERMINAL_BOUNDARY_RECOVERY_MAX_REACHABLE", "32");
-      ScopedEnvOverride terminal_boundary_recovery_max_iterations(
-          "OMILL_TERMINAL_BOUNDARY_RECOVERY_MAX_ITERATIONS", "14");
-      ScopedEnvOverride terminal_boundary_recovery_max_new_target_rounds(
-          "OMILL_TERMINAL_BOUNDARY_RECOVERY_MAX_NEW_TARGET_ROUNDS", "14");
-      ScopedEnvOverride dump_virtual_model("OMILL_DUMP_VIRTUAL_MODEL",
-                                           temp_model_path.str().str().c_str());
-      int rc = llvm::sys::ExecuteAndWait(
-          argv_refs.front(), argv_refs, std::nullopt, {},
-          parseUnsignedEnv("OMILL_MAIN_ROOT_NOABI_CHILD_TIMEOUT_SECONDS")
-              .value_or(900u),
-          0, &err_msg, &exec_failed);
-      if (rc != 0 || exec_failed) {
-        llvm::sys::fs::remove(temp_ll_path);
-        llvm::sys::fs::remove(temp_model_path);
-        return std::nullopt;
-      }
-
-      auto buf_or_err = llvm::MemoryBuffer::getFile(temp_ll_path);
-      llvm::sys::fs::remove(temp_ll_path);
-      if (!buf_or_err) {
-        llvm::sys::fs::remove(temp_model_path);
-        return std::nullopt;
-      }
-      TerminalBoundaryChildLiftResult result;
-      result.ir_text = (*buf_or_err)->getBuffer().str();
-      auto model_or_err = llvm::MemoryBuffer::getFile(temp_model_path);
-      llvm::sys::fs::remove(temp_model_path);
-      if (model_or_err)
-        result.model_text = (*model_or_err)->getBuffer().str();
-      return result;
-    }();
-    if (!noabi_child)
-      return false;
-
-    dumpTextIfEnvEnabled(noabi_child->ir_text,
-                         "OMILL_DEBUG_DUMP_MAIN_ROOT_NOABI_CHILD_IR",
-                         "main_root_noabi_child.ll");
-
-    llvm::StringMap<std::string> original_output_root_attrs;
-    auto rememberOriginalOutputRootAttr = [&](llvm::StringRef name) {
-      for (auto &F : *module) {
-        if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
-          continue;
-        auto attr = F.getFnAttribute(name);
-        if (!attr.isValid() || !attr.isStringAttribute())
-          continue;
-        auto value = attr.getValueAsString();
-        if (value.empty())
-          continue;
-        original_output_root_attrs[name] = value.str();
-        break;
-      }
-    };
-    rememberOriginalOutputRootAttr("omill.export_entry_seed_exprs");
-    rememberOriginalOutputRootAttr("omill.export_callsite_win64_gpr_count");
-    rememberOriginalOutputRootAttr("omill.extra_gpr_live_ins");
-    rememberOriginalOutputRootAttr("omill.public_root_seed_kind");
-    rememberOriginalOutputRootAttr("omill.public_root_seed_summary");
-
-    auto prepareMainRootNoABIChildForABIReplay =
-        [&](llvm::StringRef child_ir, llvm::StringRef child_model) -> std::string {
-      llvm::SMDiagnostic parse_error;
-      auto child_module = llvm::parseAssemblyString(child_ir, parse_error, ctx);
-      if (!child_module)
-        return child_ir.str();
-
-      auto parsePrefixedHex = [](llvm::StringRef name,
-                                 llvm::StringRef prefix) -> uint64_t {
-        if (!name.starts_with(prefix))
-          return 0;
-        auto rest = name.drop_front(prefix.size());
-        size_t hex_len = 0;
-        while (hex_len < rest.size() && llvm::isHexDigit(rest[hex_len]))
-          ++hex_len;
-        if (hex_len == 0)
-          return 0;
-        uint64_t pc = 0;
-        if (rest.substr(0, hex_len).getAsInteger(16, pc))
-          return 0;
-        return pc;
-      };
-
-      auto extractLiftedPC = [&](llvm::Function &F) -> uint64_t {
-        auto name = F.getName();
-        if (uint64_t pc = parsePrefixedHex(name, "sub_"); pc != 0)
-          return pc;
-        if (uint64_t pc = parsePrefixedHex(name, "blk_"); pc != 0)
-          return pc;
-        if (uint64_t pc = parsePrefixedHex(name, "block_"); pc != 0)
-          return pc;
-        return 0;
-      };
-
-      auto findNearestDefinedLiftedOrBlock = [&](uint64_t target_pc)
-          -> llvm::Function * {
-        if (!target_pc)
-          return nullptr;
-        llvm::Function *best = nullptr;
-        uint64_t best_distance = std::numeric_limits<uint64_t>::max();
-        for (auto &F : *child_module) {
-          if (F.isDeclaration())
-            continue;
-          uint64_t pc = extractLiftedPC(F);
-          if (!pc)
-            continue;
-          uint64_t distance =
-              pc > target_pc ? (pc - target_pc) : (target_pc - pc);
-          if (distance > 0x80)
-            continue;
-          if (!best || distance < best_distance) {
-            best = &F;
-            best_distance = distance;
-          }
-        }
-        return best;
-      };
-
-      auto importLiftedChildClosure =
-          [&](uint64_t target_pc, llvm::StringRef imported_ir,
-              llvm::StringRef imported_model,
-              llvm::StringRef name_prefix) -> llvm::Function * {
-            llvm::SMDiagnostic parse_error;
-            auto imported_module =
-                llvm::parseAssemblyString(imported_ir, parse_error, ctx);
-            if (!imported_module)
-              return nullptr;
-
-            auto findLiftedRootByPc = [&](uint64_t pc) -> llvm::Function * {
-              const std::string target_hex = llvm::utohexstr(pc);
-              const std::string target_hex_lower =
-                  llvm::StringRef(target_hex).lower();
-              for (const std::string &name :
-                   {"sub_" + target_hex, "sub_" + target_hex_lower,
-                    "blk_" + target_hex, "blk_" + target_hex_lower,
-                    "block_" + target_hex, "block_" + target_hex_lower}) {
-                if (auto *fn = imported_module->getFunction(name))
-                  return fn;
-              }
-              for (auto &F : *imported_module) {
-                if (F.isDeclaration())
-                  continue;
-                if (omill::extractEntryVA(F.getName()) == pc)
-                  return &F;
-              }
-              return nullptr;
-            };
-
-            auto *root = findLiftedRootByPc(target_pc);
-            if (!root || root->isDeclaration())
-              return nullptr;
-
-            llvm::StringSet<> allowed_slice_names;
-            for (const auto &name :
-                 parseClosedRootSliceHandlerNames(imported_model, target_pc)) {
-              allowed_slice_names.insert(name);
-            }
-
-            llvm::SmallVector<llvm::Function *, 16> closure;
-            llvm::SmallVector<llvm::Function *, 16> worklist;
-            llvm::SmallPtrSet<llvm::Function *, 16> visited;
-            if (!allowed_slice_names.empty()) {
-              for (const auto &name : allowed_slice_names) {
-                if (auto *fn = imported_module->getFunction(name.getKey());
-                    fn && !fn->isDeclaration()) {
-                  worklist.push_back(fn);
-                }
-              }
-            }
-            if (worklist.empty())
-              worklist.push_back(root);
-
-            while (!worklist.empty()) {
-              auto *F = worklist.pop_back_val();
-              if (!F || F->isDeclaration() || !visited.insert(F).second)
-                continue;
-              closure.push_back(F);
-              for (auto &BB : *F) {
-                for (auto &I : BB) {
-                  for (llvm::Value *operand : I.operands()) {
-                    auto *GV = llvm::dyn_cast<llvm::GlobalValue>(operand);
-                    if (!GV)
-                      continue;
-                    if (auto *callee = llvm::dyn_cast<llvm::Function>(GV)) {
-                      if (callee->isDeclaration())
-                        continue;
-                      if (!allowed_slice_names.empty() &&
-                          !allowed_slice_names.count(callee->getName()))
-                        continue;
-                      worklist.push_back(callee);
-                      continue;
-                    }
-                    if (auto *global =
-                            llvm::dyn_cast<llvm::GlobalVariable>(GV)) {
-                      if (!global->isDeclaration() &&
-                          !global->getName().starts_with("llvm.")) {
-                        return nullptr;
-                      }
-                    }
-                  }
-                }
-              }
-            }
-            if (closure.empty())
-              return nullptr;
-
-            llvm::DenseMap<const llvm::Function *, llvm::Function *> cloned;
-            llvm::DenseMap<const llvm::GlobalValue *, llvm::GlobalValue *>
-                decl_map;
-            llvm::Function *cloned_root = nullptr;
-
-            auto clearImportedAttrs = [&](llvm::Function &F) {
-              clearTerminalBoundaryAttrs(F);
-              F.removeFnAttr("omill.output_root");
-              F.removeFnAttr("omill.closed_root_slice");
-              F.removeFnAttr("omill.closed_root_slice_root");
-              F.removeFnAttr("omill.param_state_offsets");
-              F.removeFnAttr("omill.vm_unresolved_continuation_count");
-              F.removeFnAttr("omill.vm_unresolved_continuation_targets");
-              F.removeFnAttr("omill.vm_unresolved_continuation_summary");
-              F.removeFnAttr("omill.terminal_boundary_recovery_status");
-              F.removeFnAttr("omill.terminal_boundary_recovery_target_va");
-              F.removeFnAttr("omill.terminal_boundary_recovery_summary");
-            };
-
-            auto makeUniqueImportName = [&](llvm::StringRef base_name) {
-              std::string candidate = (name_prefix + base_name).str();
-              if (!child_module->getFunction(candidate) &&
-                  !imported_module->getFunction(candidate)) {
-                return candidate;
-              }
-              for (unsigned i = 1; i < 100; ++i) {
-                auto numbered = candidate + "." + std::to_string(i);
-                if (!child_module->getFunction(numbered) &&
-                    !imported_module->getFunction(numbered)) {
-                  return numbered;
-                }
-              }
-              return candidate;
-            };
-
-            for (auto *src_fn : closure) {
-              auto clone_name = makeUniqueImportName(src_fn->getName());
-              auto *dst_fn = llvm::Function::Create(
-                  src_fn->getFunctionType(),
-                  llvm::GlobalValue::InternalLinkage, clone_name, *child_module);
-              dst_fn->copyAttributesFrom(src_fn);
-              clearImportedAttrs(*dst_fn);
-              cloned[src_fn] = dst_fn;
-              if (src_fn == root)
-                cloned_root = dst_fn;
-            }
-            if (!cloned_root)
-              return nullptr;
-
-            for (auto *src_fn : closure) {
-              for (auto &BB : *src_fn) {
-                for (auto &I : BB) {
-                  for (llvm::Value *operand : I.operands()) {
-                    auto *GV = llvm::dyn_cast<llvm::GlobalValue>(operand);
-                    if (!GV || decl_map.count(GV))
-                      continue;
-                    if (auto *callee = llvm::dyn_cast<llvm::Function>(GV)) {
-                      if (auto it = cloned.find(callee); it != cloned.end()) {
-                        decl_map[GV] = it->second;
-                        continue;
-                      }
-                      auto *decl = child_module->getFunction(callee->getName());
-                      if (!decl) {
-                        decl = llvm::Function::Create(
-                            callee->getFunctionType(), callee->getLinkage(),
-                            callee->getName(), *child_module);
-                        decl->copyAttributesFrom(callee);
-                      }
-                      decl_map[GV] = decl;
-                    }
-                  }
-                }
-              }
-            }
-
-            for (auto *src_fn : closure) {
-              auto *dst_fn = cloned.lookup(src_fn);
-              llvm::ValueToValueMapTy vmap;
-              auto src_arg_it = src_fn->arg_begin();
-              auto dst_arg_it = dst_fn->arg_begin();
-              for (; src_arg_it != src_fn->arg_end() &&
-                     dst_arg_it != dst_fn->arg_end();
-                   ++src_arg_it, ++dst_arg_it) {
-                vmap[&*src_arg_it] = &*dst_arg_it;
-              }
-              for (const auto &decl_entry : decl_map)
-                vmap[const_cast<llvm::GlobalValue *>(decl_entry.first)] =
-                    decl_entry.second;
-              llvm::SmallVector<llvm::ReturnInst *, 8> returns;
-              llvm::CloneFunctionInto(
-                  dst_fn, src_fn, vmap,
-                  llvm::CloneFunctionChangeType::DifferentModule, returns);
-              clearImportedAttrs(*dst_fn);
-            }
-
-            return cloned_root;
-          };
-
-      llvm::SmallVector<llvm::Function *, 8> output_roots;
-      for (auto &F : *child_module) {
-        if (!F.isDeclaration() && F.hasFnAttribute("omill.output_root"))
-          output_roots.push_back(&F);
-      }
-      if (output_roots.size() != 1)
-        return child_ir.str();
-
-      llvm::SmallVector<llvm::Function *, 8> worklist(output_roots.begin(),
-                                                      output_roots.end());
-      llvm::SmallPtrSet<llvm::Function *, 16> visited;
-      llvm::SmallPtrSet<llvm::Function *, 8> extra_output_roots;
-      unsigned rewritten_dispatch_calls = 0;
-      unsigned rewritten_dispatch_calls_after_import = 0;
-      unsigned promoted_continuation_roots = 0;
-      unsigned promoted_frontier_roots = 0;
-      unsigned attempted_frontier_imports = 0;
-      const unsigned kMaxFrontierImports =
-          parseUnsignedEnv("OMILL_MAIN_ROOT_CHILD_MAX_FRONTIER_IMPORTS")
-              .value_or(1u);
-      while (!worklist.empty()) {
-        auto *F = worklist.pop_back_val();
-        if (!visited.insert(F).second)
-          continue;
-
-        for (auto &BB : *F) {
-          for (auto &I : llvm::make_early_inc_range(BB)) {
-            auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
-            if (!call)
-              continue;
-            if (auto *callee = call->getCalledFunction()) {
-              if (!callee->isDeclaration())
-                worklist.push_back(callee);
-              if (!omill::isDispatchCallName(callee->getName()) ||
-                  call->arg_size() < 2) {
-                continue;
-              }
-            } else {
-              continue;
-            }
-
-            auto *pc_ci =
-                llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
-            if (!pc_ci)
-              continue;
-            uint64_t target_pc = pc_ci->getZExtValue();
-            if (!target_pc)
-              continue;
-
-            auto *target_fn = findNearestDefinedLiftedOrBlock(target_pc);
-            if (!target_fn || target_fn == F)
-              continue;
-            if (target_fn->getFunctionType() == call->getFunctionType()) {
-              call->setCalledFunction(target_fn);
-              ++rewritten_dispatch_calls;
-            }
-            extra_output_roots.insert(target_fn);
-          }
-        }
-      }
-
-      for (uint64_t continuation_pc :
-           parseLocalizedContinuationCalleePcs(child_model, func_va)) {
-        auto *target_fn = findNearestDefinedLiftedOrBlock(continuation_pc);
-        if (!target_fn)
-          continue;
-        if (extra_output_roots.insert(target_fn).second)
-          ++promoted_continuation_roots;
-      }
-      for (uint64_t frontier_pc :
-           parseRootSliceFrontierTargetPcs(child_model, func_va)) {
-        auto *target_fn = findNearestDefinedLiftedOrBlock(frontier_pc);
-        if (!target_fn && attempted_frontier_imports < kMaxFrontierImports) {
-          ++attempted_frontier_imports;
-          auto child = runTerminalBoundaryChildLift(frontier_pc, /*no_abi=*/true,
-                                                    opts.generic_static_devirtualize,
-                                                    /*enable_recovery_mode=*/true,
-                                                    /*dump_virtual_model=*/true);
-          if (child) {
-            target_fn = importLiftedChildClosure(frontier_pc, child->ir_text,
-                                                 child->model_text,
-                                                 "tbrec_");
-          }
-        }
-        if (!target_fn)
-          continue;
-        if (extra_output_roots.insert(target_fn).second)
-          ++promoted_frontier_roots;
-      }
-
-      worklist.assign(output_roots.begin(), output_roots.end());
-      visited.clear();
-      while (!worklist.empty()) {
-        auto *F = worklist.pop_back_val();
-        if (!visited.insert(F).second)
-          continue;
-
-        for (auto &BB : *F) {
-          for (auto &I : llvm::make_early_inc_range(BB)) {
-            auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
-            if (!call)
-              continue;
-            if (auto *callee = call->getCalledFunction()) {
-              if (!callee->isDeclaration())
-                worklist.push_back(callee);
-              if (!omill::isDispatchCallName(callee->getName()) ||
-                  call->arg_size() < 2) {
-                continue;
-              }
-            } else {
-              continue;
-            }
-
-            auto *pc_ci =
-                llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
-            if (!pc_ci)
-              continue;
-            auto *target_fn =
-                findNearestDefinedLiftedOrBlock(pc_ci->getZExtValue());
-            if (!target_fn || target_fn == F ||
-                target_fn->getFunctionType() != call->getFunctionType()) {
-              continue;
-            }
-            call->setCalledFunction(target_fn);
-            ++rewritten_dispatch_calls_after_import;
-          }
-        }
-      }
-
-      if (extra_output_roots.empty())
-        return child_ir.str();
-
-      for (auto *F : extra_output_roots) {
-        F->addFnAttr("omill.output_root");
-        F->addFnAttr("omill.internal_output_root", "1");
-      }
-
-      for (auto &F : *child_module) {
-        if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
-          continue;
-        if (F.hasFnAttribute("omill.internal_output_root"))
-          continue;
-        for (const auto &entry : original_output_root_attrs)
-          F.addFnAttr(entry.getKey(), entry.getValue());
-      }
-
-      std::string prepared_ir;
-      llvm::raw_string_ostream os(prepared_ir);
-      child_module->print(os, nullptr);
-      os.flush();
-      errs() << "[abi-child] promoted-dispatch-helper-output-roots="
-             << extra_output_roots.size()
-             << " rewritten-dispatch-calls=" << rewritten_dispatch_calls
-             << " rewritten-dispatch-calls-after-import="
-             << rewritten_dispatch_calls_after_import
-             << " promoted-continuation-roots="
-             << promoted_continuation_roots
-             << " promoted-frontier-roots=" << promoted_frontier_roots
-             << "\n";
-      return prepared_ir;
-    };
-
-    std::string prepared_noabi_child_ir =
-        prepareMainRootNoABIChildForABIReplay(noabi_child->ir_text,
-                                              noabi_child->model_text);
-    dumpTextIfEnvEnabled(prepared_noabi_child_ir,
-                         "OMILL_DEBUG_DUMP_PREPARED_MAIN_ROOT_NOABI_CHILD_IR",
-                         "prepared_main_root_noabi_child.ll");
-    auto replayed_ir = recoverABIForTerminalBoundaryIR(prepared_noabi_child_ir);
-    if (!replayed_ir)
-      return false;
-
-    llvm::SMDiagnostic parse_error;
-    auto replayed_module =
-        llvm::parseAssemblyString(*replayed_ir, parse_error, ctx);
-    if (!replayed_module)
-      return false;
-    if (verifyModule(*replayed_module, nullptr))
-      return false;
-    auto ensure_output_root = [&](llvm::Module &M) -> bool {
-      auto pickUnique = [](llvm::ArrayRef<llvm::Function *> candidates)
-          -> llvm::Function * {
-        return candidates.size() == 1 ? candidates.front() : nullptr;
-      };
-      std::string target_hex = llvm::utohexstr(func_va);
-      llvm::SmallVector<llvm::Function *, 8> exact_target_roots;
-      llvm::SmallVector<llvm::Function *, 8> exact_target_lifted_roots;
-      llvm::SmallVector<llvm::Function *, 8> exact_target_native_roots;
-      llvm::SmallVector<llvm::Function *, 8> output_roots;
-      llvm::SmallVector<llvm::Function *, 8> lifted_functions;
-      llvm::SmallVector<llvm::Function *, 8> native_functions;
-      llvm::SmallVector<llvm::Function *, 8> defined_functions;
-      for (auto &F : M) {
-        if (F.isDeclaration())
-          continue;
-        defined_functions.push_back(&F);
-        if (F.hasFnAttribute("omill.output_root"))
-          output_roots.push_back(&F);
-        if (!F.getName().ends_with("_native"))
-          lifted_functions.push_back(&F);
-        if (F.getName().ends_with("_native"))
-          native_functions.push_back(&F);
-        const bool is_exact_lifted =
-            (F.getName() == ("sub_" + target_hex)) ||
-            (F.getName() == ("blk_" + target_hex)) ||
-            (F.getName().contains(target_hex) &&
-             !F.getName().ends_with("_native"));
-        const bool is_exact_native =
-            (F.getName() == ("sub_" + target_hex + "_native")) ||
-            (F.getName() == ("blk_" + target_hex + "_native")) ||
-            (F.getName().contains(target_hex) &&
-             F.getName().ends_with("_native"));
-        if (is_exact_lifted)
-          exact_target_lifted_roots.push_back(&F);
-        if (is_exact_native)
-          exact_target_native_roots.push_back(&F);
-        if (is_exact_lifted || is_exact_native) {
-          exact_target_roots.push_back(&F);
-        }
-      }
-      if (!output_roots.empty())
-        return true;
-
-      llvm::Function *root = nullptr;
-      if (auto *F = pickUnique(exact_target_lifted_roots))
-        root = F;
-      else if (auto *F = pickUnique(exact_target_roots))
-        root = F;
-      else if (auto *F = pickUnique(lifted_functions))
-        root = F;
-      else if (auto *F = pickUnique(native_functions))
-        root = F;
-      if (!root)
-        root = pickUnique(defined_functions);
-      if (!root)
-        return false;
-      root->addFnAttr("omill.output_root");
-      return true;
-    };
-    if (!ensure_output_root(*replayed_module))
-      return false;
-    bool requires_hidden_entry_seed_preservation = false;
-    if (auto it = original_output_root_attrs.find("omill.export_entry_seed_exprs");
-        it != original_output_root_attrs.end() && !it->second.empty()) {
-      requires_hidden_entry_seed_preservation = true;
-    }
-
-    for (auto &F : *replayed_module) {
-      if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
-        continue;
-      if (F.hasFnAttribute("omill.internal_output_root"))
-        continue;
-      for (const auto &entry : original_output_root_attrs)
-        F.addFnAttr(entry.getKey(), entry.getValue());
-    }
-
-    if (requires_hidden_entry_seed_preservation) {
-      bool preserved = false;
-      for (auto &F : *replayed_module) {
-        if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
-          continue;
-        auto attr = F.getFnAttribute("omill.export_entry_seed_exprs");
-        preserved = attr.isValid() && attr.isStringAttribute() &&
-                    !attr.getValueAsString().empty();
-        break;
-      }
-      if (!preserved)
-        return false;
-    }
-
-    auto saved_module = std::move(module);
-    module = std::move(replayed_module);
-    MAM.invalidate(*module, llvm::PreservedAnalyses::none());
-
-    rerunLateNativeArgRepair();
-    repairMalformedPHIs(*module);
-    annotateVmUnresolvedContinuationsInCurrentModule();
-    annotateOutputRootTerminalBoundaryProbeChains();
-    runFinalOutputCleanup();
-    rerunLateOutputRootTargetPipeline();
-    annotateOutputRootTerminalBoundaryProbeChains();
-    omill::refreshTerminalBoundaryRecoveryMetadata(*module);
-    repairMalformedPHIs(*module);
-    annotateVmUnresolvedContinuationsInCurrentModule();
-    auto unresolved_after_child_replay = collectUnresolvedOutputRootPcCalls();
-    auto function_return_leaks = collectOutputRootFunctionReturnLeaks();
-    if (!unresolved_after_child_replay.empty() || countDefinedOutputRoots() == 0u) {
-      dumpModuleIfEnvEnabled(
-          *module, "OMILL_DEBUG_DUMP_CHILD_NOABI_REPLAY_CANDIDATE",
-          "child_noabi_replay_candidate.ll");
-      errs() << "External main-root no-ABI child replay not adopted"
-             << " roots=" << countDefinedOutputRoots()
-             << " unresolved=";
-      for (size_t i = 0; i < unresolved_after_child_replay.size(); ++i) {
-        if (i)
-          errs() << ",";
-        errs() << unresolved_after_child_replay[i];
-      }
-      if (!function_return_leaks.empty()) {
-        errs() << " function_return_leaks=";
-        for (size_t i = 0; i < function_return_leaks.size(); ++i) {
-          if (i)
-            errs() << ",";
-          errs() << function_return_leaks[i];
-        }
-      }
-      errs() << "\n";
-      module = std::move(saved_module);
-      MAM.invalidate(*module, llvm::PreservedAnalyses::none());
-      repairMalformedPHIs(*module);
-      return false;
-    }
-
-    events.emitInfo("main_root_noabi_child_replay_adopted",
-                    "replayed ABI from external main-root no-ABI child",
-                    {{"defined_output_roots",
-                      static_cast<int64_t>(countDefinedOutputRoots())}});
+    events.emitInfo("pre_abi_truthful_checkpoint_adopted",
+                    "adopted truthful pre-ABI checkpoint instead of ABI shell");
     return true;
   };
 
@@ -16784,22 +14098,54 @@ int main(int argc, char **argv) {
   for (const auto &note : output_recovery_summary.notes)
     errs() << "[runtime-output-recovery] " << note << "\n";
 
+  auto tryProjectAbiTailGraphFromMainRootNoABIChild = [&]() -> bool {
+    if (RawBinary || NoABI)
+      return false;
+
+    auto noabi_child = runTerminalBoundaryChildLift(
+        func_va, /*no_abi=*/true, opts.generic_static_devirtualize,
+        /*enable_recovery_mode=*/false, /*dump_virtual_model=*/false,
+        /*allow_recursive_output_recovery=*/true);
+    if (!noabi_child || noabi_child->ir_text.empty())
+      return false;
+
+    llvm::SMDiagnostic parse_error;
+    auto child_module =
+        llvm::parseAssemblyString(noabi_child->ir_text, parse_error, ctx);
+    if (!child_module)
+      return false;
+    if (verifyModule(*child_module, nullptr))
+      return false;
+
+    auto tail_graph = devirtualization_runtime.buildFinalTailGraph(*child_module);
+    if (tail_graph.nodes.empty() && tail_graph.edges.empty())
+      return false;
+
+    const bool refined =
+        devirtualization_runtime.refineFinalTailGraphWithBoundaryReplay(
+            *child_module, tail_graph, output_recovery_callbacks,
+            opts.generic_static_devirtualize);
+
+    annotateVmUnresolvedContinuationsInCurrentModule();
+    if (!devirtualization_runtime.projectFinalTailGraphIntoAbiModule(*module,
+                                                                     tail_graph)) {
+      return false;
+    }
+
+    MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+    omill::refreshTerminalBoundaryRecoveryMetadata(*module);
+    repairMalformedPHIs(*module);
+    events.emitInfo(
+        "abi_tail_graph_projected",
+        "projected recursive unresolved tails from truthful no-ABI child into ABI output",
+        {{"tail_nodes", static_cast<int64_t>(tail_graph.nodes.size())},
+         {"tail_edges", static_cast<int64_t>(tail_graph.edges.size())},
+         {"boundary_refined", refined}});
+    return true;
+  };
+
   if (!RawBinary && !NoABI)
     unresolved_pc_output_roots = collectUnresolvedOutputRootPcCalls();
-
-  if ((!unresolved_pc_output_roots.empty() ||
-       (!RawBinary && !NoABI && countDefinedOutputRoots() == 0u)) &&
-      tryReplayABIFromPreABICheckpoint()) {
-    annotateVmUnresolvedContinuationsInCurrentModule();
-    unresolved_pc_output_roots = collectUnresolvedOutputRootPcCalls();
-  }
-
-  if ((!unresolved_pc_output_roots.empty() ||
-       (!RawBinary && !NoABI && countDefinedOutputRoots() == 0u)) &&
-      tryReplayABIFromExternalMainRootNoABIChild()) {
-    annotateVmUnresolvedContinuationsInCurrentModule();
-    unresolved_pc_output_roots = collectUnresolvedOutputRootPcCalls();
-  }
 
   dumpModuleIfEnvEnabled(*module, "OMILL_DEBUG_DUMP_BEFORE_UNRESOLVED_CHECK",
                          "before_unresolved_check.ll");
@@ -16865,10 +14211,6 @@ int main(int argc, char **argv) {
     }
   }
   if (!suspicious_zero_arity_output_roots.empty()) {
-    if (auto rc =
-            tryFastPlainNoBlockExportFallback("suspicious_zero_arity_output_root")) {
-      return *rc;
-    }
     errs() << "Error: suspicious zero-arity stack-backed output root(s): ";
     for (size_t i = 0; i < suspicious_zero_arity_output_roots.size(); ++i) {
       if (i)
@@ -16884,10 +14226,6 @@ int main(int argc, char **argv) {
     suspicious_stack_backed_output_roots =
         collectSuspiciousStackBackedOutputRoots();
   if (!suspicious_stack_backed_output_roots.empty()) {
-    if (auto rc = tryFastPlainNoBlockExportFallback(
-            "suspicious_stack_backed_output_root")) {
-      return *rc;
-    }
     errs() << "Error: suspicious stack-backed output root(s): ";
     for (size_t i = 0; i < suspicious_stack_backed_output_roots.size(); ++i) {
       if (i)
@@ -16999,6 +14337,8 @@ int main(int argc, char **argv) {
             if (callee->isIntrinsic())
               continue;
             if (callee->isDeclaration()) {
+              if (omill::isLoweringHelperCalleeName(callee->getName()))
+                continue;
               warnings.push_back(
                   {root->getName().str(), current->getName().str(),
                    callee->getName().str(),
@@ -17042,19 +14382,47 @@ int main(int argc, char **argv) {
                     std::move(payload));
   }
 
-  auto finalization_summary = devirtualization_runtime.finalizeOutput(
-      *module, devirtualization_plan.enable_devirtualization);
   omill::FinalStateRecoveryRequest final_state_recovery_request;
   final_state_recovery_request.no_abi = NoABI;
   final_state_recovery_request.enabled =
-      NoABI && devirtualization_plan.enable_devirtualization;
-  if (auto plan = devirtualization_runtime.planFinalStateRecovery(
-          *module, final_state_recovery_request)) {
-    finalization_summary.final_state_recovery_plan = *plan;
-  }
-  if (auto final_state_bundle = devirtualization_runtime.runFinalStateRecovery(
-          *module, final_state_recovery_request, output_recovery_callbacks)) {
-    finalization_summary.artifact_bundles.push_back(*final_state_bundle);
+      NoABI && devirtualization_plan.enable_devirtualization &&
+      !disable_recursive_output_recovery;
+  final_state_recovery_request.enable_gsd = opts.generic_static_devirtualize;
+  auto buildFinalizationSummary = [&]() {
+    auto summary = devirtualization_runtime.finalizeOutput(
+        *module, devirtualization_plan.enable_devirtualization);
+    if (auto plan = devirtualization_runtime.planFinalStateRecovery(
+            *module, final_state_recovery_request)) {
+      summary.final_state_recovery_plan = *plan;
+    }
+    if (auto final_state_bundle = devirtualization_runtime.runFinalStateRecovery(
+            *module, final_state_recovery_request, output_recovery_callbacks)) {
+      summary.artifact_bundles.push_back(*final_state_bundle);
+    }
+    return summary;
+  };
+
+  auto finalization_summary = buildFinalizationSummary();
+  const bool abi_dispatcher_shell_after_finalization =
+      !RawBinary && !NoABI &&
+      classifySerializedRuntimeRecoveryQuality(*module)
+          .value_or(classifyRuntimeRecoveryQuality(*module))
+          .dispatcher_shell;
+  if (abi_dispatcher_shell_after_finalization) {
+    errs() << "ABI dispatcher-shell output detected; projecting truthful "
+              "no-ABI tail graph into ABI output\n";
+    events.emitInfo("abi_dispatcher_shell_detected",
+                    "ABI output collapsed to dispatcher shell; projecting "
+                    "truthful no-ABI tail graph");
+    bool repaired = false;
+    repaired = tryProjectAbiTailGraphFromMainRootNoABIChild() || repaired;
+    if (!repaired)
+      repaired = tryAdoptTruthfulPreABICheckpoint();
+    if (repaired) {
+      annotateVmUnresolvedContinuationsInCurrentModule();
+      unresolved_pc_output_roots = collectUnresolvedOutputRootPcCalls();
+      finalization_summary = buildFinalizationSummary();
+    }
   }
   emitRuntimeArtifactBundleEvents(events, "finalization",
                                   finalization_summary.artifact_bundles);
@@ -17099,15 +14467,6 @@ int main(int argc, char **argv) {
       events.emitWarn("protector_model_validation_report",
                       "protector-focused validation report",
                       std::move(payload));
-    }
-  }
-
-  if (!RawBinary && !NoABI && fast_plain_export_root_fallback &&
-      opts.use_block_lifting) {
-    auto large_stack_output_roots = collectLargeStackOutputRoots();
-    if (!large_stack_output_roots.empty()) {
-      if (auto rc = tryFastPlainNoBlockExportFallback("large_stack_output_root"))
-        return *rc;
     }
   }
 
@@ -17161,5 +14520,8 @@ int main(int argc, char **argv) {
   events.emitTerminalSuccess(OutputFilename);
   return 0;
 }
+
+
+
 
 

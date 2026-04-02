@@ -1,4 +1,5 @@
 add_executable(omill-lift
+  InputLoader.cpp
   main.cpp
   RuntimeAdapters.cpp
 )

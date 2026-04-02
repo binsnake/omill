@@ -12,6 +12,8 @@ const char *toString(ContinuationProvenance provenance) {
       return "invalidated_executable_entry";
     case ContinuationProvenance::kExecutablePlaceholder:
       return "executable_placeholder";
+    case ContinuationProvenance::kReturnAddressControlled:
+      return "return_address_controlled";
     case ContinuationProvenance::kNativeBoundary:
       return "native_boundary";
     case ContinuationProvenance::kVmEnterBoundary:

@@ -160,6 +160,78 @@ std::string renderVirtualValueExpr(const VirtualValueExpr &expr) {
   return "unknown";
 }
 
+std::string renderVirtualStackOwnerKind(VirtualStackOwnerKind kind) {
+  switch (kind) {
+    case VirtualStackOwnerKind::kUnknown:
+      return "unknown";
+    case VirtualStackOwnerKind::kNativeStackPointer:
+      return "native_stack_pointer";
+    case VirtualStackOwnerKind::kFramePointerLike:
+      return "frame_pointer_like";
+    case VirtualStackOwnerKind::kVmStackRootSlot:
+      return "vm_stack_root_slot";
+    case VirtualStackOwnerKind::kArgumentRoot:
+      return "argument_root";
+    case VirtualStackOwnerKind::kAllocaRoot:
+      return "alloca_root";
+    case VirtualStackOwnerKind::kDerivedOwner:
+      return "derived_owner";
+  }
+  return "unknown";
+}
+
+std::string renderVirtualReturnAddressControlKind(
+    VirtualReturnAddressControlKind kind) {
+  switch (kind) {
+    case VirtualReturnAddressControlKind::kUnknown:
+      return "unknown";
+    case VirtualReturnAddressControlKind::kPreserved:
+      return "preserved";
+    case VirtualReturnAddressControlKind::kStateSlotControlled:
+      return "state_slot_controlled";
+    case VirtualReturnAddressControlKind::kStackCellControlled:
+      return "stack_cell_controlled";
+    case VirtualReturnAddressControlKind::kRedirectedConstant:
+      return "redirected_constant";
+    case VirtualReturnAddressControlKind::kRedirectedSymbolic:
+      return "redirected_symbolic";
+    case VirtualReturnAddressControlKind::kClobbered:
+      return "clobbered";
+  }
+  return "unknown";
+}
+
+std::string renderVirtualReturnAddressControlSummary(
+    const VirtualReturnAddressControlSummary &summary) {
+  std::ostringstream os;
+  os << renderVirtualReturnAddressControlKind(summary.kind);
+  if (summary.original_return_pc) {
+    os << " original=0x" << std::hex << *summary.original_return_pc;
+  }
+  if (summary.return_slot_id)
+    os << " slot=" << std::dec << *summary.return_slot_id;
+  if (summary.return_stack_cell_id)
+    os << " cell=" << std::dec << *summary.return_stack_cell_id;
+  if (summary.return_owner_id) {
+    os << " owner=" << std::dec << *summary.return_owner_id << ":"
+       << renderVirtualStackOwnerKind(summary.return_owner_kind);
+  }
+  if (summary.return_owner_delta)
+    os << " owner_delta=" << std::showpos << *summary.return_owner_delta
+       << std::noshowpos;
+  if (summary.effective_return_expr.kind != VirtualExprKind::kUnknown) {
+    os << " expr=" << renderVirtualValueExpr(summary.effective_return_expr);
+  }
+  if (summary.resolved_effective_return_pc) {
+    os << " effective=0x" << std::hex << *summary.resolved_effective_return_pc;
+  }
+  if (summary.was_overwritten)
+    os << " overwritten";
+  if (summary.suppresses_normal_fallthrough)
+    os << " suppresses_fallthrough";
+  return os.str();
+}
+
 std::string renderVirtualIncomingContextSourceKind(
     VirtualIncomingContextSourceKind kind) {
   switch (kind) {

@@ -180,9 +180,14 @@ BoundaryResolutionResult BoundaryContinuationResolver::resolve(
   }
 
   const auto &boundary = *request.boundary;
+  const bool has_controlled_return =
+      boundary.suppresses_normal_fallthrough &&
+      boundary.return_address_control_kind !=
+          VirtualReturnAddressControlKind::kUnknown;
   const bool has_reentry_evidence =
-      boundary.reenters_vm || boundary.is_vm_enter ||
+      has_controlled_return || boundary.reenters_vm || boundary.is_vm_enter ||
       boundary.is_nested_vm_enter || boundary.continuation_pc.has_value() ||
+      boundary.controlled_return_pc.has_value() ||
       boundary.continuation_slot_id.has_value() ||
       boundary.continuation_stack_cell_id.has_value();
   if (has_reentry_evidence) {
@@ -194,17 +199,30 @@ BoundaryResolutionResult BoundaryContinuationResolver::resolve(
     result.updated_proof->selected_root_import_class =
         ChildImportClass::kBoundaryModeledChild;
     result.updated_proof->provenance =
-        boundary.is_vm_enter || boundary.is_nested_vm_enter
-            ? ContinuationProvenance::kVmEnterBoundary
-            : ContinuationProvenance::kNativeBoundary;
-    result.updated_proof->rationale = "modeled_reentry_boundary";
-    result.rationale = boundary.reenters_vm
-                           ? "boundary_reenters_vm"
-                           : (boundary.continuation_stack_cell_id
-                                  ? "boundary_continuation_stack_cell"
-                                  : (boundary.continuation_slot_id
-                                         ? "boundary_continuation_slot"
-                                         : "boundary_continuation_pc"));
+        has_controlled_return
+            ? ContinuationProvenance::kReturnAddressControlled
+            : (boundary.is_vm_enter || boundary.is_nested_vm_enter
+                   ? ContinuationProvenance::kVmEnterBoundary
+                   : ContinuationProvenance::kNativeBoundary);
+    result.updated_proof->return_address_control_kind =
+        boundary.return_address_control_kind;
+    result.updated_proof->controlled_return_pc = boundary.controlled_return_pc;
+    result.updated_proof->suppresses_normal_fallthrough =
+        boundary.suppresses_normal_fallthrough;
+    result.updated_proof->rationale = has_controlled_return
+                                          ? "modeled_controlled_return"
+                                          : "modeled_reentry_boundary";
+    result.rationale = has_controlled_return
+                           ? (boundary.controlled_return_pc
+                                  ? "boundary_controlled_return_pc"
+                                  : "boundary_controlled_return_unresolved")
+                           : (boundary.reenters_vm
+                                  ? "boundary_reenters_vm"
+                                  : (boundary.continuation_stack_cell_id
+                                         ? "boundary_continuation_stack_cell"
+                                         : (boundary.continuation_slot_id
+                                                ? "boundary_continuation_slot"
+                                                : "boundary_continuation_pc")));
     return result;
   }
 

@@ -31,6 +31,8 @@ llvm::Function *findLiftedOrBlockFunctionByPC(llvm::Module &M, uint64_t pc);
 llvm::Function *findLiftedOrCoveredFunctionByPC(llvm::Module &M, uint64_t pc);
 llvm::Function *findStructuralCodeTargetFunctionByPC(llvm::Module &M,
                                                      uint64_t pc);
+llvm::Function *findNearestStructuralCodeTargetFunctionByPC(
+    llvm::Module &M, uint64_t pc, uint64_t max_distance = 0x20);
 std::optional<uint64_t> findNearestCoveredLiftedOrBlockPC(
     llvm::Module &M, uint64_t pc, uint64_t max_distance = 0x20);
 

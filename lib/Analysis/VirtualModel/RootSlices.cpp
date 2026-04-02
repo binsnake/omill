@@ -416,10 +416,10 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
   auto has_same_handler_localized_continuation =
       [&](const VirtualHandlerSummary &handler,
           const VirtualCallSiteSummary &callsite) -> bool {
-        if (!callsite.continuation_pc.has_value())
+        auto continuation_pc = effectiveContinuationPc(callsite);
+        if (!continuation_pc.has_value())
           return false;
-        return has_handler_localized_continuation(handler,
-                                                  *callsite.continuation_pc);
+        return has_handler_localized_continuation(handler, *continuation_pc);
       };
 
   auto lookup_stack_cell = [&](unsigned cell_id)
@@ -452,7 +452,7 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
   auto has_stack_reentry_to_initial_slot =
       [&](const VirtualHandlerSummary &handler,
           const VirtualCallSiteSummary &callsite) -> bool {
-        if (!callsite.continuation_pc.has_value())
+        if (!effectiveContinuationPc(callsite).has_value())
           return false;
         if (callsite.exit.disposition !=
             VirtualExitDisposition::kVmExitNativeCallReenter) {
@@ -500,19 +500,20 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
 
   auto has_lifted_continuation_handler =
       [&](const VirtualCallSiteSummary &callsite) -> bool {
-        if (!callsite.continuation_pc.has_value())
+        auto continuation_pc = effectiveContinuationPc(callsite);
+        if (!continuation_pc.has_value())
           return false;
-        auto it = handler_by_pc.find(*callsite.continuation_pc);
+        auto it = handler_by_pc.find(*continuation_pc);
         if (it != handler_by_pc.end())
           return true;
-        return lookup_exact_lifted_leaf(callsite.continuation_pc,
-                                        std::nullopt) != nullptr;
+        return lookup_exact_lifted_leaf(continuation_pc, std::nullopt) !=
+               nullptr;
       };
 
   auto is_semantically_localized_callsite =
       [&](const VirtualHandlerSummary &handler,
           const VirtualCallSiteSummary &callsite) -> bool {
-        if (!callsite.continuation_pc.has_value())
+        if (!effectiveContinuationPc(callsite).has_value())
           return false;
         if (has_stack_reentry_to_initial_slot(handler, callsite)) {
           return callsite.unresolved_reason.empty() ||
@@ -689,7 +690,7 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
           handler->is_candidate || has_lifted_direct_callee(*handler) ||
           !handler->dispatches.empty() || !handler->called_boundaries.empty() ||
           llvm::any_of(handler->callsites, [](const VirtualCallSiteSummary &cs) {
-            return cs.continuation_pc.has_value();
+            return effectiveContinuationPc(cs).has_value();
           });
       if (traverse_direct_callees) {
         for (const auto &callee_name : handler->direct_callees) {
@@ -938,8 +939,9 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
           if (it != handler_by_pc.end())
             target = it->second;
         }
-        if (target && callsite.continuation_pc.has_value())
-          enqueue_handler(target, callsite.continuation_pc, worklist,
+        auto continuation_pc = effectiveContinuationPc(callsite);
+        if (target && continuation_pc.has_value())
+          enqueue_handler(target, continuation_pc, worklist,
                           queued_names, reachable_names);
         else if (auto *exact = lookup_exact_lifted_leaf(
                      callsite.recovered_entry_pc
@@ -964,8 +966,8 @@ void summarizeRootSlices(llvm::Module &M, VirtualMachineModel &model,
             "root-callsite handler=" + handler->function_name +
             " unresolved=" + callsite.unresolved_reason +
             " cont=" +
-            (callsite.continuation_pc
-                 ? ("0x" + llvm::utohexstr(*callsite.continuation_pc))
+            (continuation_pc
+                 ? ("0x" + llvm::utohexstr(*continuation_pc))
                  : std::string("-")) +
             " target=" +
             (callsite.resolved_target_pc

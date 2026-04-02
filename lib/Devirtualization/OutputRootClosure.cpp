@@ -112,6 +112,27 @@ std::string buildClosureWorkIdentity(const OutputRootClosureWorkItem &item) {
       id += ":full";
     if (item.boundary->reenters_vm)
       id += ":reenter";
+    if (item.boundary->continuation_pc)
+      id += ":cont:" + llvm::utohexstr(*item.boundary->continuation_pc);
+    if (item.boundary->controlled_return_pc)
+      id += ":cret:" + llvm::utohexstr(*item.boundary->controlled_return_pc);
+    if (item.boundary->continuation_owner_id)
+      id += ":owner:" + std::to_string(*item.boundary->continuation_owner_id);
+    if (item.boundary->continuation_owner_kind !=
+        VirtualStackOwnerKind::kUnknown) {
+      id += ":ownerkind:" +
+            std::to_string(
+                static_cast<int>(item.boundary->continuation_owner_kind));
+    }
+    if (item.boundary->continuation_entry_transform) {
+      id += ":xform:" + std::to_string(static_cast<int>(
+                             item.boundary->continuation_entry_transform->kind));
+      if (item.boundary->continuation_entry_transform->jump_target_pc) {
+        id += ":xjmp:" + llvm::utohexstr(
+                             *item.boundary->continuation_entry_transform
+                                  ->jump_target_pc);
+      }
+    }
   }
   if (item.executable_target) {
     const auto &fact = *item.executable_target;
@@ -327,34 +348,8 @@ std::vector<OutputRootClosureWorkItem> collectOutputRootClosureWorkItems(
           if (!item.boundary) {
             item.boundary = callee_boundary;
           } else {
-            if (!item.boundary->boundary_pc)
-              item.boundary->boundary_pc = callee_boundary->boundary_pc;
-            if (!item.boundary->native_target_pc)
-              item.boundary->native_target_pc = callee_boundary->native_target_pc;
-            if (!item.boundary->continuation_pc)
-              item.boundary->continuation_pc = callee_boundary->continuation_pc;
-            if (!item.boundary->continuation_vip_pc) {
-              item.boundary->continuation_vip_pc =
-                  callee_boundary->continuation_vip_pc;
-            }
-            if (item.boundary->exit_disposition == BoundaryDisposition::kUnknown) {
-              item.boundary->exit_disposition =
-                  callee_boundary->exit_disposition;
-            }
-            item.boundary->is_partial_exit =
-                item.boundary->is_partial_exit || callee_boundary->is_partial_exit;
-            item.boundary->is_full_exit =
-                item.boundary->is_full_exit || callee_boundary->is_full_exit;
-            item.boundary->reenters_vm =
-                item.boundary->reenters_vm || callee_boundary->reenters_vm;
-            item.boundary->is_vm_enter =
-                item.boundary->is_vm_enter || callee_boundary->is_vm_enter;
-            item.boundary->is_nested_vm_enter =
-                item.boundary->is_nested_vm_enter ||
-                callee_boundary->is_nested_vm_enter;
-            if (item.boundary->kind == BoundaryKind::kUnknown) {
-              item.boundary->kind = callee_boundary->kind;
-            }
+            *item.boundary =
+                mergeBoundaryFacts(*item.boundary, *callee_boundary);
           }
         }
       }

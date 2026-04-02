@@ -6676,6 +6676,8 @@ TEST_F(VirtualMachineModelTest,
   EXPECT_EQ(*callsite.exit.continuation_pc, 0x180021080ULL);
   ASSERT_TRUE(callsite.exit.continuation_vip.resolved_pc.has_value());
   EXPECT_EQ(*callsite.exit.continuation_vip.resolved_pc, 0x180021080ULL);
+  EXPECT_EQ(callsite.return_address_control.kind,
+            omill::VirtualReturnAddressControlKind::kUnknown);
 
   auto *slice = model.lookupRootSlice(0x180021000ULL);
   ASSERT_NE(slice, nullptr);
@@ -6690,6 +6692,169 @@ TEST_F(VirtualMachineModelTest,
                frontier.target_pc.has_value() &&
                *frontier.target_pc == 0x180030000ULL;
       }));
+}
+
+TEST_F(VirtualMachineModelTest,
+       RedirectsReturnAddressWhenReturnPcSlotIsOverwrittenToConstant) {
+  auto M = createModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+  auto *calli_ty = llvm::FunctionType::get(
+      ptr_ty, {ptr_ty, ptr_ty, i64_ty, ptr_ty, i64_ty, ptr_ty}, false);
+  auto *calli = llvm::Function::Create(
+      calli_ty, llvm::Function::ExternalLinkage,
+      "_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_", *M);
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::Function::ExternalLinkage,
+                                      "sub_180021200", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *next_pc = B.CreateAlloca(i64_ty, nullptr, "NEXT_PC");
+    auto *return_pc = B.CreateAlloca(i64_ty, nullptr, "RETURN_PC");
+    B.CreateStore(B.getInt64(0x180021240ULL), next_pc);
+    B.CreateStore(B.getInt64(0x180021213ULL), return_pc);
+    auto *call = B.CreateCall(calli, {root->getArg(2), root->getArg(0),
+                                      B.getInt64(0x180032000ULL), next_pc,
+                                      B.getInt64(0x180021213ULL), return_pc});
+    (void)call;
+    B.CreateStore(B.getInt64(0x180021290ULL), return_pc);
+    B.CreateRet(root->getArg(0));
+  }
+
+  omill::BinaryMemoryMap map;
+  map.setImageBase(0x180020000ULL);
+  std::array<uint8_t, 16> native_code = {0x48, 0x89, 0xC8, 0xC3};
+  map.addRegion(0x180032000ULL, native_code.data(), native_code.size(),
+                /*read_only=*/false, /*executable=*/true);
+
+  auto model = runAnalysis(*M, std::move(map));
+  auto *summary = model.lookupHandler("sub_180021200");
+  ASSERT_NE(summary, nullptr);
+  ASSERT_EQ(summary->callsites.size(), 1u);
+  const auto &callsite = summary->callsites.front();
+  EXPECT_EQ(callsite.return_address_control.kind,
+            omill::VirtualReturnAddressControlKind::kRedirectedConstant);
+  EXPECT_TRUE(callsite.continuation_owner_id.has_value());
+  EXPECT_TRUE(callsite.return_address_control.was_overwritten);
+  EXPECT_TRUE(callsite.return_address_control.suppresses_normal_fallthrough);
+  EXPECT_EQ(callsite.return_address_control.return_owner_id,
+            callsite.continuation_owner_id);
+  EXPECT_EQ(callsite.return_address_control.resolved_effective_return_pc,
+            std::optional<uint64_t>(0x180021290ULL));
+  EXPECT_EQ(callsite.exit.continuation_pc,
+            std::optional<uint64_t>(0x180021290ULL));
+}
+
+TEST_F(VirtualMachineModelTest,
+       RedirectsReturnAddressWhenTrackedStackCellIsOverwrittenToConstant) {
+  auto M = createModule();
+  addMinimalX86FlagStateTypes(*M);
+  auto *i8_ty = llvm::Type::getInt8Ty(Ctx);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+  auto *calli_ty = llvm::FunctionType::get(
+      ptr_ty, {ptr_ty, ptr_ty, i64_ty, ptr_ty, i64_ty, ptr_ty}, false);
+  auto *calli = llvm::Function::Create(
+      calli_ty, llvm::Function::ExternalLinkage,
+      "_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_", *M);
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::Function::ExternalLinkage,
+                                      "sub_180021300", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *sp_slot = B.CreateGEP(i8_ty, root->getArg(0), B.getInt64(0x908));
+    auto *next_pc = B.CreateAlloca(i64_ty, nullptr, "NEXT_PC");
+    B.CreateStore(B.getInt64(0x200000ULL), sp_slot);
+    auto *initial_sp = B.CreateLoad(i64_ty, sp_slot);
+    auto *continuation_ptr_i64 =
+        B.CreateIntToPtr(initial_sp, llvm::PointerType::get(Ctx, 0));
+    auto *continuation_ptr = B.CreateBitCast(continuation_ptr_i64, ptr_ty);
+    B.CreateCall(calli, {root->getArg(2), root->getArg(0),
+                         B.getInt64(0x180033000ULL), next_pc,
+                         B.getInt64(0x180021313ULL), continuation_ptr});
+    B.CreateStore(B.getInt64(0x180021390ULL), continuation_ptr_i64);
+    B.CreateRet(root->getArg(0));
+  }
+
+  omill::BinaryMemoryMap map;
+  map.setImageBase(0x180020000ULL);
+  std::array<uint8_t, 16> native_code = {0x48, 0x89, 0xC8, 0xC3};
+  map.addRegion(0x180033000ULL, native_code.data(), native_code.size(),
+                /*read_only=*/false, /*executable=*/true);
+
+  auto model = runAnalysis(*M, std::move(map));
+  auto *summary = model.lookupHandler("sub_180021300");
+  ASSERT_NE(summary, nullptr);
+  ASSERT_EQ(summary->callsites.size(), 1u);
+  const auto &callsite = summary->callsites.front();
+  ASSERT_TRUE(callsite.continuation_stack_cell_id.has_value());
+  EXPECT_TRUE(callsite.continuation_owner_id.has_value());
+  EXPECT_TRUE(callsite.return_address_control.return_stack_cell_id.has_value());
+  EXPECT_EQ(callsite.return_address_control.return_owner_id,
+            callsite.continuation_owner_id);
+  EXPECT_EQ(callsite.return_address_control.kind,
+            omill::VirtualReturnAddressControlKind::kRedirectedConstant);
+  EXPECT_TRUE(callsite.return_address_control.suppresses_normal_fallthrough);
+  EXPECT_EQ(callsite.return_address_control.resolved_effective_return_pc,
+            std::optional<uint64_t>(0x180021390ULL));
+  EXPECT_EQ(callsite.exit.continuation_pc,
+            std::optional<uint64_t>(0x180021390ULL));
+}
+
+TEST_F(VirtualMachineModelTest,
+       InfersFramePointerLikeContinuationOwnerFromContinuationSlot) {
+  auto M = createModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *lifted_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty},
+                                            false);
+  auto *calli_ty = llvm::FunctionType::get(
+      ptr_ty, {ptr_ty, ptr_ty, i64_ty, ptr_ty, i64_ty, ptr_ty}, false);
+  auto *calli = llvm::Function::Create(
+      calli_ty, llvm::Function::ExternalLinkage,
+      "_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_", *M);
+
+  auto *root = llvm::Function::Create(lifted_ty,
+                                      llvm::Function::ExternalLinkage,
+                                      "sub_180021320", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *next_pc = B.CreateAlloca(i64_ty, nullptr, "NEXT_PC");
+    auto *rbp_slot = B.CreateAlloca(i64_ty, nullptr, "RBP");
+    B.CreateStore(B.getInt64(0x180021333ULL), rbp_slot);
+    auto *call = B.CreateCall(calli, {root->getArg(2), root->getArg(0),
+                                      B.getInt64(0x180033100ULL), next_pc,
+                                      B.getInt64(0x180021333ULL), rbp_slot});
+    (void)call;
+    B.CreateRet(root->getArg(0));
+  }
+
+  omill::BinaryMemoryMap map;
+  map.setImageBase(0x180020000ULL);
+  std::array<uint8_t, 16> native_code = {0x48, 0x89, 0xC8, 0xC3};
+  map.addRegion(0x180033100ULL, native_code.data(), native_code.size(),
+                /*read_only=*/false, /*executable=*/true);
+
+  auto model = runAnalysis(*M, std::move(map));
+  auto *summary = model.lookupHandler("sub_180021320");
+  ASSERT_NE(summary, nullptr);
+  ASSERT_EQ(summary->callsites.size(), 1u);
+  const auto &callsite = summary->callsites.front();
+  EXPECT_TRUE(callsite.continuation_owner_id.has_value());
+  EXPECT_EQ(callsite.continuation_owner_kind,
+            omill::VirtualStackOwnerKind::kFramePointerLike);
 }
 
 TEST_F(VirtualMachineModelTest,

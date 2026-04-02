@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -170,6 +171,273 @@ static void seedNamedSlotFact(const std::map<SlotKey, unsigned> &slot_ids,
   slot_facts[it->second] = constantExpr(value, width_bits);
 }
 
+static const VirtualSlotFact *lookupReturnSlotFact(
+    llvm::ArrayRef<VirtualSlotFact> facts, unsigned slot_id) {
+  auto it = llvm::find_if(facts, [&](const VirtualSlotFact &fact) {
+    return fact.slot_id == slot_id;
+  });
+  return it == facts.end() ? nullptr : &*it;
+}
+
+static const VirtualStackFact *lookupReturnStackFact(
+    llvm::ArrayRef<VirtualStackFact> facts, unsigned cell_id) {
+  auto it = llvm::find_if(facts, [&](const VirtualStackFact &fact) {
+    return fact.cell_id == cell_id;
+  });
+  return it == facts.end() ? nullptr : &*it;
+}
+
+static bool exprReferencesSlotId(const VirtualValueExpr &expr,
+                                 unsigned slot_id) {
+  if (expr.slot_id && *expr.slot_id == slot_id)
+    return true;
+  return llvm::any_of(expr.operands, [&](const VirtualValueExpr &operand) {
+    return exprReferencesSlotId(operand, slot_id);
+  });
+}
+
+static bool exprReferencesStackCellId(const VirtualValueExpr &expr,
+                                      unsigned cell_id) {
+  if (expr.stack_cell_id && *expr.stack_cell_id == cell_id)
+    return true;
+  return llvm::any_of(expr.operands, [&](const VirtualValueExpr &operand) {
+    return exprReferencesStackCellId(operand, cell_id);
+  });
+}
+
+static bool exprReferencesTrackedReturnStorage(
+    const VirtualValueExpr &expr, std::optional<unsigned> slot_id,
+    std::optional<unsigned> stack_cell_id) {
+  return (slot_id && exprReferencesSlotId(expr, *slot_id)) ||
+         (stack_cell_id && exprReferencesStackCellId(expr, *stack_cell_id));
+}
+
+static std::optional<VirtualValueExpr> selectEffectiveReturnExpr(
+    const VirtualCallSiteSummary &callsite) {
+  if (callsite.continuation_stack_cell_id) {
+    if (const auto *fact = lookupReturnStackFact(
+            callsite.return_stack_facts, *callsite.continuation_stack_cell_id)) {
+      return fact->value;
+    }
+  }
+  if (callsite.continuation_slot_id) {
+    if (const auto *fact = lookupReturnSlotFact(
+            callsite.return_slot_facts, *callsite.continuation_slot_id)) {
+      return fact->value;
+    }
+  }
+
+  for (const auto &fact : callsite.return_stack_facts) {
+    if (exprReferencesTrackedReturnStorage(fact.value, callsite.continuation_slot_id,
+                                          callsite.continuation_stack_cell_id)) {
+      return fact.value;
+    }
+  }
+  for (const auto &fact : callsite.return_slot_facts) {
+    if (exprReferencesTrackedReturnStorage(fact.value, callsite.continuation_slot_id,
+                                          callsite.continuation_stack_cell_id)) {
+      return fact.value;
+    }
+  }
+  return std::nullopt;
+}
+
+static std::pair<std::optional<unsigned>, VirtualStackOwnerKind>
+inferContinuationOwnerFromCallsite(
+    const VirtualCallSiteSummary &callsite,
+    const std::map<unsigned, const VirtualStackCellInfo *> &stack_cell_info,
+    const std::map<unsigned, const VirtualStateSlotInfo *> &slot_info) {
+  if (callsite.continuation_stack_cell_id) {
+    if (auto it = stack_cell_info.find(*callsite.continuation_stack_cell_id);
+        it != stack_cell_info.end()) {
+      return {it->second->owner_slot_id, it->second->owner_kind};
+    }
+  }
+  if (callsite.continuation_slot_id) {
+    if (auto it = slot_info.find(*callsite.continuation_slot_id);
+        it != slot_info.end()) {
+      llvm::StringRef name = it->second->base_name;
+      if (name.equals_insensitive("RSP") || name.equals_insensitive("SP"))
+        return {*callsite.continuation_slot_id,
+                VirtualStackOwnerKind::kNativeStackPointer};
+      if (name.equals_insensitive("RBP") || name.equals_insensitive("BP"))
+        return {*callsite.continuation_slot_id,
+                VirtualStackOwnerKind::kFramePointerLike};
+      if (name.contains_insensitive("stack") || name.contains_insensitive("vsp") ||
+          name.contains_insensitive("vm_sp"))
+        return {*callsite.continuation_slot_id,
+                VirtualStackOwnerKind::kVmStackRootSlot};
+      if (it->second->from_argument)
+        return {*callsite.continuation_slot_id, VirtualStackOwnerKind::kArgumentRoot};
+      if (it->second->from_alloca)
+        return {*callsite.continuation_slot_id, VirtualStackOwnerKind::kAllocaRoot};
+    }
+  }
+  return {std::nullopt, VirtualStackOwnerKind::kUnknown};
+}
+
+static std::optional<uint64_t> resolveEffectiveReturnExpr(
+    const VirtualCallSiteSummary &callsite, const VirtualValueExpr &expr) {
+  std::map<unsigned, VirtualValueExpr> slot_facts =
+      factMapFor(callsite.return_slot_facts);
+  std::map<unsigned, VirtualValueExpr> stack_facts =
+      stackFactMapFor(callsite.return_stack_facts);
+
+  const unsigned width = expr.bit_width ? expr.bit_width : 64u;
+  if (callsite.continuation_pc) {
+    if (callsite.continuation_slot_id &&
+        !slot_facts.count(*callsite.continuation_slot_id)) {
+      slot_facts.emplace(*callsite.continuation_slot_id,
+                         constantExpr(*callsite.continuation_pc, width));
+    }
+    if (callsite.continuation_stack_cell_id &&
+        !stack_facts.count(*callsite.continuation_stack_cell_id)) {
+      stack_facts.emplace(*callsite.continuation_stack_cell_id,
+                          constantExpr(*callsite.continuation_pc, width));
+    }
+  }
+
+  return evaluateVirtualExpr(expr, slotFactsForMap(slot_facts),
+                             stackFactsForMap(stack_facts));
+}
+
+static VirtualReturnAddressControlSummary classifyReturnAddressControl(
+    const VirtualCallSiteSummary &callsite,
+    const std::set<unsigned> &written_slot_ids,
+    const llvm::SmallDenseSet<unsigned, 16> &written_stack_cell_ids,
+    const std::map<unsigned, const VirtualStackCellInfo *> &stack_cell_info,
+    const std::map<unsigned, const VirtualStateSlotInfo *> &slot_info) {
+  VirtualReturnAddressControlSummary summary;
+  summary.original_return_pc = callsite.continuation_pc;
+  summary.return_slot_id = callsite.continuation_slot_id;
+  summary.return_stack_cell_id = callsite.continuation_stack_cell_id;
+  std::tie(summary.return_owner_id, summary.return_owner_kind) =
+      inferContinuationOwnerFromCallsite(callsite, stack_cell_info, slot_info);
+
+  if (!summary.original_return_pc ||
+      (!summary.return_slot_id && !summary.return_stack_cell_id)) {
+    return summary;
+  }
+
+  const bool slot_written =
+      summary.return_slot_id && written_slot_ids.count(*summary.return_slot_id);
+  const bool stack_written = summary.return_stack_cell_id &&
+                             written_stack_cell_ids.count(
+                                 *summary.return_stack_cell_id);
+
+  auto effective_expr = selectEffectiveReturnExpr(callsite);
+  if (!effective_expr) {
+    if (slot_written || stack_written) {
+      summary.kind = VirtualReturnAddressControlKind::kClobbered;
+      summary.effective_return_expr = unknownExpr(64);
+      summary.was_overwritten = true;
+      summary.suppresses_normal_fallthrough = true;
+      return summary;
+    }
+    summary.kind = VirtualReturnAddressControlKind::kPreserved;
+    summary.effective_return_expr = constantExpr(*summary.original_return_pc, 64);
+    summary.resolved_effective_return_pc = summary.original_return_pc;
+    return summary;
+  }
+
+  summary.effective_return_expr = *effective_expr;
+  summary.resolved_effective_return_pc =
+      resolveEffectiveReturnExpr(callsite, *effective_expr);
+  summary.was_overwritten = slot_written || stack_written;
+
+  if (summary.resolved_effective_return_pc &&
+      *summary.resolved_effective_return_pc == *summary.original_return_pc) {
+    summary.kind = VirtualReturnAddressControlKind::kPreserved;
+    summary.suppresses_normal_fallthrough = false;
+    return summary;
+  }
+
+  if (summary.resolved_effective_return_pc) {
+    summary.kind = VirtualReturnAddressControlKind::kRedirectedConstant;
+    summary.suppresses_normal_fallthrough = true;
+    return summary;
+  }
+
+  if (stack_written ||
+      (summary.return_stack_cell_id &&
+       exprReferencesStackCellId(*effective_expr, *summary.return_stack_cell_id))) {
+    summary.kind = VirtualReturnAddressControlKind::kStackCellControlled;
+    summary.suppresses_normal_fallthrough = true;
+    return summary;
+  }
+
+  if (slot_written ||
+      (summary.return_slot_id &&
+       exprReferencesSlotId(*effective_expr, *summary.return_slot_id))) {
+    summary.kind = VirtualReturnAddressControlKind::kStateSlotControlled;
+    summary.suppresses_normal_fallthrough = true;
+    return summary;
+  }
+
+  if (summary.was_overwritten) {
+    summary.kind = VirtualReturnAddressControlKind::kRedirectedSymbolic;
+    summary.suppresses_normal_fallthrough = true;
+  }
+  return summary;
+}
+
+static void populateReturnAddressControlFromHandlerFallback(
+    const VirtualHandlerSummary &handler, VirtualCallSiteSummary &callsite,
+    const std::map<unsigned, const VirtualStackCellInfo *> &stack_cell_info,
+    const std::map<unsigned, const VirtualStateSlotInfo *> &slot_info) {
+  if (!callsite.continuation_pc ||
+      (!callsite.continuation_slot_id && !callsite.continuation_stack_cell_id)) {
+    return;
+  }
+
+  const auto slot_or_cell_is_tracked = [&](const VirtualValueExpr &expr) {
+    return exprReferencesTrackedReturnStorage(expr, callsite.continuation_slot_id,
+                                             callsite.continuation_stack_cell_id);
+  };
+
+  const auto append_slot_fact = [&](const VirtualSlotFact &fact) {
+    if (llvm::any_of(callsite.return_slot_facts, [&](const VirtualSlotFact &existing) {
+          return existing.slot_id == fact.slot_id;
+        })) {
+      return;
+    }
+    callsite.return_slot_facts.push_back(fact);
+  };
+  const auto append_stack_fact = [&](const VirtualStackFact &fact) {
+    if (llvm::any_of(callsite.return_stack_facts,
+                     [&](const VirtualStackFact &existing) {
+                       return existing.cell_id == fact.cell_id;
+                     })) {
+      return;
+    }
+    callsite.return_stack_facts.push_back(fact);
+  };
+
+  for (const auto &fact : handler.outgoing_facts) {
+    if ((callsite.continuation_slot_id &&
+         fact.slot_id == *callsite.continuation_slot_id) ||
+        slot_or_cell_is_tracked(fact.value)) {
+      append_slot_fact(fact);
+    }
+  }
+  for (const auto &fact : handler.outgoing_stack_facts) {
+    if ((callsite.continuation_stack_cell_id &&
+         fact.cell_id == *callsite.continuation_stack_cell_id) ||
+        slot_or_cell_is_tracked(fact.value)) {
+      append_stack_fact(fact);
+    }
+  }
+
+  std::set<unsigned> written_slot_ids(handler.written_slot_ids.begin(),
+                                      handler.written_slot_ids.end());
+  llvm::SmallDenseSet<unsigned, 16> written_stack_cell_ids;
+  written_stack_cell_ids.insert(handler.written_stack_cell_ids.begin(),
+                                handler.written_stack_cell_ids.end());
+  callsite.return_address_control = classifyReturnAddressControl(
+      callsite, written_slot_ids, written_stack_cell_ids, stack_cell_info,
+      slot_info);
+}
+
 }  // namespace
 
 ResolvedCallSiteInfo resolveCallSiteInfo(
@@ -245,6 +513,32 @@ ResolvedCallSiteInfo resolveCallSiteInfo(
         resolveSpecializedExprToConstant(specialized_target, callsite_slots,
                                          callsite_stack);
   }
+  if (info.continuation_stack_cell_id) {
+    if (auto cell = llvm::find_if(stack_cell_ids, [&](const auto &entry) {
+          return entry.second == *info.continuation_stack_cell_id;
+        });
+        cell != stack_cell_ids.end()) {
+      if (auto base_slot_id = lookupSlotIdForSummary(
+              VirtualStateSlotSummary{cell->first.base_slot.base_name,
+                                      cell->first.base_slot.offset,
+                                      cell->first.base_slot.width, 0, 0,
+                                      cell->first.base_slot.from_argument,
+                                      cell->first.base_slot.from_alloca,
+                                      std::nullopt},
+              slot_ids)) {
+        info.continuation_owner_id = *base_slot_id;
+      }
+      info.continuation_owner_kind = cell->first.base_slot.base_name == "RBP" ||
+                                             cell->first.base_slot.base_name == "BP"
+                                         ? VirtualStackOwnerKind::kFramePointerLike
+                                         : (cell->first.base_slot.base_name == "RSP" ||
+                                                    cell->first.base_slot.base_name == "SP"
+                                                ? VirtualStackOwnerKind::kNativeStackPointer
+                                                : VirtualStackOwnerKind::kDerivedOwner);
+    }
+  } else if (info.continuation_slot_id) {
+    info.continuation_owner_id = info.continuation_slot_id;
+  }
   return info;
 }
 
@@ -298,6 +592,9 @@ void summarizeCallSites(llvm::Module &M, VirtualMachineModel &model,
       callsite.continuation_pc.reset();
       callsite.continuation_slot_id.reset();
       callsite.continuation_stack_cell_id.reset();
+      callsite.continuation_owner_id.reset();
+      callsite.continuation_owner_kind = VirtualStackOwnerKind::kUnknown;
+      callsite.return_address_control = VirtualReturnAddressControlSummary{};
       callsite.is_executable_in_image = false;
       callsite.is_decodable_entry = false;
       callsite.target_function_name.reset();
@@ -391,6 +688,21 @@ void summarizeCallSites(llvm::Module &M, VirtualMachineModel &model,
         callsite_summary.continuation_slot_id = resolved.continuation_slot_id;
         callsite_summary.continuation_stack_cell_id =
             resolved.continuation_stack_cell_id;
+        callsite_summary.continuation_owner_id = resolved.continuation_owner_id;
+        callsite_summary.continuation_owner_kind =
+            resolved.continuation_owner_kind;
+        if (!callsite_summary.continuation_owner_id ||
+            callsite_summary.continuation_owner_kind ==
+                VirtualStackOwnerKind::kUnknown) {
+          std::tie(callsite_summary.continuation_owner_id,
+                   callsite_summary.continuation_owner_kind) =
+              inferContinuationOwnerFromCallsite(callsite_summary,
+                                                 stack_cell_info, slot_info);
+        }
+        populateReturnAddressControlFromHandlerFallback(summary,
+                                                       callsite_summary,
+                                                       stack_cell_info,
+                                                       slot_info);
 
         if (!resolved.target_pc.has_value()) {
           callsite_summary.unresolved_reason = "call_target_unresolved";
@@ -607,6 +919,10 @@ void summarizeCallSites(llvm::Module &M, VirtualMachineModel &model,
           callsite_summary.return_stack_facts.push_back(
               VirtualStackFact{cell_id, std::move(*normalized)});
         }
+
+        callsite_summary.return_address_control = classifyReturnAddressControl(
+            callsite_summary, localized->written_slot_ids, written_stack_cells,
+            stack_cell_info, slot_info);
 
         if (callsite_summary.unresolved_reason.empty() &&
             callsite_summary.continuation_pc.has_value() &&

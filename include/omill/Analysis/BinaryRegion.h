@@ -13,6 +13,8 @@ enum class EdgeRestatementKind {
   kBinaryDirect,
   kProofSupplied,
   kBoundaryModeled,
+  kControlledReturn,
+  kControlledReturnUnresolved,
   kUnresolvedIndirect,
 };
 
@@ -37,6 +39,7 @@ struct LearnedOutgoingEdge {
   EdgeResolutionStatus resolution_status = EdgeResolutionStatus::kUnknown;
   bool is_boundary = false;
   bool is_terminal = false;
+  bool is_controlled_return = false;
   bool is_unresolved_indirect = false;
 
   bool operator==(const LearnedOutgoingEdge &other) const {
@@ -45,6 +48,7 @@ struct LearnedOutgoingEdge {
            resolution_status == other.resolution_status &&
            is_boundary == other.is_boundary &&
            is_terminal == other.is_terminal &&
+           is_controlled_return == other.is_controlled_return &&
            is_unresolved_indirect == other.is_unresolved_indirect;
   }
 };
@@ -61,6 +65,7 @@ struct BinaryRegionSnapshot {
   std::map<uint64_t, BinaryRegionBlockSummary> blocks_by_pc;
   std::vector<uint64_t> unresolved_edge_pcs;
   std::vector<uint64_t> boundary_target_pcs;
+  std::vector<uint64_t> controlled_return_unresolved_pcs;
   BinaryRegionClosureKind closure_kind = BinaryRegionClosureKind::kOpen;
   bool has_structural_loop = false;
   bool preserved_exact_call_fallthrough = false;

@@ -209,6 +209,8 @@ static std::string projectedRootFrontierReason(
     case FrontierWorkKind::kVmEnterBoundary:
     case FrontierWorkKind::kTerminalBoundary:
       return "boundary_target_unlifted";
+    case FrontierWorkKind::kIntraOwnerContinuation:
+    case FrontierWorkKind::kBoundaryContinuation:
     case FrontierWorkKind::kNativeCallBoundary:
       return edge.root_frontier_kind == VirtualRootFrontierKind::kCall
                  ? "call_target_unlifted"
@@ -276,6 +278,8 @@ static VirtualBoundaryKind projectedBoundaryKind(FrontierWorkKind kind) {
     case FrontierWorkKind::kNativeCallBoundary:
     case FrontierWorkKind::kTerminalBoundary:
       return VirtualBoundaryKind::kProtectedBoundary;
+    case FrontierWorkKind::kIntraOwnerContinuation:
+    case FrontierWorkKind::kBoundaryContinuation:
     case FrontierWorkKind::kLiftableBlock:
     case FrontierWorkKind::kUnknownExecutableTarget:
       return VirtualBoundaryKind::kUnknown;
@@ -303,12 +307,30 @@ static void applyProjectedExitSummary(VirtualExitSummary &exit,
       edge.boundary ? edge.boundary->continuation_vip_pc : std::nullopt;
   const auto continuation_pc =
       edge.boundary ? edge.boundary->continuation_pc : std::nullopt;
+  const auto controlled_return_pc =
+      edge.boundary ? edge.boundary->controlled_return_pc : std::nullopt;
   exit.disposition = disposition;
   exit.continuation_vip.resolved_pc = continuation_vip_pc;
   exit.continuation_vip.slot_id =
       edge.boundary ? edge.boundary->continuation_slot_id : std::nullopt;
   exit.continuation_vip.stack_cell_id =
       edge.boundary ? edge.boundary->continuation_stack_cell_id : std::nullopt;
+  exit.return_address_control.kind =
+      edge.boundary ? edge.boundary->return_address_control_kind
+                    : VirtualReturnAddressControlKind::kUnknown;
+  exit.return_address_control.original_return_pc = continuation_pc;
+  exit.return_address_control.return_slot_id =
+      edge.boundary ? edge.boundary->continuation_slot_id : std::nullopt;
+  exit.return_address_control.return_stack_cell_id =
+      edge.boundary ? edge.boundary->continuation_stack_cell_id : std::nullopt;
+  exit.return_address_control.resolved_effective_return_pc =
+      controlled_return_pc;
+  exit.return_address_control.suppresses_normal_fallthrough =
+      edge.boundary && edge.boundary->suppresses_normal_fallthrough;
+  if (controlled_return_pc) {
+    exit.return_address_control.effective_return_expr =
+        constantPcExpr(controlled_return_pc);
+  }
   if (exit.continuation_vip.stack_cell_id) {
     exit.continuation_vip.source_kind =
         VirtualInstructionPointerSourceKind::kStackCell;
@@ -320,6 +342,13 @@ static void applyProjectedExitSummary(VirtualExitSummary &exit,
       !continuation_vip_pc.has_value() && edge.vip_symbolic;
   exit.continuation_pc =
       continuation_pc.has_value() ? continuation_pc : continuation_vip_pc;
+  if (exit.return_address_control.suppresses_normal_fallthrough) {
+    exit.continuation_pc = controlled_return_pc;
+    if (controlled_return_pc)
+      exit.continuation_vip.resolved_pc = controlled_return_pc;
+    else
+      exit.continuation_vip.symbolic = true;
+  }
 
   switch (disposition) {
     case VirtualExitDisposition::kVmExitTerminal:
@@ -427,6 +456,8 @@ static bool projectFlowFactsFromSessionGraph(const SessionGraphState &graph,
         }
         switch (edge.kind) {
           case FrontierWorkKind::kLiftableBlock:
+          case FrontierWorkKind::kIntraOwnerContinuation:
+          case FrontierWorkKind::kBoundaryContinuation:
             successor.kind = VirtualSuccessorKind::kLiftedBlock;
             break;
           case FrontierWorkKind::kVmEnterBoundary:
@@ -471,6 +502,23 @@ static bool projectFlowFactsFromSessionGraph(const SessionGraphState &graph,
     callsite.continuation_stack_cell_id =
         edge.boundary ? edge.boundary->continuation_stack_cell_id
                       : std::nullopt;
+    callsite.return_address_control.kind =
+        edge.boundary ? edge.boundary->return_address_control_kind
+                      : VirtualReturnAddressControlKind::kUnknown;
+    callsite.return_address_control.original_return_pc = callsite.continuation_pc;
+    callsite.return_address_control.return_slot_id =
+        callsite.continuation_slot_id;
+    callsite.return_address_control.return_stack_cell_id =
+        callsite.continuation_stack_cell_id;
+    callsite.return_address_control.resolved_effective_return_pc =
+        edge.boundary ? edge.boundary->controlled_return_pc : std::nullopt;
+    callsite.return_address_control.suppresses_normal_fallthrough =
+        edge.boundary && edge.boundary->suppresses_normal_fallthrough;
+    if (callsite.return_address_control.resolved_effective_return_pc) {
+      callsite.return_address_control.effective_return_expr =
+          constantPcExpr(
+              callsite.return_address_control.resolved_effective_return_pc);
+    }
     callsite.vip.resolved_pc = edge.vip_pc;
     callsite.vip.symbolic = !edge.vip_pc.has_value() && edge.vip_symbolic;
     callsite.is_executable_in_image = edge.target_pc.has_value();

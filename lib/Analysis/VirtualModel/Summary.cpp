@@ -18,6 +18,28 @@
 
 namespace omill::virtual_model::detail {
 
+namespace {
+
+static VirtualStackOwnerKind classifyStackOwnerKindForName(
+    llvm::StringRef base_name, bool from_argument, bool from_alloca) {
+  if (from_argument)
+    return VirtualStackOwnerKind::kArgumentRoot;
+  if (from_alloca)
+    return VirtualStackOwnerKind::kAllocaRoot;
+  if (base_name.equals_insensitive("RSP") || base_name.equals_insensitive("SP"))
+    return VirtualStackOwnerKind::kNativeStackPointer;
+  if (base_name.equals_insensitive("RBP") || base_name.equals_insensitive("BP"))
+    return VirtualStackOwnerKind::kFramePointerLike;
+  if (base_name.contains_insensitive("stack") ||
+      base_name.contains_insensitive("vsp") ||
+      base_name.contains_insensitive("vm_sp")) {
+    return VirtualStackOwnerKind::kVmStackRootSlot;
+  }
+  return VirtualStackOwnerKind::kUnknown;
+}
+
+}  // namespace
+
 static uint64_t parseLeadingHex(llvm::StringRef text) {
   size_t hex_len = 0;
   while (hex_len < text.size() && llvm::isHexDigit(text[hex_len]))
@@ -291,6 +313,10 @@ static void collectExprReferencedStackCells(
     llvm::StringRef base_name = *expr.state_base_name;
     const bool from_argument = base_name.starts_with("arg");
     cells.push_back(VirtualStackCellSummary{
+        std::nullopt,
+        classifyStackOwnerKindForName(base_name, from_argument, !from_argument),
+        std::nullopt,
+        std::nullopt,
         *expr.state_base_name,
         *expr.state_offset,
         expr_width_bytes(expr),
@@ -597,6 +623,11 @@ VirtualHandlerSummary summarizeFunction(
 
   for (const auto &cell : stack_cell_accum) {
     summary.stack_cells.push_back(VirtualStackCellSummary{
+        std::nullopt,
+        classifyStackOwnerKindForName(std::get<0>(cell), std::get<7>(cell),
+                                      std::get<8>(cell)),
+        std::nullopt,
+        std::nullopt,
         std::get<0>(cell),
         std::get<1>(cell),
         std::get<2>(cell),
@@ -609,6 +640,100 @@ VirtualHandlerSummary summarizeFunction(
         std::nullopt,
         std::nullopt,
     });
+  }
+
+  for (const auto &slot : summary.state_slots) {
+    VirtualStackOwnerSummary owner;
+    owner.base_name = slot.base_name;
+    owner.base_offset = slot.offset;
+    owner.base_width = slot.width;
+    owner.kind = classifyStackOwnerKindForName(slot.base_name, slot.from_argument,
+                                               slot.from_alloca);
+    owner.owner_slot_id = slot.canonical_id;
+    owner.is_active_stack_owner =
+        owner.kind == VirtualStackOwnerKind::kNativeStackPointer ||
+        owner.kind == VirtualStackOwnerKind::kVmStackRootSlot;
+    if (owner.kind != VirtualStackOwnerKind::kUnknown)
+      summary.stack_owners.push_back(std::move(owner));
+  }
+
+  auto owner_slot_kind = [&](unsigned slot_id) {
+    for (const auto &owner : summary.stack_owners) {
+      if (owner.owner_slot_id && *owner.owner_slot_id == slot_id)
+        return owner.kind;
+    }
+    return VirtualStackOwnerKind::kUnknown;
+  };
+  auto mark_owner_active = [&](unsigned slot_id) {
+    for (auto &owner : summary.stack_owners) {
+      if (owner.owner_slot_id && *owner.owner_slot_id == slot_id)
+        owner.is_active_stack_owner = true;
+    }
+  };
+
+  for (auto &transfer : summary.state_transfers) {
+    if (!transfer.target_slot.canonical_id)
+      continue;
+    const unsigned target_slot_id = *transfer.target_slot.canonical_id;
+    std::optional<unsigned> source_slot_id;
+    std::optional<int64_t> constant_delta;
+    VirtualStackOwnerTransferKind transfer_kind =
+        VirtualStackOwnerTransferKind::kUnknown;
+    if (transfer.value.kind == VirtualExprKind::kStateSlot &&
+        transfer.value.slot_id) {
+      source_slot_id = transfer.value.slot_id;
+      transfer_kind = VirtualStackOwnerTransferKind::kCopy;
+    } else if ((transfer.value.kind == VirtualExprKind::kAdd ||
+                transfer.value.kind == VirtualExprKind::kSub) &&
+               transfer.value.operands.size() == 2 &&
+               transfer.value.operands[0].slot_id &&
+               transfer.value.operands[1].constant) {
+      source_slot_id = transfer.value.operands[0].slot_id;
+      constant_delta =
+          static_cast<int64_t>(*transfer.value.operands[1].constant) *
+          (transfer.value.kind == VirtualExprKind::kSub ? -1 : 1);
+      transfer_kind = transfer.value.kind == VirtualExprKind::kAdd
+                          ? VirtualStackOwnerTransferKind::kAddConst
+                          : VirtualStackOwnerTransferKind::kSubConst;
+    }
+    if (!source_slot_id)
+      continue;
+    if (owner_slot_kind(*source_slot_id) == VirtualStackOwnerKind::kUnknown)
+      continue;
+    if (owner_slot_kind(target_slot_id) == VirtualStackOwnerKind::kUnknown) {
+      VirtualStackOwnerSummary owner;
+      owner.owner_slot_id = target_slot_id;
+      owner.base_name = transfer.target_slot.base_name;
+      owner.base_offset = transfer.target_slot.offset;
+      owner.base_width = transfer.target_slot.width;
+      owner.kind = transfer.target_slot.base_name == "RBP" ||
+                           transfer.target_slot.base_name == "BP"
+                       ? VirtualStackOwnerKind::kFramePointerLike
+                       : VirtualStackOwnerKind::kDerivedOwner;
+      owner.derived_from_owner_slot_id = *source_slot_id;
+      owner.constant_delta = constant_delta;
+      summary.stack_owners.push_back(owner);
+    }
+    summary.stack_owner_transfers.push_back(
+        VirtualStackOwnerTransferSummary{*source_slot_id, target_slot_id,
+                                         transfer_kind, constant_delta});
+    if (llvm::StringRef(transfer.target_slot.base_name).equals_insensitive("RBP") ||
+        llvm::StringRef(transfer.target_slot.base_name).equals_insensitive("BP")) {
+      mark_owner_active(target_slot_id);
+    }
+  }
+
+  for (auto &cell : summary.stack_cells) {
+    for (const auto &owner : summary.stack_owners) {
+      if (owner.base_name == cell.base_name && owner.base_offset == cell.base_offset &&
+          owner.base_width == cell.base_width && owner.owner_slot_id) {
+        cell.owner_slot_id = owner.owner_slot_id;
+        cell.owner_kind = owner.kind;
+        cell.derived_from_owner_slot_id = owner.derived_from_owner_slot_id;
+        cell.owner_constant_delta = owner.constant_delta;
+        break;
+      }
+    }
   }
 
   std::sort(summary.called_boundaries.begin(), summary.called_boundaries.end());

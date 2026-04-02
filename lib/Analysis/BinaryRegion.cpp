@@ -12,6 +12,10 @@ const char *toString(EdgeRestatementKind kind) {
       return "proof_supplied";
     case EdgeRestatementKind::kBoundaryModeled:
       return "boundary_modeled";
+    case EdgeRestatementKind::kControlledReturn:
+      return "controlled_return";
+    case EdgeRestatementKind::kControlledReturnUnresolved:
+      return "controlled_return_unresolved";
     case EdgeRestatementKind::kUnresolvedIndirect:
       return "unresolved_indirect";
   }

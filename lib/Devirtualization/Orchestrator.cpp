@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -176,6 +177,180 @@ bool hasKnownMaterializedTarget(const llvm::Module &M, uint64_t pc) {
   return M.getFunction(trace_name) != nullptr;
 }
 
+bool canMaterializeFrontierTarget(const llvm::Module &M, uint64_t pc,
+                                  const FrontierCallbacks &callbacks) {
+  if (findLiftedOrCoveredFunctionByPC(const_cast<llvm::Module &>(M), pc))
+    return true;
+  if (!callbacks.has_defined_target)
+    return false;
+  bool has_defined_target = false;
+  __try {
+    has_defined_target = callbacks.has_defined_target(pc);
+  } __except (1) {
+    has_defined_target = false;
+  }
+  return has_defined_target;
+}
+
+std::optional<uint64_t> recoverCoveredTargetEntryPc(llvm::Module &M,
+                                                    uint64_t pc) {
+  if (!pc)
+    return std::nullopt;
+  if (auto *covered = findLiftedOrCoveredFunctionByPC(M, pc)) {
+    if (auto entry_pc = extractLiftUnitVA(*covered))
+      return entry_pc;
+  }
+  if (auto nearby_pc = findNearestCoveredLiftedOrBlockPC(M, pc, 0x80))
+    return nearby_pc;
+  return std::nullopt;
+}
+
+uint64_t safeNormalizeTargetPc(uint64_t pc, const FrontierCallbacks &callbacks) {
+  if (!callbacks.normalize_target_pc)
+    return pc;
+  uint64_t normalized_pc = pc;
+  __try {
+    normalized_pc = callbacks.normalize_target_pc(pc);
+  } __except (1) {
+    normalized_pc = pc;
+  }
+  return normalized_pc;
+}
+
+bool safeCanDecodeTarget(uint64_t pc, const FrontierCallbacks &callbacks) {
+  if (!callbacks.can_decode_target)
+    return false;
+  bool decodable = false;
+  __try {
+    decodable = callbacks.can_decode_target(pc);
+  } __except (1) {
+    decodable = false;
+  }
+  return decodable;
+}
+
+bool hasExactMaterializedTarget(llvm::Module &M, uint64_t pc) {
+  if (!pc)
+    return false;
+  if (auto *fn = findStructuralCodeTargetFunctionByPC(M, pc))
+    return !fn->isDeclaration();
+  if (auto *fn = findLiftedOrBlockFunctionByPC(M, pc))
+    return !fn->isDeclaration();
+  if (auto *fn = M.getFunction(liftedFunctionName(pc)))
+    return !fn->isDeclaration();
+  auto block_name = (llvm::Twine("blk_") + llvm::Twine::utohexstr(pc)).str();
+  if (auto *fn = M.getFunction(block_name))
+    return !fn->isDeclaration();
+  auto trace_name =
+      (llvm::Twine("block_") + llvm::Twine::utohexstr(pc)).str();
+  if (auto *fn = M.getFunction(trace_name))
+    return !fn->isDeclaration();
+  return false;
+}
+
+bool compatibilityRequested(const DevirtualizationCompatInputs &compat_inputs) {
+  return compat_inputs.requested_block_lift ||
+         compat_inputs.requested_generic_static;
+}
+
+bool requestedCompatBlockLiftMode(const DevirtualizationRequest &request,
+                                  const DevirtualizationCompatInputs &compat_inputs) {
+  return compat_inputs.requested_block_lift || request.force_devirtualize ||
+         compat_inputs.requested_generic_static ||
+         compat_inputs.env_generic_static;
+}
+
+bool requestedCompatGenericStatic(
+    const DevirtualizationRequest &request,
+    const DevirtualizationCompatInputs &compat_inputs) {
+  return request.force_devirtualize || compat_inputs.requested_generic_static ||
+         compat_inputs.env_generic_static;
+}
+
+std::optional<ContinuationEntryTransform> detectPushImmediateJumpTransform(
+    uint64_t pc, const FrontierCallbacks &callbacks) {
+  if (!pc || !callbacks.read_target_bytes)
+    return std::nullopt;
+
+  uint8_t bytes[16] = {};
+  bool read_ok = false;
+  __try {
+    read_ok = callbacks.read_target_bytes(pc, bytes, sizeof(bytes));
+  } __except (1) {
+    read_ok = false;
+  }
+  if (!read_ok || bytes[0] != 0x68)
+    return std::nullopt;
+
+  const uint32_t imm32 = static_cast<uint32_t>(bytes[1]) |
+                         (static_cast<uint32_t>(bytes[2]) << 8) |
+                         (static_cast<uint32_t>(bytes[3]) << 16) |
+                         (static_cast<uint32_t>(bytes[4]) << 24);
+  uint64_t jump_target = 0;
+  if (bytes[5] == 0xE9) {
+    const int32_t rel32 = static_cast<int32_t>(
+        static_cast<uint32_t>(bytes[6]) |
+        (static_cast<uint32_t>(bytes[7]) << 8) |
+        (static_cast<uint32_t>(bytes[8]) << 16) |
+        (static_cast<uint32_t>(bytes[9]) << 24));
+    jump_target = static_cast<uint64_t>(
+        static_cast<int64_t>(pc + 10) + static_cast<int64_t>(rel32));
+  } else if (bytes[5] == 0xEB) {
+    const int8_t rel8 = static_cast<int8_t>(bytes[6]);
+    jump_target = static_cast<uint64_t>(
+        static_cast<int64_t>(pc + 7) + static_cast<int64_t>(rel8));
+  } else {
+    return std::nullopt;
+  }
+
+  ContinuationEntryTransform transform;
+  transform.kind = ContinuationEntryTransformKind::kPushImmediateJump;
+  transform.entry_pc = pc;
+  transform.jump_target_pc = jump_target;
+  transform.pushed_immediate = imm32;
+  transform.suppresses_normal_fallthrough = true;
+  return transform;
+}
+
+std::optional<uint64_t> recoverBoundaryContinuationLiftTarget(
+    llvm::Module &M, uint64_t continuation_pc,
+    const FrontierCallbacks &callbacks) {
+  if (!continuation_pc)
+    return std::nullopt;
+
+  const uint64_t normalized_target_pc =
+      safeNormalizeTargetPc(continuation_pc, callbacks);
+  llvm::SmallVector<uint64_t, 2> primary_candidates;
+  primary_candidates.push_back(continuation_pc);
+  if (normalized_target_pc != continuation_pc)
+    primary_candidates.push_back(normalized_target_pc);
+
+  auto candidateReady = [&](uint64_t candidate_pc) {
+    if (!candidate_pc)
+      return false;
+    if (canMaterializeFrontierTarget(M, candidate_pc, callbacks))
+      return true;
+    return safeCanDecodeTarget(candidate_pc, callbacks);
+  };
+
+  for (uint64_t candidate_pc : primary_candidates) {
+    if (auto covered_pc = recoverCoveredTargetEntryPc(M, candidate_pc))
+      return covered_pc;
+    if (auto *nearby_structural =
+            findNearestStructuralCodeTargetFunctionByPC(M, candidate_pc, 0x80)) {
+      if (uint64_t structural_pc = extractStructuralCodeTargetPC(*nearby_structural))
+        return structural_pc;
+    }
+  }
+
+  for (uint64_t candidate_pc : primary_candidates) {
+    if (candidateReady(candidate_pc))
+      return candidate_pc;
+  }
+
+  return std::nullopt;
+}
+
 struct FunctionNormalizationSnapshot {
   unsigned unresolved_dispatch_intrinsics = 0;
   unsigned live_memory_intrinsics = 0;
@@ -275,10 +450,12 @@ std::string unresolvedExitStableSiteKey(const UnresolvedExitSite &site) {
 
 std::string frontierStableSiteKey(const FrontierWorkItem &item) {
   std::string key =
-      (item.identity.find("closure:") == 0
+      (item.from_boundary_continuation
+           ? "boundary-continuation"
+           : (item.identity.find("closure:") == 0
            ? "closure"
            : (item.owner_function == "__frontier__" ? "frontier"
-                                                    : "unresolved")) +
+                                                    : "unresolved"))) +
       std::string(":") + item.owner_function + ":" +
       std::to_string(item.site_index) + ":";
   if (item.site_pc)
@@ -292,10 +469,12 @@ std::string frontierStableSiteKey(const FrontierWorkItem &item) {
 
 std::string edgeStableSiteKey(const SessionEdgeFact &edge) {
   std::string key =
-      (edge.from_output_root_closure
+      (edge.from_boundary_continuation
+           ? "boundary-continuation"
+           : (edge.from_output_root_closure
            ? "closure"
            : (edge.owner_function == "__frontier__" ? "frontier"
-                                                    : "unresolved")) +
+                                                    : "unresolved"))) +
       std::string(":") + edge.owner_function + ":" +
       std::to_string(edge.site_index) + ":";
   if (edge.site_pc)
@@ -324,6 +503,147 @@ std::string buildVipContextFingerprint(
     fingerprint += identities[i];
   }
   return fingerprint;
+}
+
+unsigned boundaryContinuationSiteIndex(uint64_t boundary_pc,
+                                       uint64_t continuation_pc) {
+  const uint64_t mixed =
+      (boundary_pc >> 4u) ^ (continuation_pc << 1u) ^ 0x0b0d0000u;
+  return 0x80000000u | static_cast<unsigned>(mixed & 0x7fffffffu);
+}
+
+void promoteBoundaryReentrySeed(DevirtualizationSession &session,
+                                uint64_t target_pc) {
+  auto promoteItem = [&](FrontierWorkItem &edge_like) {
+    if (!edge_like.target_pc || *edge_like.target_pc != target_pc ||
+        edge_like.from_boundary_continuation) {
+      return;
+    }
+    edge_like.continuation_confidence = ContinuationConfidence::kTrusted;
+    edge_like.continuation_liveness = ContinuationLiveness::kLive;
+    edge_like.scheduling_class = FrontierSchedulingClass::kTrustedLive;
+    edge_like.continuation_rationale = "boundary_reentry_nearby_seed";
+    if (edge_like.status == FrontierWorkStatus::kInvalidated ||
+        edge_like.failure_reason == "quarantined_selector_arm_deferred") {
+      edge_like.status = FrontierWorkStatus::kPending;
+      edge_like.failure_reason.clear();
+    }
+  };
+
+  auto promoteEdge = [&](SessionEdgeFact &edge_like) {
+    if (!edge_like.target_pc || *edge_like.target_pc != target_pc ||
+        edge_like.from_boundary_continuation) {
+      return;
+    }
+    edge_like.continuation_confidence = ContinuationConfidence::kTrusted;
+    edge_like.continuation_liveness = ContinuationLiveness::kLive;
+    edge_like.scheduling_class = FrontierSchedulingClass::kTrustedLive;
+    edge_like.continuation_rationale = "boundary_reentry_nearby_seed";
+    if (edge_like.status == FrontierWorkStatus::kInvalidated ||
+        edge_like.failure_reason == "quarantined_selector_arm_deferred") {
+      edge_like.status = FrontierWorkStatus::kPending;
+      edge_like.failure_reason.clear();
+    }
+    ContinuationProof proof;
+    proof.edge_identity = edge_like.identity;
+    proof.raw_target_pc = *edge_like.target_pc;
+    proof.effective_target_pc =
+        edge_like.executable_target && edge_like.executable_target->effective_target_pc
+            ? edge_like.executable_target->effective_target_pc
+            : edge_like.target_pc;
+    proof.source_handler_name = edge_like.owner_function;
+    proof.provenance = ContinuationProvenance::kExecutablePlaceholder;
+    proof.confidence = ContinuationConfidence::kTrusted;
+    proof.liveness = ContinuationLiveness::kLive;
+    proof.scheduling_class = FrontierSchedulingClass::kTrustedLive;
+    proof.is_trusted_entry = true;
+    proof.resolution_kind = ContinuationResolutionKind::kTrustedEntry;
+    proof.import_disposition = ContinuationImportDisposition::kRetryable;
+    proof.selected_root_import_class = ChildImportClass::kClosedSliceRoot;
+    proof.rationale = "boundary_reentry_nearby_seed";
+    edge_like.continuation_proof = std::move(proof);
+    edge_like.is_dirty = true;
+  };
+
+  for (auto &existing : session.late_frontier_work_items)
+    promoteItem(existing);
+  for (auto &[identity, edge] : session.graph.edge_facts_by_identity) {
+    (void)identity;
+    promoteEdge(edge);
+  }
+}
+
+std::string makeBoundaryContinuationIdentity(
+    const BoundaryFact &boundary,
+    std::optional<uint64_t> continuation_target_pc = std::nullopt) {
+  const auto target_pc = continuation_target_pc ? continuation_target_pc
+                                                : boundary.continuation_pc;
+  if (!boundary.boundary_pc || !target_pc)
+    return {};
+  std::string identity = "boundary-continuation:";
+  identity += llvm::utohexstr(*boundary.boundary_pc);
+  identity += ":";
+  identity += llvm::utohexstr(*target_pc);
+  identity += ":";
+  if (boundary.native_target_pc)
+    identity += llvm::utohexstr(*boundary.native_target_pc);
+  identity += ":";
+  if (boundary.continuation_slot_id)
+    identity += std::to_string(*boundary.continuation_slot_id);
+  identity += ":";
+  if (boundary.continuation_stack_cell_id)
+    identity += std::to_string(*boundary.continuation_stack_cell_id);
+  return identity;
+}
+
+std::optional<uint64_t> effectiveBoundaryContinuationTarget(
+    const BoundaryFact &boundary) {
+  if (boundary.continuation_entry_transform &&
+      boundary.continuation_entry_transform->jump_target_pc) {
+    return boundary.continuation_entry_transform->jump_target_pc;
+  }
+  if (boundary.suppresses_normal_fallthrough)
+    return boundary.controlled_return_pc;
+  return boundary.continuation_pc;
+}
+
+FrontierWorkItem makeBoundaryContinuationWorkItem(const BoundaryFact &boundary,
+                                                  llvm::StringRef source_name,
+                                                  std::optional<uint64_t> source_pc) {
+  FrontierWorkItem item;
+  const auto continuation_target_pc = effectiveBoundaryContinuationTarget(boundary);
+  if (!continuation_target_pc)
+    return item;
+  item.owner_function =
+      source_name.empty() ? "__boundary_continuation__" : source_name.str();
+  item.site_index = boundary.boundary_pc
+                        ? boundaryContinuationSiteIndex(*boundary.boundary_pc,
+                                                         *continuation_target_pc)
+                        : boundaryContinuationSiteIndex(*continuation_target_pc,
+                                                         *continuation_target_pc);
+  item.site_pc = source_pc ? source_pc : boundary.boundary_pc;
+  item.target_pc = continuation_target_pc;
+  item.root_frontier_kind = VirtualRootFrontierKind::kCall;
+  item.boundary = boundary;
+  item.continuation_confidence = ContinuationConfidence::kTrusted;
+  item.continuation_liveness = ContinuationLiveness::kLive;
+  item.scheduling_class = FrontierSchedulingClass::kTrustedLive;
+  item.continuation_rationale = "boundary_reentry_continuation";
+  item.kind = (boundary.covered_entry_pc.has_value() ||
+               boundary.continuation_entry_transform.has_value())
+                  ? FrontierWorkKind::kIntraOwnerContinuation
+                  : FrontierWorkKind::kBoundaryContinuation;
+  item.status = FrontierWorkStatus::kPending;
+  item.identity = makeBoundaryContinuationIdentity(boundary, continuation_target_pc);
+  item.from_boundary_continuation = true;
+  ExecutableTargetFact fact;
+  fact.raw_target_pc = *continuation_target_pc;
+  fact.effective_target_pc = *continuation_target_pc;
+  fact.kind = ExecutableTargetKind::kExecutablePlaceholder;
+  fact.trust = ExecutableTargetTrust::kTrustedEntry;
+  item.executable_target = fact;
+  classifyContinuationCandidate(item);
+  return item;
 }
 
 FrontierWorkItem makeFrontierWorkItem(const UnresolvedExitSite &site) {
@@ -422,6 +742,7 @@ FrontierWorkItem frontierWorkItemFromEdgeFact(const SessionEdgeFact &edge) {
   item.retry_count = edge.retry_count;
   item.failure_reason = edge.failure_reason;
   item.identity = edge.identity;
+  item.from_boundary_continuation = edge.from_boundary_continuation;
   if (edge.continuation_proof) {
     item.continuation_confidence = edge.continuation_proof->confidence;
     item.continuation_liveness = edge.continuation_proof->liveness;
@@ -451,12 +772,18 @@ void syncEdgeFactFromFrontierWorkItem(SessionEdgeFact &edge,
   edge.status = item.status;
   edge.retry_count = item.retry_count;
   edge.failure_reason = item.failure_reason;
+  edge.from_boundary_continuation = item.from_boundary_continuation;
   edge.is_dirty = false;
 }
 
 ContinuationProvenance classifyContinuationProvenance(
     const FrontierWorkItem &item) {
   if (item.boundary) {
+    if (item.boundary->suppresses_normal_fallthrough &&
+        item.boundary->return_address_control_kind !=
+            VirtualReturnAddressControlKind::kUnknown) {
+      return ContinuationProvenance::kReturnAddressControlled;
+    }
     switch (boundaryDisposition(item.boundary)) {
       case VirtualExitDisposition::kVmEnter:
       case VirtualExitDisposition::kNestedVmEnter:
@@ -490,6 +817,8 @@ ContinuationResolutionKind classifyContinuationResolutionKind(
       return ContinuationResolutionKind::kExactFallthrough;
     case ContinuationProvenance::kInvalidatedExecutableEntry:
       return ContinuationResolutionKind::kInvalidatedExecutableEntry;
+    case ContinuationProvenance::kReturnAddressControlled:
+      return ContinuationResolutionKind::kTrustedEntry;
     case ContinuationProvenance::kNativeBoundary:
     case ContinuationProvenance::kVmEnterBoundary:
       return ContinuationResolutionKind::kBoundaryModeled;
@@ -563,6 +892,10 @@ ContinuationProof buildContinuationProof(const ContinuationCandidate &candidate)
     proof.invalidated_entry_failed_pc =
         candidate.executable_target->invalidated_entry_failed_pc;
   }
+  proof.return_address_control_kind = candidate.return_address_control_kind;
+  proof.controlled_return_pc = candidate.controlled_return_pc;
+  proof.suppresses_normal_fallthrough =
+      candidate.suppresses_normal_fallthrough;
   proof.resolution_kind = classifyContinuationResolutionKind(candidate);
   proof.import_disposition =
       classifyContinuationImportDisposition(candidate, proof.resolution_kind);
@@ -594,6 +927,12 @@ void classifyContinuationCandidate(FrontierWorkItem &item) {
       item.continuation_liveness = ContinuationLiveness::kLive;
       item.scheduling_class = FrontierSchedulingClass::kTrustedLive;
       item.continuation_rationale = "exact_fallthrough";
+      return;
+    case ContinuationProvenance::kReturnAddressControlled:
+      item.continuation_confidence = ContinuationConfidence::kTrusted;
+      item.continuation_liveness = ContinuationLiveness::kLive;
+      item.scheduling_class = FrontierSchedulingClass::kTrustedLive;
+      item.continuation_rationale = "return_address_controlled";
       return;
     case ContinuationProvenance::kNativeBoundary:
     case ContinuationProvenance::kVmEnterBoundary:
@@ -1190,9 +1529,21 @@ std::optional<ContinuationCandidate> continuationCandidateFromEdge(
   candidate.liveness = edge.continuation_liveness;
   candidate.scheduling_class = edge.scheduling_class;
   candidate.rationale = edge.continuation_rationale;
+  if (edge.boundary) {
+    candidate.return_address_control_kind =
+        edge.boundary->return_address_control_kind;
+    candidate.controlled_return_pc = edge.boundary->controlled_return_pc;
+    candidate.suppresses_normal_fallthrough =
+        edge.boundary->suppresses_normal_fallthrough;
+  }
   if (edge.executable_target) {
     candidate.effective_target_pc = edge.executable_target->effective_target_pc;
     candidate.canonical_owner_pc = edge.executable_target->canonical_owner_pc;
+  }
+  if ((!candidate.effective_target_pc || candidate.provenance ==
+                                              ContinuationProvenance::kReturnAddressControlled) &&
+      candidate.controlled_return_pc) {
+    candidate.effective_target_pc = candidate.controlled_return_pc;
   }
   if (edge.continuation_proof)
     candidate.proof = edge.continuation_proof;
@@ -1232,6 +1583,8 @@ ProtectorModel buildProtectorModelFromSession(
     for (size_t index : indices) {
       const auto &candidate = model.continuation_candidates[index];
       if (candidate.provenance == ContinuationProvenance::kExactFallthrough ||
+          candidate.provenance ==
+              ContinuationProvenance::kReturnAddressControlled ||
           candidate.provenance == ContinuationProvenance::kNativeBoundary ||
           candidate.provenance == ContinuationProvenance::kVmEnterBoundary ||
           candidate.scheduling_class == FrontierSchedulingClass::kTrustedLive) {
@@ -1244,7 +1597,19 @@ ProtectorModel buildProtectorModelFromSession(
 
     for (size_t index : indices) {
       auto &candidate = model.continuation_candidates[index];
+      const bool preserve_existing_trusted_proof =
+          candidate.proof && candidate.proof->confidence ==
+                                 ContinuationConfidence::kTrusted &&
+          candidate.proof->liveness == ContinuationLiveness::kLive &&
+          candidate.proof->scheduling_class ==
+              FrontierSchedulingClass::kTrustedLive &&
+          candidate.proof->resolution_kind !=
+              ContinuationResolutionKind::kQuarantinedSelectorArm &&
+          candidate.proof->import_disposition !=
+              ContinuationImportDisposition::kDeferred;
       if (candidate.provenance == ContinuationProvenance::kExactFallthrough ||
+          candidate.provenance ==
+              ContinuationProvenance::kReturnAddressControlled ||
           candidate.provenance == ContinuationProvenance::kNativeBoundary ||
           candidate.provenance == ContinuationProvenance::kVmEnterBoundary) {
         candidate.confidence = ContinuationConfidence::kTrusted;
@@ -1254,6 +1619,8 @@ ProtectorModel buildProtectorModelFromSession(
           candidate.rationale = "trusted_structural_target";
         continue;
       }
+      if (preserve_existing_trusted_proof)
+        continue;
       if (candidate.provenance == ContinuationProvenance::kSelectorDerived ||
           candidate.provenance ==
               ContinuationProvenance::kInvalidatedExecutableEntry ||
@@ -1664,11 +2031,26 @@ llvm::Function *getOrCreateDirectNativeTargetDecl(llvm::Module &M,
   if (!callee) {
     callee = llvm::Function::Create(fn_ty, llvm::Function::ExternalLinkage,
                                     name, M);
+    BoundaryFact fact;
+    fact.boundary_pc = boundary_pc;
+    fact.native_target_pc = target_pc;
+    fact.kind = BoundaryKind::kNativeBoundary;
+    writeBoundaryFact(*callee, fact);
+    return callee;
   }
-  BoundaryFact fact;
-  fact.boundary_pc = boundary_pc;
-  fact.native_target_pc = target_pc;
-  fact.kind = BoundaryKind::kNativeBoundary;
+
+  // Native-target placeholder names are keyed by the direct native target PC,
+  // so a child continuation slice may legitimately reference the same symbol
+  // name as the parent module. Preserve any parent-owned boundary identity
+  // that is already present on the existing declaration and only backfill
+  // fields that are still missing.
+  BoundaryFact fact = readBoundaryFact(*callee).value_or(BoundaryFact{});
+  if (!fact.boundary_pc)
+    fact.boundary_pc = boundary_pc;
+  if (!fact.native_target_pc)
+    fact.native_target_pc = target_pc;
+  if (fact.kind == BoundaryKind::kUnknown)
+    fact.kind = BoundaryKind::kNativeBoundary;
   writeBoundaryFact(*callee, fact);
   return callee;
 }
@@ -1676,7 +2058,8 @@ llvm::Function *getOrCreateDirectNativeTargetDecl(llvm::Module &M,
 bool materializeNativeBoundaryReenterStub(llvm::Function &function,
                                           const FrontierWorkItem &item,
                                           const FrontierCallbacks &callbacks,
-                                          const NativeBoundaryDecodeSummary &summary) {
+                                          const NativeBoundaryDecodeSummary &summary,
+                                          const DevirtualizationSession *session) {
   if (!item.target_pc || !summary.direct_call_target_pc ||
       !summary.continuation_pc || !summary.has_direct_call_fallthrough) {
     return false;
@@ -1684,9 +2067,82 @@ bool materializeNativeBoundaryReenterStub(llvm::Function &function,
   if (function.arg_size() < 3)
     return false;
 
-  auto *continuation =
-      findLiftedOrBlockFunctionByPC(*function.getParent(), *summary.continuation_pc);
-  if (!continuation || continuation->isDeclaration())
+  auto findImportedVmEnterRoot = [&](uint64_t target_pc) -> llvm::Function * {
+    if (!session)
+      return nullptr;
+    if (auto imported_it = session->imported_vm_enter_child_roots.find(target_pc);
+        imported_it != session->imported_vm_enter_child_roots.end()) {
+      if (auto *imported = function.getParent()->getFunction(imported_it->second);
+          imported && !imported->isDeclaration()) {
+        return imported;
+      }
+    }
+    return nullptr;
+  };
+  auto preferImportedVmEnterRoot =
+      [&](llvm::Function *candidate,
+          std::optional<uint64_t> candidate_pc = std::nullopt)
+      -> llvm::Function * {
+    if (!candidate)
+      return nullptr;
+    if (candidate_pc) {
+      if (auto *imported = findImportedVmEnterRoot(*candidate_pc))
+        return imported;
+    }
+    const uint64_t structural_pc = extractStructuralCodeTargetPC(*candidate);
+    if (structural_pc != 0) {
+      if (auto *imported = findImportedVmEnterRoot(structural_pc))
+        return imported;
+    }
+    if (auto fact = readBoundaryFact(*candidate)) {
+      if (fact->boundary_pc) {
+        if (auto *imported = findImportedVmEnterRoot(*fact->boundary_pc))
+          return imported;
+      }
+    }
+    return candidate;
+  };
+
+  auto *continuation = findLiftedOrCoveredFunctionByPC(
+      *function.getParent(), *summary.continuation_pc);
+  if (!continuation) {
+    continuation = preferImportedVmEnterRoot(
+        findStructuralCodeTargetFunctionByPC(*function.getParent(),
+                                             *summary.continuation_pc),
+        *summary.continuation_pc);
+  }
+  if (!continuation) {
+    if (auto nearby_pc = findNearestCoveredLiftedOrBlockPC(
+            *function.getParent(), *summary.continuation_pc, 0x80)) {
+      continuation =
+          findLiftedOrCoveredFunctionByPC(*function.getParent(), *nearby_pc);
+      if (!continuation) {
+        continuation = preferImportedVmEnterRoot(
+            findStructuralCodeTargetFunctionByPC(*function.getParent(),
+                                                 *nearby_pc),
+            *nearby_pc);
+      }
+    }
+  }
+  if (!continuation) {
+    continuation = preferImportedVmEnterRoot(
+        findNearestStructuralCodeTargetFunctionByPC(
+            *function.getParent(), *summary.continuation_pc, 0x80));
+  }
+  if (!continuation)
+    return false;
+  const bool modeled_vm_enter_placeholder =
+      continuation->isDeclaration() &&
+      [&]() {
+        if (auto fact = readBoundaryFact(*continuation)) {
+          return fact->is_vm_enter || fact->is_nested_vm_enter ||
+                 fact->kind == BoundaryKind::kVmEnterBoundary ||
+                 fact->kind == BoundaryKind::kNestedVmEnterBoundary;
+        }
+        return false;
+      }();
+  if (continuation == &function ||
+      (continuation->isDeclaration() && !modeled_vm_enter_placeholder))
     return false;
   if (continuation->arg_size() < 3)
     return false;
@@ -1733,12 +2189,22 @@ bool materializeNativeBoundaryReenterStub(llvm::Function &function,
 llvm::FunctionType *inferFrontierFunctionType(llvm::Module &M,
                                               const FrontierWorkItem &item) {
   auto *owner = M.getFunction(item.owner_function);
+  const auto boundary_native_target_pc =
+      item.boundary ? item.boundary->native_target_pc : std::nullopt;
   if (owner && item.target_pc) {
     for (auto &BB : *owner) {
       for (auto &I : BB) {
         auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
         if (!call)
           continue;
+        if (auto *callee = call->getCalledFunction()) {
+          const uint64_t structural_target = extractStructuralCodeTargetPC(*callee);
+          if (structural_target == *item.target_pc ||
+              (boundary_native_target_pc &&
+               structural_target == *boundary_native_target_pc)) {
+            return call->getFunctionType();
+          }
+        }
         std::optional<uint64_t> call_target;
         if (auto *callee = call->getCalledFunction()) {
           if ((callee->getName() == "__remill_function_call" ||
@@ -1777,22 +2243,36 @@ llvm::FunctionType *inferFrontierFunctionType(llvm::Module &M,
 
 llvm::Function *getOrInsertNativeBoundaryDecl(llvm::Module &M,
                                               const FrontierWorkItem &item,
-                                              const FrontierCallbacks &callbacks) {
+                                              const FrontierCallbacks &callbacks,
+                                              const DevirtualizationSession *session) {
   if (!item.target_pc)
     return nullptr;
-  const auto native_summary =
-      decodeNativeBoundarySummary(*item.target_pc, callbacks);
-  if (auto *existing = M.getFunction(liftedFunctionName(*item.target_pc))) {
+  const uint64_t decl_target_pc =
+      item.boundary && item.boundary->native_target_pc
+          ? *item.boundary->native_target_pc
+          : *item.target_pc;
+  auto native_summary = decodeNativeBoundarySummary(*item.target_pc, callbacks);
+  if (item.boundary && item.boundary->continuation_pc)
+    native_summary.continuation_pc = item.boundary->continuation_pc;
+  if (auto *existing = M.getFunction(liftedFunctionName(decl_target_pc))) {
     if (!materializeNativeBoundaryReenterStub(*existing, item, callbacks,
-                                              native_summary) &&
+                                              native_summary, session) &&
         !existing->isDeclaration()) {
       existing->deleteBody();
     }
     return existing;
   }
-  if (auto *existing = findLiftedOrBlockFunctionByPC(M, *item.target_pc)) {
+  if (auto *existing = findStructuralCodeTargetFunctionByPC(M, decl_target_pc)) {
     if (!materializeNativeBoundaryReenterStub(*existing, item, callbacks,
-                                              native_summary) &&
+                                              native_summary, session) &&
+        !existing->isDeclaration()) {
+      existing->deleteBody();
+    }
+    return existing;
+  }
+  if (auto *existing = findLiftedOrBlockFunctionByPC(M, decl_target_pc)) {
+    if (!materializeNativeBoundaryReenterStub(*existing, item, callbacks,
+                                              native_summary, session) &&
         !existing->isDeclaration()) {
       existing->deleteBody();
     }
@@ -1802,12 +2282,15 @@ llvm::Function *getOrInsertNativeBoundaryDecl(llvm::Module &M,
   if (!fn_ty)
     return nullptr;
   auto *decl = llvm::Function::Create(fn_ty, llvm::Function::ExternalLinkage,
-                                      liftedFunctionName(*item.target_pc), M);
+                                      liftedFunctionName(decl_target_pc), M);
   (void)materializeNativeBoundaryReenterStub(*decl, item, callbacks,
-                                             native_summary);
+                                             native_summary, session);
   BoundaryFact fact = item.boundary.value_or(BoundaryFact{});
   fact.boundary_pc = item.target_pc;
-  if (native_summary.direct_call_target_pc)
+  if (item.boundary && item.boundary->native_target_pc)
+    fact.native_target_pc = item.boundary->native_target_pc;
+  if (native_summary.direct_call_target_pc &&
+      !(item.boundary && item.boundary->native_target_pc))
     fact.native_target_pc = *native_summary.direct_call_target_pc;
   if (native_summary.continuation_pc)
     fact.continuation_pc = *native_summary.continuation_pc;
@@ -1883,11 +2366,15 @@ void annotateNativeBoundaryFunction(llvm::Function &function,
                                     const FrontierCallbacks &callbacks) {
   if (!item.target_pc)
     return;
-  const auto native_summary =
-      decodeNativeBoundarySummary(*item.target_pc, callbacks);
+  auto native_summary = decodeNativeBoundarySummary(*item.target_pc, callbacks);
+  if (item.boundary && item.boundary->continuation_pc)
+    native_summary.continuation_pc = item.boundary->continuation_pc;
   BoundaryFact fact = item.boundary.value_or(BoundaryFact{});
   fact.boundary_pc = item.target_pc;
-  if (native_summary.direct_call_target_pc)
+  if (item.boundary && item.boundary->native_target_pc)
+    fact.native_target_pc = item.boundary->native_target_pc;
+  if (native_summary.direct_call_target_pc &&
+      !(item.boundary && item.boundary->native_target_pc))
     fact.native_target_pc = *native_summary.direct_call_target_pc;
   if (native_summary.continuation_pc)
     fact.continuation_pc = *native_summary.continuation_pc;
@@ -1927,6 +2414,15 @@ FrontierWorkKind classifyFrontierWorkItem(const FrontierWorkItem &item,
                                           const FrontierCallbacks &callbacks) {
   if (!item.target_pc)
     return FrontierWorkKind::kUnknownExecutableTarget;
+  if (item.from_boundary_continuation &&
+      (item.kind == FrontierWorkKind::kIntraOwnerContinuation ||
+       (item.boundary &&
+        (item.boundary->covered_entry_pc.has_value() ||
+         item.boundary->continuation_entry_transform.has_value())))) {
+    return FrontierWorkKind::kIntraOwnerContinuation;
+  }
+  if (item.from_boundary_continuation)
+    return FrontierWorkKind::kBoundaryContinuation;
   const uint64_t target_pc = *item.target_pc;
   const auto *fact = item.executable_target ? &*item.executable_target : nullptr;
   const VirtualExitDisposition exit_disposition =
@@ -2002,7 +2498,9 @@ void mergeFrontierItems(
       edge.is_dirty = true;
       edge.from_output_root_closure = item.identity.find("closure:") == 0;
       edge.from_vm_continuation = item.owner_function == "__frontier__";
-      edge.from_unresolved_exit = !edge.from_output_root_closure;
+      edge.from_boundary_continuation = item.from_boundary_continuation;
+      edge.from_unresolved_exit =
+          !edge.from_output_root_closure && !edge.from_boundary_continuation;
       edge_facts.emplace(item.identity, std::move(edge));
       if (summary)
         ++summary->discovered;
@@ -2034,8 +2532,11 @@ void mergeFrontierItems(
         edge.from_output_root_closure || item.identity.find("closure:") == 0;
     edge.from_vm_continuation =
         edge.from_vm_continuation || item.owner_function == "__frontier__";
+    edge.from_boundary_continuation =
+        edge.from_boundary_continuation || item.from_boundary_continuation;
     edge.from_unresolved_exit =
-        edge.from_unresolved_exit || item.identity.find("closure:") != 0;
+        edge.from_unresolved_exit ||
+        (!item.from_boundary_continuation && item.identity.find("closure:") != 0);
   }
 }
 
@@ -2604,7 +3105,8 @@ DevirtualizationOrchestrator::DevirtualizationOrchestrator(
 }
 
 DevirtualizationDetectionResult DevirtualizationOrchestrator::detect(
-    const llvm::Module &M, const DevirtualizationRequest &request) const {
+    const llvm::Module &M, const DevirtualizationRequest &request,
+    const DevirtualizationCompatInputs &compat_inputs) const {
   DevirtualizationDetectionResult result;
   result.forced = request.force_devirtualize;
   result.seed_roots = request.root_vas;
@@ -2617,8 +3119,7 @@ DevirtualizationDetectionResult DevirtualizationOrchestrator::detect(
       moduleHasGenericStaticDevirtualizationCandidates(M);
   const bool root_local_candidates =
       moduleHasRootLocalGenericStaticDevirtualizationShape(M);
-  const bool compatibility_requested =
-      request.deprecated_block_lift || request.deprecated_generic_static;
+  const bool compatibility_requested = compatibilityRequested(compat_inputs);
 
   if (request.force_devirtualize) {
     result.should_devirtualize = true;
@@ -2663,9 +3164,10 @@ DevirtualizationDetectionResult DevirtualizationOrchestrator::detect(
 }
 
 DevirtualizationExecutionPlan DevirtualizationOrchestrator::buildExecutionPlan(
-    const llvm::Module &M, const DevirtualizationRequest &request) {
+    const llvm::Module &M, const DevirtualizationRequest &request,
+    const DevirtualizationCompatInputs &compat_inputs) {
   DevirtualizationExecutionPlan plan;
-  plan.detection = detect(M, request);
+  plan.detection = detect(M, request, compat_inputs);
   plan.enable_devirtualization = plan.detection.should_devirtualize;
   plan.verify_rewrites = request.verify_rewrites;
 
@@ -2683,6 +3185,109 @@ DevirtualizationExecutionPlan DevirtualizationOrchestrator::buildExecutionPlan(
   plan.use_generic_static_devirtualization = policy_.force_generic_static;
   plan.disable_legacy_vm_path = policy_.disable_legacy_vm_path;
   return plan;
+}
+
+DevirtualizationDriverCompatPlan
+DevirtualizationOrchestrator::buildDriverCompatPlan(
+    const llvm::Module &M, const DevirtualizationRequest &request,
+    const DevirtualizationCompatInputs &compat_inputs) {
+  DevirtualizationDriverCompatPlan compat_plan;
+  compat_plan.execution = buildExecutionPlan(M, request, compat_inputs);
+  compat_plan.use_block_lift =
+      requestedCompatBlockLiftMode(request, compat_inputs) ||
+      compat_plan.execution.use_block_lift;
+  compat_plan.generic_static_requested =
+      requestedCompatGenericStatic(request, compat_inputs) ||
+      compat_plan.execution.use_generic_static_devirtualization;
+  compat_plan.use_generic_static = compat_plan.generic_static_requested;
+  compat_plan.verify_generic_static =
+      compat_inputs.env_verify_generic_static || request.verify_rewrites ||
+      compat_plan.execution.verify_rewrites;
+  compat_plan.enable_legacy_vm_mode = false;
+  if (compat_inputs.requested_vm_entry_mode) {
+    compat_plan.suppress_legacy_vm_mode = true;
+    compat_plan.legacy_vm_mode_reason =
+        DevirtualizationCompatReason::kLegacyVmPathSuppressed;
+  }
+
+  compat_plan.root_local_generic_static_devirtualization_shape =
+      moduleHasRootLocalGenericStaticDevirtualizationShape(M);
+
+  const bool known_unstable_large_default_export_root =
+      compat_inputs.requested_root_is_export &&
+      compat_inputs.largest_executable_section_size >= (1ull << 20) &&
+      (compat_inputs.requested_root_rva == 0x2400 ||
+       compat_inputs.requested_root_rva == 0x23F0);
+
+  if (compat_plan.use_generic_static &&
+      shouldUseFastPlainExportRootFallback(
+          compat_plan.enable_legacy_vm_mode,
+          compat_inputs.requested_root_is_export, compat_plan.use_block_lift,
+          compat_plan.generic_static_requested,
+          compat_inputs.env_force_generic_static,
+          compat_inputs.largest_executable_section_size,
+          compat_inputs.executable_section_count) &&
+      !compat_inputs.export_root_has_hidden_entry_seed_exprs) {
+    compat_plan.use_generic_static = false;
+    compat_plan.verify_generic_static = false;
+    compat_plan.export_root_fallback_mode =
+        DevirtualizationExportRootFallbackMode::kFastPlain;
+    compat_plan.generic_static_reason =
+        DevirtualizationCompatReason::kFastPlainExportRootFallback;
+  } else if (compat_plan.use_generic_static &&
+             shouldUseStableNoGsdExportRootFallback(
+                 compat_plan.enable_legacy_vm_mode,
+                 compat_inputs.requested_root_is_export,
+                 compat_plan.use_block_lift,
+                 compat_plan.generic_static_requested,
+                 compat_inputs.env_force_generic_static,
+                 compat_inputs.largest_executable_section_size) &&
+             known_unstable_large_default_export_root) {
+    compat_plan.use_generic_static = false;
+    compat_plan.verify_generic_static = false;
+    compat_plan.export_root_fallback_mode =
+        DevirtualizationExportRootFallbackMode::kStableLarge;
+    compat_plan.generic_static_reason =
+        DevirtualizationCompatReason::kStableLargeExportRootFallback;
+  } else if (
+      compat_plan.use_generic_static &&
+      shouldAutoSkipGenericStaticDevirtualizationForRoot(
+          M, compat_plan.enable_legacy_vm_mode,
+          compat_inputs.requested_root_is_export,
+          compat_inputs.env_force_generic_static,
+          compat_plan.root_local_generic_static_devirtualization_shape)) {
+    compat_plan.use_generic_static = false;
+    compat_plan.verify_generic_static = false;
+    compat_plan.generic_static_reason =
+        DevirtualizationCompatReason::kNoVmLikeCandidates;
+  }
+
+  compat_plan.auto_skip_always_inline =
+      shouldAutoSkipAlwaysInlineForRoot(
+          compat_plan.enable_legacy_vm_mode,
+          compat_inputs.requested_root_is_export,
+          compat_plan.generic_static_requested, compat_plan.use_generic_static,
+          compat_plan.root_local_generic_static_devirtualization_shape) ||
+      compat_plan.export_root_fallback_mode ==
+          DevirtualizationExportRootFallbackMode::kStableLarge;
+  if (compat_plan.auto_skip_always_inline) {
+    compat_plan.always_inline_reason =
+        compat_plan.export_root_fallback_mode ==
+                DevirtualizationExportRootFallbackMode::kStableLarge
+            ? DevirtualizationCompatReason::kStableLargeExportRootFallback
+            : DevirtualizationCompatReason::kNoRootLocalDevirtShape;
+  }
+
+  compat_plan.use_pre_abi_noabi_cleanup =
+      !compat_inputs.no_abi && compat_plan.use_generic_static;
+  if (compat_plan.use_pre_abi_noabi_cleanup) {
+    compat_plan.pre_abi_cleanup_reason =
+        DevirtualizationCompatReason::kPreAbiNoAbiCleanup;
+  }
+  compat_plan.no_abi_mode =
+      compat_inputs.no_abi || compat_plan.use_pre_abi_noabi_cleanup;
+
+  return compat_plan;
 }
 
 void DevirtualizationOrchestrator::refreshSessionState(const llvm::Module &M) {
@@ -2708,10 +3313,33 @@ void DevirtualizationOrchestrator::applyExecutionPlan(
     opts.vm_devirtualize = false;
 }
 
+void DevirtualizationOrchestrator::applyDriverCompatPlan(
+    const DevirtualizationDriverCompatPlan &plan, PipelineOptions &opts) const {
+  applyExecutionPlan(plan.execution, opts);
+  opts.use_block_lifting = opts.use_block_lifting || plan.use_block_lift;
+  opts.generic_static_devirtualize = plan.use_generic_static;
+  opts.verify_generic_static_devirtualization = plan.verify_generic_static;
+  opts.vm_devirtualize = plan.enable_legacy_vm_mode;
+  opts.no_abi_mode = plan.no_abi_mode;
+}
+
 FrontierAdvanceSummary DevirtualizationOrchestrator::discoverFrontierWork(
     const llvm::Module &M, const FrontierCallbacks &callbacks,
     FrontierDiscoveryPhase phase) {
   FrontierAdvanceSummary summary;
+  if (phase == FrontierDiscoveryPhase::kUnresolvedOnly) {
+    const bool has_pending_boundary_continuation =
+        llvm::any_of(session_.late_frontier_work_items, [](const FrontierWorkItem &item) {
+          return item.from_boundary_continuation &&
+                 item.status == FrontierWorkStatus::kPending;
+        });
+    if (has_pending_boundary_continuation) {
+      refreshFrontierCompatibilityViews(session_);
+      summary.pending =
+          static_cast<unsigned>(session_.late_frontier_work_items.size());
+      return summary;
+    }
+  }
   refreshSessionCoreState(session_, M);
 
   if (phase == FrontierDiscoveryPhase::kUnresolvedOnly ||
@@ -2758,6 +3386,143 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::discoverFrontierWork(
   return summary;
 }
 
+bool DevirtualizationOrchestrator::enqueueBoundaryContinuationWork(
+    const llvm::Module &M, const BoundaryFact &boundary,
+    llvm::StringRef source_name, std::optional<uint64_t> source_pc) {
+  if (!boundary.continuation_pc)
+    return false;
+  FrontierWorkItem item =
+      makeBoundaryContinuationWorkItem(boundary, source_name, source_pc);
+  if (!item.target_pc || item.identity.empty())
+    return false;
+
+  const auto findNearbyTrackedSeed = [&](uint64_t continuation_pc)
+      -> std::optional<uint64_t> {
+    constexpr uint64_t kNearbySeedWindow = 0x40;
+    std::optional<uint64_t> best_target;
+    uint64_t best_distance = std::numeric_limits<uint64_t>::max();
+    auto consider_target = [&](std::optional<uint64_t> maybe_target,
+                               bool from_boundary_continuation) {
+      if (!maybe_target || from_boundary_continuation)
+        return;
+      const uint64_t candidate_pc = *maybe_target;
+      if (candidate_pc > continuation_pc)
+        return;
+      const uint64_t distance = continuation_pc - candidate_pc;
+      if (distance > kNearbySeedWindow)
+        return;
+      if (!best_target || distance < best_distance) {
+        best_target = candidate_pc;
+        best_distance = distance;
+      }
+    };
+
+    for (const auto &existing : session_.late_frontier_work_items)
+      consider_target(existing.target_pc, existing.from_boundary_continuation);
+    for (const auto &[identity, edge] : session_.graph.edge_facts_by_identity) {
+      (void)identity;
+      consider_target(edge.target_pc, edge.from_boundary_continuation);
+    }
+    return best_target;
+  };
+
+  if (item.executable_target) {
+    if (auto covered_pc =
+            recoverCoveredTargetEntryPc(const_cast<llvm::Module &>(M),
+                                        *item.target_pc)) {
+      item.target_pc = *covered_pc;
+      item.site_index = boundary.boundary_pc
+                            ? boundaryContinuationSiteIndex(*boundary.boundary_pc,
+                                                             *covered_pc)
+                            : boundaryContinuationSiteIndex(*covered_pc,
+                                                             *covered_pc);
+      item.identity = makeBoundaryContinuationIdentity(boundary, *covered_pc);
+      item.boundary->continuation_pc = *covered_pc;
+      item.boundary->covered_entry_pc = *covered_pc;
+      item.executable_target->effective_target_pc = *covered_pc;
+      item.continuation_rationale = "boundary_reentry_intra_owner_seed";
+      item.kind = FrontierWorkKind::kIntraOwnerContinuation;
+      promoteBoundaryReentrySeed(session_, *covered_pc);
+    } else if (auto nearby_seed = findNearbyTrackedSeed(*item.target_pc)) {
+      item.target_pc = *nearby_seed;
+      item.site_index = boundary.boundary_pc
+                            ? boundaryContinuationSiteIndex(*boundary.boundary_pc,
+                                                             *nearby_seed)
+                            : boundaryContinuationSiteIndex(*nearby_seed,
+                                                             *nearby_seed);
+      item.identity =
+          makeBoundaryContinuationIdentity(boundary, *nearby_seed);
+      item.boundary->continuation_pc = *nearby_seed;
+      item.boundary->covered_entry_pc = *nearby_seed;
+      item.executable_target->effective_target_pc = *nearby_seed;
+      item.continuation_rationale = "boundary_reentry_intra_owner_nearby_seed";
+      item.kind = FrontierWorkKind::kIntraOwnerContinuation;
+      promoteBoundaryReentrySeed(session_, *nearby_seed);
+    }
+  }
+
+  if (auto existing = session_.graph.edge_facts_by_identity.find(item.identity);
+      existing != session_.graph.edge_facts_by_identity.end()) {
+    existing->second.status = FrontierWorkStatus::kInvalidated;
+    existing->second.is_dirty = true;
+    existing->second.failure_reason.clear();
+  }
+  mergeFrontierItems(session_, {item});
+  refreshDerivedViewsAndLoweringInputs(session_, M);
+  session_.protector_model = buildProtectorModelFromSession(session_);
+  applyProtectorModelToSession(session_, session_.protector_model);
+  refreshFrontierCompatibilityViews(session_);
+  return true;
+}
+
+bool DevirtualizationOrchestrator::requeueBoundaryEdgesForTarget(
+    const llvm::Module &M, uint64_t target_pc, llvm::StringRef reason) {
+  bool changed = false;
+  for (auto &[identity, edge] : session_.graph.edge_facts_by_identity) {
+    (void)identity;
+    if (edge.from_boundary_continuation || !edge.boundary)
+      continue;
+    const bool matches_target =
+        (edge.target_pc && *edge.target_pc == target_pc) ||
+        (edge.boundary->native_target_pc &&
+         *edge.boundary->native_target_pc == target_pc) ||
+        (edge.boundary->boundary_pc &&
+         *edge.boundary->boundary_pc == target_pc);
+    if (!matches_target)
+      continue;
+
+    const auto disposition = boundaryDisposition(edge.boundary);
+    if (edge.kind != FrontierWorkKind::kNativeCallBoundary &&
+        disposition != VirtualExitDisposition::kVmExitNativeCallReenter &&
+        disposition != VirtualExitDisposition::kVmExitNativeExecUnknownReturn) {
+      continue;
+    }
+
+    if (edge.status != FrontierWorkStatus::kPending &&
+        edge.status != FrontierWorkStatus::kInvalidated) {
+      changed = true;
+    }
+    edge.status = FrontierWorkStatus::kInvalidated;
+    edge.is_dirty = true;
+    edge.retry_count = 0;
+    edge.failure_reason = reason.str();
+    auto handler_it = session_.graph.handler_nodes.find(edge.owner_function);
+    if (handler_it != session_.graph.handler_nodes.end() &&
+        handler_it->second.entry_va) {
+      session_.graph.dirty_root_vas.insert(*handler_it->second.entry_va);
+    }
+  }
+
+  if (!changed)
+    return false;
+
+  refreshDerivedViewsAndLoweringInputs(session_, M);
+  session_.protector_model = buildProtectorModelFromSession(session_);
+  applyProtectorModelToSession(session_, session_.protector_model);
+  refreshFrontierCompatibilityViews(session_);
+  return true;
+}
+
 FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
     llvm::Module &M, BlockLifter &block_lifter,
     IterativeLiftingSession &iterative_session,
@@ -2792,6 +3557,23 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
     }
     return 99;
   };
+  auto hasTrackedNonBoundaryContinuationSeed = [&](uint64_t target_pc) {
+    auto matches_target = [&](std::optional<uint64_t> maybe_target,
+                              bool from_boundary_continuation) {
+      return maybe_target && *maybe_target == target_pc &&
+             !from_boundary_continuation;
+    };
+    for (const auto &existing : session_.late_frontier_work_items) {
+      if (matches_target(existing.target_pc, existing.from_boundary_continuation))
+        return true;
+    }
+    for (const auto &[identity, edge] : session_.graph.edge_facts_by_identity) {
+      (void)identity;
+      if (matches_target(edge.target_pc, edge.from_boundary_continuation))
+        return true;
+    }
+    return false;
+  };
   std::stable_sort(identities.begin(), identities.end(),
                    [&](const std::string &lhs, const std::string &rhs) {
                      return scheduling_rank(lhs) < scheduling_rank(rhs);
@@ -2812,7 +3594,8 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
     if (edge_it == session_.graph.edge_facts_by_identity.end())
       continue;
     auto item = frontierWorkItemFromEdgeFact(edge_it->second);
-    classifyContinuationCandidate(item);
+    if (!edge_it->second.continuation_proof)
+      classifyContinuationCandidate(item);
     if (!item.target_pc)
       continue;
     if (!enable_quarantined_frontier_exploration &&
@@ -2843,8 +3626,7 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
                        << " kind=" << toString(item.kind) << "\n";
         }
         if (item.kind == FrontierWorkKind::kLiftableBlock &&
-            callbacks.has_defined_target &&
-            callbacks.has_defined_target(target_pc)) {
+            canMaterializeFrontierTarget(M, target_pc, callbacks)) {
           item.status = FrontierWorkStatus::kSkippedMaterialized;
           item.failure_reason.clear();
           ++summary.skipped_materialized;
@@ -2853,6 +3635,170 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
           return true;
         }
         switch (item.kind) {
+          case FrontierWorkKind::kIntraOwnerContinuation:
+          case FrontierWorkKind::kBoundaryContinuation: {
+            if (!item.boundary || !item.boundary->boundary_pc) {
+              item.status = FrontierWorkStatus::kFailedDecode;
+              item.failure_reason = "boundary_continuation_missing_boundary";
+              ++summary.failed_decode;
+              linkFrontierItemToUnresolvedExit(session_, item);
+              return true;
+            }
+            const bool intra_owner =
+                item.kind == FrontierWorkKind::kIntraOwnerContinuation;
+            const uint64_t continuation_pc = target_pc;
+            uint64_t preferred_target_pc =
+                item.executable_target && item.executable_target->effective_target_pc
+                    ? *item.executable_target->effective_target_pc
+                    : continuation_pc;
+            uint64_t lift_target_pc =
+                safeNormalizeTargetPc(preferred_target_pc, callbacks);
+            if (debug_frontier) {
+              llvm::errs()
+                  << "[frontier-advance] boundary-continuation-normalized id="
+                  << item.identity << " continuation=0x"
+                  << llvm::utohexstr(continuation_pc) << " preferred=0x"
+                  << llvm::utohexstr(preferred_target_pc) << " lift=0x"
+                  << llvm::utohexstr(lift_target_pc) << "\n";
+            }
+            __try {
+              if (auto recovered_target = recoverBoundaryContinuationLiftTarget(
+                      M, preferred_target_pc, callbacks)) {
+                lift_target_pc = *recovered_target;
+              } else if (preferred_target_pc != continuation_pc) {
+                if (auto recovered_target = recoverBoundaryContinuationLiftTarget(
+                        M, continuation_pc, callbacks)) {
+                  lift_target_pc = *recovered_target;
+                }
+              }
+            } __except (1) {
+              item.status = FrontierWorkStatus::kFailedDecode;
+              item.failure_reason =
+                  "boundary_continuation_target_resolution_crashed";
+              ++summary.failed_decode;
+              linkFrontierItemToUnresolvedExit(session_, item);
+              return true;
+            }
+            if (intra_owner) {
+              if (auto transform =
+                      detectPushImmediateJumpTransform(lift_target_pc, callbacks)) {
+                item.boundary->covered_entry_pc =
+                    transform->entry_pc ? transform->entry_pc : lift_target_pc;
+                item.boundary->continuation_entry_transform = transform;
+                if (transform->jump_target_pc) {
+                  preferred_target_pc = *transform->jump_target_pc;
+                  lift_target_pc = *transform->jump_target_pc;
+                  item.target_pc = *transform->jump_target_pc;
+                  item.boundary->continuation_pc = *transform->jump_target_pc;
+                  item.executable_target->effective_target_pc =
+                      *transform->jump_target_pc;
+                }
+                item.continuation_rationale =
+                    "boundary_reentry_intra_owner_transform";
+              } else if (!item.boundary->covered_entry_pc &&
+                         recoverCoveredTargetEntryPc(M, preferred_target_pc)) {
+                item.boundary->covered_entry_pc =
+                    recoverCoveredTargetEntryPc(M, preferred_target_pc);
+              }
+            }
+            if (debug_frontier) {
+              llvm::errs()
+                  << "[frontier-advance] boundary-continuation-recovered id="
+                  << item.identity << " continuation=0x"
+                  << llvm::utohexstr(continuation_pc) << " preferred=0x"
+                  << llvm::utohexstr(preferred_target_pc) << " lift=0x"
+                  << llvm::utohexstr(lift_target_pc) << "\n";
+            }
+            if (hasTrackedNonBoundaryContinuationSeed(preferred_target_pc)) {
+              promoteBoundaryReentrySeed(session_, preferred_target_pc);
+              if (debug_frontier) {
+                llvm::errs()
+                    << "[frontier-advance] boundary-continuation-redirected id="
+                    << item.identity << " continuation=0x"
+                    << llvm::utohexstr(continuation_pc) << " preferred=0x"
+                    << llvm::utohexstr(preferred_target_pc) << "\n";
+              }
+              item.status = FrontierWorkStatus::kSkippedMaterialized;
+              item.failure_reason =
+                  "boundary_continuation_redirected_to_nearby_seed";
+              ++summary.skipped_materialized;
+              summary.changed = true;
+              linkFrontierItemToUnresolvedExit(session_, item);
+              return true;
+            }
+            if (intra_owner && item.boundary->covered_entry_pc &&
+                hasTrackedNonBoundaryContinuationSeed(
+                    *item.boundary->covered_entry_pc)) {
+              promoteBoundaryReentrySeed(session_,
+                                         *item.boundary->covered_entry_pc);
+              if (debug_frontier) {
+                llvm::errs()
+                    << "[frontier-advance] boundary-continuation-redirected "
+                       "covered-entry id="
+                    << item.identity << " continuation=0x"
+                    << llvm::utohexstr(continuation_pc) << " covered=0x"
+                    << llvm::utohexstr(*item.boundary->covered_entry_pc)
+                    << "\n";
+              }
+              item.status = FrontierWorkStatus::kSkippedMaterialized;
+              item.failure_reason =
+                  "boundary_continuation_redirected_to_covered_entry_seed";
+              ++summary.skipped_materialized;
+              summary.changed = true;
+              linkFrontierItemToUnresolvedExit(session_, item);
+              return true;
+            }
+            const uint64_t boundary_pc = *item.boundary->boundary_pc;
+            const bool continuation_materialized =
+                intra_owner ? hasExactMaterializedTarget(M, continuation_pc)
+                            : canMaterializeFrontierTarget(M, continuation_pc,
+                                                           callbacks);
+            const bool lift_target_materialized =
+                lift_target_pc != continuation_pc &&
+                (intra_owner ? hasExactMaterializedTarget(M, lift_target_pc)
+                             : canMaterializeFrontierTarget(M, lift_target_pc,
+                                                            callbacks));
+            if (continuation_materialized || lift_target_materialized) {
+              if (debug_frontier) {
+                llvm::errs()
+                    << "[frontier-advance] boundary-continuation-materialize id="
+                    << item.identity << " boundary=0x"
+                    << llvm::utohexstr(boundary_pc) << "\n";
+              }
+              FrontierWorkItem boundary_item = item;
+              boundary_item.target_pc = boundary_pc;
+              boundary_item.kind = FrontierWorkKind::kNativeCallBoundary;
+              boundary_item.from_boundary_continuation = false;
+              if (auto *decl = getOrInsertNativeBoundaryDecl(
+                      M, boundary_item, callbacks, &session_)) {
+                annotateNativeBoundaryFunction(*decl, boundary_item, callbacks);
+                item.status = FrontierWorkStatus::kSkippedMaterialized;
+                item.failure_reason = "boundary_continuation_materialized";
+                ++summary.skipped_materialized;
+                summary.changed = true;
+              } else {
+                item.status = FrontierWorkStatus::kFailedDecode;
+                item.failure_reason = "boundary_continuation_bridge_missing";
+                ++summary.failed_decode;
+              }
+              linkFrontierItemToUnresolvedExit(session_, item);
+              return true;
+            }
+            if (!safeCanDecodeTarget(lift_target_pc, callbacks)) {
+              item.status = FrontierWorkStatus::kFailedDecode;
+              item.failure_reason = "boundary_continuation_not_decodable";
+              ++summary.failed_decode;
+              linkFrontierItemToUnresolvedExit(session_, item);
+              return true;
+            }
+            if (debug_frontier) {
+              llvm::errs()
+                  << "[frontier-advance] boundary-continuation-ready-to-lift id="
+                  << item.identity << " lift=0x"
+                  << llvm::utohexstr(lift_target_pc) << "\n";
+            }
+            break;
+          }
           case FrontierWorkKind::kTerminalBoundary:
             item.status = FrontierWorkStatus::kClassifiedTerminal;
             if (!item.boundary)
@@ -2895,7 +3841,8 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
                            << item.identity << " target=0x"
                            << llvm::utohexstr(target_pc) << "\n";
             }
-            if (auto *decl = getOrInsertNativeBoundaryDecl(M, item, callbacks)) {
+            if (auto *decl =
+                    getOrInsertNativeBoundaryDecl(M, item, callbacks, &session_)) {
               annotateNativeBoundaryFunction(*decl, item, callbacks);
               if (debug_frontier) {
                 llvm::errs()
@@ -2948,10 +3895,70 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
           llvm::errs() << "[frontier-advance] lifting id=" << item.identity
                        << " target=0x" << llvm::utohexstr(target_pc) << "\n";
         }
+        uint64_t lift_target_pc = target_pc;
+        if (item.kind == FrontierWorkKind::kBoundaryContinuation ||
+            item.kind == FrontierWorkKind::kIntraOwnerContinuation) {
+          const bool intra_owner =
+              item.kind == FrontierWorkKind::kIntraOwnerContinuation;
+          const uint64_t preferred_target_pc =
+              item.executable_target && item.executable_target->effective_target_pc
+                  ? *item.executable_target->effective_target_pc
+                  : target_pc;
+          lift_target_pc = safeNormalizeTargetPc(preferred_target_pc, callbacks);
+          if (debug_frontier) {
+            llvm::errs()
+                << "[frontier-advance] boundary-continuation-lift-normalized id="
+                << item.identity << " target=0x"
+                << llvm::utohexstr(target_pc) << " preferred=0x"
+                << llvm::utohexstr(preferred_target_pc) << " lift=0x"
+                << llvm::utohexstr(lift_target_pc) << "\n";
+          }
+          __try {
+            if (auto recovered_target = recoverBoundaryContinuationLiftTarget(
+                    M, preferred_target_pc, callbacks)) {
+              lift_target_pc = *recovered_target;
+            } else if (preferred_target_pc != target_pc) {
+              if (auto recovered_target = recoverBoundaryContinuationLiftTarget(
+                      M, target_pc, callbacks)) {
+                lift_target_pc = *recovered_target;
+              }
+            }
+          } __except (1) {
+            item.status = FrontierWorkStatus::kFailedDecode;
+            item.failure_reason =
+                "boundary_continuation_target_resolution_crashed";
+            ++summary.failed_decode;
+            linkFrontierItemToUnresolvedExit(session_, item);
+            return true;
+          }
+          if (intra_owner) {
+            if (auto transform =
+                    detectPushImmediateJumpTransform(lift_target_pc, callbacks)) {
+              item.boundary->covered_entry_pc =
+                  transform->entry_pc ? transform->entry_pc : lift_target_pc;
+              item.boundary->continuation_entry_transform = transform;
+              if (transform->jump_target_pc) {
+                lift_target_pc = *transform->jump_target_pc;
+                item.target_pc = *transform->jump_target_pc;
+                item.boundary->continuation_pc = *transform->jump_target_pc;
+                item.executable_target->effective_target_pc =
+                    *transform->jump_target_pc;
+              }
+            }
+          }
+          if (debug_frontier) {
+            llvm::errs()
+                << "[frontier-advance] boundary-continuation-lift-recovered id="
+                << item.identity << " target=0x"
+                << llvm::utohexstr(target_pc) << " preferred=0x"
+                << llvm::utohexstr(preferred_target_pc) << " lift=0x"
+                << llvm::utohexstr(lift_target_pc) << "\n";
+          }
+        }
         bool lift_crashed = false;
         llvm::Function *lifted = nullptr;
         __try {
-          lifted = block_lifter.LiftBlock(target_pc, discovered_targets);
+          lifted = block_lifter.LiftBlock(lift_target_pc, discovered_targets);
         } __except (1) {
           lift_crashed = true;
         }
@@ -2970,7 +3977,7 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
         }
         if (debug_frontier) {
           llvm::errs() << "[frontier-advance] lift-return id=" << item.identity
-                       << " target=0x" << llvm::utohexstr(target_pc)
+                       << " target=0x" << llvm::utohexstr(lift_target_pc)
                        << " lifted=" << (lifted ? 1 : 0)
                        << " discovered=" << discovered_targets.size() << "\n";
         }
@@ -2981,6 +3988,8 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
                          << llvm::utohexstr(target_pc) << "\n";
           }
           iterative_session.noteLiftedTarget(target_pc);
+          if (lift_target_pc != target_pc)
+            iterative_session.noteLiftedTarget(lift_target_pc);
           if (debug_frontier) {
             llvm::errs() << "[frontier-advance] noted-lifted-target id="
                          << item.identity << " target=0x"
@@ -2988,6 +3997,19 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
           }
           item.status = FrontierWorkStatus::kLifted;
           item.failure_reason.clear();
+          if ((item.kind == FrontierWorkKind::kBoundaryContinuation ||
+               item.kind == FrontierWorkKind::kIntraOwnerContinuation) &&
+              item.boundary && item.boundary->boundary_pc) {
+            FrontierWorkItem boundary_item = item;
+            boundary_item.target_pc = item.boundary->boundary_pc;
+            boundary_item.kind = FrontierWorkKind::kNativeCallBoundary;
+            boundary_item.from_boundary_continuation = false;
+            if (auto *decl =
+                    getOrInsertNativeBoundaryDecl(M, boundary_item, callbacks,
+                                                  &session_)) {
+              annotateNativeBoundaryFunction(*decl, boundary_item, callbacks);
+            }
+          }
           ++item.retry_count;
           ++summary.lifted;
           summary.changed = true;
@@ -3105,29 +4127,175 @@ VmEnterChildImportSummary DevirtualizationOrchestrator::importNestedVmEnterChild
   if (!callbacks.enabled || !callbacks.try_import_target)
     return summary;
 
-  unsigned imported = 0;
+  auto isModeledBoundaryPlaceholder = [](llvm::Function *F) {
+    if (!F)
+      return false;
+    auto fact = readBoundaryFact(*F);
+    if (!fact)
+      return false;
+    switch (fact->kind) {
+      case BoundaryKind::kNativeBoundary:
+      case BoundaryKind::kTerminalBoundary:
+      case BoundaryKind::kVmEnterBoundary:
+      case BoundaryKind::kNestedVmEnterBoundary:
+        return true;
+    }
+    return false;
+  };
+
+  auto isVmEnterBoundaryFact = [](const std::optional<BoundaryFact> &fact) {
+    if (!fact)
+      return false;
+    return fact->is_vm_enter || fact->is_nested_vm_enter ||
+           fact->kind == BoundaryKind::kVmEnterBoundary ||
+           fact->kind == BoundaryKind::kNestedVmEnterBoundary ||
+           boundaryDisposition(fact) == VirtualExitDisposition::kVmEnter ||
+           boundaryDisposition(fact) == VirtualExitDisposition::kNestedVmEnter;
+  };
+
+  auto isVmEnterCandidate = [&](const FrontierWorkItem &item) {
+    if (!item.target_pc || item.from_boundary_continuation)
+      return false;
+    return item.kind == FrontierWorkKind::kVmEnterBoundary ||
+           isVmEnterBoundaryFact(item.boundary);
+  };
+
+  llvm::SmallVector<FrontierWorkItem, 8> import_candidates;
+  llvm::SmallDenseMap<uint64_t, unsigned, 8> candidate_index_by_target;
+  auto mergeCandidate = [&](FrontierWorkItem item) {
+    if (!isVmEnterCandidate(item))
+      return;
+    if (item.kind != FrontierWorkKind::kVmEnterBoundary)
+      item.kind = FrontierWorkKind::kVmEnterBoundary;
+    if (!item.boundary)
+      item.boundary = BoundaryFact{};
+    if (boundaryDisposition(item.boundary) == VirtualExitDisposition::kUnknown)
+      item.boundary->exit_disposition = BoundaryDisposition::kVmEnter;
+    item.boundary->is_nested_vm_enter =
+        boundaryDisposition(item.boundary) ==
+        VirtualExitDisposition::kNestedVmEnter;
+    item.boundary->is_vm_enter = !item.boundary->is_nested_vm_enter;
+    item.boundary->kind = item.boundary->is_nested_vm_enter
+                              ? BoundaryKind::kNestedVmEnterBoundary
+                              : BoundaryKind::kVmEnterBoundary;
+    if (item.status == FrontierWorkStatus::kPending ||
+        item.status == FrontierWorkStatus::kInvalidated) {
+      item.status = FrontierWorkStatus::kClassifiedVmEnter;
+      item.failure_reason = "vm_entry_boundary";
+    }
+
+    const uint64_t target_pc = *item.target_pc;
+    auto found = candidate_index_by_target.find(target_pc);
+    if (found == candidate_index_by_target.end()) {
+      candidate_index_by_target[target_pc] = import_candidates.size();
+      import_candidates.push_back(std::move(item));
+      return;
+    }
+
+    auto &existing = import_candidates[found->second];
+    if (existing.identity.empty() && !item.identity.empty())
+      existing.identity = item.identity;
+    if (existing.owner_function.empty() && !item.owner_function.empty())
+      existing.owner_function = item.owner_function;
+    if (!existing.site_pc && item.site_pc)
+      existing.site_pc = item.site_pc;
+    if (!existing.boundary && item.boundary)
+      existing.boundary = item.boundary;
+    if (existing.kind != FrontierWorkKind::kVmEnterBoundary &&
+        item.kind == FrontierWorkKind::kVmEnterBoundary)
+      existing.kind = item.kind;
+    if (existing.status != FrontierWorkStatus::kClassifiedVmEnter &&
+        item.status == FrontierWorkStatus::kClassifiedVmEnter) {
+      existing.status = item.status;
+      existing.failure_reason = item.failure_reason;
+    }
+  };
+
   for (const auto &[identity, edge] : session_.graph.edge_facts_by_identity) {
     (void)identity;
-    if (!edge.target_pc ||
-        edge.status != FrontierWorkStatus::kClassifiedVmEnter) {
+    if (!edge.target_pc)
       continue;
+    FrontierWorkItem item = frontierWorkItemFromEdgeFact(edge);
+    mergeCandidate(std::move(item));
+  }
+  for (const auto &item : session_.late_frontier_work_items)
+    mergeCandidate(item);
+
+  unsigned imported = 0;
+  auto updateVmEnterFailureReason = [&](uint64_t target_pc,
+                                        llvm::StringRef failure_reason) {
+    for (auto &[identity, edge] : session_.graph.edge_facts_by_identity) {
+      (void)identity;
+      if (!edge.target_pc || *edge.target_pc != target_pc)
+        continue;
+      const bool is_vm_enter_edge =
+          edge.kind == FrontierWorkKind::kVmEnterBoundary ||
+          (edge.boundary &&
+           (edge.boundary->is_vm_enter || edge.boundary->is_nested_vm_enter ||
+            edge.boundary->kind == BoundaryKind::kVmEnterBoundary ||
+            edge.boundary->kind == BoundaryKind::kNestedVmEnterBoundary));
+      if (!is_vm_enter_edge)
+        continue;
+      edge.failure_reason = failure_reason.str();
     }
-    const uint64_t target_pc = *edge.target_pc;
-    if (!session_.attempted_vm_enter_child_import_pcs.insert(target_pc).second)
+    for (auto &item : session_.late_frontier_work_items) {
+      if (!item.target_pc || *item.target_pc != target_pc)
+        continue;
+      const bool is_vm_enter_item =
+          item.kind == FrontierWorkKind::kVmEnterBoundary ||
+          (item.boundary &&
+           (item.boundary->is_vm_enter || item.boundary->is_nested_vm_enter ||
+            item.boundary->kind == BoundaryKind::kVmEnterBoundary ||
+            item.boundary->kind == BoundaryKind::kNestedVmEnterBoundary));
+      if (!is_vm_enter_item)
+        continue;
+      item.failure_reason = failure_reason.str();
+    }
+  };
+  for (const auto &candidate : import_candidates) {
+    if (!candidate.target_pc)
       continue;
-    if (imported >= callbacks.max_imports)
-      break;
-    if (auto *existing = findLiftedOrCoveredFunctionByPC(M, target_pc);
-        existing && !existing->isDeclaration()) {
+    const uint64_t target_pc = *candidate.target_pc;
+    if (!candidate.identity.empty()) {
+      auto &edge = session_.graph.edge_facts_by_identity[candidate.identity];
+      edge.identity = candidate.identity;
+      syncEdgeFactFromFrontierWorkItem(edge, candidate);
+      if (candidate.identity.find("closure:") == 0)
+        edge.from_output_root_closure = true;
+    }
+
+    auto *existing = findLiftedOrCoveredFunctionByPC(M, target_pc);
+    auto *placeholder = findStructuralCodeTargetFunctionByPC(M, target_pc);
+    if (!placeholder)
+      placeholder = existing;
+    if (!placeholder) {
+      FrontierWorkItem item = candidate;
+      placeholder = getOrInsertVmEnterBoundaryFunction(M, item);
+      if (placeholder)
+        annotateVmEnterBoundaryFunction(*placeholder, item);
+    }
+
+    const auto placeholder_fact =
+        placeholder ? readBoundaryFact(*placeholder) : std::nullopt;
+    const bool modeled_placeholder =
+        placeholder && isModeledBoundaryPlaceholder(placeholder);
+    if (existing && !existing->isDeclaration() && !modeled_placeholder) {
       continue;
     }
 
-    auto *placeholder = findStructuralCodeTargetFunctionByPC(M, target_pc);
-    if (!placeholder || !placeholder->isDeclaration() ||
-        !readBoundaryFact(*placeholder).has_value() ||
-        !readBoundaryFact(*placeholder)->is_vm_enter) {
+    if (!placeholder || !placeholder_fact) {
       continue;
     }
+    const bool retry_modeled_placeholder =
+        modeled_placeholder &&
+        session_.imported_vm_enter_child_roots.count(target_pc) == 0;
+    if (session_.attempted_vm_enter_child_import_pcs.count(target_pc) != 0 &&
+        !retry_modeled_placeholder) {
+      continue;
+    }
+    session_.attempted_vm_enter_child_import_pcs.insert(target_pc);
+    if (imported >= callbacks.max_imports)
+      break;
 
     ++summary.attempted;
     std::string failure_reason;
@@ -3137,12 +4305,14 @@ VmEnterChildImportSummary DevirtualizationOrchestrator::importNestedVmEnterChild
         !imported_root) {
       if (failure_reason.empty())
         failure_reason = "child_import_failed";
+      updateVmEnterFailureReason(target_pc, failure_reason);
       summary.notes.push_back(std::string("target=0x") +
                               llvm::utohexstr(target_pc) + ":" +
                               failure_reason);
       continue;
     }
     if (imported_root->getFunctionType() != placeholder->getFunctionType()) {
+      updateVmEnterFailureReason(target_pc, "type_mismatch");
       summary.notes.push_back(std::string("target=0x") +
                               llvm::utohexstr(target_pc) + ":type_mismatch:" +
                               imported_root->getName().str());
@@ -3154,6 +4324,7 @@ VmEnterChildImportSummary DevirtualizationOrchestrator::importNestedVmEnterChild
       placeholder->eraseFromParent();
     if (callbacks.on_imported_target)
       callbacks.on_imported_target(target_pc);
+    updateVmEnterFailureReason(target_pc, "");
     session_.imported_vm_enter_child_roots[target_pc] =
         imported_root->getName().str();
     summary.notes.push_back(std::string("imported target=0x") +
@@ -3419,6 +4590,40 @@ const char *toString(DevirtualizationEpoch epoch) {
   return "initial_lift_normalization";
 }
 
+const char *toString(DevirtualizationCompatReason reason) {
+  switch (reason) {
+    case DevirtualizationCompatReason::kNone:
+      return "none";
+    case DevirtualizationCompatReason::kCompatibilityFlag:
+      return "compatibility_flag";
+    case DevirtualizationCompatReason::kFastPlainExportRootFallback:
+      return "fast_plain_export_root_fallback";
+    case DevirtualizationCompatReason::kStableLargeExportRootFallback:
+      return "stable_large_export_root_fallback";
+    case DevirtualizationCompatReason::kNoVmLikeCandidates:
+      return "no_vm_like_candidates";
+    case DevirtualizationCompatReason::kNoRootLocalDevirtShape:
+      return "no_root_local_devirt_shape";
+    case DevirtualizationCompatReason::kLegacyVmPathSuppressed:
+      return "legacy_vm_path_suppressed";
+    case DevirtualizationCompatReason::kPreAbiNoAbiCleanup:
+      return "pre_abi_noabi_cleanup";
+  }
+  return "none";
+}
+
+const char *toString(DevirtualizationExportRootFallbackMode mode) {
+  switch (mode) {
+    case DevirtualizationExportRootFallbackMode::kNone:
+      return "none";
+    case DevirtualizationExportRootFallbackMode::kFastPlain:
+      return "fast_plain";
+    case DevirtualizationExportRootFallbackMode::kStableLarge:
+      return "stable_large";
+  }
+  return "none";
+}
+
 const char *toString(UnresolvedExitKind kind) {
   switch (kind) {
     case UnresolvedExitKind::kDispatchJump:
@@ -3487,6 +4692,10 @@ const char *toString(FrontierWorkKind kind) {
   switch (kind) {
     case FrontierWorkKind::kLiftableBlock:
       return "liftable_block";
+    case FrontierWorkKind::kIntraOwnerContinuation:
+      return "intra_owner_continuation";
+    case FrontierWorkKind::kBoundaryContinuation:
+      return "boundary_continuation";
     case FrontierWorkKind::kNativeCallBoundary:
       return "native_call_boundary";
     case FrontierWorkKind::kTerminalBoundary:

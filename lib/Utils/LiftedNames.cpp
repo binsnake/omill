@@ -351,6 +351,32 @@ llvm::Function *findStructuralCodeTargetFunctionByPC(llvm::Module &M,
   return nullptr;
 }
 
+llvm::Function *findNearestStructuralCodeTargetFunctionByPC(
+    llvm::Module &M, uint64_t pc, uint64_t max_distance) {
+  llvm::Function *best_fn = nullptr;
+  uint64_t best_distance = std::numeric_limits<uint64_t>::max();
+
+  auto consider = [&](llvm::Function &F, uint64_t candidate_pc) {
+    const uint64_t distance =
+        candidate_pc > pc ? candidate_pc - pc : pc - candidate_pc;
+    if (distance > max_distance)
+      return;
+    if (!best_fn || distance < best_distance ||
+        (distance == best_distance &&
+         candidate_pc < extractStructuralCodeTargetPC(*best_fn))) {
+      best_fn = &F;
+      best_distance = distance;
+    }
+  };
+
+  for (auto &F : M) {
+    if (uint64_t candidate_pc = extractStructuralCodeTargetPC(F); candidate_pc != 0)
+      consider(F, candidate_pc);
+  }
+
+  return best_fn;
+}
+
 std::optional<uint64_t> findNearestCoveredLiftedOrBlockPC(llvm::Module &M,
                                                           uint64_t pc,
                                                           uint64_t max_distance) {
@@ -437,6 +463,14 @@ uint64_t extractStructuralCodeTargetPC(llvm::StringRef name) {
 }
 
 uint64_t extractStructuralCodeTargetPC(const llvm::Function &F) {
+  if (uint64_t pc = extractStructuralCodeTargetPC(F.getName())) {
+    if (F.getName().starts_with("omill_native_target_") ||
+        F.getName().starts_with("omill_native_boundary_") ||
+        F.getName().starts_with("omill_vm_enter_target_") ||
+        F.getName().starts_with("omill_executable_target_")) {
+      return pc;
+    }
+  }
   if (auto attr = F.getFnAttribute("omill.executable_target_pc");
       attr.isValid()) {
     uint64_t pc = 0;

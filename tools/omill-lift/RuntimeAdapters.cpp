@@ -132,21 +132,27 @@ OutputRecoveryCallbacks buildOutputRecoveryCallbacks(
         plan.imported_root = imported;
         plan.allowed_declaration_callees =
             preimport_plan.allowed_declaration_callees;
+        plan.lowering_helper_callees =
+            preimport_plan.lowering_helper_callees;
         return plan;
       };
   callbacks.import_vm_enter_child =
       [&](uint64_t target_pc, const ChildLiftArtifact &artifact,
-          llvm::Function &placeholder) {
-        ChildImportPlan plan;
+          const ChildImportPlan &preimport_plan, llvm::Function &placeholder) {
+        ChildImportPlan plan = preimport_plan;
         plan.target_pc = target_pc;
-        plan.selected_root_pc = artifact.selected_root_pc;
-        std::string import_rejection_reason;
-        auto *imported = context.import_recovered_terminal_boundary_function(
-            artifact.ir_text, target_pc, &import_rejection_reason);
+        if (!plan.selected_root_pc)
+          plan.selected_root_pc = artifact.selected_root_pc;
+        if (plan.eligibility != ImportEligibility::kImportable)
+          return plan;
+        auto *imported = context.import_executable_child_root(
+            target_pc, artifact, preimport_plan, "");
         if (!imported) {
           plan.eligibility = ImportEligibility::kRejected;
-          plan.rejection_reason = RecoveryRejectionReason::kImportFailed;
-          plan.rejection_detail = import_rejection_reason;
+          if (plan.rejection_reason == RecoveryRejectionReason::kNone)
+            plan.rejection_reason = RecoveryRejectionReason::kImportFailed;
+          if (plan.rejection_detail.empty())
+            plan.rejection_detail = "vm_enter_child_import_failed";
           return plan;
         }
         if (imported->getFunctionType() != placeholder.getFunctionType()) {

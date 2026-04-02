@@ -90,7 +90,7 @@ struct TrackedStackLookupResult {
 struct TrackedFactState {
   std::map<unsigned, VirtualValueExpr> slot_facts;
   std::map<CanonicalStackFactKey, VirtualValueExpr> stack_facts;
-  std::map<unsigned, int64_t> stack_base_deltas;
+  std::map<unsigned, int64_t> stack_owner_deltas;
   std::map<unsigned, VirtualValueExpr> materialized_stack_facts;
 };
 
@@ -236,6 +236,9 @@ struct ResolvedCallSiteInfo {
   std::optional<uint64_t> continuation_pc;
   std::optional<unsigned> continuation_slot_id;
   std::optional<unsigned> continuation_stack_cell_id;
+  std::optional<unsigned> continuation_owner_id;
+  VirtualStackOwnerKind continuation_owner_kind =
+      VirtualStackOwnerKind::kUnknown;
 };
 
 struct LocalCallSiteState {

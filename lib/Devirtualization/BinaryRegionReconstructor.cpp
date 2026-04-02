@@ -5,6 +5,8 @@
 #include <llvm/ADT/StringExtras.h>
 
 #include <cstring>
+#include <set>
+#include <tuple>
 
 namespace omill {
 
@@ -30,6 +32,17 @@ LearnedOutgoingEdge makeBoundaryEdge(uint64_t source_pc, uint64_t target_pc) {
   return edge;
 }
 
+LearnedOutgoingEdge makeControlledReturnEdge(uint64_t source_pc,
+                                             uint64_t target_pc) {
+  LearnedOutgoingEdge edge;
+  edge.source_pc = source_pc;
+  edge.target_pc = target_pc;
+  edge.restatement_kind = EdgeRestatementKind::kControlledReturn;
+  edge.resolution_status = EdgeResolutionStatus::kResolved;
+  edge.is_controlled_return = true;
+  return edge;
+}
+
 LearnedOutgoingEdge makeTerminalEdge(uint64_t source_pc) {
   LearnedOutgoingEdge edge;
   edge.source_pc = source_pc;
@@ -49,11 +62,80 @@ LearnedOutgoingEdge makeUnresolvedEdge(uint64_t source_pc,
   return edge;
 }
 
+LearnedOutgoingEdge makeUnresolvedControlledReturnEdge(uint64_t source_pc) {
+  LearnedOutgoingEdge edge;
+  edge.source_pc = source_pc;
+  edge.restatement_kind = EdgeRestatementKind::kControlledReturnUnresolved;
+  edge.resolution_status = EdgeResolutionStatus::kUnresolved;
+  edge.is_controlled_return = true;
+  edge.is_unresolved_indirect = true;
+  return edge;
+}
+
 void appendUnique(std::vector<uint64_t> &values, uint64_t pc) {
   if (!pc)
     return;
   if (llvm::find(values, pc) == values.end())
     values.push_back(pc);
+}
+
+struct DescentVisitKey {
+  uint64_t pc = 0;
+  uint64_t call_site_pc = 0;
+  uint64_t original_return_pc = 0;
+  uint64_t effective_return_pc = 0;
+  unsigned return_slot_id = 0;
+  unsigned return_stack_cell_id = 0;
+  unsigned return_owner_id = 0;
+  VirtualStackOwnerKind return_owner_kind = VirtualStackOwnerKind::kUnknown;
+  int64_t return_owner_delta = 0;
+  VirtualReturnAddressControlKind control_kind =
+      VirtualReturnAddressControlKind::kUnknown;
+  bool suppresses_normal_fallthrough = false;
+
+  bool operator<(const DescentVisitKey &other) const {
+    return std::tie(pc, call_site_pc, original_return_pc, effective_return_pc,
+    return_slot_id, return_stack_cell_id, return_owner_id, return_owner_kind,
+    return_owner_delta, control_kind,
+                    suppresses_normal_fallthrough) <
+           std::tie(other.pc, other.call_site_pc, other.original_return_pc,
+                    other.effective_return_pc, other.return_slot_id,
+                    other.return_stack_cell_id, other.return_owner_id,
+                    other.return_owner_kind, other.return_owner_delta,
+                    other.control_kind,
+                    other.suppresses_normal_fallthrough);
+  }
+};
+
+DescentVisitKey makeVisitKey(const RecursiveDescentFrame &frame) {
+  DescentVisitKey key;
+  key.pc = frame.pc;
+  if (!frame.return_address_state)
+    return key;
+  key.call_site_pc = frame.return_address_state->call_site_pc;
+  key.original_return_pc = frame.return_address_state->original_return_pc.value_or(0);
+  key.effective_return_pc =
+      frame.return_address_state->effective_return_pc.value_or(0);
+  key.return_slot_id = frame.return_address_state->return_slot_id.value_or(0);
+  key.return_stack_cell_id =
+      frame.return_address_state->return_stack_cell_id.value_or(0);
+  key.return_owner_id = frame.return_address_state->return_owner_id.value_or(0);
+  key.return_owner_kind = frame.return_address_state->return_owner_kind;
+  key.return_owner_delta =
+      frame.return_address_state->return_owner_delta.value_or(0);
+  key.control_kind = frame.return_address_state->control_kind;
+  key.suppresses_normal_fallthrough =
+      frame.return_address_state->suppresses_normal_fallthrough;
+  return key;
+}
+
+RecursiveDescentFrame makeFrame(
+    uint64_t pc,
+    std::optional<DescentReturnAddressState> return_address_state = std::nullopt) {
+  RecursiveDescentFrame frame;
+  frame.pc = pc;
+  frame.return_address_state = std::move(return_address_state);
+  return frame;
 }
 
 std::optional<FrontierCallbacks::DecodedTargetSummary> decodeWithFallback(
@@ -155,16 +237,18 @@ BinaryRegionSnapshot BinaryRegionReconstructor::reconstruct(
   if (!request.root_target_pc)
     return snapshot;
 
-  llvm::DenseSet<uint64_t> visited;
-  llvm::SmallVector<uint64_t, 16> worklist = {request.root_target_pc};
+  std::set<DescentVisitKey> visited;
+  llvm::SmallVector<RecursiveDescentFrame, 16> worklist = {
+      makeFrame(request.root_target_pc, request.initial_return_address_state)};
   unsigned steps = 0;
   bool saw_unresolved = false;
   bool saw_boundary = false;
 
   while (!worklist.empty() && steps < request.policy.max_steps &&
          snapshot.blocks_by_pc.size() < request.policy.max_blocks) {
-    const uint64_t pc = worklist.pop_back_val();
-    if (!visited.insert(pc).second) {
+    const RecursiveDescentFrame frame = worklist.pop_back_val();
+    const uint64_t pc = frame.pc;
+    if (!visited.insert(makeVisitKey(frame)).second) {
       snapshot.has_structural_loop = true;
       continue;
     }
@@ -186,11 +270,15 @@ BinaryRegionSnapshot BinaryRegionReconstructor::reconstruct(
       block.outgoing_edges = learned_it->second;
       for (const auto &edge : block.outgoing_edges) {
         if (edge.target_pc)
-          worklist.push_back(*edge.target_pc);
+          worklist.push_back(makeFrame(*edge.target_pc, frame.return_address_state));
         if (edge.is_boundary) {
           saw_boundary = true;
           if (edge.target_pc)
             appendUnique(snapshot.boundary_target_pcs, *edge.target_pc);
+        }
+        if (edge.is_controlled_return && edge.is_unresolved_indirect) {
+          saw_unresolved = true;
+          appendUnique(snapshot.controlled_return_unresolved_pcs, pc);
         }
         if (edge.is_unresolved_indirect) {
           saw_unresolved = true;
@@ -211,7 +299,45 @@ BinaryRegionSnapshot BinaryRegionReconstructor::reconstruct(
       continue;
     }
 
-    if (decoded->is_return || decoded->is_terminal) {
+    if (decoded->is_return) {
+      if (frame.return_address_state &&
+          frame.return_address_state->suppresses_normal_fallthrough) {
+        if (frame.return_address_state->effective_return_pc) {
+          block.outgoing_edges.push_back(makeControlledReturnEdge(
+              pc, *frame.return_address_state->effective_return_pc));
+          if (visited.find(makeVisitKey(makeFrame(
+                              *frame.return_address_state
+                                   ->effective_return_pc))) != visited.end()) {
+            snapshot.has_structural_loop = true;
+          }
+          worklist.push_back(makeFrame(
+              *frame.return_address_state->effective_return_pc));
+        } else {
+          block.outgoing_edges.push_back(makeUnresolvedControlledReturnEdge(pc));
+          saw_unresolved = true;
+          appendUnique(snapshot.unresolved_edge_pcs, pc);
+          appendUnique(snapshot.controlled_return_unresolved_pcs, pc);
+        }
+      } else if (frame.return_address_state &&
+                 frame.return_address_state->original_return_pc) {
+        block.outgoing_edges.push_back(makeResolvedEdge(
+            pc, *frame.return_address_state->original_return_pc,
+            EdgeRestatementKind::kBinaryDirect));
+        if (visited.find(makeVisitKey(
+                makeFrame(*frame.return_address_state->original_return_pc))) !=
+            visited.end()) {
+          snapshot.has_structural_loop = true;
+        }
+        worklist.push_back(
+            makeFrame(*frame.return_address_state->original_return_pc));
+      } else {
+        block.outgoing_edges.push_back(makeTerminalEdge(pc));
+      }
+      snapshot.blocks_by_pc.emplace(pc, std::move(block));
+      continue;
+    }
+
+    if (decoded->is_terminal) {
       block.outgoing_edges.push_back(makeTerminalEdge(pc));
       snapshot.blocks_by_pc.emplace(pc, std::move(block));
       continue;
@@ -235,30 +361,43 @@ BinaryRegionSnapshot BinaryRegionReconstructor::reconstruct(
       } else {
         block.outgoing_edges.push_back(
             makeResolvedEdge(pc, target, EdgeRestatementKind::kBinaryDirect));
-        if (visited.contains(target))
+        if (visited.find(makeVisitKey(makeFrame(target))) != visited.end())
           snapshot.has_structural_loop = true;
-        worklist.push_back(target);
+        if (decoded->is_call) {
+          DescentReturnAddressState return_state;
+          return_state.call_site_pc = pc;
+          return_state.original_return_pc = decoded->next_pc;
+          return_state.effective_return_pc = decoded->next_pc;
+          return_state.return_owner_kind =
+              VirtualStackOwnerKind::kNativeStackPointer;
+          return_state.control_kind =
+              VirtualReturnAddressControlKind::kPreserved;
+          return_state.suppresses_normal_fallthrough = false;
+          worklist.push_back(makeFrame(target, return_state));
+        } else {
+          worklist.push_back(makeFrame(target, frame.return_address_state));
+        }
       }
     }
-    if (decoded->branch_not_taken_pc) {
+    if (decoded->branch_not_taken_pc && !decoded->is_call) {
       const uint64_t target = *decoded->branch_not_taken_pc;
       block.outgoing_edges.push_back(
           makeResolvedEdge(pc, target, EdgeRestatementKind::kBinaryDirect));
-      if (visited.contains(target))
+      if (visited.find(
+              makeVisitKey(makeFrame(target, frame.return_address_state))) !=
+          visited.end())
         snapshot.has_structural_loop = true;
-      worklist.push_back(target);
+      worklist.push_back(makeFrame(target, frame.return_address_state));
     } else if (!decoded->is_control_flow && decoded->next_pc &&
                (!callbacks.is_executable_target ||
                 callbacks.is_executable_target(decoded->next_pc))) {
       block.outgoing_edges.push_back(makeResolvedEdge(
           pc, decoded->next_pc, EdgeRestatementKind::kBinaryDirect));
-      if (visited.contains(decoded->next_pc))
+      if (visited.find(makeVisitKey(
+              makeFrame(decoded->next_pc, frame.return_address_state))) !=
+          visited.end())
         snapshot.has_structural_loop = true;
-      worklist.push_back(decoded->next_pc);
-    } else if (decoded->is_call && decoded->next_pc) {
-      block.outgoing_edges.push_back(makeResolvedEdge(
-          pc, decoded->next_pc, EdgeRestatementKind::kBinaryDirect));
-      worklist.push_back(decoded->next_pc);
+      worklist.push_back(makeFrame(decoded->next_pc, frame.return_address_state));
     } else if (block.outgoing_edges.empty()) {
       block.outgoing_edges.push_back(makeTerminalEdge(pc));
     }

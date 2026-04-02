@@ -3,6 +3,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 namespace {
 
 TEST(BinaryRegionReconstructorTest,
@@ -90,6 +92,139 @@ TEST(BinaryRegionReconstructorTest,
   auto snapshot = reconstructor.reconstruct(request, callbacks);
   EXPECT_TRUE(snapshot.preserved_exact_call_fallthrough);
   EXPECT_FALSE(snapshot.visited_block_pcs.empty());
+}
+
+TEST(BinaryRegionReconstructorTest,
+     RecursiveDescentReturnsThroughCallFrameInsteadOfDirectFallthrough) {
+  omill::BinaryRegionReconstructor reconstructor;
+  omill::BinaryRegionReconstructionRequest request;
+  request.root_target_pc = 0x401000u;
+
+  omill::FrontierCallbacks callbacks;
+  callbacks.read_target_bytes = [](uint64_t pc, uint8_t *out, size_t size) {
+    if (!size)
+      return false;
+    std::fill(out, out + size, 0x90);
+    if (pc == 0x401000u) {
+      out[0] = 0xE8;
+      out[1] = 0x0B;
+      out[2] = 0x00;
+      out[3] = 0x00;
+      out[4] = 0x00;
+      return true;
+    }
+    if (pc == 0x401010u) {
+      out[0] = 0xC3;
+      return true;
+    }
+    if (pc == 0x401005u) {
+      out[0] = 0x90;
+      return true;
+    }
+    return false;
+  };
+  callbacks.can_decode_target = [](uint64_t pc) {
+    return pc == 0x401000u || pc == 0x401010u || pc == 0x401005u;
+  };
+  callbacks.is_executable_target = [](uint64_t pc) {
+    return pc == 0x401000u || pc == 0x401010u || pc == 0x401005u;
+  };
+
+  auto snapshot = reconstructor.reconstruct(request, callbacks);
+  auto root_it = snapshot.blocks_by_pc.find(0x401000u);
+  ASSERT_NE(root_it, snapshot.blocks_by_pc.end());
+  ASSERT_EQ(root_it->second.outgoing_edges.size(), 1u);
+  EXPECT_EQ(root_it->second.outgoing_edges.front().target_pc,
+            std::optional<uint64_t>(0x401010u));
+
+  auto callee_it = snapshot.blocks_by_pc.find(0x401010u);
+  ASSERT_NE(callee_it, snapshot.blocks_by_pc.end());
+  ASSERT_EQ(callee_it->second.outgoing_edges.size(), 1u);
+  EXPECT_EQ(callee_it->second.outgoing_edges.front().target_pc,
+            std::optional<uint64_t>(0x401005u));
+  EXPECT_EQ(callee_it->second.outgoing_edges.front().restatement_kind,
+            omill::EdgeRestatementKind::kBinaryDirect);
+}
+
+TEST(BinaryRegionReconstructorTest,
+     ReturnAddressControlledRetRedirectsToEffectiveReturnTarget) {
+  omill::BinaryRegionReconstructor reconstructor;
+  omill::BinaryRegionReconstructionRequest request;
+  request.root_target_pc = 0x401010u;
+  omill::DescentReturnAddressState state;
+  state.call_site_pc = 0x401000u;
+  state.original_return_pc = 0x401005u;
+  state.effective_return_pc = 0x401099u;
+  state.return_slot_id = 7u;
+  state.control_kind =
+      omill::VirtualReturnAddressControlKind::kRedirectedConstant;
+  state.suppresses_normal_fallthrough = true;
+  request.initial_return_address_state = state;
+
+  omill::FrontierCallbacks callbacks;
+  callbacks.read_target_bytes = [](uint64_t pc, uint8_t *out, size_t size) {
+    if (!size)
+      return false;
+    std::fill(out, out + size, 0x90);
+    if (pc == 0x401010u || pc == 0x401099u) {
+      out[0] = (pc == 0x401010u) ? 0xC3 : 0x90;
+      return true;
+    }
+    return false;
+  };
+  callbacks.can_decode_target = [](uint64_t pc) {
+    return pc == 0x401010u || pc == 0x401099u;
+  };
+  callbacks.is_executable_target = [](uint64_t pc) {
+    return pc == 0x401010u || pc == 0x401099u;
+  };
+
+  auto snapshot = reconstructor.reconstruct(request, callbacks);
+  auto it = snapshot.blocks_by_pc.find(0x401010u);
+  ASSERT_NE(it, snapshot.blocks_by_pc.end());
+  ASSERT_EQ(it->second.outgoing_edges.size(), 1u);
+  EXPECT_EQ(it->second.outgoing_edges.front().target_pc,
+            std::optional<uint64_t>(0x401099u));
+  EXPECT_TRUE(it->second.outgoing_edges.front().is_controlled_return);
+  EXPECT_EQ(it->second.outgoing_edges.front().restatement_kind,
+            omill::EdgeRestatementKind::kControlledReturn);
+}
+
+TEST(BinaryRegionReconstructorTest,
+     ReturnAddressControlledRetKeepsUnresolvedTailWhenTargetIsUnknown) {
+  omill::BinaryRegionReconstructor reconstructor;
+  omill::BinaryRegionReconstructionRequest request;
+  request.root_target_pc = 0x401010u;
+  omill::DescentReturnAddressState state;
+  state.call_site_pc = 0x401000u;
+  state.original_return_pc = 0x401005u;
+  state.return_stack_cell_id = 11u;
+  state.control_kind =
+      omill::VirtualReturnAddressControlKind::kRedirectedSymbolic;
+  state.suppresses_normal_fallthrough = true;
+  request.initial_return_address_state = state;
+
+  omill::FrontierCallbacks callbacks;
+  callbacks.read_target_bytes = [](uint64_t pc, uint8_t *out, size_t size) {
+    if (!size || pc != 0x401010u)
+      return false;
+    std::fill(out, out + size, 0x90);
+    out[0] = 0xC3;
+    return true;
+  };
+  callbacks.can_decode_target = [](uint64_t pc) { return pc == 0x401010u; };
+
+  auto snapshot = reconstructor.reconstruct(request, callbacks);
+  auto it = snapshot.blocks_by_pc.find(0x401010u);
+  ASSERT_NE(it, snapshot.blocks_by_pc.end());
+  ASSERT_EQ(it->second.outgoing_edges.size(), 1u);
+  EXPECT_FALSE(it->second.outgoing_edges.front().target_pc.has_value());
+  EXPECT_TRUE(it->second.outgoing_edges.front().is_controlled_return);
+  EXPECT_TRUE(it->second.outgoing_edges.front().is_unresolved_indirect);
+  EXPECT_EQ(it->second.outgoing_edges.front().restatement_kind,
+            omill::EdgeRestatementKind::kControlledReturnUnresolved);
+  EXPECT_EQ(snapshot.controlled_return_unresolved_pcs.size(), 1u);
+  EXPECT_EQ(snapshot.controlled_return_unresolved_pcs.front(), 0x401010u);
 }
 
 TEST(BinaryRegionReconstructorTest,

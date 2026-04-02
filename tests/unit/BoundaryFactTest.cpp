@@ -35,6 +35,8 @@ TEST(BoundaryFactTest, RoundTripsCallAttrs) {
   fact.continuation_vip_pc = 0x401130;
   fact.continuation_slot_id = 7;
   fact.continuation_stack_cell_id = 11;
+  fact.continuation_owner_id = 7;
+  fact.continuation_owner_kind = omill::VirtualStackOwnerKind::kFramePointerLike;
   fact.kind = omill::BoundaryKind::kNativeBoundary;
   fact.exit_disposition = omill::BoundaryDisposition::kVmExitNativeCallReenter;
   fact.is_partial_exit = true;
@@ -62,6 +64,8 @@ TEST(BoundaryFactTest, RoundTripsFunctionAttrs) {
   fact.boundary_pc = 0x401220;
   fact.continuation_vip_pc = 0x401280;
   fact.continuation_slot_id = 3;
+  fact.continuation_owner_id = 3;
+  fact.continuation_owner_kind = omill::VirtualStackOwnerKind::kVmStackRootSlot;
   fact.kind = omill::BoundaryKind::kNestedVmEnterBoundary;
   fact.exit_disposition = omill::BoundaryDisposition::kNestedVmEnter;
   fact.is_nested_vm_enter = true;

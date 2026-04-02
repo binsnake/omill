@@ -86,6 +86,8 @@ enum class FrontierDiscoveryPhase {
 
 enum class FrontierWorkKind {
   kLiftableBlock,
+  kIntraOwnerContinuation,
+  kBoundaryContinuation,
   kNativeCallBoundary,
   kTerminalBoundary,
   kVmEnterBoundary,
@@ -122,11 +124,38 @@ struct DevirtualizationRequest {
   bool verify_rewrites = false;
   bool force_devirtualize = false;
   bool auto_detect = true;
+};
 
-  // Compatibility inputs from the old CLI surface.
-  bool deprecated_block_lift = false;
-  bool deprecated_generic_static = false;
-  bool deprecated_vm_entry_mode = false;
+struct DevirtualizationCompatInputs {
+  bool requested_block_lift = false;
+  bool requested_generic_static = false;
+  bool requested_vm_entry_mode = false;
+  bool env_generic_static = false;
+  bool env_verify_generic_static = false;
+  bool env_force_generic_static = false;
+  bool no_abi = false;
+  bool requested_root_is_export = false;
+  bool export_root_has_hidden_entry_seed_exprs = false;
+  uint64_t requested_root_rva = 0;
+  uint64_t largest_executable_section_size = 0;
+  uint64_t executable_section_count = 0;
+};
+
+enum class DevirtualizationCompatReason {
+  kNone,
+  kCompatibilityFlag,
+  kFastPlainExportRootFallback,
+  kStableLargeExportRootFallback,
+  kNoVmLikeCandidates,
+  kNoRootLocalDevirtShape,
+  kLegacyVmPathSuppressed,
+  kPreAbiNoAbiCleanup,
+};
+
+enum class DevirtualizationExportRootFallbackMode {
+  kNone,
+  kFastPlain,
+  kStableLarge,
 };
 
 struct DevirtualizationDetectionResult {
@@ -214,6 +243,7 @@ struct FrontierWorkItem {
   unsigned retry_count = 0;
   std::string failure_reason;
   std::string identity;
+  bool from_boundary_continuation = false;
 };
 
 struct SessionHandlerNode {
@@ -267,6 +297,7 @@ struct SessionEdgeFact {
   bool from_unresolved_exit = false;
   bool from_output_root_closure = false;
   bool from_vm_continuation = false;
+  bool from_boundary_continuation = false;
 };
 
 struct SessionBoundaryFact {
@@ -470,6 +501,30 @@ struct DevirtualizationExecutionPlan {
   DevirtualizationDetectionResult detection;
 };
 
+struct DevirtualizationDriverCompatPlan {
+  DevirtualizationExecutionPlan execution;
+  bool use_block_lift = false;
+  bool generic_static_requested = false;
+  bool use_generic_static = false;
+  bool verify_generic_static = false;
+  bool enable_legacy_vm_mode = false;
+  bool suppress_legacy_vm_mode = false;
+  DevirtualizationCompatReason legacy_vm_mode_reason =
+      DevirtualizationCompatReason::kNone;
+  DevirtualizationExportRootFallbackMode export_root_fallback_mode =
+      DevirtualizationExportRootFallbackMode::kNone;
+  DevirtualizationCompatReason generic_static_reason =
+      DevirtualizationCompatReason::kNone;
+  bool auto_skip_always_inline = false;
+  DevirtualizationCompatReason always_inline_reason =
+      DevirtualizationCompatReason::kNone;
+  bool root_local_generic_static_devirtualization_shape = false;
+  bool use_pre_abi_noabi_cleanup = false;
+  DevirtualizationCompatReason pre_abi_cleanup_reason =
+      DevirtualizationCompatReason::kNone;
+  bool no_abi_mode = false;
+};
+
 class DevirtualizationOrchestrator {
  public:
   explicit DevirtualizationOrchestrator(
@@ -481,15 +536,28 @@ class DevirtualizationOrchestrator {
   const DevirtualizationSession &session() const { return session_; }
 
   DevirtualizationDetectionResult detect(
-      const llvm::Module &M, const DevirtualizationRequest &request) const;
+      const llvm::Module &M, const DevirtualizationRequest &request,
+      const DevirtualizationCompatInputs &compat_inputs = {}) const;
   DevirtualizationExecutionPlan buildExecutionPlan(
-      const llvm::Module &M, const DevirtualizationRequest &request);
+      const llvm::Module &M, const DevirtualizationRequest &request,
+      const DevirtualizationCompatInputs &compat_inputs = {});
+  DevirtualizationDriverCompatPlan buildDriverCompatPlan(
+      const llvm::Module &M, const DevirtualizationRequest &request,
+      const DevirtualizationCompatInputs &compat_inputs = {});
   void refreshSessionState(const llvm::Module &M);
   void applyExecutionPlan(const DevirtualizationExecutionPlan &plan,
                           PipelineOptions &opts) const;
+  void applyDriverCompatPlan(const DevirtualizationDriverCompatPlan &plan,
+                             PipelineOptions &opts) const;
   FrontierAdvanceSummary discoverFrontierWork(
       const llvm::Module &M, const FrontierCallbacks &callbacks,
       FrontierDiscoveryPhase phase = FrontierDiscoveryPhase::kCombined);
+  bool enqueueBoundaryContinuationWork(
+      const llvm::Module &M, const BoundaryFact &boundary,
+      llvm::StringRef source_name = {},
+      std::optional<uint64_t> source_pc = std::nullopt);
+  bool requeueBoundaryEdgesForTarget(const llvm::Module &M, uint64_t target_pc,
+                                     llvm::StringRef reason = {});
   FrontierAdvanceSummary advanceFrontierWork(
       llvm::Module &M, BlockLifter &block_lifter,
       IterativeLiftingSession &iterative_session,
@@ -532,6 +600,8 @@ class DevirtualizationOrchestrator {
 
 const char *toString(DevirtualizationConfidence confidence);
 const char *toString(DevirtualizationEpoch epoch);
+const char *toString(DevirtualizationCompatReason reason);
+const char *toString(DevirtualizationExportRootFallbackMode mode);
 const char *toString(UnresolvedExitKind kind);
 const char *toString(ExitCompleteness completeness);
 const char *toString(LiftUnitCacheStatus status);

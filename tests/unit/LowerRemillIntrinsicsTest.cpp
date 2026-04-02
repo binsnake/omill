@@ -370,4 +370,109 @@ TEST_F(LowerRemillIntrinsicsTest, SelectiveCategory_OnlyLowersSpecified) {
   EXPECT_TRUE(foundLoad);
 }
 
+TEST_F(LowerRemillIntrinsicsTest, FpuHelpersLowerToInternalStateWithoutDecls) {
+  auto M = makeModule();
+  auto *ptrTy = llvm::PointerType::get(Ctx, 0);
+  auto *i32Ty = llvm::Type::getInt32Ty(Ctx);
+
+  auto *testTy = llvm::FunctionType::get(i32Ty, {i32Ty}, false);
+  auto *setRoundTy = llvm::FunctionType::get(i32Ty, {i32Ty}, false);
+  auto *getRoundTy = llvm::FunctionType::get(i32Ty, {}, false);
+  auto testFn =
+      M->getOrInsertFunction("__remill_fpu_exception_test", testTy);
+  auto clearFn =
+      M->getOrInsertFunction("__remill_fpu_exception_clear", testTy);
+  auto raiseFn =
+      M->getOrInsertFunction("__remill_fpu_exception_raise", testTy);
+  auto setRoundFn =
+      M->getOrInsertFunction("__remill_fpu_set_rounding", setRoundTy);
+  auto getRoundFn =
+      M->getOrInsertFunction("__remill_fpu_get_rounding", getRoundTy);
+
+  auto *F = createLiftedFn(*M);
+  auto *BB = llvm::BasicBlock::Create(Ctx, "entry", F);
+  llvm::IRBuilder<> B(BB);
+  auto *mem = F->getArg(2);
+
+  auto *clearCall = B.CreateCall(clearFn, {B.getInt32(0x7f)});
+  auto *raiseCall = B.CreateCall(raiseFn, {B.getInt32(0x3)});
+  auto *setRoundCall = B.CreateCall(setRoundFn, {B.getInt32(2)});
+  auto *testCall = B.CreateCall(testFn, {B.getInt32(0x7f)});
+  auto *getRoundCall = B.CreateCall(getRoundFn, {});
+  auto *combined = B.CreateAdd(testCall, getRoundCall);
+  auto *combined2 = B.CreateAdd(combined, clearCall);
+  auto *combined3 = B.CreateAdd(combined2, raiseCall);
+  auto *combined4 = B.CreateAdd(combined3, setRoundCall);
+  (void)combined4;
+  B.CreateRet(mem);
+
+  ASSERT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+  runPass(F, omill::LowerCategories::HyperCalls);
+  ASSERT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+
+  EXPECT_EQ(M->getFunction("fetestexcept"), nullptr);
+  EXPECT_EQ(M->getFunction("feclearexcept"), nullptr);
+  EXPECT_EQ(M->getFunction("feraiseexcept"), nullptr);
+  EXPECT_EQ(M->getFunction("fesetround"), nullptr);
+  EXPECT_EQ(M->getFunction("fegetround"), nullptr);
+
+  auto *exceptState = M->getNamedGlobal("__omill_fenv_except_state");
+  auto *roundState = M->getNamedGlobal("__omill_fenv_rounding_mode");
+  ASSERT_NE(exceptState, nullptr);
+  ASSERT_NE(roundState, nullptr);
+
+  bool sawLoad = false;
+  bool sawStore = false;
+  bool sawRemillCall = false;
+  for (auto &I : *BB) {
+    sawLoad |= llvm::isa<llvm::LoadInst>(&I);
+    sawStore |= llvm::isa<llvm::StoreInst>(&I);
+    if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I)) {
+      if (auto *callee = CI->getCalledFunction();
+          callee && callee->getName().starts_with("__remill_fpu_")) {
+        sawRemillCall = true;
+      }
+    }
+  }
+  EXPECT_TRUE(sawLoad);
+  EXPECT_TRUE(sawStore);
+  EXPECT_FALSE(sawRemillCall);
+}
+
+TEST_F(LowerRemillIntrinsicsTest, FP80NearbyIntLowersWithoutResidualIntrinsic) {
+  auto M = makeModule();
+  auto *ptrTy = llvm::PointerType::get(Ctx, 0);
+  auto *fp80Ty = llvm::Type::getX86_FP80Ty(Ctx);
+  auto *nearbyDecl =
+      llvm::Intrinsic::getOrInsertDeclaration(M.get(), llvm::Intrinsic::nearbyint,
+                                              {fp80Ty});
+
+  auto *F = createLiftedFn(*M);
+  auto *BB = llvm::BasicBlock::Create(Ctx, "entry", F);
+  llvm::IRBuilder<> B(BB);
+  auto *rounded =
+      B.CreateCall(nearbyDecl, {llvm::ConstantFP::get(fp80Ty, 1.5)});
+  (void)B.CreateFNeg(rounded);
+  B.CreateRet(F->getArg(2));
+
+  ASSERT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+  runPass(F, omill::LowerCategories::HyperCalls);
+  ASSERT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+
+  bool sawNearbyIntrinsic = false;
+  bool sawInlineAsm = false;
+  for (auto &I : *BB) {
+    if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I)) {
+      if (auto *callee = CI->getCalledFunction()) {
+        if (callee->getName() == "llvm.nearbyint.f80")
+          sawNearbyIntrinsic = true;
+      }
+      sawInlineAsm |= CI->isInlineAsm();
+    }
+  }
+  EXPECT_FALSE(sawNearbyIntrinsic);
+  EXPECT_TRUE(sawInlineAsm);
+  EXPECT_EQ(M->getFunction("nearbyintl"), nullptr);
+}
+
 }  // namespace

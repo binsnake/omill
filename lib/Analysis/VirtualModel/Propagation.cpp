@@ -52,6 +52,18 @@ void canonicalizeVirtualState(VirtualMachineModel &model) {
   for (auto &summary : handlers) {
     for (auto &slot : summary.state_slots)
       stack_model_builder.internSlot(slot, summary.function_name);
+    for (auto &owner : summary.stack_owners) {
+      VirtualStateSlotSummary owner_slot;
+      owner_slot.base_name = owner.base_name;
+      owner_slot.offset = owner.base_offset;
+      owner_slot.width = owner.base_width;
+      owner_slot.from_argument =
+          owner.kind == VirtualStackOwnerKind::kArgumentRoot;
+      owner_slot.from_alloca =
+          owner.kind == VirtualStackOwnerKind::kAllocaRoot;
+      stack_model_builder.internSlot(owner_slot, summary.function_name);
+      owner.owner_slot_id = owner_slot.canonical_id;
+    }
     for (auto &transfer : summary.state_transfers)
       stack_model_builder.internSlot(transfer.target_slot, summary.function_name);
     for (auto &cell : summary.stack_cells)
@@ -87,6 +99,18 @@ void canonicalizeVirtualState(VirtualMachineModel &model) {
   const auto &stack_cell_ids = stack_model.stack_cell_ids;
 
   for (auto &summary : handlers) {
+    for (auto &cell : summary.stack_cells) {
+      if (!cell.owner_slot_id) {
+        for (const auto &owner : summary.stack_owners) {
+          if (owner.owner_slot_id && owner.base_name == cell.base_name &&
+              owner.base_offset == cell.base_offset &&
+              owner.base_width == cell.base_width) {
+            cell.owner_slot_id = owner.owner_slot_id;
+            break;
+          }
+        }
+      }
+    }
     for (auto &dispatch : summary.dispatches)
       annotateExprSlots(dispatch.target, slot_ids);
     for (auto &dispatch : summary.dispatches)

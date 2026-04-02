@@ -87,6 +87,53 @@ enum class FinalStateRecoveryDisposition {
   kHardRejected,
 };
 
+enum class BoundaryTailRecoveryActionKind {
+  kLiftBoundaryContinuation,
+  kMaterializeTerminalBoundary,
+  kReplayBoundaryAndReclassify,
+  kKeepModeledBoundary,
+  kHardRejectBoundary,
+};
+
+enum class BoundaryTailRecoveryDisposition {
+  kPlanned,
+  kSkipped,
+  kContinuationLifted,
+  kMaterializedTerminalBoundary,
+  kReclassified,
+  kKeptModeledBoundary,
+  kHardRejected,
+};
+
+enum class FinalTailNodeKind {
+  kExecutablePlaceholder,
+  kModeledReentryBoundary,
+  kTerminalModeledBoundary,
+  kTerminalModeledChild,
+  kHardRejectedBoundary,
+  kHardRejectedExecutable,
+  kRetryableBoundary,
+};
+
+struct FinalTailGraphNode {
+  uint64_t target_pc = 0;
+  std::string symbol_name;
+  FinalTailNodeKind kind = FinalTailNodeKind::kExecutablePlaceholder;
+  std::string detail;
+  std::optional<uint64_t> continuation_pc;
+};
+
+struct FinalTailGraphEdge {
+  std::optional<uint64_t> source_pc;
+  std::string source_name;
+  uint64_t target_pc = 0;
+};
+
+struct FinalTailGraph {
+  std::vector<FinalTailGraphNode> nodes;
+  std::vector<FinalTailGraphEdge> edges;
+};
+
 struct RejectedImportArtifact {
   uint64_t target_pc = 0;
   RecoveryRejectionReason reason = RecoveryRejectionReason::kUnsupported;
@@ -137,6 +184,28 @@ struct ExecutedRecoveryActionArtifact {
   bool module_changed = false;
 };
 
+struct BoundaryTailRecoveryAction {
+  BoundaryTailRecoveryActionKind kind =
+      BoundaryTailRecoveryActionKind::kKeepModeledBoundary;
+  uint64_t target_pc = 0;
+  std::optional<uint64_t> continuation_pc;
+  std::string source_label;
+  std::string reason;
+  std::string expected_outcome;
+};
+
+struct BoundaryTailRecoveryActionResult {
+  BoundaryTailRecoveryActionKind kind =
+      BoundaryTailRecoveryActionKind::kKeepModeledBoundary;
+  uint64_t target_pc = 0;
+  std::optional<uint64_t> continuation_pc;
+  bool attempted = false;
+  BoundaryTailRecoveryDisposition disposition =
+      BoundaryTailRecoveryDisposition::kSkipped;
+  std::string detail;
+  bool module_changed = false;
+};
+
 struct FinalStateRecoveryPlan {
   std::vector<FinalStateRecoveryAction> actions;
 };
@@ -145,9 +214,19 @@ struct RecoveryQualitySummary {
   bool structurally_closed = false;
   bool functionally_recovered = false;
   bool dispatcher_heavy = false;
+  bool dispatcher_shell = false;
+  std::vector<uint64_t> modeled_intra_owner_continuations;
+  std::vector<uint64_t> lifted_intra_owner_continuations;
+  std::vector<uint64_t> modeled_pc_relative_return_thunks;
+  std::vector<uint64_t> modeled_controlled_returns;
+  std::vector<uint64_t> controlled_return_unresolved;
+  std::vector<uint64_t> lifted_controlled_return_continuations;
   std::vector<uint64_t> terminal_modeled_targets;
   std::vector<uint64_t> terminal_modeled_children;
+  std::vector<uint64_t> terminal_modeled_boundaries;
   std::vector<uint64_t> modeled_reentry_boundaries;
+  std::vector<uint64_t> lifted_boundary_continuations;
+  std::vector<std::string> lowering_helper_callees;
   std::vector<std::string> accepted_external_leaf_calls;
   std::vector<uint64_t> hard_rejected_targets;
 };
@@ -163,13 +242,17 @@ struct RoundArtifactBundle {
   std::vector<uint64_t> native_boundary_targets;
   std::vector<std::string> remill_runtime_callees;
   std::vector<std::string> external_callees;
+  std::vector<std::string> lowering_helper_callees;
   std::vector<uint64_t> imported_targets;
   std::vector<RejectedImportArtifact> rejected_imports;
   std::vector<ImportDecisionArtifact> import_decisions;
   std::vector<CleanupActionArtifact> cleanup_actions;
   std::vector<FinalStateRecoveryAction> planned_recovery_actions;
   std::vector<ExecutedRecoveryActionArtifact> executed_recovery_actions;
+  std::vector<BoundaryTailRecoveryAction> boundary_recovery_actions;
+  std::vector<BoundaryTailRecoveryActionResult> boundary_recovery_results;
   RecoveryQualitySummary recovery_quality;
+  std::optional<FinalTailGraph> final_tail_graph;
   std::vector<std::string> notes;
 };
 
@@ -180,18 +263,29 @@ struct ChildLiftArtifact {
   std::optional<uint64_t> selected_root_pc;
   std::string selected_root_name;
   std::string selected_root_kind;
+  bool selected_root_was_retargeted = false;
+  std::string selected_root_selection_detail;
   bool selected_root_is_trusted_entry = false;
   bool selected_root_is_terminal_only = false;
   bool selected_root_is_terminal_modeled = false;
   bool selected_root_is_self_loop_only = false;
   bool selected_root_has_structural_loop = false;
+  bool has_jump_tail = false;
+  bool has_local_controlled_return = false;
   bool has_runtime_leak = false;
+  bool has_unresolved_dispatch_intrinsics = false;
   bool has_remill_jump = false;
   bool has_remill_function_call = false;
+  bool has_pc_relative_return_thunk = false;
   std::vector<uint64_t> modeled_executable_targets;
   std::vector<uint64_t> modeled_boundary_targets;
+  std::vector<uint64_t> localized_continuation_targets;
+  std::vector<uint64_t> frontier_target_pcs;
+  std::optional<uint64_t> jump_tail_continuation_pc;
+  std::optional<uint64_t> local_controlled_return_pc;
   std::vector<std::string> closed_slice_function_names;
   std::vector<std::string> reachable_declaration_callees;
+  std::vector<std::string> lowering_helper_callees;
   ChildImportClass import_safety = ChildImportClass::kUnsupported;
   RecoveryRejectionReason rejection_reason =
       RecoveryRejectionReason::kUnsupported;
@@ -212,6 +306,25 @@ struct PreparedChildArtifact {
   ChildArtifactPreparationSummary summary;
 };
 
+struct PreparedBoundaryArtifact {
+  ChildLiftArtifact artifact;
+  ChildArtifactPreparationSummary summary;
+  ChildArtifactLeakKind leak_kind = ChildArtifactLeakKind::kNone;
+};
+
+struct BoundaryReplaySummary {
+  uint64_t target_pc = 0;
+  bool replayed = false;
+  std::optional<BoundaryResolutionResult> resolution;
+  ChildArtifactLeakKind leak_kind = ChildArtifactLeakKind::kNone;
+  std::string detail;
+};
+
+struct BoundaryReplayPlan {
+  uint64_t target_pc = 0;
+  bool enable_gsd = false;
+};
+
 struct ChildImportPlan {
   uint64_t target_pc = 0;
   ImportEligibility eligibility = ImportEligibility::kRejected;
@@ -223,6 +336,7 @@ struct ChildImportPlan {
   std::optional<ChildImportClass> import_class;
   std::optional<ContinuationProof> proof;
   std::vector<std::string> allowed_declaration_callees;
+  std::vector<std::string> lowering_helper_callees;
 };
 
 struct ChildArtifactCacheKey {
@@ -307,7 +421,7 @@ struct OutputRecoveryCallbacks {
                                 const ChildImportPlan &, llvm::StringRef)>
       import_executable_child;
   std::function<ChildImportPlan(uint64_t, const ChildLiftArtifact &,
-                                llvm::Function &)>
+                                const ChildImportPlan &, llvm::Function &)>
       import_vm_enter_child;
   std::function<void(uint64_t)> note_imported_target;
   std::function<std::vector<uint64_t>()>
@@ -340,12 +454,14 @@ struct FinalizationSummary {
   ProtectorValidationReport protector_report;
   std::optional<FinalStateRecoveryPlan> final_state_recovery_plan;
   std::optional<RecoveryQualitySummary> recovery_quality;
+  std::optional<FinalTailGraph> final_tail_graph;
   std::vector<RoundArtifactBundle> artifact_bundles;
 };
 
 struct FinalStateRecoveryRequest {
   bool no_abi = false;
   bool enabled = false;
+  bool enable_gsd = false;
 };
 
 class DevirtualizationRuntime {
@@ -383,6 +499,14 @@ class DevirtualizationRuntime {
 
   ProtectorValidationReport buildValidationReport(const llvm::Module &M) const;
 
+  RecoveryQualitySummary classifyRecoveryQuality(const llvm::Module &M) const;
+  FinalTailGraph buildFinalTailGraph(const llvm::Module &M) const;
+  bool refineFinalTailGraphWithBoundaryReplay(
+      llvm::Module &M, FinalTailGraph &graph,
+      const OutputRecoveryCallbacks &callbacks, bool enable_gsd) const;
+  bool projectFinalTailGraphIntoAbiModule(llvm::Module &M,
+                                          const FinalTailGraph &graph) const;
+
   FinalizationSummary finalizeOutput(const llvm::Module &M,
                                      bool devirtualization_enabled) const;
 
@@ -392,22 +516,34 @@ class DevirtualizationRuntime {
   std::optional<RoundArtifactBundle> runFinalStateRecovery(
       llvm::Module &M, const FinalStateRecoveryRequest &request,
       const OutputRecoveryCallbacks &callbacks) const;
+  std::optional<RoundArtifactBundle> runBoundaryTailRecovery(
+      llvm::Module &M, const FinalStateRecoveryRequest &request,
+      const OutputRecoveryCallbacks &callbacks) const;
 
   const std::vector<RoundArtifactBundle> &roundArtifactBundles() const {
     return round_artifact_bundles_;
   }
-  void clearRoundArtifactBundles() const { round_artifact_bundles_.clear(); }
+  void clearRoundArtifactBundles() const {
+    round_artifact_bundles_.clear();
+    vm_enter_child_import_plan_cache_.clear();
+  }
 
  private:
   DevirtualizationOrchestrator &orchestrator_;
   mutable std::optional<llvm::stable_hash> child_cache_module_fingerprint_;
   mutable std::map<ChildArtifactCacheKey, ChildArtifactCacheEntry>
       child_artifact_cache_;
+  mutable std::map<uint64_t, ChildImportPlan> vm_enter_child_import_plan_cache_;
   mutable std::map<uint64_t, BoundaryResolutionResult> boundary_resolution_cache_;
   mutable std::vector<RoundArtifactBundle> round_artifact_bundles_;
 };
 
+bool isLoweringHelperCalleeName(llvm::StringRef name);
+
 const char *toString(FinalStateRecoveryActionKind kind);
 const char *toString(FinalStateRecoveryDisposition disposition);
+const char *toString(BoundaryTailRecoveryActionKind kind);
+const char *toString(BoundaryTailRecoveryDisposition disposition);
+const char *toString(FinalTailNodeKind kind);
 
 }  // namespace omill

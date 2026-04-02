@@ -1,4 +1,5 @@
 #include "omill/Devirtualization/OutputRootClosure.h"
+#include "omill/Devirtualization/BoundaryFact.h"
 #include "omill/Devirtualization/ExecutableTargetFact.h"
 
 #include <llvm/IR/Constants.h>
@@ -155,6 +156,84 @@ TEST(OutputRootClosureTest, ProducesTypedWorkItemsForConstantJumpTargets) {
   ASSERT_NE(it, items.end());
   EXPECT_EQ(it->owner_function, "sub_180001850");
   EXPECT_FALSE(it->identity.empty());
+}
+
+TEST(OutputRootClosureTest,
+     MergesCalleeBoundaryContinuationMetadataIntoClosureWorkItem) {
+  llvm::LLVMContext ctx;
+  llvm::Module module("test", ctx);
+
+  auto *ptr_ty = llvm::PointerType::getUnqual(ctx);
+  auto *i64_ty = llvm::Type::getInt64Ty(ctx);
+  auto *lifted_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+
+  auto *root = llvm::Function::Create(lifted_ty, llvm::GlobalValue::ExternalLinkage,
+                                      "sub_180001850", module);
+  root->addFnAttr("omill.output_root");
+  auto *entry = llvm::BasicBlock::Create(ctx, "entry", root);
+  llvm::IRBuilder<> builder(entry);
+
+  auto *callee = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage,
+      "omill_vm_enter_target_180042BA4", module);
+  omill::BoundaryFact callee_boundary;
+  callee_boundary.boundary_pc = 0x180042BA4u;
+  callee_boundary.continuation_pc = 0x180042BC3u;
+  callee_boundary.continuation_owner_id = 17u;
+  callee_boundary.continuation_owner_kind =
+      omill::VirtualStackOwnerKind::kFramePointerLike;
+  callee_boundary.return_address_control_kind =
+      omill::VirtualReturnAddressControlKind::kRedirectedConstant;
+  callee_boundary.controlled_return_pc = 0x180051897u;
+  callee_boundary.exit_disposition = omill::BoundaryDisposition::kVmEnter;
+  callee_boundary.kind = omill::BoundaryKind::kVmEnterBoundary;
+  callee_boundary.is_vm_enter = true;
+  callee_boundary.reenters_vm = true;
+  callee_boundary.suppresses_normal_fallthrough = true;
+  callee_boundary.continuation_entry_transform =
+      omill::ContinuationEntryTransform{
+          omill::ContinuationEntryTransformKind::kPushImmediateJump,
+          0x180042BA4u, 0x180055365u, 0x43228725u, true};
+  omill::writeBoundaryFact(*callee, callee_boundary);
+
+  auto args = root->args().begin();
+  llvm::Value *state = &*args++;
+  llvm::Value *pc = &*args++;
+  llvm::Value *memory = &*args++;
+  auto *call = builder.CreateCall(
+      callee, {state, llvm::ConstantInt::get(i64_ty, 0x180042BA4), memory});
+  call->addAttributeAtIndex(
+      llvm::AttributeList::FunctionIndex,
+      llvm::Attribute::get(ctx, "omill.virtual_exit_disposition", "unknown"));
+  builder.CreateRet(call);
+
+  auto items = omill::collectOutputRootClosureWorkItems(
+      module,
+      [&](uint64_t target) { return target >= 0x180001000 && target < 0x180100000; },
+      [&](uint64_t) { return false; },
+      [&](uint64_t target) { return target; },
+      /*include_defined_targets=*/false);
+  auto it = std::find_if(items.begin(), items.end(),
+                         [](const omill::OutputRootClosureWorkItem &item) {
+                           return item.target_pc == 0x180042BA4u &&
+                                  item.boundary.has_value();
+                         });
+  ASSERT_NE(it, items.end());
+  ASSERT_TRUE(it->boundary.has_value());
+  EXPECT_EQ(it->boundary->exit_disposition, omill::BoundaryDisposition::kVmEnter);
+  EXPECT_EQ(it->boundary->continuation_pc, 0x180042BC3u);
+  EXPECT_EQ(it->boundary->continuation_owner_id, 17u);
+  EXPECT_EQ(it->boundary->continuation_owner_kind,
+            omill::VirtualStackOwnerKind::kFramePointerLike);
+  EXPECT_EQ(it->boundary->controlled_return_pc, 0x180051897u);
+  EXPECT_EQ(it->boundary->return_address_control_kind,
+            omill::VirtualReturnAddressControlKind::kRedirectedConstant);
+  ASSERT_TRUE(it->boundary->continuation_entry_transform.has_value());
+  EXPECT_EQ(it->boundary->continuation_entry_transform->kind,
+            omill::ContinuationEntryTransformKind::kPushImmediateJump);
+  EXPECT_EQ(it->boundary->continuation_entry_transform->jump_target_pc,
+            0x180055365u);
 }
 
 TEST(OutputRootClosureTest, IncludesBlkDeclarationCalleesAsClosureTargets) {

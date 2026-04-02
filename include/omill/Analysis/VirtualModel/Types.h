@@ -121,6 +121,36 @@ enum class VirtualExitStackDeltaKind {
   kOther,
 };
 
+enum class VirtualReturnAddressControlKind {
+  kUnknown,
+  kPreserved,
+  kStateSlotControlled,
+  kStackCellControlled,
+  kRedirectedConstant,
+  kRedirectedSymbolic,
+  kClobbered,
+};
+
+enum class VirtualStackOwnerKind {
+  kUnknown,
+  kNativeStackPointer,
+  kFramePointerLike,
+  kVmStackRootSlot,
+  kArgumentRoot,
+  kAllocaRoot,
+  kDerivedOwner,
+};
+
+enum class VirtualStackOwnerTransferKind {
+  kUnknown,
+  kCopy,
+  kAddConst,
+  kSubConst,
+  kPushStyleAdjust,
+  kPopStyleAdjust,
+  kSyntheticEntryTransform,
+};
+
 struct VirtualValueExpr {
   VirtualExprKind kind = VirtualExprKind::kUnknown;
   unsigned bit_width = 0;
@@ -146,11 +176,27 @@ struct VirtualInstructionPointerSummary {
   bool symbolic = false;
 };
 
+struct VirtualReturnAddressControlSummary {
+  VirtualReturnAddressControlKind kind =
+      VirtualReturnAddressControlKind::kUnknown;
+  std::optional<uint64_t> original_return_pc;
+  std::optional<unsigned> return_slot_id;
+  std::optional<unsigned> return_stack_cell_id;
+  std::optional<unsigned> return_owner_id;
+  VirtualStackOwnerKind return_owner_kind = VirtualStackOwnerKind::kUnknown;
+  std::optional<int64_t> return_owner_delta;
+  VirtualValueExpr effective_return_expr;
+  std::optional<uint64_t> resolved_effective_return_pc;
+  bool was_overwritten = false;
+  bool suppresses_normal_fallthrough = false;
+};
+
 struct VirtualExitSummary {
   VirtualExitDisposition disposition = VirtualExitDisposition::kUnknown;
   std::optional<uint64_t> native_target_pc;
   VirtualInstructionPointerSummary continuation_vip;
   std::optional<uint64_t> continuation_pc;
+  VirtualReturnAddressControlSummary return_address_control;
   VirtualExitStackDeltaKind stack_delta_kind =
       VirtualExitStackDeltaKind::kUnknown;
   std::optional<int64_t> stack_delta_bytes;
@@ -198,6 +244,10 @@ struct VirtualArgumentFact {
 };
 
 struct VirtualStackCellSummary {
+  std::optional<unsigned> owner_slot_id;
+  VirtualStackOwnerKind owner_kind = VirtualStackOwnerKind::kUnknown;
+  std::optional<unsigned> derived_from_owner_slot_id;
+  std::optional<int64_t> owner_constant_delta;
   std::string base_name;
   int64_t base_offset = 0;
   unsigned base_width = 0;
@@ -214,6 +264,10 @@ struct VirtualStackCellSummary {
 struct VirtualStackCellInfo {
   unsigned id = 0;
   unsigned base_slot_id = 0;
+  unsigned owner_slot_id = 0;
+  VirtualStackOwnerKind owner_kind = VirtualStackOwnerKind::kUnknown;
+  std::optional<unsigned> derived_from_owner_slot_id;
+  std::optional<int64_t> owner_constant_delta;
   std::string base_name;
   int64_t base_offset = 0;
   unsigned base_width = 0;
@@ -224,9 +278,27 @@ struct VirtualStackCellInfo {
   std::vector<std::string> handler_names;
 };
 
+struct VirtualStackOwnerSummary {
+  std::optional<unsigned> owner_slot_id;
+  std::string base_name;
+  int64_t base_offset = 0;
+  unsigned base_width = 0;
+  VirtualStackOwnerKind kind = VirtualStackOwnerKind::kUnknown;
+  std::optional<unsigned> derived_from_owner_slot_id;
+  std::optional<int64_t> constant_delta;
+  bool is_active_stack_owner = false;
+};
+
 struct VirtualStackTransferSummary {
   VirtualStackCellSummary target_cell;
   VirtualValueExpr value;
+};
+
+struct VirtualStackOwnerTransferSummary {
+  std::optional<unsigned> source_owner_id;
+  std::optional<unsigned> target_owner_id;
+  VirtualStackOwnerTransferKind kind = VirtualStackOwnerTransferKind::kUnknown;
+  std::optional<int64_t> constant_delta;
 };
 
 struct VirtualStackFact {
@@ -272,6 +344,10 @@ struct VirtualCallSiteSummary {
   std::optional<uint64_t> continuation_pc;
   std::optional<unsigned> continuation_slot_id;
   std::optional<unsigned> continuation_stack_cell_id;
+  std::optional<unsigned> continuation_owner_id;
+  VirtualStackOwnerKind continuation_owner_kind =
+      VirtualStackOwnerKind::kUnknown;
+  VirtualReturnAddressControlSummary return_address_control;
   VirtualInstructionPointerSummary vip;
   VirtualExitSummary exit;
   bool is_executable_in_image = false;
@@ -299,10 +375,12 @@ struct VirtualHandlerSummary {
   std::vector<std::string> called_boundaries;
   std::vector<std::string> direct_callees;
   std::vector<VirtualStateSlotSummary> state_slots;
+  std::vector<VirtualStackOwnerSummary> stack_owners;
   std::vector<VirtualStackCellSummary> stack_cells;
   std::vector<VirtualDispatchSummary> dispatches;
   std::vector<VirtualCallSiteSummary> callsites;
   std::vector<VirtualStateTransferSummary> state_transfers;
+  std::vector<VirtualStackOwnerTransferSummary> stack_owner_transfers;
   std::vector<VirtualStackTransferSummary> stack_transfers;
   std::vector<unsigned> live_in_slot_ids;
   std::vector<unsigned> written_slot_ids;
@@ -372,7 +450,20 @@ struct VirtualRootSliceSummary {
   unsigned specialization_count = 0;
 };
 
+inline std::optional<uint64_t> effectiveContinuationPc(
+    const VirtualCallSiteSummary &callsite) {
+  if (callsite.return_address_control.suppresses_normal_fallthrough) {
+    return callsite.return_address_control.resolved_effective_return_pc;
+  }
+  return callsite.continuation_pc;
+}
+
 std::string renderVirtualValueExpr(const VirtualValueExpr &expr);
+std::string renderVirtualStackOwnerKind(VirtualStackOwnerKind kind);
+std::string renderVirtualReturnAddressControlKind(
+    VirtualReturnAddressControlKind kind);
+std::string renderVirtualReturnAddressControlSummary(
+    const VirtualReturnAddressControlSummary &summary);
 std::string renderVirtualIncomingContextSourceKind(
     VirtualIncomingContextSourceKind kind);
 std::string renderVirtualIncomingSlotPhi(const VirtualIncomingSlotPhi &phi);

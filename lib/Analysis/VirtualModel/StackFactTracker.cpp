@@ -6,6 +6,15 @@ namespace omill::virtual_model::detail {
 
 namespace {
 
+static unsigned ownerIdForCellInfo(const VirtualStackCellInfo &info) {
+  return info.owner_slot_id ? info.owner_slot_id : info.base_slot_id;
+}
+
+static unsigned ownerIdForSummary(const VirtualStackCellSummary &summary,
+                                  unsigned fallback_base_slot_id) {
+  return summary.owner_slot_id.value_or(fallback_base_slot_id);
+}
+
 std::optional<int64_t> stackBaseDeltaForExpr(const VirtualValueExpr &expr,
                                             unsigned slot_id) {
   if (expr.kind == VirtualExprKind::kStateSlot && expr.slot_id == slot_id)
@@ -137,8 +146,9 @@ std::optional<CanonicalStackFactKey> canonicalStackFactKeyForCellId(
     return std::nullopt;
 
   int64_t delta = 0;
-  if (auto delta_it = state.stack_base_deltas.find(it->second->base_slot_id);
-      delta_it != state.stack_base_deltas.end()) {
+  if (auto delta_it =
+          state.stack_owner_deltas.find(ownerIdForCellInfo(*it->second));
+      delta_it != state.stack_owner_deltas.end()) {
     delta = delta_it->second;
   }
 
@@ -162,8 +172,9 @@ std::optional<CanonicalStackFactKey> canonicalStackFactKeyForSummary(
     return std::nullopt;
 
   int64_t delta = 0;
-  if (auto delta_it = state.stack_base_deltas.find(*base_slot_id);
-      delta_it != state.stack_base_deltas.end()) {
+  if (auto delta_it = state.stack_owner_deltas.find(
+          ownerIdForSummary(summary, *base_slot_id));
+      delta_it != state.stack_owner_deltas.end()) {
     delta = delta_it->second;
   }
 
@@ -221,8 +232,8 @@ std::map<unsigned, VirtualValueExpr> materializeTrackedStackFacts(
   std::map<unsigned, VirtualValueExpr> materialized;
   for (const auto &[key, value] : state.stack_facts) {
     int64_t delta = 0;
-    if (auto delta_it = state.stack_base_deltas.find(key.base_slot_id);
-        delta_it != state.stack_base_deltas.end()) {
+  if (auto delta_it = state.stack_owner_deltas.find(key.base_slot_id);
+      delta_it != state.stack_owner_deltas.end()) {
       delta = delta_it->second;
     }
     auto current_offset = key.cell_offset + delta;
@@ -250,8 +261,8 @@ std::map<StackCellKey, VirtualValueExpr> materializeTrackedStructuralStackFacts(
     if (slot_it == context.slot_info.end())
       continue;
     int64_t delta = 0;
-    if (auto delta_it = state.stack_base_deltas.find(key.base_slot_id);
-        delta_it != state.stack_base_deltas.end()) {
+  if (auto delta_it = state.stack_owner_deltas.find(key.base_slot_id);
+      delta_it != state.stack_owner_deltas.end()) {
       delta = delta_it->second;
     }
     StackCellKey structural{
@@ -276,8 +287,8 @@ llvm::SmallDenseSet<unsigned, 16> materializeTrackedWrittenStackCellIds(
   llvm::SmallDenseSet<unsigned, 16> materialized;
   for (const auto &key : written_stack_keys) {
     int64_t delta = 0;
-    if (auto delta_it = state.stack_base_deltas.find(key.base_slot_id);
-        delta_it != state.stack_base_deltas.end()) {
+  if (auto delta_it = state.stack_owner_deltas.find(key.base_slot_id);
+      delta_it != state.stack_owner_deltas.end()) {
       delta = delta_it->second;
     }
     auto it = context.materialized_stack_cell_ids.find(MaterializedStackCellKey{
@@ -383,12 +394,12 @@ TrackedFactState buildTrackedFactState(
 
 void refreshTrackedFactState(const StackModelContext &context,
                              TrackedFactState &state) {
-  state.stack_base_deltas.clear();
+  state.stack_owner_deltas.clear();
   for (const auto &[slot_id, slot] : context.slot_info) {
     (void) slot;
     if (auto delta =
             inferTrackedStackBaseDeltaForSlot(state.slot_facts, slot_id)) {
-      state.stack_base_deltas.emplace(slot_id, *delta);
+      state.stack_owner_deltas.emplace(slot_id, *delta);
     }
   }
   state.materialized_stack_facts = materializeTrackedStackFacts(context, state);
@@ -408,8 +419,9 @@ std::optional<TrackedStackLookupResult> lookupTrackedStackFact(
     return std::nullopt;
 
   int64_t delta = 0;
-  if (auto delta_it = state.stack_base_deltas.find(*base_slot_id);
-      delta_it != state.stack_base_deltas.end()) {
+  if (auto delta_it = state.stack_owner_deltas.find(
+          ownerIdForSummary(summary, *base_slot_id));
+      delta_it != state.stack_owner_deltas.end()) {
     delta = delta_it->second;
   }
 

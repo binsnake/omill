@@ -240,7 +240,8 @@ static bool isSemanticallyLocalizedCallsite(
     const VirtualMachineModel &model, const VirtualHandlerSummary &handler,
     const VirtualCallSiteSummary &callsite,
     const std::map<std::string, const VirtualHandlerSummary *> &handler_by_name) {
-  if (!callsite.continuation_pc.has_value())
+  auto continuation_pc = effectiveContinuationPc(callsite);
+  if (!continuation_pc.has_value())
     return false;
   if (!shouldMaterializeContinuationShimForExit(callsite.exit))
     return false;
@@ -257,7 +258,7 @@ static bool isSemanticallyLocalizedCallsite(
       return exprReferencesNamedSlot(model, expr, "RETURN_PC") ||
              (expr.kind == VirtualExprKind::kConstant &&
               expr.constant.has_value() &&
-              *expr.constant == *callsite.continuation_pc);
+              *expr.constant == *continuation_pc);
     };
 
     has_same_handler_localized_continuation =
@@ -2362,13 +2363,13 @@ static bool synthesizeLocalizedContinuationShims(
       continue;
 
     for (const auto &callsite : handler.callsites) {
-      if (!callsite.continuation_pc.has_value())
+      auto continuation_pc = effectiveContinuationPc(callsite);
+      if (!continuation_pc.has_value())
         continue;
       if (!shouldMaterializeContinuationShimForExit(callsite.exit))
         continue;
 
-      auto *continuation =
-          lookupLiftedTargetByPC(M, *callsite.continuation_pc);
+      auto *continuation = lookupLiftedTargetByPC(M, *continuation_pc);
       if (!continuation)
         continue;
       if (!continuation->isDeclaration())
@@ -3878,9 +3879,9 @@ static MaterializationResult runMaterialization(llvm::Module &M,
             os << "    recovered_entry=0x"
                << llvm::utohexstr(*callsite.recovered_entry_pc) << "\n";
           }
-          if (callsite.continuation_pc.has_value()) {
+          if (auto continuation_pc = effectiveContinuationPc(callsite)) {
             os << "    continuation_pc=0x"
-               << llvm::utohexstr(*callsite.continuation_pc) << "\n";
+               << llvm::utohexstr(*continuation_pc) << "\n";
           }
           if (callsite.vip.resolved_pc.has_value()) {
             os << "    vip=0x" << llvm::utohexstr(*callsite.vip.resolved_pc)

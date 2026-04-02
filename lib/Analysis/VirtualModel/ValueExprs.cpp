@@ -19,6 +19,21 @@ namespace omill::virtual_model::detail {
 
 namespace {
 
+static bool isNativeStackOwnerName(llvm::StringRef name) {
+  return name.equals_insensitive("RSP") || name.equals_insensitive("SP");
+}
+
+static bool isFramePointerLikeName(llvm::StringRef name) {
+  return name.equals_insensitive("RBP") || name.equals_insensitive("BP");
+}
+
+static bool isVmStackRootLikeName(llvm::StringRef name) {
+  llvm::StringRef lowered = name;
+  return lowered.contains_insensitive("stack") ||
+         lowered.contains_insensitive("vsp") ||
+         lowered.contains_insensitive("vm_sp");
+}
+
 }  // namespace
 
 std::optional<unsigned> remillMemoryBitWidth(llvm::StringRef name) {
@@ -283,6 +298,17 @@ std::optional<VirtualStackCellSummary> extractStackCellSummaryFromExpr(
                           unsigned base_width, bool base_from_argument,
                           bool base_from_alloca, int64_t cell_offset) {
     VirtualStackCellSummary summary;
+    if (base_from_argument) {
+      summary.owner_kind = VirtualStackOwnerKind::kArgumentRoot;
+    } else if (base_from_alloca) {
+      summary.owner_kind = VirtualStackOwnerKind::kAllocaRoot;
+    } else if (isNativeStackOwnerName(base_name)) {
+      summary.owner_kind = VirtualStackOwnerKind::kNativeStackPointer;
+    } else if (isFramePointerLikeName(base_name)) {
+      summary.owner_kind = VirtualStackOwnerKind::kFramePointerLike;
+    } else if (isVmStackRootLikeName(base_name)) {
+      summary.owner_kind = VirtualStackOwnerKind::kVmStackRootSlot;
+    }
     summary.base_name = base_name.str();
     summary.base_offset = base_offset;
     summary.base_width = base_width;
@@ -305,8 +331,9 @@ std::optional<VirtualStackCellSummary> extractStackCellSummaryFromExpr(
                             static_cast<int64_t>(*native_sp_offset);
       } else {
         llvm::StringRef name(base_name);
-        is_stack_base = name.equals_insensitive("RSP") ||
-                        name.equals_insensitive("SP");
+        is_stack_base = isNativeStackOwnerName(name) ||
+                        isFramePointerLikeName(name) ||
+                        isVmStackRootLikeName(name);
       }
       if (!is_stack_base)
         return std::nullopt;

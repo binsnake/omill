@@ -20,6 +20,7 @@ enum class ContinuationProvenance {
   kExactFallthrough,
   kInvalidatedExecutableEntry,
   kExecutablePlaceholder,
+  kReturnAddressControlled,
   kNativeBoundary,
   kVmEnterBoundary,
   kSelectorDerived,
@@ -92,6 +93,10 @@ struct ContinuationProof {
   bool is_trusted_entry = false;
   bool is_exact_fallthrough = false;
   bool is_invalidated_entry = false;
+  VirtualReturnAddressControlKind return_address_control_kind =
+      VirtualReturnAddressControlKind::kUnknown;
+  std::optional<uint64_t> controlled_return_pc;
+  bool suppresses_normal_fallthrough = false;
   std::optional<uint64_t> invalidated_entry_source_pc;
   std::optional<uint64_t> invalidated_entry_failed_pc;
   std::optional<uint64_t> selected_root_pc;
@@ -112,6 +117,10 @@ struct ContinuationCandidate {
   ContinuationLiveness liveness = ContinuationLiveness::kUnknown;
   FrontierSchedulingClass scheduling_class =
       FrontierSchedulingClass::kWeakExecutable;
+  VirtualReturnAddressControlKind return_address_control_kind =
+      VirtualReturnAddressControlKind::kUnknown;
+  std::optional<uint64_t> controlled_return_pc;
+  bool suppresses_normal_fallthrough = false;
   std::optional<ExecutableTargetFact> executable_target;
   std::optional<BoundaryFact> boundary;
   std::optional<ContinuationProof> proof;

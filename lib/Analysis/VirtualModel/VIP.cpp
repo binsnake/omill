@@ -232,10 +232,19 @@ static void applyContinuationLocation(VirtualInstructionPointerSummary &vip,
 static std::pair<VirtualExitStackDeltaKind, std::optional<int64_t>>
 classifyStackDelta(const VirtualHandlerSummary &summary) {
   std::optional<unsigned> sp_slot_id;
-  for (llvm::StringRef sp_name : {"RSP", "SP", "sp"}) {
-    if (auto slot_id = lookupNamedSummarySlotId(summary, sp_name)) {
-      sp_slot_id = slot_id;
+  for (const auto &owner : summary.stack_owners) {
+    if (owner.is_active_stack_owner && owner.owner_slot_id) {
+      sp_slot_id = owner.owner_slot_id;
       break;
+    }
+  }
+  if (!sp_slot_id) {
+    for (llvm::StringRef sp_name : {"RSP", "SP", "sp", "RBP", "BP", "rbp",
+                                    "bp"}) {
+      if (auto slot_id = lookupNamedSummarySlotId(summary, sp_name)) {
+        sp_slot_id = slot_id;
+        break;
+      }
     }
   }
   if (!sp_slot_id)
@@ -362,10 +371,41 @@ static VirtualExitSummary classifyCallsiteExit(
   exit.stack_delta_kind = stack_delta_kind;
   exit.stack_delta_bytes = stack_delta_bytes;
   exit.continuation_pc = callsite.continuation_pc;
+  exit.return_address_control = callsite.return_address_control;
   exit.continuation_vip = buildContinuationVip(callsite.continuation_pc);
   applyContinuationLocation(exit.continuation_vip,
                             inferContinuationLocationFromCallsite(summary,
                                                                  callsite));
+
+  if (exit.return_address_control.suppresses_normal_fallthrough) {
+    if (exit.return_address_control.resolved_effective_return_pc) {
+      exit.continuation_pc =
+          exit.return_address_control.resolved_effective_return_pc;
+      exit.continuation_vip = buildContinuationVip(exit.continuation_pc);
+      applyContinuationLocation(exit.continuation_vip,
+                                inferContinuationLocationFromCallsite(summary,
+                                                                     callsite));
+    } else {
+      exit.continuation_pc.reset();
+      exit.continuation_vip.resolved_pc.reset();
+      exit.continuation_vip.slot_id =
+          callsite.return_address_control.return_slot_id;
+      exit.continuation_vip.stack_cell_id =
+          callsite.return_address_control.return_stack_cell_id;
+      if (exit.continuation_vip.stack_cell_id) {
+        exit.continuation_vip.source_kind =
+            VirtualInstructionPointerSourceKind::kStackCell;
+      } else if (exit.continuation_vip.slot_id) {
+        exit.continuation_vip.source_kind =
+            VirtualInstructionPointerSourceKind::kNamedSlot;
+      }
+      exit.continuation_vip.symbolic = true;
+      exit.continuation_vip.expr_after_dispatch =
+          callsite.return_address_control.effective_return_expr;
+      exit.continuation_vip.expr_before_dispatch =
+          callsite.return_address_control.effective_return_expr;
+    }
+  }
 
   const auto effective_target_pc =
       callsite.resolved_target_pc ? callsite.resolved_target_pc

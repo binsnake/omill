@@ -1,3 +1,4 @@
+#include "omill/Devirtualization/BoundaryFact.h"
 #include "omill/Utils/LiftedNames.h"
 
 #include <llvm/IR/Function.h>
@@ -102,6 +103,17 @@ TEST_F(LiftedNamesTest, ExtractStructuralCodeTargetPC_PrefersAttrsOverName) {
   F->addFnAttr("omill.vm_enter_target_pc", "401155");
   F->addFnAttr("omill.executable_target_pc", "401145");
   EXPECT_EQ(omill::extractStructuralCodeTargetPC(*F), 0x401145ULL);
+}
+
+TEST_F(LiftedNamesTest,
+       ExtractStructuralCodeTargetPC_PrefersNativePlaceholderNameOverBoundaryFact) {
+  auto M = std::make_unique<llvm::Module>("test_boundary_placeholder", Ctx);
+  auto *F = createLiftedDecl(*M, "omill_native_target_401250");
+  omill::BoundaryFact fact;
+  fact.boundary_pc = 0x4012A0ULL;
+  fact.native_target_pc = 0x4012B0ULL;
+  omill::writeBoundaryFact(*F, fact);
+  EXPECT_EQ(omill::extractStructuralCodeTargetPC(*F), 0x401250ULL);
 }
 
 

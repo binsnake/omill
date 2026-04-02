@@ -32,6 +32,51 @@ bool debugJumpSelector() {
   return enabled;
 }
 
+llvm::GlobalVariable *getOrCreateFEnvI32Global(llvm::Module &M,
+                                               llvm::StringRef name) {
+  if (auto *GV = M.getNamedGlobal(name))
+    return GV;
+  auto *Ty = llvm::Type::getInt32Ty(M.getContext());
+  auto *Init = llvm::ConstantInt::get(Ty, 0);
+  auto *GV = new llvm::GlobalVariable(M, Ty,
+                                      /*isConstant=*/false,
+                                      llvm::GlobalValue::InternalLinkage,
+                                      Init, name);
+  GV->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+  GV->setAlignment(llvm::MaybeAlign(4));
+  return GV;
+}
+
+llvm::CallInst *createFP80RoundToIntegral(llvm::IRBuilder<> &Builder,
+                                          llvm::Value *input) {
+  auto *Ty = llvm::Type::getX86_FP80Ty(Builder.getContext());
+  auto *FT = llvm::FunctionType::get(Ty, {Ty}, false);
+  auto *IA = llvm::InlineAsm::get(
+      FT, "frndint", "={st},0,~{fpsr},~{flags}",
+      /*hasSideEffects=*/true);
+  return Builder.CreateCall(IA, {input});
+}
+
+bool isNearbyIntFP80Intrinsic(const llvm::CallInst *CI) {
+  auto *callee = CI->getCalledFunction();
+  if (!callee)
+    return false;
+  return callee->getName() == "llvm.nearbyint.f80" &&
+         CI->getType()->isX86_FP80Ty();
+}
+
+void eraseUnusedLoweringHelperDeclarations(llvm::Module &M) {
+  static constexpr llvm::StringLiteral kHelperNames[] = {
+      "fetestexcept", "feclearexcept", "feraiseexcept",
+      "fesetround",   "fegetround",    "nearbyintl"};
+  for (auto name : kHelperNames) {
+    if (auto *F = M.getFunction(name); F && F->isDeclaration() &&
+                                       F->use_empty()) {
+      F->eraseFromParent();
+    }
+  }
+}
+
 // ===----------------------------------------------------------------------===
 // Category 1: Flags — replace flag computation/comparison calls with arg0
 // ===----------------------------------------------------------------------===
@@ -1032,37 +1077,46 @@ void lowerFPUOp(llvm::CallInst *CI, IntrinsicKind kind) {
   auto &M = *CI->getModule();
   auto &Ctx = CI->getContext();
   auto *i32_ty = llvm::Type::getInt32Ty(Ctx);
+  auto *except_state = getOrCreateFEnvI32Global(M, "__omill_fenv_except_state");
+  auto *rounding_state =
+      getOrCreateFEnvI32Global(M, "__omill_fenv_rounding_mode");
 
   switch (kind) {
     case IntrinsicKind::kFPUExceptionTest: {
-      auto *FT = llvm::FunctionType::get(i32_ty, {i32_ty}, false);
-      auto callee = getOrDeclareHelper(M, "fetestexcept", FT);
-      auto *result = Builder.CreateCall(callee, {CI->getArgOperand(0)});
+      auto *state = Builder.CreateLoad(i32_ty, except_state, "fenv.excepts");
+      auto *mask = CI->getArgOperand(0);
+      auto *result = Builder.CreateAnd(state, mask, "fenv.test");
       CI->replaceAllUsesWith(result);
       break;
     }
     case IntrinsicKind::kFPUExceptionClear: {
-      auto *FT = llvm::FunctionType::get(i32_ty, {i32_ty}, false);
-      auto callee = getOrDeclareHelper(M, "feclearexcept", FT);
-      Builder.CreateCall(callee, {CI->getArgOperand(0)});
+      auto *state = Builder.CreateLoad(i32_ty, except_state, "fenv.excepts");
+      auto *mask = CI->getArgOperand(0);
+      auto *cleared = Builder.CreateAnd(state, Builder.CreateNot(mask),
+                                        "fenv.cleared");
+      Builder.CreateStore(cleared, except_state);
+      if (!CI->getType()->isVoidTy())
+        CI->replaceAllUsesWith(llvm::ConstantInt::get(i32_ty, 0));
       break;
     }
     case IntrinsicKind::kFPUExceptionRaise: {
-      auto *FT = llvm::FunctionType::get(i32_ty, {i32_ty}, false);
-      auto callee = getOrDeclareHelper(M, "feraiseexcept", FT);
-      Builder.CreateCall(callee, {CI->getArgOperand(0)});
+      auto *state = Builder.CreateLoad(i32_ty, except_state, "fenv.excepts");
+      auto *raised =
+          Builder.CreateOr(state, CI->getArgOperand(0), "fenv.raised");
+      Builder.CreateStore(raised, except_state);
+      if (!CI->getType()->isVoidTy())
+        CI->replaceAllUsesWith(llvm::ConstantInt::get(i32_ty, 0));
       break;
     }
     case IntrinsicKind::kFPUSetRounding: {
-      auto *FT = llvm::FunctionType::get(i32_ty, {i32_ty}, false);
-      auto callee = getOrDeclareHelper(M, "fesetround", FT);
-      Builder.CreateCall(callee, {CI->getArgOperand(0)});
+      Builder.CreateStore(CI->getArgOperand(0), rounding_state);
+      if (!CI->getType()->isVoidTy())
+        CI->replaceAllUsesWith(llvm::ConstantInt::get(i32_ty, 0));
       break;
     }
     case IntrinsicKind::kFPUGetRounding: {
-      auto *FT = llvm::FunctionType::get(i32_ty, {}, false);
-      auto callee = getOrDeclareHelper(M, "fegetround", FT);
-      auto *result = Builder.CreateCall(callee, {});
+      auto *result =
+          Builder.CreateLoad(i32_ty, rounding_state, "fenv.rounding");
       CI->replaceAllUsesWith(result);
       break;
     }
@@ -1070,6 +1124,29 @@ void lowerFPUOp(llvm::CallInst *CI, IntrinsicKind kind) {
       return;
   }
   CI->eraseFromParent();
+}
+
+bool lowerFP80NearbyIntIntrinsics(llvm::Function &F) {
+  llvm::SmallVector<llvm::CallInst *, 8> to_lower;
+
+  for (auto &BB : F) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (CI && isNearbyIntFP80Intrinsic(CI))
+        to_lower.push_back(CI);
+    }
+  }
+
+  if (to_lower.empty())
+    return false;
+
+  for (auto *CI : to_lower) {
+    llvm::IRBuilder<> Builder(CI);
+    auto *result = createFP80RoundToIntegral(Builder, CI->getArgOperand(0));
+    CI->replaceAllUsesWith(result);
+    CI->eraseFromParent();
+  }
+  return true;
 }
 
 void lowerX86Specific(llvm::CallInst *CI) {
@@ -1603,6 +1680,8 @@ llvm::PreservedAnalyses LowerRemillIntrinsicsPass::run(
     changed |= lowerAtomicIntrinsics(F, table);
   if (categories_ & LowerCategories::HyperCalls)
     changed |= lowerHyperCalls(F, table);
+  if (categories_ & LowerCategories::HyperCalls)
+    changed |= lowerFP80NearbyIntIntrinsics(F);
   if (categories_ & LowerCategories::ErrorMissing)
     changed |= lowerErrorAndMissing(F, table);
   if (categories_ & LowerCategories::Return)
@@ -1615,6 +1694,8 @@ llvm::PreservedAnalyses LowerRemillIntrinsicsPass::run(
     changed |= lowerUndefinedIntrinsics(F, table);
   if (categories_ & LowerCategories::ResolvedDispatch)
     changed |= lowerResolvedDispatchCalls(F);
+
+  eraseUnusedLoweringHelperDeclarations(*F.getParent());
 
   return changed ? llvm::PreservedAnalyses::none()
                  : llvm::PreservedAnalyses::all();
