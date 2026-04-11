@@ -274,8 +274,26 @@ static bool isDispatchIntrinsic(const llvm::Function &F) {
   return isDispatchIntrinsicName(F.getName());
 }
 
+bool isRemillSemanticsTemplateFunction(const llvm::Function &F) {
+  // Remill's instruction-semantics templates live in an anonymous C++
+  // namespace. Under Itanium mangling (which remill uses even on Windows
+  // when built with its bundled clang) every such function name starts
+  // with `_ZN12_GLOBAL__N_1`. This catches ADDI, MOVI, CALLI, SUBI, ... —
+  // all the generic x86 instruction helpers that have no VM-specific
+  // meaning and should be skipped by the virtual-model analysis.
+  return F.getName().starts_with("_ZN12_GLOBAL__N_");
+}
+
 bool isVirtualModelAnalysisHelperFunction(const llvm::Function &F) {
   if (F.isDeclaration() || F.hasFnAttribute("omill.localized_continuation_shim"))
+    return false;
+  // Never treat remill instruction-semantics templates as VM helpers. Their
+  // names often contain substrings like "CALLI" (matching isCallSiteHelper)
+  // and their bodies call `__remill_read_memory_*`/`__remill_write_memory_*`
+  // (matching the intrinsic heuristic below), so they would otherwise leak
+  // into the interesting-handler closure and be summarized/propagated even
+  // though they carry no VM-specific facts. There are thousands of them.
+  if (isRemillSemanticsTemplateFunction(F))
     return false;
   if (F.hasFnAttribute("omill.vm_handler") || isCallSiteHelper(F))
     return true;

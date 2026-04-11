@@ -310,6 +310,13 @@ bool isVirtualModelInitialSeedFunction(const llvm::Function &F);
 bool isVirtualModelCodeBearingFunction(const llvm::Function &F);
 bool isVirtualModelAnalysisHelperFunction(const llvm::Function &F);
 
+/// True for remill-generated instruction semantics templates, which live in
+/// the anonymous namespace and become Itanium-mangled names starting with
+/// `_ZN12_GLOBAL__N_`. These templates (ADDI, MOVI, CALLI, ...) implement
+/// generic x86 instruction behavior and are not VM-handler code: analyzing
+/// them adds cost without yielding any virtual-slot facts.
+bool isRemillSemanticsTemplateFunction(const llvm::Function &F);
+
 llvm::stable_hash summaryRelevantFunctionFingerprint(const llvm::Function &F);
 VirtualHandlerSummary summarizeFunction(llvm::Function &F);
 llvm::SmallVector<std::string, 8> collectDirectCalleesForFunction(
