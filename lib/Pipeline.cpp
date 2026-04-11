@@ -5330,26 +5330,16 @@ struct LiftConstantContinuationDeclarationTargetsPass
     // should be discovered and lifted in the same cleanup invocation
     // rather than waiting for the next phase to find them. We cap both
     // the iteration count AND the total number of newly-lifted blocks
-    // per invocation. CRITICAL: any new lift can introduce unresolved
-    // boundary placeholder calls (omill_executable_target_*) inside the
-    // freshly-lifted body, which then trigger the post-main repair loop
-    // to spawn an expensive sub-process pipeline run per target. So we
-    // keep the bounds at 1 iteration / 1 lift by default — effectively
-    // single-shot — to preserve the baseline behavior, and let the
-    // OMILL_LIFT_CONST_CONTINUATION_FIXPOINT env var enable deeper
-    // expansion for binaries where that tradeoff is acceptable.
-    static const unsigned kMaxFixpointIterations = []() {
-      if (const char *env = std::getenv("OMILL_LIFT_CONST_CONTINUATION_FIXPOINT"))
-        if (env[0] != '\0' && env[0] != '0')
-          return 4u;
-      return 1u;
-    }();
-    static const unsigned kMaxLiftsPerInvocation = []() {
-      if (const char *env = std::getenv("OMILL_LIFT_CONST_CONTINUATION_FIXPOINT"))
-        if (env[0] != '\0' && env[0] != '0')
-          return 16u;
-      return std::numeric_limits<unsigned>::max();
-    }();
+    // per invocation, so a deeply-chained binary cannot cause unbounded
+    // work. Previously the defaults were single-shot because deeper
+    // expansion exposed `omill_executable_target_*` placeholder calls
+    // to the post-main `repairReachableDeclaredStructuralTargets` loop,
+    // which would spawn one sub-process omill-lift run per placeholder
+    // (tens of seconds per target). That loop is now skipped in the
+    // large-noabi generic-static path, so we can safely iterate here
+    // to pick up deeper continuation chains in a single cleanup call.
+    constexpr unsigned kMaxFixpointIterations = 8;
+    constexpr unsigned kMaxLiftsPerInvocation = 64;
     unsigned lifts_this_invocation = 0;
     for (unsigned iteration = 0; iteration < kMaxFixpointIterations;
          ++iteration) {
