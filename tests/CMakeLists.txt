@@ -27,6 +27,7 @@ add_executable(omill-unit-tests
   unit/CallGraphAnalysisTest.cpp
   unit/IterativeLiftingSessionTest.cpp
   unit/InterProceduralConstPropTest.cpp
+  unit/InterProceduralDeadStateStoreTest.cpp
   unit/IntrinsicTableTest.cpp
   unit/LowerFlagIntrinsicsTest.cpp
   unit/LowerMemoryIntrinsicsTest.cpp
@@ -99,6 +100,8 @@ add_executable(omill-unit-tests
   unit/RemillNormalizationOrchestratorTest.cpp
   unit/ProtectedBoundaryUtilsTest.cpp
   unit/LiftedFunctionMapTest.cpp
+  unit/LiftDatabaseTest.cpp
+  unit/LiftDatabaseProjectionTest.cpp
   unit/BoundaryFactTest.cpp
   unit/ExecutableTargetFactTest.cpp
   unit/ProtectorModelTest.cpp

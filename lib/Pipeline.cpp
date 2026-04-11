@@ -78,6 +78,7 @@
 #include "omill/Passes/ResolveIATCalls.h"
 #include "omill/Passes/ResolveAndLowerControlFlow.h"
 #include "omill/Passes/InterProceduralConstProp.h"
+#include "omill/Passes/InterProceduralDeadStateStore.h"
 #include "omill/Passes/IterativeTargetResolution.h"
 #include "omill/Passes/EliminateDeadPaths.h"
 #include "omill/Passes/CombinedFixedPointDevirt.h"
@@ -9585,6 +9586,8 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
         MPM.addPass(
             llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
       }
+      if (!envDisabled("OMILL_SKIP_IPDSE"))
+        MPM.addPass(InterProceduralDeadStateStorePass());
       MPM.addPass(MarkReachableClosedRootSliceFunctionsPass{});
       MPM.addPass(CollapseSyntheticBlockContinuationCallsPass(
           /*rewrite_to_missing_block=*/true,

@@ -27,6 +27,7 @@ add_library(omill STATIC
   Analysis/LiftedFunctionMap.cpp
   Analysis/IterativeLiftingSession.cpp
   Analysis/RemillIntrinsicAnalysis.cpp
+  Analysis/RemillStateVariableSolver.cpp
   Analysis/StateFieldAccessAnalysis.cpp
   Analysis/VirtualModel/CallSites.cpp
   Analysis/VirtualModel/CallState.cpp
@@ -57,6 +58,9 @@ add_library(omill STATIC
   Analysis/ExceptionInfo.cpp
   Analysis/SegmentsAA.cpp
   Analysis/VirtualCalleeRegistry.cpp
+  BC/LiftDatabase.cpp
+  BC/LiftDatabaseIO.cpp
+  BC/LiftDatabaseProjection.cpp
 
   # Passes - Stage 2: Intrinsic Lowering
   Passes/LowerRemillIntrinsics.cpp
@@ -93,6 +97,7 @@ add_library(omill STATIC
   Passes/ResolveIATCalls.cpp
   Passes/ResolveAndLowerControlFlow.cpp
   Passes/InterProceduralConstProp.cpp
+  Passes/InterProceduralDeadStateStore.cpp
   Passes/IterativeTargetResolution.cpp
   Passes/OutlineConstantStackData.cpp
   Passes/SimplifyVectorReassembly.cpp
@@ -174,6 +179,8 @@ endif()
 # Ported remill TraceLifter + BlockLifter (only when remill is available)
 if(OMILL_ENABLE_REMILL)
   target_sources(omill PRIVATE
+    BC/StaticLiftBuilder.cpp
+    BC/RemillProjectionLifter.cpp
     BC/LiftTargetPolicy.cpp
     BC/TraceLifter.cpp
     BC/BlockLifter.cpp
