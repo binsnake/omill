@@ -9511,8 +9511,14 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
         MPM.addPass(llvm::AlwaysInlinerPass());
       {
         llvm::FunctionPassManager FPM;
-        FPM.addPass(LowerRemillIntrinsicsPass(
-            LowerCategories::Phase1 | LowerCategories::ResolvedDispatch));
+        // Also lower `__remill_undefined_*` here (Category 10): the default
+        // `buildFinalCleanupPipeline` lowers them later, but that means our
+        // SROA+DSE sweep below never sees the resulting `freeze(poison)`
+        // stores. Lowering them in this pass puts the dead stores in
+        // reach of the cleanup.
+        FPM.addPass(LowerRemillIntrinsicsPass(LowerCategories::Phase1 |
+                                              LowerCategories::ResolvedDispatch |
+                                              LowerCategories::Undefined));
         FPM.addPass(llvm::SimplifyCFGPass());
         MPM.addPass(createScopedFPM(
             std::move(FPM), [](llvm::Function &F) {
@@ -9561,13 +9567,15 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
       {
         llvm::FunctionPassManager FPM;
         FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+        FPM.addPass(llvm::EarlyCSEPass(/*UseMemorySSA=*/true));
         FPM.addPass(llvm::InstCombinePass());
         FPM.addPass(llvm::GVNPass());
         FPM.addPass(llvm::DSEPass());
         FPM.addPass(llvm::ADCEPass());
+        FPM.addPass(llvm::InstCombinePass());
         FPM.addPass(llvm::SimplifyCFGPass());
-        MPM.addPass(createScopedFPM(std::move(FPM),
-                                    shouldRunClosedRootSliceCodeBearingPass));
+        MPM.addPass(
+            llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
       }
       MPM.addPass(MarkReachableClosedRootSliceFunctionsPass{});
       MPM.addPass(CollapseSyntheticBlockContinuationCallsPass(
