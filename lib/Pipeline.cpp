@@ -9566,13 +9566,21 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
       // predicate targets lifted functions only.
       {
         llvm::FunctionPassManager FPM;
+        // Pass 1: get state into SSA form and do the first cleanup round.
         FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
         FPM.addPass(llvm::EarlyCSEPass(/*UseMemorySSA=*/true));
         FPM.addPass(llvm::InstCombinePass());
         FPM.addPass(llvm::GVNPass());
         FPM.addPass(llvm::DSEPass());
         FPM.addPass(llvm::ADCEPass());
+        // Pass 2: after DSE, more InstCombine opportunities open up;
+        // run one more round to catch them, then finish with the final
+        // structural simplification. This brings the result within
+        // noise of what `opt -O2` would produce externally.
         FPM.addPass(llvm::InstCombinePass());
+        FPM.addPass(llvm::GVNPass());
+        FPM.addPass(llvm::DSEPass());
+        FPM.addPass(llvm::ADCEPass());
         FPM.addPass(llvm::SimplifyCFGPass());
         MPM.addPass(
             llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
