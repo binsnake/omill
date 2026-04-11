@@ -12,6 +12,7 @@
 
 #include "omill/Analysis/BinaryMemoryMap.h"
 
+
 namespace omill {
 
 // ============================================================================
@@ -405,6 +406,16 @@ static ExecResult stepInstruction(EmuState &state,
     }
     if (buf[pos] == 0xF0 || buf[pos] == 0xF2 || buf[pos] == 0xF3 ||
         buf[pos] == 0x67) {
+      ++pos;
+      continue;
+    }
+    // Segment-override prefixes (ES/CS/SS/DS/FS/GS). In 64-bit mode the
+    // CS/DS/ES/SS overrides are no-ops for memory addressing; FS/GS are
+    // legitimately used but our flat memory model treats them the same as
+    // the default. We just need to consume the byte so the opcode parser
+    // doesn't see it as an opcode.
+    if (buf[pos] == 0x26 || buf[pos] == 0x2E || buf[pos] == 0x36 ||
+        buf[pos] == 0x3E || buf[pos] == 0x64 || buf[pos] == 0x65) {
       ++pos;
       continue;
     }
@@ -1620,6 +1631,243 @@ std::optional<uint64_t> nextDecodableX86InstructionPC(
   if (delta > 15)
     return std::nullopt;
   return state.rip;
+}
+
+// ============================================================================
+// Generic call-target bridge analyzer
+// ============================================================================
+//
+// See include/omill/Analysis/VMTraceEmulator.h for rationale.  The analyzer
+// runs the existing stepInstruction emulator against the first few
+// instructions at the target of a direct CALL.  If the target turns out to
+// be a pure stack-effect thunk that deterministically writes constants to
+// a small set of [RSP±k] slots and terminates with a jmp-to-constant (or a
+// ret that consumes a constant we just wrote), it returns a descriptor of
+// the stack writes and net RSP delta; otherwise it refuses and the caller
+// falls back to the standard dispatch-call path.
+//
+// Taint detection:
+// All non-RSP registers (and XMMs) are initialized to unique 64-bit
+// sentinel values at entry. If any byte window of a stack write matches
+// the sentinel upper-word pattern FACEB00C or the lower-word family
+// FEEDC0D[0..F], the write came from caller-supplied (symbolic) state
+// and we refuse to fold.  The caller-supplied return address at [entry_rsp]
+// is seeded with a distinct kRetaddrSentinel so retaddr passthroughs can
+// be distinguished from constant stores.
+
+namespace {
+
+static constexpr uint32_t kBridgeUninitUpper = 0xFACEB00Cu;
+static constexpr uint32_t kBridgeUninitLowerBase = 0xFEEDC0D0u;
+static constexpr uint64_t kBridgeRetaddrSentinel = 0xDEADBEEFC0DE0001ULL;
+
+static constexpr uint64_t bridgeUninitSentinel(unsigned reg) {
+  return (static_cast<uint64_t>(kBridgeUninitUpper) << 32) |
+         static_cast<uint64_t>(kBridgeUninitLowerBase + (reg & 0xFu));
+}
+
+/// Scan \p bytes for any 4-byte window that matches a register sentinel
+/// marker.  Returns true if any tainted bytes appear in the buffer.
+static bool bridgeHasTaintPattern(const uint8_t *bytes, size_t size) {
+  if (size < 4) {
+    return false;
+  }
+  for (size_t i = 0; i + 4 <= size; ++i) {
+    uint32_t w = 0;
+    std::memcpy(&w, bytes + i, 4);
+    if (w == kBridgeUninitUpper) {
+      return true;
+    }
+    if ((w & 0xFFFFFFF0u) == kBridgeUninitLowerBase) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// Peek at the instruction at \p pc and return true when it looks like a
+/// form that stepInstruction() handles as a conditional branch (Jcc).
+/// Our bridge analyzer refuses these because the flag register starts
+/// uninitialized and the taken/not-taken choice would be arbitrary.
+static bool bridgeIsConditionalBranchAt(const BinaryMemoryMap &mem,
+                                        uint64_t pc) {
+  uint8_t buf[2] = {};
+  if (!mem.read(pc, buf, 2)) {
+    return false;
+  }
+  // Jcc rel8: 70..7F.
+  if (buf[0] >= 0x70 && buf[0] <= 0x7F) {
+    return true;
+  }
+  // JCXZ/JECXZ/JRCXZ rel8 (E3), LOOP/LOOPE/LOOPNE (E0/E1/E2).
+  if (buf[0] == 0xE0 || buf[0] == 0xE1 || buf[0] == 0xE2 || buf[0] == 0xE3) {
+    return true;
+  }
+  // Jcc rel32: 0F 80..8F.
+  if (buf[0] == 0x0F && buf[1] >= 0x80 && buf[1] <= 0x8F) {
+    return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+std::optional<CallTargetBridgeEffect> analyzeCallTargetBridgeEffect(
+    const BinaryMemoryMap &mem, uint64_t call_target_pc) {
+  if (!call_target_pc) {
+    return std::nullopt;
+  }
+  if (!mem.isExecutable(call_target_pc, 1)) {
+    return std::nullopt;
+  }
+
+  EmuState state;
+  const uint64_t entry_rsp =
+      EmuState::kStackBase + (EmuState::kStackSize / 2);
+  state.regs[RSP] = entry_rsp;
+  state.rip = call_target_pc;
+
+  // Taint all non-RSP registers with unique sentinel values so stack
+  // writes sourced from caller-supplied state can be recognised.
+  for (unsigned r = 0; r < REG_COUNT; ++r) {
+    if (r == RSP) {
+      continue;
+    }
+    state.regs[r] = bridgeUninitSentinel(r);
+  }
+  // Fill the XMM registers with a sentinel byte that matches the taint
+  // pattern so that `movdqu [rsp], xmm0` would be caught.  The pattern
+  // `0C B0 CE FA` repeated matches kBridgeUninitUpper (0xFACEB00C).
+  for (unsigned i = 0; i < state.xmm.size(); ++i) {
+    for (unsigned j = 0; j + 4 <= state.xmm[i].size(); j += 4) {
+      uint32_t v = kBridgeUninitUpper;
+      std::memcpy(state.xmm[i].data() + j, &v, 4);
+    }
+  }
+
+  // Seed the caller-pushed return address slot with a distinct sentinel
+  // so we can detect retaddr passthroughs (they are not a stack effect we
+  // want to replay).
+  std::memcpy(state.stackPtr(entry_rsp), &kBridgeRetaddrSentinel,
+              sizeof(kBridgeRetaddrSentinel));
+
+  CallTargetBridgeEffect effect;
+  constexpr unsigned kMaxSteps = 16;
+
+  std::array<uint8_t, EmuState::kStackSize> prev_mem{};
+
+  for (unsigned step = 0; step < kMaxSteps; ++step) {
+    if (!mem.isExecutable(state.rip, 1)) {
+      return std::nullopt;
+    }
+    if (bridgeIsConditionalBranchAt(mem, state.rip)) {
+      return std::nullopt;
+    }
+
+    prev_mem = state.stack_mem;
+
+    ExecResult r = stepInstruction(state, mem);
+    ++effect.instructions_modeled;
+
+    if (r == ExecResult::Unsupported || r == ExecResult::Call ||
+        r == ExecResult::IndirectJump) {
+      return std::nullopt;
+    }
+
+    // RSP must remain concrete and inside the simulator stack window.
+    if (state.regs[RSP] == bridgeUninitSentinel(RSP)) {
+      return std::nullopt;
+    }
+    if (!state.isStackAddr(state.regs[RSP]) ||
+        !state.isStackAddr(state.regs[RSP] + 7)) {
+      return std::nullopt;
+    }
+
+    // Collect newly-written stack words by diffing 8-byte aligned slots
+    // around entry_rsp.  Bridges never touch more than a couple of slots,
+    // so a small window is sufficient.  Upper halves of sign-extended
+    // imm32 pushes remain zero and the recorded 64-bit value still
+    // matches the pushed constant.
+    {
+      constexpr int64_t kScanRadius = 2048;
+      for (int64_t off = -kScanRadius; off <= kScanRadius; off += 8) {
+        const uint64_t addr = entry_rsp + static_cast<uint64_t>(off);
+        if (!state.isStackAddr(addr) || !state.isStackAddr(addr + 7)) {
+          continue;
+        }
+        const size_t idx =
+            static_cast<size_t>(addr - EmuState::kStackBase);
+        if (std::memcmp(state.stack_mem.data() + idx,
+                        prev_mem.data() + idx, 8) == 0) {
+          continue;
+        }
+
+        // Refuse tainted stores.
+        if (bridgeHasTaintPattern(state.stack_mem.data() + idx, 8)) {
+          return std::nullopt;
+        }
+
+        uint64_t val = 0;
+        std::memcpy(&val, state.stack_mem.data() + idx, 8);
+
+        // Drop retaddr passthroughs.
+        if (val == kBridgeRetaddrSentinel) {
+          continue;
+        }
+
+        // Coalesce: later writes to the same slot overwrite earlier ones.
+        bool replaced = false;
+        for (auto &existing : effect.stack_writes) {
+          if (existing.rsp_offset == off && existing.size_bytes == 8) {
+            existing.value = val;
+            replaced = true;
+            break;
+          }
+        }
+        if (!replaced) {
+          BridgeStackWrite bw_rec;
+          bw_rec.rsp_offset = off;
+          bw_rec.size_bytes = 8;
+          bw_rec.value = val;
+          effect.stack_writes.push_back(bw_rec);
+        }
+      }
+    }
+
+    if (r == ExecResult::Jump) {
+      if (!mem.isExecutable(state.rip, 1)) {
+        return std::nullopt;
+      }
+      effect.terminator = CallTargetBridgeEffect::Terminator::kJmpConst;
+      effect.final_jump_target_pc = state.rip;
+      effect.net_rsp_delta =
+          static_cast<int64_t>(state.regs[RSP] - entry_rsp);
+      return effect;
+    }
+
+    if (r == ExecResult::Ret) {
+      // stepInstruction already popped the retaddr into state.rip.  We
+      // only accept this as a bridge if the retaddr slot was overwritten
+      // earlier in the trace (i.e. state.rip now holds that constant,
+      // not the kBridgeRetaddrSentinel) and the new target is executable.
+      if (state.rip == kBridgeRetaddrSentinel) {
+        return std::nullopt;
+      }
+      if (!mem.isExecutable(state.rip, 1)) {
+        return std::nullopt;
+      }
+      effect.terminator = CallTargetBridgeEffect::Terminator::kRet;
+      effect.final_jump_target_pc = state.rip;
+      effect.net_rsp_delta =
+          static_cast<int64_t>(state.regs[RSP] - entry_rsp);
+      return effect;
+    }
+
+    // ExecResult::Continue — fall through to the next step.
+  }
+
+  // Step budget exhausted without finding a clean terminator.
+  return std::nullopt;
 }
 
 // ============================================================================
