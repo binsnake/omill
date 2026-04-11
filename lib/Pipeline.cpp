@@ -9469,6 +9469,14 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
             VerifiedVirtualCFGMaterializationPass(opts.session_graph));
       else
         MPM.addPass(VirtualCFGMaterializationPass(opts.session_graph));
+      // The Phase 3.95 materialization run introduces new blk_/sub_
+      // bodies. Walk their direct musttail calls to declared blk_*<pc>
+      // continuations and lift them before the collapse pass rewrites
+      // stragglers to __remill_missing_block. Per-PC `scheduled` set and
+      // bounded fixpoint caps keep this step fast.
+      if (!envDisabled("OMILL_SKIP_LIFT_CONST_CONTINUATION_DECL_TARGETS"))
+        MPM.addPass(LiftConstantContinuationDeclarationTargetsPass(
+            /*only_when_noabi_mode=*/true));
       MPM.addPass(RebuildClosedRootSliceCodeScopePass{});
       MPM.addPass(CollapseSyntheticBlockContinuationCallsPass(
           /*rewrite_to_missing_block=*/true,
