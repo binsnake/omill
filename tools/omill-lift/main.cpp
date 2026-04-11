@@ -17525,6 +17525,14 @@ int main(int argc, char **argv) {
       }
     };
 
+    // Collect reachable unresolved code-target PCs. Picks up both
+    // `omill_native_boundary_*` placeholders (what `finalizeOutput`
+    // created) and unlifted `blk_*` / `sub_*` / `block_*` declarations
+    // (successors of newly-lifted blocks that haven't been lifted yet).
+    // The second bucket is critical for convergence: each round of
+    // lifting introduces new declarations for the lifted block's
+    // statically-known successors, and without picking those up we'd
+    // leave a trail of open edges on every repair round.
     auto collectReachablePCs = [&]() {
       llvm::DenseSet<uint64_t> targets;
       for (auto &F : *module) {
@@ -17550,14 +17558,18 @@ int main(int argc, char **argv) {
                 continue;
               }
               auto name = callee->getName();
-              if (!name.starts_with("omill_native_boundary_"))
-                continue;
               uint64_t pc = 0;
-              if (auto bnd = omill::readBoundaryFact(*callee);
-                  bnd && bnd->boundary_pc)
-                pc = *bnd->boundary_pc;
-              else
-                pc = omill::extractEntryVA(name);
+              if (name.starts_with("omill_native_boundary_")) {
+                if (auto bnd = omill::readBoundaryFact(*callee);
+                    bnd && bnd->boundary_pc)
+                  pc = *bnd->boundary_pc;
+                else
+                  pc = omill::extractStructuralCodeTargetPC(name);
+              } else if (name.starts_with("blk_") ||
+                         name.starts_with("sub_") ||
+                         name.starts_with("block_")) {
+                pc = omill::extractStructuralCodeTargetPC(name);
+              }
               if (pc && isCodeAddressInCurrentInput(pc))
                 targets.insert(pc);
             }
@@ -17726,8 +17738,13 @@ int main(int argc, char **argv) {
       repair_block_lifter->SetLiftDatabase(lift_db.get());
 
     // Phase A: identify and drive the fresh block lifter one PC at a time.
-    constexpr unsigned kMaxRounds = 16;
-    constexpr unsigned kMaxTargetsPerRound = 64;
+    // Bound iterations generously so the fixpoint converges even when the
+    // reachable set grows before it shrinks (newly-lifted blocks discover
+    // new successors). Converge when no lifts are attempted in a round.
+    constexpr unsigned kMaxRounds = 64;
+    constexpr unsigned kMaxTargetsPerRound = 128;
+    unsigned last_reachable = 0;
+    unsigned stall_rounds = 0;
     for (unsigned round = 0; round < kMaxRounds; ++round) {
       auto targets_set = collectReachablePCs();
       debug_log(llvm::Twine("round=") + llvm::Twine(round) +
@@ -17751,12 +17768,6 @@ int main(int argc, char **argv) {
           continue;
         }
         ++lift_attempts;
-        if (existing && existing->isDeclaration()) {
-          debug_log(llvm::Twine("pre-existing decl blk_") +
-                    llvm::Twine::utohexstr(pc) + " users=" +
-                    llvm::Twine(existing->getNumUses()));
-        }
-        debug_log(llvm::Twine("lifting 0x") + llvm::Twine::utohexstr(pc));
         bool ok = false;
 #if defined(_WIN32)
         __try {
@@ -17792,8 +17803,35 @@ int main(int argc, char **argv) {
       }
       debug_log(llvm::Twine("round=") + llvm::Twine(round) +
                 " rewrote=" + llvm::Twine(rewrote));
-      if (rewrote == 0)
+      // Converge when no new lifts were attempted (everything already
+      // defined) or when the reachable set stops shrinking for 2 rounds.
+      if (lift_attempts == 0)
         break;
+      if (targets_set.size() >= last_reachable && last_reachable > 0) {
+        if (++stall_rounds >= 2)
+          break;
+      } else {
+        stall_rounds = 0;
+      }
+      last_reachable = targets_set.size();
+    }
+
+    if (debug_repair) {
+      auto final_targets = collectReachablePCs();
+      unsigned blk_decls = 0;
+      unsigned blk_defs = 0;
+      for (auto &F : *module) {
+        if (F.getName().starts_with("blk_")) {
+          if (F.isDeclaration())
+            ++blk_decls;
+          else
+            ++blk_defs;
+        }
+      }
+      debug_log(llvm::Twine("final reachable=") +
+                llvm::Twine(final_targets.size()) +
+                " blk_defs=" + llvm::Twine(blk_defs) +
+                " blk_decls=" + llvm::Twine(blk_decls));
     }
 
     // Post-repair cleanup: the restore loop added a large number of
