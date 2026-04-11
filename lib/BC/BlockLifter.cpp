@@ -4,6 +4,7 @@
 /// See include/omill/BC/BlockLifter.h for design rationale.
 
 #include "omill/BC/BlockLifter.h"
+#include "omill/BC/DecodeInstruction.h"
 
 #include "omill/Devirtualization/ExecutableTargetFact.h"
 #include "omill/Utils/LiftedNames.h"
@@ -23,14 +24,106 @@
 #include <remill/BC/IntrinsicTable.h>
 #include <remill/BC/Util.h>
 
+#include <algorithm>
 #include <cassert>
+#include <cstring>
 #include <queue>
 #include <set>
 #include <sstream>
 
+#include "omill/BC/LiftDatabaseProjection.h"
 #include "omill/Utils/LiftedNames.h"
 
 namespace omill {
+namespace {
+
+template <typename T>
+static void PushUnique(std::vector<T> &values, const T &value) {
+  if (std::find(values.begin(), values.end(), value) == values.end()) {
+    values.push_back(value);
+  }
+}
+
+template <typename T>
+static void PushUnique(llvm::SmallVectorImpl<T> &values, const T &value) {
+  if (std::find(values.begin(), values.end(), value) == values.end()) {
+    values.push_back(value);
+  }
+}
+
+/// Detect a VMProtect-style virtual-return-address thunk at \p pc, which
+/// may appear in either of two forms:
+///
+///   push imm32; jmp rel32                                (10 bytes)
+///   push imm32; lea rsp, [rsp+disp8]; jmp rel32          (15 bytes)
+///
+/// The second form is a "push retaddr + adjust RSP" redirect emitted by
+/// VMProtect to leave the controlled return slot below the caller-visible
+/// stack pointer.  Both forms hand control to a VM handler that ultimately
+/// consumes the pushed imm32 via a later `ret`.  Recognizing the pattern
+/// at lift time lets BlockLifter model the stack effect inline at the
+/// call site without ever emitting an `omill_native_boundary_<pc>`
+/// placeholder declaration.
+///
+/// On success, populates \p pushed_imm_out with the immediate that would
+/// be pushed, \p rsp_lea_disp_out with the (signed) RSP adjustment applied
+/// by the lea (zero for the 10-byte variant), and \p jump_target_out with
+/// the final jmp destination.
+static bool IsVmProtectPushImmThunk(BlockManager &manager, uint64_t pc,
+                                    int32_t *pushed_imm_out,
+                                    int32_t *rsp_lea_disp_out,
+                                    uint64_t *jump_target_out) {
+  uint8_t bytes[16] = {};
+  for (unsigned i = 0; i < sizeof(bytes); ++i) {
+    if (!manager.TryReadExecutableByte(pc + i, &bytes[i])) {
+      return false;
+    }
+  }
+  if (bytes[0] != 0x68) {
+    return false;
+  }
+  int32_t pushed_imm = 0;
+  std::memcpy(&pushed_imm, &bytes[1], sizeof(pushed_imm));
+
+  // 10-byte variant: push imm32; jmp rel32.
+  if (bytes[5] == 0xE9) {
+    int32_t rel32 = 0;
+    std::memcpy(&rel32, &bytes[6], sizeof(rel32));
+    const uint64_t jump_target_pc = static_cast<uint64_t>(
+        static_cast<int64_t>(pc) + 10 + static_cast<int64_t>(rel32));
+    uint8_t probe = 0;
+    if (!manager.TryReadExecutableByte(jump_target_pc, &probe)) {
+      return false;
+    }
+    if (pushed_imm_out) *pushed_imm_out = pushed_imm;
+    if (rsp_lea_disp_out) *rsp_lea_disp_out = 0;
+    if (jump_target_out) *jump_target_out = jump_target_pc;
+    return true;
+  }
+
+  // 15-byte variant: push imm32; lea rsp, [rsp+disp8]; jmp rel32.
+  if (bytes[5] == 0x48 && bytes[6] == 0x8D && bytes[7] == 0x64 &&
+      bytes[8] == 0x24 && bytes[10] == 0xE9) {
+    const int32_t lea_disp =
+        static_cast<int32_t>(static_cast<int8_t>(bytes[9]));
+    int32_t rel32 = 0;
+    std::memcpy(&rel32, &bytes[11], sizeof(rel32));
+    const uint64_t jump_target_pc = static_cast<uint64_t>(
+        static_cast<int64_t>(pc) + 15 + static_cast<int64_t>(rel32));
+    uint8_t probe = 0;
+    if (!manager.TryReadExecutableByte(jump_target_pc, &probe)) {
+      return false;
+    }
+    if (pushed_imm_out) *pushed_imm_out = pushed_imm;
+    if (rsp_lea_disp_out) *rsp_lea_disp_out = lea_disp;
+    if (jump_target_out) *jump_target_out = jump_target_pc;
+    return true;
+  }
+
+  return false;
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // BlockManager default implementations
@@ -99,6 +192,7 @@ class BlockLifter::Impl {
       llvm::SmallVectorImpl<uint64_t> &discovered_targets);
 
   unsigned LiftReachable(uint64_t addr);
+  void SetLiftDatabase(const LiftDatabase *db_) { lift_db = db_; }
 
   llvm::Module *GetModule() const { return module; }
 
@@ -142,6 +236,9 @@ class BlockLifter::Impl {
       const LiftTargetDecision &decision, llvm::Value *memory_value,
       llvm::SmallVectorImpl<uint64_t> &discovered_targets);
 
+  bool PopulateProjectedTargets(
+      uint64_t addr, llvm::SmallVectorImpl<uint64_t> &discovered_targets) const;
+
   const remill::Arch *const arch;
   const remill::IntrinsicTable *intrinsics;
   llvm::Type *word_type;
@@ -154,6 +251,7 @@ class BlockLifter::Impl {
   std::string inst_bytes;
   remill::Instruction inst;
   remill::Instruction delayed_inst;
+  const LiftDatabase *lift_db = nullptr;
 };
 
 BlockLifter::Impl::Impl(const remill::Arch *arch_, BlockManager &manager_)
@@ -169,6 +267,42 @@ BlockLifter::Impl::Impl(const remill::Arch *arch_, BlockManager &manager_)
       manager(manager_),
       max_inst_bytes(arch->MaxInstructionSize(arch->CreateInitialContext())) {
   inst_bytes.reserve(max_inst_bytes);
+}
+
+bool BlockLifter::Impl::PopulateProjectedTargets(
+    uint64_t addr, llvm::SmallVectorImpl<uint64_t> &discovered_targets) const {
+  if (!lift_db) {
+    return false;
+  }
+
+  LiftDatabaseProjector projector(*lift_db);
+  auto projection = projector.projectBlock(addr);
+  if (!projection) {
+    return false;
+  }
+
+  auto block_it = projection->blocks.find(addr);
+  if (block_it == projection->blocks.end()) {
+    return false;
+  }
+
+  discovered_targets.clear();
+  for (const auto &edge : block_it->second.successors) {
+    if (!edge.target_block_va) {
+      continue;
+    }
+    switch (edge.kind) {
+      case LiftDbEdgeKind::kFallthrough:
+      case LiftDbEdgeKind::kBranchTaken:
+      case LiftDbEdgeKind::kOverlay:
+        PushUnique(discovered_targets, edge.target_block_va);
+        break;
+      default:
+        break;
+    }
+  }
+
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -360,6 +494,7 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
   auto name = manager.BlockName(addr);
   if (auto *existing = module->getFunction(name);
       existing && !existing->isDeclaration()) {
+    PopulateProjectedTargets(addr, discovered_targets);
     return existing;
   }
 
@@ -407,8 +542,7 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
     }
 
     inst.Reset();
-    auto decode_ok = arch->DecodeInstruction(current_pc, inst_bytes, inst,
-                                              arch->CreateInitialContext());
+    auto decode_ok = omill::DecodeInstruction(*arch, current_pc, inst_bytes, inst);
     if (!decode_ok) {
       llvm::errs() << "omill: BlockLifter: decode failed at 0x"
                    << llvm::Twine::utohexstr(current_pc) << "\n";
@@ -515,20 +649,28 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
         try_add_delay_slot(true, current_block);
         EmitDispatchJump(current_block);
 
-        // Ask the manager for devirtualized targets.
-        manager.ForEachDevirtualizedTarget(
-            inst,
-            [&](uint64_t target, DevirtualizedTargetKind) {
-              auto decision = manager.ResolveLiftTarget(
-                  current_pc, target, LiftTargetEdgeKind::kIndirectTarget);
-              if (decision.shouldLift() && decision.effective_target_pc) {
-                discovered_targets.push_back(*decision.effective_target_pc);
-              } else if (decision.effective_target_pc) {
-                discovered_targets.push_back(*decision.effective_target_pc);
-              } else if (decision.raw_target_pc) {
-                discovered_targets.push_back(decision.raw_target_pc);
-              }
-            });
+        llvm::SmallVector<uint64_t, 8> projected_targets;
+        if (PopulateProjectedTargets(addr, projected_targets) &&
+            !projected_targets.empty()) {
+          for (uint64_t target : projected_targets) {
+            PushUnique(discovered_targets, target);
+          }
+        } else {
+          // Ask the manager for devirtualized targets.
+          manager.ForEachDevirtualizedTarget(
+              inst,
+              [&](uint64_t target, DevirtualizedTargetKind) {
+                auto decision = manager.ResolveLiftTarget(
+                    current_pc, target, LiftTargetEdgeKind::kIndirectTarget);
+                if (decision.shouldLift() && decision.effective_target_pc) {
+                  PushUnique(discovered_targets, *decision.effective_target_pc);
+                } else if (decision.effective_target_pc) {
+                  PushUnique(discovered_targets, *decision.effective_target_pc);
+                } else if (decision.raw_target_pc) {
+                  PushUnique(discovered_targets, decision.raw_target_pc);
+                }
+              });
+        }
         goto done;
       }
 
@@ -583,6 +725,74 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
             current_pc, fallthrough, LiftTargetEdgeKind::kCallFallthrough);
         auto call_target_decision = manager.ResolveLiftTarget(
             current_pc, call_target, LiftTargetEdgeKind::kDirectCallTarget);
+
+        // VMProtect-style virtual-return-address thunks appear as the
+        // direct call target of native CALL instructions.  Both the
+        // 10-byte `push imm32; jmp rel32` form and the 15-byte
+        // `push imm32; lea rsp,[rsp+disp8]; jmp rel32` form are
+        // recognized; the latter is the "push retaddr + adjust RSP"
+        // pattern that leaves the controlled return slot below the
+        // caller-visible stack.  Model the stack effect inline here so
+        // no `omill_native_boundary_<thunk_pc>` placeholder ever needs
+        // to exist: write imm32 to the (pre-adjustment) top-of-stack,
+        // apply the net RSP delta, stash RETURN_PC into NEXT_PC, then
+        // musttail to the caller's fallthrough as if the call returned
+        // immediately.  The pushed imm32 stays on the simulated stack
+        // and will be consumed by a later lifted `ret`.
+        {
+          int32_t thunk_imm = 0;
+          int32_t thunk_lea_disp = 0;
+          uint64_t thunk_jump_target_pc = 0;
+          if (IsVmProtectPushImmThunk(manager, call_target, &thunk_imm,
+                                      &thunk_lea_disp,
+                                      &thunk_jump_target_pc)) {
+            auto [rsp_addr, rsp_type] =
+                arch->DefaultLifter(*intrinsics)
+                    ->LoadRegAddress(current_block, state_ptr, "RSP");
+
+            llvm::IRBuilder<> ir(current_block);
+            auto *rsp_val =
+                ir.CreateLoad(word_type, rsp_addr, "rsp.cur");
+            auto *push_slot_rsp = ir.CreateSub(
+                rsp_val, llvm::ConstantInt::get(word_type, 8),
+                "rsp.pushed");
+            auto *stack_slot = ir.CreateIntToPtr(
+                push_slot_rsp, llvm::PointerType::getUnqual(context),
+                "rsp.slot");
+            auto *pushed_val = llvm::ConstantInt::get(
+                word_type,
+                static_cast<uint64_t>(static_cast<int64_t>(thunk_imm)),
+                /*isSigned=*/true);
+            ir.CreateStore(pushed_val, stack_slot);
+
+            // Net RSP delta is (-8) from the push plus the lea's
+            // displacement.  For the 10-byte variant lea_disp is 0.
+            const int64_t net_rsp_delta =
+                static_cast<int64_t>(thunk_lea_disp) - 8;
+            auto *new_rsp = ir.CreateAdd(
+                rsp_val,
+                llvm::ConstantInt::get(
+                    word_type, static_cast<uint64_t>(net_rsp_delta),
+                    /*isSigned=*/true),
+                "rsp.new");
+            ir.CreateStore(new_rsp, rsp_addr);
+
+            // Mirror the normal direct-call semantics for the
+            // fallthrough: move RETURN_PC into NEXT_PC so the caller
+            // resumes at the instruction following the original CALL.
+            auto *ret_pc_ref =
+                remill::LoadReturnProgramCounterRef(current_block);
+            auto *next_pc_ref =
+                remill::LoadNextProgramCounterRef(current_block);
+            ir.CreateStore(ir.CreateLoad(word_type, ret_pc_ref),
+                           next_pc_ref);
+
+            (void)thunk_jump_target_pc;
+            EmitDecisionEdge(current_block, fallthrough,
+                             fallthrough_target, discovered_targets);
+            goto done;
+          }
+        }
 
         // Emit: dispatch_call(state, call_target_pc, mem)
         // Then: musttail call @blk_<fallthrough>(state, fallthrough_pc, result)
@@ -922,6 +1132,7 @@ done:
     }
   }
 
+  PopulateProjectedTargets(addr, discovered_targets);
   manager.SetLiftedBlockDefinition(addr, func);
   return func;
 }
@@ -967,6 +1178,10 @@ BlockLifter::~BlockLifter() {}
 
 BlockLifter::BlockLifter(const remill::Arch *arch, BlockManager &manager)
     : impl(new Impl(arch, manager)) {}
+
+void BlockLifter::SetLiftDatabase(const LiftDatabase *db) {
+  impl->SetLiftDatabase(db);
+}
 
 llvm::Function *BlockLifter::LiftBlock(
     uint64_t addr,
