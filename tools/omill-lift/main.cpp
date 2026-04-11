@@ -17508,6 +17508,336 @@ int main(int argc, char **argv) {
 
 
   auto finalization_summary = buildFinalizationSummary();
+  // In-process native-boundary repair: collect reachable
+  // `omill_native_boundary_*` PCs and drive the already-initialized
+  // block lifter directly to materialize their bodies, then rewrite the
+  // declaration call-sites to the freshly-lifted `blk_<pc>` definitions.
+  // This runs after `finalizeOutput` because that's when the placeholder
+  // declarations are materialized.
+  if (opts.use_block_lifting && iterative_session &&
+      !parseBoolEnv("OMILL_SKIP_NATIVE_BOUNDARY_REPAIR").value_or(false)) {
+    const bool debug_repair =
+        parseBoolEnv("OMILL_DEBUG_NATIVE_BOUNDARY_REPAIR").value_or(false);
+    auto debug_log = [&](const llvm::Twine &msg) {
+      if (debug_repair) {
+        errs() << "[native-boundary-repair] " << msg << "\n";
+        errs().flush();
+      }
+    };
+
+    auto collectReachablePCs = [&]() {
+      llvm::DenseSet<uint64_t> targets;
+      for (auto &F : *module) {
+        if (F.isDeclaration())
+          continue;
+        if (!F.hasFnAttribute("omill.output_root") &&
+            !F.hasFnAttribute("omill.closed_root_slice_root"))
+          continue;
+        llvm::SmallPtrSet<llvm::Function *, 32> visited;
+        llvm::SmallVector<llvm::Function *, 32> worklist{&F};
+        while (!worklist.empty()) {
+          auto *cur = worklist.pop_back_val();
+          if (!visited.insert(cur).second)
+            continue;
+          for (auto &BB : *cur) {
+            for (auto &I : BB) {
+              auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+              auto *callee = CB ? CB->getCalledFunction() : nullptr;
+              if (!callee)
+                continue;
+              if (!callee->isDeclaration()) {
+                worklist.push_back(callee);
+                continue;
+              }
+              auto name = callee->getName();
+              if (!name.starts_with("omill_native_boundary_"))
+                continue;
+              uint64_t pc = 0;
+              if (auto bnd = omill::readBoundaryFact(*callee);
+                  bnd && bnd->boundary_pc)
+                pc = *bnd->boundary_pc;
+              else
+                pc = omill::extractEntryVA(name);
+              if (pc && isCodeAddressInCurrentInput(pc))
+                targets.insert(pc);
+            }
+          }
+        }
+      }
+      return targets;
+    };
+
+    auto rewriteBoundaryCallsites =
+        [&](uint64_t target_pc, llvm::Function &replacement) -> bool {
+      bool changed = false;
+      llvm::SmallVector<llvm::CallBase *, 8> to_rewrite;
+      llvm::SmallPtrSet<llvm::Function *, 8> unique_decls;
+      auto matches = [&](llvm::Function &callee) {
+        if (!callee.isDeclaration())
+          return false;
+        auto name = callee.getName();
+        if (!name.starts_with("omill_native_boundary_"))
+          return false;
+        uint64_t pc = 0;
+        if (auto bnd = omill::readBoundaryFact(callee);
+            bnd && bnd->boundary_pc)
+          pc = *bnd->boundary_pc;
+        else
+          pc = omill::extractEntryVA(name);
+        return pc == target_pc;
+      };
+      for (auto &F : *module) {
+        if (F.isDeclaration())
+          continue;
+        for (auto &BB : F) {
+          for (auto &I : BB) {
+            auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+            if (!CB)
+              continue;
+            auto *callee = CB->getCalledFunction();
+            if (!callee || !matches(*callee))
+              continue;
+            if (callee->getFunctionType() != replacement.getFunctionType())
+              continue;
+            to_rewrite.push_back(CB);
+            unique_decls.insert(callee);
+          }
+        }
+      }
+      for (auto *CB : to_rewrite) {
+        if (auto *CI = llvm::dyn_cast<llvm::CallInst>(CB))
+          CI->setCalledFunction(&replacement);
+        else if (auto *II = llvm::dyn_cast<llvm::InvokeInst>(CB))
+          II->setCalledFunction(&replacement);
+        changed = true;
+      }
+      for (auto *decl : unique_decls) {
+        if (decl && decl->getParent() == module.get() &&
+            decl->isDeclaration() && decl->use_empty())
+          decl->eraseFromParent();
+      }
+      return changed;
+    };
+
+    // Phase 0: restore stripped `__remill_*` intrinsic declarations so we
+    // can rebuild the arch's IntrinsicTable against the current module.
+    // Pipeline passes (LowerRemillIntrinsics, LowerMemory/Atomic/etc.) erase
+    // most intrinsic declarations once they're no longer needed; the cached
+    // pointers inside `arch->GetInstrinsicTable()` and the BlockLifter that
+    // captured it are therefore dangling post-finalize. We source fresh
+    // declarations (and their exact function types) from a freshly-loaded
+    // semantics module — the same module `remill::LoadArchSemantics` returns
+    // at startup. Linking the full semantics module back would be wasteful
+    // (megabytes of template bodies that we already stripped); we only
+    // create NEW declarations in the current module with the same names
+    // and signatures.
+    auto fresh_semantics = remill::LoadArchSemantics(arch.get());
+    if (!fresh_semantics) {
+      debug_log("failed to load fresh semantics; skipping repair");
+      goto native_boundary_repair_done;
+    }
+    unsigned restored = 0;
+    unsigned already_present = 0;
+    for (auto &F : *fresh_semantics) {
+      auto name = F.getName();
+      if (!name.starts_with("__remill_"))
+        continue;
+      if (auto *existing = module->getFunction(name)) {
+        (void)existing;
+        ++already_present;
+        continue;
+      }
+      auto *fn = llvm::Function::Create(
+          F.getFunctionType(), llvm::GlobalValue::ExternalLinkage, name,
+          module.get());
+      // Mark restored intrinsics as noinline+optnone so the nearby
+      // cleanup/GlobalDCE passes don't discard them before the lifter
+      // writes its calls. `IntrinsicTable::IntrinsicTable` will also
+      // re-apply the canonical attributes.
+      fn->addFnAttr(llvm::Attribute::NoInline);
+      fn->addFnAttr(llvm::Attribute::OptimizeNone);
+      ++restored;
+    }
+    debug_log(llvm::Twine("intrinsics restored=") + llvm::Twine(restored) +
+              " already_present=" + llvm::Twine(already_present));
+
+    // `InstructionLifter::Impl::Impl` looks up `ISEL_INVALID_INSTRUCTION`
+    // and `ISEL_UNSUPPORTED_INSTRUCTION` global variables in the module
+    // and CHECK-aborts if either is missing. Pipeline passes strip these
+    // globals during semantics cleanup, so we clone them (and the
+    // semantic helper functions they reference) from the fresh semantics
+    // module. `CloneFunction` would also work but is overkill — the
+    // globals are constant pointers and we only need their targets to
+    // exist as declarations so `GetInstructionFunction` can return a
+    // non-null `Function*`. The referenced helpers don't need bodies
+    // because we're not actually expecting invalid / unsupported
+    // instructions in the blocks we lift.
+    unsigned isel_globals_restored = 0;
+    unsigned isel_helpers_restored = 0;
+    for (auto &gv : fresh_semantics->globals()) {
+      auto name = gv.getName();
+      if (!name.starts_with("ISEL_"))
+        continue;
+      if (module->getGlobalVariable(name, /*AllowInternal=*/true))
+        continue;
+      if (!gv.hasInitializer())
+        continue;
+      auto *init = gv.getInitializer()->stripPointerCasts();
+      auto *fresh_fn = llvm::dyn_cast<llvm::Function>(init);
+      if (!fresh_fn)
+        continue;
+
+      // Ensure the semantic helper function is declared in main.
+      llvm::Function *main_fn = module->getFunction(fresh_fn->getName());
+      if (!main_fn) {
+        main_fn = llvm::Function::Create(
+            fresh_fn->getFunctionType(),
+            llvm::GlobalValue::ExternalLinkage, fresh_fn->getName(),
+            module.get());
+        main_fn->addFnAttr(llvm::Attribute::NoInline);
+        main_fn->addFnAttr(llvm::Attribute::OptimizeNone);
+        ++isel_helpers_restored;
+      }
+
+      // Create the ISEL_* global with an initializer pointing at
+      // main's declaration of the helper.
+      new llvm::GlobalVariable(
+          *module, main_fn->getType(), /*isConstant=*/true,
+          llvm::GlobalValue::ExternalLinkage, main_fn, name);
+      ++isel_globals_restored;
+    }
+    debug_log(llvm::Twine("isel_globals_restored=") +
+              llvm::Twine(isel_globals_restored) +
+              " isel_helpers_restored=" +
+              llvm::Twine(isel_helpers_restored));
+
+    // Refresh arch's cached IntrinsicTable so subsequent BlockLifter
+    // constructors see fresh `llvm::Function*` pointers into the current
+    // module (instead of the dangling ones from before finalizeOutput).
+    arch->RefreshIntrinsicTable(module.get());
+
+    // Build a fresh BlockLifter that picks up the refreshed intrinsic
+    // table. The existing `block_lifter` / `projection_lifter` captured
+    // the old pointers at construction and we don't want to mutate them
+    // while the rest of the post-finalize code may still reference them.
+    auto repair_block_lifter =
+        std::make_unique<omill::BlockLifter>(arch.get(), *block_manager);
+    if (lift_db)
+      repair_block_lifter->SetLiftDatabase(lift_db.get());
+
+    // Phase A: identify and drive the fresh block lifter one PC at a time.
+    constexpr unsigned kMaxRounds = 16;
+    constexpr unsigned kMaxTargetsPerRound = 64;
+    for (unsigned round = 0; round < kMaxRounds; ++round) {
+      auto targets_set = collectReachablePCs();
+      debug_log(llvm::Twine("round=") + llvm::Twine(round) +
+                " reachable=" + llvm::Twine(targets_set.size()));
+      if (targets_set.empty())
+        break;
+      llvm::SmallVector<uint64_t, 32> ordered(targets_set.begin(),
+                                                targets_set.end());
+      llvm::sort(ordered);
+      if (ordered.size() > kMaxTargetsPerRound)
+        ordered.resize(kMaxTargetsPerRound);
+
+      unsigned lift_attempts = 0;
+      unsigned lift_successes = 0;
+      unsigned lift_crashes = 0;
+      for (uint64_t pc : ordered) {
+        auto *existing =
+            findLiftedOrBlockFunction(pc, /*native=*/false);
+        if (existing && !existing->isDeclaration()) {
+          ++lift_successes;  // already have a body; just needs rewrite
+          continue;
+        }
+        ++lift_attempts;
+        if (existing && existing->isDeclaration()) {
+          debug_log(llvm::Twine("pre-existing decl blk_") +
+                    llvm::Twine::utohexstr(pc) + " users=" +
+                    llvm::Twine(existing->getNumUses()));
+        }
+        debug_log(llvm::Twine("lifting 0x") + llvm::Twine::utohexstr(pc));
+        bool ok = false;
+#if defined(_WIN32)
+        __try {
+#endif
+          llvm::SmallVector<uint64_t, 4> discovered;
+          auto *fn =
+              repair_block_lifter->LiftBlock(pc, discovered);
+          ok = (fn != nullptr);
+#if defined(_WIN32)
+        } __except (1) {
+          debug_log(llvm::Twine("LIFT-SEH-CRASH 0x") +
+                    llvm::Twine::utohexstr(pc));
+          ++lift_crashes;
+          ok = false;
+        }
+#endif
+        if (ok)
+          ++lift_successes;
+      }
+      debug_log(llvm::Twine("round=") + llvm::Twine(round) +
+                " attempts=" + llvm::Twine(lift_attempts) +
+                " successes=" + llvm::Twine(lift_successes) +
+                " crashes=" + llvm::Twine(lift_crashes));
+
+      // Phase B: rewrite callsites for every target that now has a body.
+      unsigned rewrote = 0;
+      for (uint64_t pc : ordered) {
+        auto *def = findLiftedOrBlockFunction(pc, /*native=*/false);
+        if (!def || def->isDeclaration())
+          continue;
+        if (rewriteBoundaryCallsites(pc, *def))
+          ++rewrote;
+      }
+      debug_log(llvm::Twine("round=") + llvm::Twine(round) +
+                " rewrote=" + llvm::Twine(rewrote));
+      if (rewrote == 0)
+        break;
+    }
+
+    // Post-repair cleanup: the restore loop added a large number of
+    // declarations and globals that the InstructionLifter construction
+    // path required but that the final output doesn't need (no lifted
+    // block in our closure actually calls the semantic helper via the
+    // ISEL_* global — that indirection is only used by the initial
+    // lifting, and our freshly-lifted blocks were already resolved by
+    // the block lifter). Erase ISEL_* globals first, then the orphaned
+    // semantic helper declarations and any unused __remill_*
+    // declarations.
+    llvm::SmallVector<llvm::GlobalVariable *, 16> isel_globals_to_erase;
+    for (auto &gv : module->globals()) {
+      if (!gv.getName().starts_with("ISEL_"))
+        continue;
+      if (gv.use_empty())
+        isel_globals_to_erase.push_back(&gv);
+    }
+    for (auto *gv : isel_globals_to_erase)
+      gv->eraseFromParent();
+
+    llvm::SmallVector<llvm::Function *, 16> funcs_to_erase;
+    for (auto &F : *module) {
+      if (!F.isDeclaration())
+        continue;
+      auto name = F.getName();
+      const bool is_restored_helper =
+          name.starts_with("__remill_") ||
+          name.starts_with("_ZN12_GLOBAL__N_");
+      if (!is_restored_helper)
+        continue;
+      if (!F.use_empty())
+        continue;
+      funcs_to_erase.push_back(&F);
+    }
+    for (auto *F : funcs_to_erase)
+      F->eraseFromParent();
+    debug_log(llvm::Twine("post-repair cleanup erased ") +
+              llvm::Twine(isel_globals_to_erase.size()) +
+              " isel globals + " + llvm::Twine(funcs_to_erase.size()) +
+              " decls");
+  }
+native_boundary_repair_done:;
+
   if (!RawBinary && !NoABI)
     unresolved_pc_output_roots = collectUnresolvedOutputRootPcCalls();
   bool repaired_after_finalization = false;
