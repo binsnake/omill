@@ -18052,6 +18052,123 @@ native_boundary_repair_lowering_done:;
               llvm::Twine(isel_globals_to_erase.size()) +
               " isel globals + " + llvm::Twine(funcs_to_erase.size()) +
               " decls");
+
+    // Internalize every lifted helper that isn't an output root so
+    // GlobalDCE can erase orphan chains that the main pipeline left
+    // behind with external linkage. Without this step, any `blk_*` /
+    // `sub_*` / `block_*` function with external linkage is assumed
+    // to have external callers and retained — even if it's sitting
+    // in an unreferenced island and its transitive call graph only
+    // reaches other orphan helpers.
+    unsigned internalized_helpers = 0;
+    for (auto &F : *module) {
+      if (F.isDeclaration())
+        continue;
+      auto name = F.getName();
+      if (!name.starts_with("blk_") && !name.starts_with("block_") &&
+          !name.starts_with("sub_"))
+        continue;
+      if (F.hasFnAttribute("omill.output_root") ||
+          F.hasFnAttribute("omill.closed_root_slice_root"))
+        continue;
+      if (F.hasLocalLinkage())
+        continue;
+      F.setLinkage(llvm::GlobalValue::InternalLinkage);
+      ++internalized_helpers;
+    }
+    debug_log(llvm::Twine("internalized ") +
+              llvm::Twine(internalized_helpers) +
+              " non-root lifted helpers");
+
+    // Run a final GlobalDCE sweep now that the orphan chains are
+    // internal. This erases every unreferenced `blk_*` / `sub_*` and
+    // in turn breaks the last chains that hold `omill_native_boundary_*`
+    // declarations alive.
+    if (internalized_helpers > 0) {
+      llvm::ModulePassManager dce_mpm;
+      dce_mpm.addPass(llvm::GlobalDCEPass());
+      dce_mpm.run(*module, MAM);
+      MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+    }
+
+    // With the orphan helpers gone, many `omill_native_boundary_*`
+    // declarations are now unused. Erase them too.
+    llvm::SmallVector<llvm::Function *, 16> boundary_to_erase;
+    for (auto &F : *module) {
+      if (!F.isDeclaration())
+        continue;
+      if (!F.getName().starts_with("omill_native_boundary_"))
+        continue;
+      if (!F.use_empty())
+        continue;
+      boundary_to_erase.push_back(&F);
+    }
+    for (auto *F : boundary_to_erase)
+      F->eraseFromParent();
+    debug_log(llvm::Twine("erased ") + llvm::Twine(boundary_to_erase.size()) +
+              " orphan native_boundary decls");
+
+    // Any remaining `omill_native_boundary_*` DEFINITIONS are bridge
+    // bodies synthesized by `materializeKnownBoundaryBridge` earlier in
+    // this function: a tiny inline emulation of a `push imm; jmp rel`
+    // thunk (decrement RSP, store imm on stack, return memory). The
+    // user-visible intent is that these should never appear in the
+    // final IR as separate functions — they should be inlined into
+    // the caller block at lift time. We can't undo the placeholder
+    // creation without restructuring the main pipeline, but we can
+    // convert them into inline IR here by marking each definition
+    // `alwaysinline` + internal and running one more AlwaysInliner
+    // pass. The bodies are ~6 instructions each so inlining them
+    // costs nothing.
+    llvm::SmallVector<llvm::Function *, 16> boundary_defs_to_inline;
+    for (auto &F : *module) {
+      if (F.isDeclaration())
+        continue;
+      if (!F.getName().starts_with("omill_native_boundary_") &&
+          !F.getName().starts_with("omill_vm_enter_boundary_"))
+        continue;
+      if (F.hasFnAttribute(llvm::Attribute::OptimizeNone))
+        F.removeFnAttr(llvm::Attribute::OptimizeNone);
+      if (F.hasFnAttribute(llvm::Attribute::NoInline))
+        F.removeFnAttr(llvm::Attribute::NoInline);
+      if (!F.hasFnAttribute(llvm::Attribute::AlwaysInline))
+        F.addFnAttr(llvm::Attribute::AlwaysInline);
+      if (!F.hasLocalLinkage())
+        F.setLinkage(llvm::GlobalValue::InternalLinkage);
+      boundary_defs_to_inline.push_back(&F);
+    }
+    debug_log(llvm::Twine("boundary bridge defs to inline=") +
+              llvm::Twine(boundary_defs_to_inline.size()));
+    if (!boundary_defs_to_inline.empty()) {
+      MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+      llvm::ModulePassManager inline_bridges;
+      inline_bridges.addPass(llvm::AlwaysInlinerPass());
+      inline_bridges.addPass(llvm::GlobalDCEPass());
+      inline_bridges.run(*module, MAM);
+      MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+
+      // Some of the bridge definitions may still be alive as tail
+      // callees of a musttail path that AlwaysInliner couldn't unwind
+      // (musttail constraints). Direct-erase any that are now unused.
+      llvm::SmallVector<llvm::Function *, 8> stragglers;
+      for (auto *F : boundary_defs_to_inline) {
+        if (F && F->getParent() == module.get() && F->use_empty())
+          stragglers.push_back(F);
+      }
+      for (auto *F : stragglers)
+        F->eraseFromParent();
+      if (debug_repair) {
+        unsigned remaining = 0;
+        for (auto &F : *module) {
+          auto name = F.getName();
+          if (name.starts_with("omill_native_boundary_") ||
+              name.starts_with("omill_vm_enter_boundary_"))
+            ++remaining;
+        }
+        debug_log(llvm::Twine("boundary bridge defs remaining=") +
+                  llvm::Twine(remaining));
+      }
+    }
   }
 native_boundary_repair_done:;
 
