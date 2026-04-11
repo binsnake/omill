@@ -2645,7 +2645,7 @@ static bool rewriteClosedSliceTerminalContinuationCalls(
 
 static bool runLateTerminalBoundaryRecoveryCleanup(
     llvm::Module &M, llvm::ModuleAnalysisManager &AM,
-    VirtualMachineModel &model,
+    VirtualMachineModel &model, const SessionGraphState *session_graph,
     llvm::SmallVectorImpl<std::string> *diagnostics,
     llvm::SmallPtrSetImpl<llvm::Function *> &changed_functions) {
   if (!envFlagEnabled("OMILL_TERMINAL_BOUNDARY_RECOVERY"))
@@ -2673,7 +2673,8 @@ static bool runLateTerminalBoundaryRecoveryCleanup(
     if (!round_changed)
       break;
 
-    model = VirtualMachineModelAnalysis().run(M, AM);
+    model =
+        VirtualMachineModelAnalysis().run(M, AM, session_graph);
     annotateClosedRootSlices(M, model);
     changed = true;
   }
@@ -2756,8 +2757,9 @@ static void annotateClosedRootSlices(llvm::Module &M,
                   static_cast<uint32_t>(has_closed_slice ? 1 : 0));
 }
 
-static MaterializationResult runMaterialization(llvm::Module &M,
-                                                llvm::ModuleAnalysisManager &AM) {
+static MaterializationResult runMaterialization(
+    llvm::Module &M, llvm::ModuleAnalysisManager &AM,
+    const SessionGraphState *session_graph = nullptr) {
   MaterializationResult result;
   genericDebugLog("begin materialization");
   const auto &binary_memory = AM.getResult<BinaryMemoryAnalysis>(M);
@@ -2792,7 +2794,8 @@ static MaterializationResult runMaterialization(llvm::Module &M,
   for (unsigned iteration = 0; iteration < max_iterations; ++iteration) {
     genericDebugLog("iteration " + llvm::Twine(iteration).str() +
                     " model-start");
-    final_model = VirtualMachineModelAnalysis().run(M, AM);
+    final_model =
+        VirtualMachineModelAnalysis().run(M, AM, session_graph);
     final_model_current = true;
     genericDebugLog("iteration " + llvm::Twine(iteration).str() +
                     " model-done handlers=" +
@@ -3452,6 +3455,35 @@ static MaterializationResult runMaterialization(llvm::Module &M,
                 resolved_pc = *fallback;
               }
             }
+            // Gspec specialization fallback: when the dispatch's specialized
+            // target expression is a kPhi whose arms include a literal
+            // executable code address but other arms are unresolvable register
+            // slots, prefer that constant. The gspec clone exists precisely
+            // because the specialization narrowed the dispatch to one caller
+            // context; the constant arm represents the resolved choice for
+            // that context, while the symbolic arms encode pre-specialization
+            // alternatives that no longer apply. Restricted to dispatch_jump
+            // sites in gspec functions to keep the relaxation tight.
+            if (!resolved_pc &&
+                F.hasFnAttribute("omill.virtual_specialized") &&
+                isDispatchJumpName(name) &&
+                dispatch.specialized_target.kind == VirtualExprKind::kPhi) {
+              for (const auto &operand :
+                   dispatch.specialized_target.operands) {
+                if (operand.kind != VirtualExprKind::kConstant ||
+                    !operand.constant.has_value()) {
+                  continue;
+                }
+                uint64_t candidate_pc = *operand.constant;
+                if (!isExecutableTargetAddress(binary_memory, candidate_pc))
+                  continue;
+                resolved_pc = candidate_pc;
+                result.diagnostics.push_back(
+                    "gspec-phi-arm-resolution fn=" + F.getName().str() +
+                    " target=0x" + llvm::utohexstr(candidate_pc));
+                break;
+              }
+            }
             if (!resolved_pc)
               continue;
 
@@ -3637,20 +3669,21 @@ static MaterializationResult runMaterialization(llvm::Module &M,
 
   genericDebugLog("final-model-start");
   if (!final_model_current)
-    final_model = VirtualMachineModelAnalysis().run(M, AM);
+    final_model = VirtualMachineModelAnalysis().run(M, AM, session_graph);
   genericDebugLog("final-model-done");
   annotateClosedRootSlices(M, final_model);
 
   if (pruneTerminalBoundaryRecoveryToClosedSlices(
           M, final_model, &result.diagnostics, result.changed_functions)) {
     result.changed = true;
-    final_model = VirtualMachineModelAnalysis().run(M, AM);
+    final_model = VirtualMachineModelAnalysis().run(M, AM, session_graph);
     final_model_current = true;
     annotateClosedRootSlices(M, final_model);
   }
 
   if (runLateTerminalBoundaryRecoveryCleanup(
-          M, AM, final_model, &result.diagnostics, result.changed_functions)) {
+          M, AM, final_model, session_graph, &result.diagnostics,
+          result.changed_functions)) {
     result.changed = true;
     final_model_current = true;
   }
@@ -3989,7 +4022,7 @@ static bool shouldForceValidationFailure(const llvm::Function &F) {
 
 llvm::PreservedAnalyses VirtualCFGMaterializationPass::run(
     llvm::Module &M, llvm::ModuleAnalysisManager &AM) {
-  auto result = runMaterialization(M, AM);
+  auto result = runMaterialization(M, AM, session_graph_);
   return result.changed ? llvm::PreservedAnalyses::none()
                         : llvm::PreservedAnalyses::all();
 }
@@ -3999,9 +4032,7 @@ llvm::PreservedAnalyses VerifiedVirtualCFGMaterializationPass::run(
 #if OMILL_ENABLE_Z3
   auto snapshot_module = llvm::CloneModule(M);
   z3::context z3_ctx;
-  auto result = runMaterialization(M, AM);
-  if (!result.changed)
-    return llvm::PreservedAnalyses::all();
+  auto result = runMaterialization(M, AM, session_graph_);
 
   bool kept_change = false;
   for (auto *changed_fn : result.changed_functions) {
@@ -4040,7 +4071,7 @@ llvm::PreservedAnalyses VerifiedVirtualCFGMaterializationPass::run(
   return kept_change ? llvm::PreservedAnalyses::none()
                      : llvm::PreservedAnalyses::all();
 #else
-  auto result = runMaterialization(M, AM);
+  auto result = runMaterialization(M, AM, session_graph_);
   return result.changed ? llvm::PreservedAnalyses::none()
                         : llvm::PreservedAnalyses::all();
 #endif
