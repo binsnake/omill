@@ -37,6 +37,8 @@
 #include <llvm/Transforms/Utils/Local.h>
 #include <llvm/Transforms/Utils/ModuleUtils.h>
 
+#include "omill/Utils/StateFieldMap.h"
+
 #include <chrono>
 #include <cstdlib>
 #include <optional>
@@ -486,7 +488,8 @@ static bool moduleHasRootLocalGenericStaticDevirtualizationShapeImpl(
                F.hasFnAttribute("omill.newly_lifted") ||
                F.hasFnAttribute("omill.virtual_specialized") ||
                F.getFnAttribute("omill.vm_demerged_clone").isValid() ||
-               F.getFnAttribute("omill.vm_outlined_virtual_call").isValid();
+               F.getFnAttribute("omill.vm_outlined_virtual_call").isValid() ||
+               F.getFnAttribute("omill.export_entry_seed_exprs").isValid();
       };
 
   llvm::SmallVector<const llvm::Function *, 16> worklist;
@@ -571,6 +574,7 @@ void collectReachableClosedRootSliceFunctions(
     llvm::Module &M, llvm::SmallVectorImpl<llvm::Function *> &functions);
 void collectReachableOutputRootFunctions(
     llvm::Module &M, llvm::SmallVectorImpl<llvm::Function *> &functions);
+bool isLargeNoAbiStateOptimizationScopeModule(const llvm::Module &M);
 
 bool getBoolMetadataValue(const llvm::Instruction &I, llvm::StringRef name) {
   auto *md = I.getMetadata(name);
@@ -626,6 +630,51 @@ std::optional<X86DecodeWindowScore> scoreForwardDecodableX86Window(
   if (!instruction_count)
     return std::nullopt;
   return X86DecodeWindowScore{current_pc, instruction_count};
+}
+
+std::optional<uint64_t> recoverWrappedDirectCallTargetFromInvalidatedEntry(
+    const BinaryMemoryMap &binary_memory, uint64_t source_pc, uint64_t failed_pc) {
+  if (failed_pc <= source_pc || (failed_pc - source_pc) > 16)
+    return std::nullopt;
+
+  const uint64_t start_pc = source_pc > 16 ? (source_pc - 16) : 1;
+  for (uint64_t call_pc = source_pc; call_pc > start_pc; --call_pc) {
+    const uint64_t candidate_pc = call_pc - 1;
+    uint8_t bytes[8] = {};
+    if (!binary_memory.read(candidate_pc, bytes, sizeof(bytes)) || bytes[0] != 0xE8)
+      continue;
+
+    int32_t rel = 0;
+    std::memcpy(&rel, bytes + 1, sizeof(rel));
+    const uint64_t fallthrough_pc = candidate_pc + 5;
+    const uint64_t target_pc = static_cast<uint64_t>(
+        static_cast<int64_t>(fallthrough_pc) + static_cast<int64_t>(rel));
+    if (!binary_memory.isExecutable(target_pc, 1) || fallthrough_pc >= source_pc)
+      continue;
+
+    uint8_t branch_bytes[6] = {};
+    if (!binary_memory.read(fallthrough_pc, branch_bytes, sizeof(branch_bytes)))
+      continue;
+
+    std::optional<uint64_t> branch_target;
+    if (branch_bytes[0] >= 0x70 && branch_bytes[0] <= 0x7F) {
+      int8_t rel8 = static_cast<int8_t>(branch_bytes[1]);
+      branch_target = static_cast<uint64_t>(
+          static_cast<int64_t>(fallthrough_pc + 2) + static_cast<int64_t>(rel8));
+    } else if (branch_bytes[0] == 0x0F &&
+               (branch_bytes[1] & 0xF0u) == 0x80u) {
+      int32_t rel32 = 0;
+      std::memcpy(&rel32, branch_bytes + 2, sizeof(rel32));
+      branch_target = static_cast<uint64_t>(
+          static_cast<int64_t>(fallthrough_pc + 6) + static_cast<int64_t>(rel32));
+    }
+    if (!branch_target.has_value() || *branch_target <= failed_pc)
+      continue;
+
+    return target_pc;
+  }
+
+  return std::nullopt;
 }
 
 std::optional<uint64_t> recoverForwardInvalidatedX86InstructionStart(
@@ -1137,6 +1186,7 @@ struct RewriteExecutableBoundaryHandlerCallsPass
             executable_fact &&
             executable_fact->invalidated_executable_entry;
         std::optional<uint64_t> invalidated_forward_entry_pc;
+        std::optional<uint64_t> invalidated_wrapped_call_target_pc;
         if (invalidated_entry && targetArchForModule(M) == TargetArch::kX86_64) {
           auto source_pc = executable_fact->invalidated_entry_source_pc;
           auto failed_pc = executable_fact->invalidated_entry_failed_pc;
@@ -1144,12 +1194,18 @@ struct RewriteExecutableBoundaryHandlerCallsPass
             invalidated_forward_entry_pc =
                 recoverForwardInvalidatedX86InstructionStart(
                     binary_memory, *source_pc, *failed_pc);
+            invalidated_wrapped_call_target_pc =
+                recoverWrappedDirectCallTargetFromInvalidatedEntry(
+                    binary_memory, *source_pc, *failed_pc);
           }
         }
         auto classification =
             classifyTerminalBoundaryTarget(M, binary_memory, target_pc);
         auto arch = targetArchForModule(M);
-        if (invalidated_forward_entry_pc.has_value()) {
+        if (invalidated_wrapped_call_target_pc.has_value()) {
+          classification.nearby_entry_pc = invalidated_wrapped_call_target_pc;
+          classification.canonicalize_placeholder_to_nearby_entry = true;
+        } else if (invalidated_forward_entry_pc.has_value()) {
           classification.nearby_entry_pc = invalidated_forward_entry_pc;
           classification.canonicalize_placeholder_to_nearby_entry = true;
         } else if (invalidated_entry &&
@@ -2016,6 +2072,168 @@ struct InternalizeDeadLiftedHelpersPass
   static bool isRequired() { return true; }
 };
 
+struct EraseDeadTrivialSelfLoopPlaceholderCallsPass
+    : llvm::PassInfoMixin<EraseDeadTrivialSelfLoopPlaceholderCallsPass> {
+  static bool isDirectSyntheticSelfLoop(const llvm::Function &F) {
+    if (F.isDeclaration() || F.empty() || F.size() != 1)
+      return false;
+
+    const auto &BB = F.getEntryBlock();
+    const auto *br = llvm::dyn_cast<llvm::BranchInst>(BB.getTerminator());
+    if (!br || !br->isUnconditional() || br->getSuccessor(0) != &BB)
+      return false;
+
+    for (const auto &I : BB) {
+      if (&I == BB.getTerminator() || I.isDebugOrPseudoInst())
+        continue;
+      return false;
+    }
+    return true;
+  }
+
+  static bool isSelfRecursiveTailLoopShell(const llvm::Function &F) {
+    if (F.isDeclaration() || F.empty() || F.size() != 1)
+      return false;
+
+    const auto &BB = F.getEntryBlock();
+    const llvm::CallBase *self_call = nullptr;
+    const llvm::ReturnInst *ret = nullptr;
+    for (const auto &I : BB) {
+      if (I.isDebugOrPseudoInst())
+        continue;
+      if (auto *CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
+        auto *callee = CB->getCalledFunction();
+        if (callee == &F) {
+          if (self_call)
+            return false;
+          self_call = CB;
+          continue;
+        }
+        if (!callee || !callee->isDeclaration())
+          return false;
+        continue;
+      }
+      if (auto *RI = llvm::dyn_cast<llvm::ReturnInst>(&I)) {
+        if (ret)
+          return false;
+        ret = RI;
+      }
+    }
+
+    if (!self_call || !ret)
+      return false;
+    const llvm::Value *returned = ret->getReturnValue();
+    return returned && returned->stripPointerCasts() == self_call;
+  }
+
+
+  static bool isTrivialSelfLoopPlaceholderImpl(
+      const llvm::Function &F, llvm::DenseSet<const llvm::Function *> &visiting) {
+    if (!visiting.insert(&F).second)
+      return true;
+
+    if (isDirectSyntheticSelfLoop(F) || isSelfRecursiveTailLoopShell(F)) {
+      visiting.erase(&F);
+      return true;
+    }
+
+    if (F.isDeclaration() || F.empty() || F.size() != 1) {
+      visiting.erase(&F);
+      return false;
+    }
+
+    const llvm::CallBase *call = nullptr;
+    const llvm::ReturnInst *ret = nullptr;
+    for (const auto &I : F.getEntryBlock()) {
+      if (I.isDebugOrPseudoInst())
+        continue;
+      if (auto *CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
+        if (call) {
+          visiting.erase(&F);
+          return false;
+        }
+        call = CB;
+        continue;
+      }
+      if (auto *RI = llvm::dyn_cast<llvm::ReturnInst>(&I)) {
+        if (ret) {
+          visiting.erase(&F);
+          return false;
+        }
+        ret = RI;
+        continue;
+      }
+      visiting.erase(&F);
+      return false;
+    }
+
+    auto *callee = call ? call->getCalledFunction() : nullptr;
+    if (!call || !ret || !callee || callee->isDeclaration()) {
+      visiting.erase(&F);
+      return false;
+    }
+
+    const llvm::Value *returned = ret->getReturnValue();
+    if (returned && returned->stripPointerCasts() != call) {
+      visiting.erase(&F);
+      return false;
+    }
+
+    const bool placeholder = isTrivialSelfLoopPlaceholderImpl(*callee, visiting);
+    visiting.erase(&F);
+    return placeholder;
+  }
+
+  static bool isTrivialSelfLoopPlaceholder(const llvm::Function &F) {
+    llvm::DenseSet<const llvm::Function *> visiting;
+    return isTrivialSelfLoopPlaceholderImpl(F, visiting);
+  }
+
+  llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &) {
+    bool changed = false;
+    for (auto &F : M) {
+      if (F.isDeclaration())
+        continue;
+      for (auto &BB : F) {
+        for (auto &I : llvm::make_early_inc_range(BB)) {
+          auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+          if (!CI || !CI->use_empty() || CI->isMustTailCall())
+            continue;
+          auto *callee = CI->getCalledFunction();
+          if (!callee || !isTrivialSelfLoopPlaceholder(*callee))
+            continue;
+
+          bool has_following_call = false;
+          for (auto it = std::next(CI->getIterator()), end = BB.end(); it != end;
+               ++it) {
+            if (it->isDebugOrPseudoInst())
+              continue;
+            if (llvm::isa<llvm::CallBase>(&*it)) {
+              has_following_call = true;
+              break;
+            }
+          }
+          if (!has_following_call)
+            continue;
+
+          CI->eraseFromParent();
+          changed = true;
+        }
+      }
+    }
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+
+  static bool isRequired() { return true; }
+};
+
+
+static constexpr llvm::StringLiteral kRootEntrySeedExprsAttr =
+    "omill.export_entry_seed_exprs";
+
+
 struct DirectABIShapingPass : llvm::PassInfoMixin<DirectABIShapingPass> {
   static llvm::Type *abiScalarType(llvm::LLVMContext &ctx, unsigned size,
                                    bool is_vector) {
@@ -2042,6 +2260,121 @@ struct DirectABIShapingPass : llvm::PassInfoMixin<DirectABIShapingPass> {
     return B.CreateConstGEP1_64(i8, byte_base, offset);
   }
 
+  static void applyRequestedRootSeedExprs(llvm::Module &M, llvm::IRBuilder<> &B,
+                                          llvm::Function &shim,
+                                          llvm::Value *state_storage) {
+    auto attr = shim.getFnAttribute(kRootEntrySeedExprsAttr);
+    if (!attr.isValid() || !attr.isStringAttribute())
+      return;
+
+    StateFieldMap field_map(M);
+    auto getShimParamAsI64 = [&](unsigned index) -> llvm::Value * {
+      if (index >= shim.arg_size())
+        return nullptr;
+      auto *arg = shim.getArg(index);
+      if (arg->getType()->isPointerTy())
+        return B.CreatePtrToInt(arg, B.getInt64Ty(), arg->getName() + ".i64");
+      if (arg->getType()->isIntegerTy())
+        return B.CreateZExtOrTrunc(arg, B.getInt64Ty(), arg->getName() + ".i64");
+      return nullptr;
+    };
+
+    std::function<llvm::Value *(llvm::StringRef)> evalExpr;
+    evalExpr = [&](llvm::StringRef text) -> llvm::Value * {
+      text = text.trim();
+      if (text.starts_with("param(") && text.ends_with(")")) {
+        unsigned idx = 0;
+        if (!text.drop_front(6).drop_back().getAsInteger(10, idx))
+          return getShimParamAsI64(idx);
+        return nullptr;
+      }
+      if (text.starts_with("const(") && text.ends_with(")")) {
+        auto body = text.drop_front(6).drop_back();
+        uint64_t value = 0;
+        if (body.starts_with("0x")) {
+          if (!body.drop_front(2).getAsInteger(16, value))
+            return llvm::ConstantInt::get(B.getInt64Ty(), value);
+        } else if (!body.getAsInteger(10, value)) {
+          return llvm::ConstantInt::get(B.getInt64Ty(), value);
+        }
+        return nullptr;
+      }
+      auto evalBinary = [&](llvm::StringRef op, auto &&fn) -> llvm::Value * {
+        if (!text.starts_with(op) || !text.ends_with(")"))
+          return nullptr;
+        auto body = text.drop_front(op.size()).drop_back();
+        int depth = 0;
+        size_t split = llvm::StringRef::npos;
+        for (size_t i = 0; i < body.size(); ++i) {
+          char c = body[i];
+          if (c == '(') ++depth;
+          else if (c == ')') --depth;
+          else if (c == ',' && depth == 0) { split = i; break; }
+        }
+        if (split == llvm::StringRef::npos)
+          return nullptr;
+        auto *lhs = evalExpr(body.take_front(split));
+        auto *rhs = evalExpr(body.drop_front(split + 1));
+        if (!lhs || !rhs)
+          return nullptr;
+        return fn(lhs, rhs);
+      };
+      auto evalUnary = [&](llvm::StringRef op) -> llvm::Value * {
+        if (!text.starts_with(op) || !text.ends_with(")"))
+          return nullptr;
+        auto *v = evalExpr(text.drop_front(op.size()).drop_back());
+        if (!v)
+          return nullptr;
+        return B.CreateAnd(v, llvm::ConstantInt::get(B.getInt64Ty(), 0xffffffffull));
+      };
+      if (auto *v = evalUnary("zext32("))
+        return v;
+      if (auto *v = evalBinary("add64(", [&](llvm::Value *lhs, llvm::Value *rhs) {
+            return B.CreateAdd(lhs, rhs);
+          }))
+        return v;
+      if (auto *v = evalBinary("xor64(", [&](llvm::Value *lhs, llvm::Value *rhs) {
+            return B.CreateXor(lhs, rhs);
+          }))
+        return v;
+      if (auto *v = evalBinary("xor32(", [&](llvm::Value *lhs, llvm::Value *rhs) {
+            auto *x = B.CreateXor(lhs, rhs);
+            return B.CreateAnd(x,
+                               llvm::ConstantInt::get(B.getInt64Ty(), 0xffffffffull));
+          }))
+        return v;
+      if (auto *v = evalBinary("and32(", [&](llvm::Value *lhs, llvm::Value *rhs) {
+            auto *x = B.CreateAnd(lhs, rhs);
+            return B.CreateAnd(x,
+                               llvm::ConstantInt::get(B.getInt64Ty(), 0xffffffffull));
+          }))
+        return v;
+      return nullptr;
+    };
+
+    llvm::SmallVector<llvm::StringRef, 16> entries;
+    attr.getValueAsString().split(entries, ';', -1, false);
+    for (auto entry : entries) {
+      entry = entry.trim();
+      if (entry.empty())
+        continue;
+      auto pair = entry.split('=');
+      if (pair.first.empty() || pair.second.empty())
+        continue;
+      auto field = field_map.fieldByName(pair.first.trim());
+      if (!field || field->size != 8)
+        continue;
+      auto *value = evalExpr(pair.second);
+      if (!value)
+        continue;
+      auto *dest_i8 = bytePtrAtOffset(B, state_storage, field->offset);
+      auto *dest = B.CreatePointerBitCastOrAddrSpaceCast(
+          dest_i8, llvm::PointerType::get(M.getContext(), 0));
+      B.CreateStore(value, dest);
+    }
+  }
+
+
   static void copyABIRelevantAttrs(llvm::Function &from, llvm::Function &to) {
     for (auto &attr_set : from.getAttributes().getFnAttrs()) {
       if (attr_set.isEnumAttribute()) {
@@ -2060,6 +2393,36 @@ struct DirectABIShapingPass : llvm::PassInfoMixin<DirectABIShapingPass> {
       }
     }
   }
+
+  static llvm::Value *buildRequestedRootReturnTransform(
+      llvm::IRBuilder<> &B, llvm::Value *root_call, llvm::Type *ret_ty,
+      llvm::StringRef transform) {
+    if (!root_call || !ret_ty || !ret_ty->isIntegerTy())
+      return nullptr;
+    if (!transform.starts_with("low8_add_const:"))
+      return nullptr;
+
+    unsigned imm = 0;
+    if (transform.drop_front(15).getAsInteger(10, imm) || imm > 0xffu)
+      return nullptr;
+
+    llvm::Value *call_i64 = root_call;
+    if (call_i64->getType()->isPointerTy()) {
+      call_i64 = B.CreatePtrToInt(call_i64, B.getInt64Ty(), "root.call.i64");
+    } else if (call_i64->getType()->isIntegerTy()) {
+      call_i64 = B.CreateZExtOrTrunc(call_i64, B.getInt64Ty(), "root.call.i64");
+    } else {
+      return nullptr;
+    }
+
+    auto *low8 = B.CreateTrunc(call_i64, B.getInt8Ty(), "root.ret.low8");
+    auto *sum8 = B.CreateAdd(low8, B.getInt8(static_cast<uint8_t>(imm)),
+                             "root.ret.sum8");
+    if (ret_ty->isIntegerTy(8))
+      return sum8;
+    return B.CreateZExt(sum8, ret_ty, "root.ret.zext");
+  }
+
 
   llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &MAM) {
     auto &cc_info = MAM.getResult<CallingConventionAnalysis>(M);
@@ -2159,17 +2522,29 @@ struct DirectABIShapingPass : llvm::PassInfoMixin<DirectABIShapingPass> {
         ++arg_index;
       }
 
+      applyRequestedRootSeedExprs(M, B, *shim, state_storage);
+
       uint64_t entry_va = extractEntryVA(public_name);
       auto *pc = llvm::ConstantInt::get(llvm::Type::getInt64Ty(M.getContext()),
                                         entry_va);
       auto *memory =
           llvm::ConstantPointerNull::get(
               llvm::cast<llvm::PointerType>(root->getArg(2)->getType()));
-      B.CreateCall(root, {state_ptr, pc, memory});
+      auto *root_call = B.CreateCall(root, {state_ptr, pc, memory});
 
       if (!abi->ret.has_value()) {
         B.CreateRetVoid();
       } else {
+        auto transform_attr =
+            shim->getFnAttribute("omill.requested_root_return_transform");
+        if (transform_attr.isValid() && transform_attr.isStringAttribute()) {
+          if (auto *ret = buildRequestedRootReturnTransform(
+                  B, root_call, ret_ty, transform_attr.getValueAsString())) {
+            B.CreateRet(ret);
+            changed = true;
+            continue;
+          }
+        }
         auto *dest_i8 = bytePtrAtOffset(B, state_storage, abi->ret->state_offset);
         auto *dest = B.CreatePointerBitCastOrAddrSpaceCast(
             dest_i8, llvm::PointerType::get(M.getContext(), 0));
@@ -3045,10 +3420,34 @@ void collectReachableOutputRootFunctions(
       return;
     functions.push_back(F);
   };
+  auto queue_structural_targets = [&]() {
+    auto summary = collectOutputRootClosureTargets(
+        M,
+        [&](uint64_t target) {
+          return lookupDefinedLiftedOrBlockTarget(M, target) != nullptr;
+        },
+        [&](uint64_t target) {
+          return lookupDefinedLiftedOrBlockTarget(M, target) != nullptr;
+        },
+        [&](uint64_t target) { return target; },
+        /*include_defined_targets=*/true);
+    auto queue_targets = [&](const std::vector<uint64_t> &targets) {
+      for (uint64_t target : targets)
+        queue_fn(lookupDefinedLiftedOrBlockTarget(M, target));
+    };
+    queue_targets(summary.constant_code_targets);
+    queue_targets(summary.constant_calli_targets);
+    queue_targets(summary.constant_dispatch_targets);
+    queue_targets(summary.annotated_vm_continuation_targets);
+  };
 
   for (auto &F : M)
     if (isOutputRootClosureSeedFunction(F) || isOutputRootNativeFunction(F))
       queue_fn(&F);
+
+  queue_structural_targets();
+  if (isLargeNoAbiStateOptimizationScopeModule(M))
+    return;
 
   for (size_t i = 0; i < functions.size(); ++i) {
     auto *F = functions[i];
@@ -3221,6 +3620,107 @@ bool rebuildClosedRootSliceCodeScope(llvm::Module &M) {
   return changed;
 }
 
+bool isOutputRootClosureScopedModule(const llvm::Module &M) {
+  auto *flag = M.getModuleFlag("omill.output_root_closure_scope");
+  if (!flag)
+    return false;
+  if (auto *value = llvm::mdconst::dyn_extract<llvm::ConstantInt>(flag))
+    return value->getZExtValue() != 0;
+  return false;
+}
+
+bool rebuildOutputRootClosureCodeScope(llvm::Module &M) {
+  constexpr unsigned kLargeLiftedFunctionThreshold = 512;
+
+  unsigned lifted_count = 0;
+  for (auto &F : M) {
+    if (!isLiftedPipelineFunction(F))
+      continue;
+    if (++lifted_count >= kLargeLiftedFunctionThreshold)
+      break;
+  }
+
+  const bool enable_scope =
+      isNoABIModeModule(M) && lifted_count >= kLargeLiftedFunctionThreshold;
+  llvm::SmallVector<llvm::Function *, 16> reachable;
+  llvm::DenseSet<llvm::Function *> keep;
+  if (enable_scope) {
+
+
+    collectReachableOutputRootFunctions(M, reachable);
+    keep.insert(reachable.begin(), reachable.end());
+  }
+
+  bool changed = false;
+  for (auto &F : M) {
+    const bool should_keep = enable_scope && keep.contains(&F);
+    if (should_keep) {
+      if (!F.hasFnAttribute("omill.output_root_closure")) {
+        F.addFnAttr("omill.output_root_closure", "1");
+        changed = true;
+      }
+      continue;
+    }
+    if (F.hasFnAttribute("omill.output_root_closure")) {
+      F.removeFnAttr("omill.output_root_closure");
+      changed = true;
+    }
+  }
+
+  const bool was_scoped = isOutputRootClosureScopedModule(M);
+  M.setModuleFlag(llvm::Module::Override, "omill.output_root_closure_scope",
+                  static_cast<uint32_t>(enable_scope ? 1 : 0));
+  return changed || was_scoped != enable_scope;
+}
+
+bool isLargeNoAbiGenericStaticScopeModule(const llvm::Module &M) {
+  auto *flag = M.getModuleFlag("omill.large_noabi_generic_static_scope");
+  if (!flag)
+    return false;
+  if (auto *value = llvm::mdconst::dyn_extract<llvm::ConstantInt>(flag))
+    return value->getZExtValue() != 0;
+  return false;
+}
+
+
+bool isLargeNoAbiStateOptimizationScopeModule(const llvm::Module &M) {
+  auto *flag = M.getModuleFlag("omill.large_noabi_state_scope");
+  if (!flag)
+    return false;
+  if (auto *value = llvm::mdconst::dyn_extract<llvm::ConstantInt>(flag))
+    return value->getZExtValue() != 0;
+  return false;
+}
+
+bool rebuildLargeNoAbiStateOptimizationScope(llvm::Module &M) {
+  constexpr unsigned kLargeLiftedFunctionThreshold = 512;
+
+  unsigned lifted_count = 0;
+  for (auto &F : M) {
+    if (!isLiftedPipelineFunction(F))
+      continue;
+    if (++lifted_count >= kLargeLiftedFunctionThreshold)
+      break;
+  }
+
+  const bool enable_scope =
+      isNoABIModeModule(M) && lifted_count >= kLargeLiftedFunctionThreshold;
+  const bool was_scoped = isLargeNoAbiStateOptimizationScopeModule(M);
+  M.setModuleFlag(llvm::Module::Override, "omill.large_noabi_state_scope",
+                  static_cast<uint32_t>(enable_scope ? 1 : 0));
+  return was_scoped != enable_scope;
+}
+
+unsigned countLiftedPipelineFunctions(const llvm::Module &M) {
+  unsigned count = 0;
+  for (auto &F : M) {
+    if (isLiftedPipelineFunction(F))
+      ++count;
+  }
+  return count;
+}
+
+
 bool isTerminalMissingBlockStub(const llvm::Function &F) {
   const llvm::Function *missing_block = nullptr;
   unsigned direct_calls = 0;
@@ -3388,6 +3888,79 @@ struct MarkClosedRootSliceSemanticHelpersForInliningPass
     for (auto &F : M) {
       changed |= maybeMarkClosedRootSliceSemanticHelperForInlining(
           F, /*max_inst_count=*/96);
+    }
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+};
+
+/// Aggressively mark every remill instruction-semantics template that is
+/// directly called by a lifted block which has not yet been through
+/// late-block reintegration. Unlike MarkClosedRootSliceSemanticHelpersForInlining,
+/// this pass applies no instruction-count limit: late-lifted blocks contain
+/// calls to large templates (CALLI/MOVI vector variants etc.) that the
+/// existing 96-instruction cap excludes, leaving them in the final IR.
+///
+/// Idempotency: only walks lifted functions without
+/// `omill.late_block_semantics_marked`. Once a function has been visited,
+/// it sets the attribute and is skipped on subsequent invocations.
+struct MarkLateBlockReachableSemanticHelpersPass
+    : llvm::PassInfoMixin<MarkLateBlockReachableSemanticHelpersPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &) {
+    bool changed = false;
+    for (auto &F : M) {
+      if (F.isDeclaration())
+        continue;
+      if (!isLiftedPipelineFunction(F))
+        continue;
+      if (F.hasFnAttribute("omill.late_block_semantics_marked"))
+        continue;
+
+      bool any_marked_here = false;
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *call = llvm::dyn_cast<llvm::CallBase>(&I);
+          if (!call)
+            continue;
+          auto *callee = call->getCalledFunction();
+          if (!callee || callee->isDeclaration())
+            continue;
+          // Only consider remill-shaped semantic templates: they have
+          // remill.function.type metadata and are not lifted/intrinsic
+          // helpers themselves.
+          auto name = callee->getName();
+          if (name.starts_with("sub_") ||
+              isSyntheticBlockLikeFunctionName(name) ||
+              name.starts_with("__remill_") ||
+              name.starts_with("__omill_") ||
+              name.ends_with("_native")) {
+            continue;
+          }
+          if (!callee->getMetadata("remill.function.type"))
+            continue;
+          if (callee->hasFnAttribute(llvm::Attribute::AlwaysInline))
+            continue;
+          if (callee->hasFnAttribute(llvm::Attribute::OptimizeNone)) {
+            callee->removeFnAttr(llvm::Attribute::OptimizeNone);
+            changed = true;
+          }
+          if (callee->hasFnAttribute(llvm::Attribute::NoInline)) {
+            callee->removeFnAttr(llvm::Attribute::NoInline);
+            changed = true;
+          }
+          callee->addFnAttr(llvm::Attribute::AlwaysInline);
+          changed = true;
+          any_marked_here = true;
+        }
+      }
+      // Tag the function so we don't re-walk it on subsequent cleanup
+      // invocations. Even if we found nothing, walking this function once
+      // is enough — its body shape is stable until a new lift adds
+      // new callsites, and a new lift will clear the attr by replacing F.
+      F.addFnAttr("omill.late_block_semantics_marked");
+      (void)any_marked_here;
     }
 
     return changed ? llvm::PreservedAnalyses::none()
@@ -4728,7 +5301,11 @@ struct LiftConstantContinuationDeclarationTargetsPass
       std::string caller_name;
       std::string callee_name;
     };
-    std::vector<PendingContinuationLift> pending_lifts;
+    // `scheduled` doubles as the per-pass dedup set and the persistent
+    // idempotency guard: callers that fail to lift get inserted, so they
+    // are not retried even on later cleanup invocations within the same
+    // run. We also remember the per-PC try via a module-level metadata
+    // marker so the next pass invocation skips them too.
     std::set<uint64_t> scheduled;
     bool changed = false;
 
@@ -4748,93 +5325,142 @@ struct LiftConstantContinuationDeclarationTargetsPass
     if (!block_lift && !trace_lift)
       return llvm::PreservedAnalyses::all();
 
-    // Pre-collect lift work so the lifter can freely mutate the module
-    // without invalidating the iterators we're using to discover candidates.
-    for (auto &F : M) {
-      if (F.isDeclaration())
-        continue;
-      if (!shouldProcessFunction(F))
-        continue;
+    // Bounded fixpoint: each lifted block can introduce new declared
+    // blk_*<pc> calls (the next basic block in the chain), and those
+    // should be discovered and lifted in the same cleanup invocation
+    // rather than waiting for the next phase to find them. We cap both
+    // the iteration count AND the total number of newly-lifted blocks
+    // per invocation. CRITICAL: any new lift can introduce unresolved
+    // boundary placeholder calls (omill_executable_target_*) inside the
+    // freshly-lifted body, which then trigger the post-main repair loop
+    // to spawn an expensive sub-process pipeline run per target. So we
+    // keep the bounds at 1 iteration / 1 lift by default — effectively
+    // single-shot — to preserve the baseline behavior, and let the
+    // OMILL_LIFT_CONST_CONTINUATION_FIXPOINT env var enable deeper
+    // expansion for binaries where that tradeoff is acceptable.
+    static const unsigned kMaxFixpointIterations = []() {
+      if (const char *env = std::getenv("OMILL_LIFT_CONST_CONTINUATION_FIXPOINT"))
+        if (env[0] != '\0' && env[0] != '0')
+          return 4u;
+      return 1u;
+    }();
+    static const unsigned kMaxLiftsPerInvocation = []() {
+      if (const char *env = std::getenv("OMILL_LIFT_CONST_CONTINUATION_FIXPOINT"))
+        if (env[0] != '\0' && env[0] != '0')
+          return 16u;
+      return std::numeric_limits<unsigned>::max();
+    }();
+    unsigned lifts_this_invocation = 0;
+    for (unsigned iteration = 0; iteration < kMaxFixpointIterations;
+         ++iteration) {
+      if (lifts_this_invocation >= kMaxLiftsPerInvocation)
+        break;
+      std::vector<PendingContinuationLift> pending_lifts;
 
-      for (auto &BB : F) {
-        for (auto &I : BB) {
-          auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
-          if (!call || call->arg_size() < 2)
-            continue;
-          auto *callee = call->getCalledFunction();
-          if (!callee || !callee->isDeclaration())
-            continue;
+      // Pre-collect lift work so the lifter can freely mutate the module
+      // without invalidating the iterators we're using to discover candidates.
+      for (auto &F : M) {
+        if (F.isDeclaration())
+          continue;
+        if (!shouldProcessFunction(F))
+          continue;
 
-          auto continuation_pc = parseSyntheticBlockLikePC(callee->getName());
-          if (!continuation_pc)
-            continue;
+        for (auto &BB : F) {
+          for (auto &I : BB) {
+            auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+            if (!call || call->arg_size() < 2)
+              continue;
+            auto *callee = call->getCalledFunction();
+            if (!callee || !callee->isDeclaration())
+              continue;
 
-          auto *pc_arg =
-              llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
-          if (!pc_arg || pc_arg->getZExtValue() != *continuation_pc)
-            continue;
-          if (!binary_memory.isExecutable(*continuation_pc, 1)) {
-            if (debug_continuation_lifts)
-              llvm::errs() << "[continuation-lift] skip non-executable pc=0x"
-                           << llvm::Twine::utohexstr(*continuation_pc) << " in "
-                           << F.getName() << "\n";
-            continue;
+            auto continuation_pc = parseSyntheticBlockLikePC(callee->getName());
+            if (!continuation_pc)
+              continue;
+
+            auto *pc_arg =
+                llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+            if (!pc_arg || pc_arg->getZExtValue() != *continuation_pc)
+              continue;
+            if (!binary_memory.isExecutable(*continuation_pc, 1)) {
+              if (debug_continuation_lifts)
+                llvm::errs() << "[continuation-lift] skip non-executable pc=0x"
+                             << llvm::Twine::utohexstr(*continuation_pc)
+                             << " in " << F.getName() << "\n";
+              continue;
+            }
+            if (findSyntheticBlockLikeDefinition(M, *continuation_pc)) {
+              if (debug_continuation_lifts)
+                llvm::errs() << "[continuation-lift] already-defined pc=0x"
+                             << llvm::Twine::utohexstr(*continuation_pc)
+                             << "\n";
+              continue;
+            }
+            if (!scheduled.insert(*continuation_pc).second)
+              continue;
+
+            pending_lifts.push_back(
+                {*continuation_pc, F.getName().str(), callee->getName().str()});
           }
-          if (findSyntheticBlockLikeDefinition(M, *continuation_pc)) {
-            if (debug_continuation_lifts)
-              llvm::errs() << "[continuation-lift] already-defined pc=0x"
-                           << llvm::Twine::utohexstr(*continuation_pc) << "\n";
-            continue;
+        }
+      }
+
+      if (pending_lifts.empty())
+        break;
+
+      bool any_lifted_this_round = false;
+      for (const auto &pending : pending_lifts) {
+        if (lifts_this_invocation >= kMaxLiftsPerInvocation)
+          break;
+        if (debug_continuation_lifts)
+          llvm::errs() << "[continuation-lift] attempt iteration="
+                       << iteration << " pc=0x"
+                       << llvm::Twine::utohexstr(pending.pc)
+                       << " caller=" << pending.caller_name
+                       << " callee=" << pending.callee_name << "\n";
+
+        bool lifted = false;
+        if (session_result && session_result->session &&
+            session_result->session->useBlockLifting() && block_lift) {
+          lifted = block_lift(pending.pc);
+        } else if (block_lift) {
+          lifted = block_lift(pending.pc);
+        } else if (trace_lift) {
+          lifted = trace_lift(pending.pc);
+        }
+
+        if (lifted && session_result && session_result->session)
+          session_result->session->noteLiftedTarget(pending.pc);
+        auto *lifted_target =
+            lifted ? findSyntheticBlockLikeDefinition(M, pending.pc) : nullptr;
+        if (debug_continuation_lifts) {
+          llvm::errs() << "[continuation-lift] result pc=0x"
+                       << llvm::Twine::utohexstr(pending.pc)
+                       << " lifted=" << lifted
+                       << " defined=" << (lifted_target != nullptr);
+          if (auto *blk = M.getFunction(
+                  (llvm::Twine("blk_") + llvm::Twine::utohexstr(pending.pc))
+                      .str())) {
+            llvm::errs() << " blk_decl=" << blk->isDeclaration();
           }
-          if (!scheduled.insert(*continuation_pc).second)
-            continue;
-
-          pending_lifts.push_back(
-              {*continuation_pc, F.getName().str(), callee->getName().str()});
+          if (auto *sub = M.getFunction(
+                  (llvm::Twine("sub_") + llvm::Twine::utohexstr(pending.pc))
+                      .str())) {
+            llvm::errs() << " sub_decl=" << sub->isDeclaration();
+          }
+          llvm::errs() << "\n";
+        }
+        if (lifted_target) {
+          changed = true;
+          any_lifted_this_round = true;
+          ++lifts_this_invocation;
         }
       }
-    }
 
-    for (const auto &pending : pending_lifts) {
-      if (debug_continuation_lifts)
-        llvm::errs() << "[continuation-lift] attempt pc=0x"
-                     << llvm::Twine::utohexstr(pending.pc)
-                     << " caller=" << pending.caller_name
-                     << " callee=" << pending.callee_name << "\n";
-
-      bool lifted = false;
-      if (session_result && session_result->session &&
-          session_result->session->useBlockLifting() && block_lift) {
-        lifted = block_lift(pending.pc);
-      } else if (block_lift) {
-        lifted = block_lift(pending.pc);
-      } else if (trace_lift) {
-        lifted = trace_lift(pending.pc);
-      }
-
-      if (lifted && session_result && session_result->session)
-        session_result->session->noteLiftedTarget(pending.pc);
-      auto *lifted_target =
-          lifted ? findSyntheticBlockLikeDefinition(M, pending.pc) : nullptr;
-      if (debug_continuation_lifts) {
-        llvm::errs() << "[continuation-lift] result pc=0x"
-                     << llvm::Twine::utohexstr(pending.pc)
-                     << " lifted=" << lifted
-                     << " defined=" << (lifted_target != nullptr);
-        if (auto *blk = M.getFunction(
-                (llvm::Twine("blk_") + llvm::Twine::utohexstr(pending.pc))
-                    .str())) {
-          llvm::errs() << " blk_decl=" << blk->isDeclaration();
-        }
-        if (auto *sub = M.getFunction(
-                (llvm::Twine("sub_") + llvm::Twine::utohexstr(pending.pc))
-                    .str())) {
-          llvm::errs() << " sub_decl=" << sub->isDeclaration();
-        }
-        llvm::errs() << "\n";
-      }
-      if (lifted_target)
-        changed = true;
+      // No forward progress this round → done. The persistent `scheduled`
+      // set guarantees we don't replay the same failed targets next round.
+      if (!any_lifted_this_round)
+        break;
     }
 
     return changed ? llvm::PreservedAnalyses::none()
@@ -6675,6 +7301,8 @@ struct FoldCallsToConstantReturnPass
   static bool isRequired() { return true; }
 };
 
+
+
 /// Repair malformed PHI nodes and strip alwaysinline from broken functions.
 /// Must run before every AlwaysInlinerPass to prevent crashes in
 /// CloneAndPruneFunctionInto (SEH 0xC0000005).
@@ -6754,6 +7382,92 @@ struct RebuildClosedRootSliceCodeScopePass
   }
   static bool isRequired() { return true; }
 };
+
+struct RebuildOutputRootClosureCodeScopePass
+    : llvm::PassInfoMixin<RebuildOutputRootClosureCodeScopePass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &) {
+    bool changed = rebuildOutputRootClosureCodeScope(M);
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+  static bool isRequired() { return true; }
+};
+
+
+struct RebuildLargeNoAbiStateOptimizationScopePass
+    : llvm::PassInfoMixin<RebuildLargeNoAbiStateOptimizationScopePass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &) {
+    bool changed = rebuildLargeNoAbiStateOptimizationScope(M);
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+  static bool isRequired() { return true; }
+};
+
+
+struct LargeNoAbiScopedAlwaysInlinerPass
+    : llvm::PassInfoMixin<LargeNoAbiScopedAlwaysInlinerPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &MAM) {
+    constexpr unsigned kLargeLiftedFunctionThreshold = 512;
+    if (!isNoABIModeModule(M) ||
+        countLiftedPipelineFunctions(M) < kLargeLiftedFunctionThreshold) {
+      return llvm::AlwaysInlinerPass().run(M, MAM);
+    }
+
+    llvm::SmallVector<llvm::Function *, 16> reachable_list;
+    collectReachableOutputRootFunctions(M, reachable_list);
+    if (reachable_list.empty())
+      return llvm::PreservedAnalyses::all();
+
+    llvm::DenseSet<llvm::Function *> reachable(reachable_list.begin(),
+                                               reachable_list.end());
+    bool changed = false;
+    bool did_inline = true;
+    while (did_inline) {
+      did_inline = false;
+      for (auto *F : reachable_list) {
+        if (!F || F->isDeclaration() || !reachable.contains(F))
+          continue;
+
+        llvm::SmallVector<llvm::CallInst *, 16> calls_to_inline;
+        for (auto &BB : *F) {
+          for (auto &I : BB) {
+            auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+            if (!CI)
+              continue;
+            auto *callee = CI->getCalledFunction();
+            if (!callee || callee->isDeclaration() || callee == F)
+              continue;
+            const bool callee_always_inline =
+                callee->hasFnAttribute(llvm::Attribute::AlwaysInline);
+            const bool site_always_inline =
+                CI->hasFnAttr(llvm::Attribute::AlwaysInline);
+            if (!callee_always_inline && !site_always_inline)
+              continue;
+            calls_to_inline.push_back(CI);
+          }
+        }
+
+        for (auto *CI : calls_to_inline) {
+          llvm::InlineFunctionInfo IFI;
+          auto result = llvm::InlineFunction(*CI, IFI);
+          if (result.isSuccess()) {
+            did_inline = true;
+            changed = true;
+          }
+        }
+      }
+    }
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+  static bool isRequired() { return true; }
+};
+
 
 struct NoAbiPostCleanupMaterializationPass
     : llvm::PassInfoMixin<NoAbiPostCleanupMaterializationPass> {
@@ -7108,6 +7822,7 @@ void refreshTerminalBoundaryRecoveryMetadata(llvm::Module &M) {
 void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
                               const PipelineOptions &) {
   addPhaseMarker(MPM, "ABI: start");
+  MPM.addPass(EraseDeadTrivialSelfLoopPlaceholderCallsPass());
   addPhaseMarker(MPM, "ABI: direct canonical export shaping");
   MPM.addPass(DirectABIShapingPass());
   MPM.addPass(CanonicalizeABIBoundaryDeclarationsPass());
@@ -8185,7 +8900,16 @@ static void buildPreResolutionPipeline(llvm::ModulePassManager &MPM,
 
   auto addLiftedScopedFPM = [&](llvm::FunctionPassManager FPM) {
     auto lifted_scope = [](llvm::Function &F) {
-      return isLiftedPipelineFunction(F);
+      if (!isLiftedPipelineFunction(F))
+        return false;
+      if (isLargeNoAbiGenericStaticScopeModule(*F.getParent())) {
+        return F.hasFnAttribute("omill.output_root") ||
+               F.hasFnAttribute("omill.internal_output_root") ||
+               F.hasFnAttribute("omill.closed_root_slice_root");
+      }
+      if (isOutputRootClosureScopedModule(*F.getParent()))
+        return F.hasFnAttribute("omill.output_root_closure");
+      return true;
     };
     if (opts.scope_predicate) {
       auto user_scope = opts.scope_predicate;
@@ -8200,6 +8924,38 @@ static void buildPreResolutionPipeline(llvm::ModulePassManager &MPM,
     }
   };
 
+  auto addLiftedStateScopedFPM = [&](llvm::FunctionPassManager FPM) {
+    auto state_scope = [](llvm::Function &F) {
+      if (!isLiftedPipelineFunction(F))
+        return false;
+      if (isLargeNoAbiGenericStaticScopeModule(*F.getParent())) {
+        return F.hasFnAttribute("omill.output_root") ||
+               F.hasFnAttribute("omill.internal_output_root") ||
+               F.hasFnAttribute("omill.closed_root_slice_root");
+      }
+      if (isLargeNoAbiStateOptimizationScopeModule(*F.getParent())) {
+        return F.hasFnAttribute("omill.output_root") ||
+               F.hasFnAttribute("omill.internal_output_root") ||
+               F.hasFnAttribute("omill.closed_root_slice_root");
+      }
+      if (isOutputRootClosureScopedModule(*F.getParent()))
+        return F.hasFnAttribute("omill.output_root_closure");
+      return true;
+    };
+    if (opts.scope_predicate) {
+      auto user_scope = opts.scope_predicate;
+      MPM.addPass(createScopedFPM(
+          std::move(FPM),
+          [state_scope, user_scope = std::move(user_scope)](
+              llvm::Function &F) mutable {
+            return state_scope(F) && user_scope(F);
+          }));
+    } else {
+      MPM.addPass(createScopedFPM(std::move(FPM), state_scope));
+    }
+  };
+
+
   // Phase 0: Externalize semantic functions BEFORE AlwaysInliner.
   // The ~2000 semantic functions live in anonymous C++ namespaces and have
   // internal linkage by construction.  AlwaysInlinerPass inlines them into
@@ -8213,25 +8969,29 @@ static void buildPreResolutionPipeline(llvm::ModulePassManager &MPM,
   // where ProtectRemillSemanticsPass already added optnone+noinline).
   MPM.addPass(UnprotectRemillSemanticsPass());
 
+  // Phase 0.5: Resolve trace stubs and connect jump-table targets discovered
+  // during lifting before AlwaysInliner can erase/disconnect named lifted
+  // target blocks. This preserves block_<hex> identities long enough to rewrite
+  // __remill_jump / __omill_dispatch_jump into local control flow.
+  if (!opts.use_block_lifting &&
+      !envDisabled("OMILL_SKIP_INLINE_JUMP_TARGETS")) {
+    MPM.addPass(InlineJumpTargetsPass());
+  }
+
+
   // Phase 0: Inline remill's alwaysinline semantic functions so that
   // subsequent passes can see through them.
   MPM.addPass(RepairBeforeInlinePass{});
   if (alwaysInlinerEnabled())
-    MPM.addPass(llvm::AlwaysInlinerPass());
+    MPM.addPass(LargeNoAbiScopedAlwaysInlinerPass());
 
   // Protect semantic function bodies from Phase 2 function-pass optimizations.
   // Phase 3.6 Step 2b restores alwaysinline before inlining into VM handlers.
   MPM.addPass(ProtectRemillSemanticsPass());
 
-  // Phase 0.5: Resolve trace stubs and inline jump-exiting callees.
-  // Must run BEFORE Phase 1 so that block_<hex> names (from jump table
-  // target discovery during lifting) survive — SimplifyCFG in Phase 1
-  // cleanup merges blocks and destroys those names.  __remill_jump is
-  // still present at this point (not lowered until Phase 3).
-  if (opts.deobfuscate && !opts.use_block_lifting &&
-      !envDisabled("OMILL_SKIP_INLINE_JUMP_TARGETS")) {
-    MPM.addPass(InlineJumpTargetsPass());
-  }
+  MPM.addPass(RebuildOutputRootClosureCodeScopePass());
+  MPM.addPass(RebuildLargeNoAbiStateOptimizationScopePass());
+
 
   addPhaseMarker(MPM, "Phase 1: intrinsic lowering");
   // Phase 1: Intrinsic Lowering
@@ -8253,7 +9013,7 @@ static void buildPreResolutionPipeline(llvm::ModulePassManager &MPM,
 
     llvm::FunctionPassManager FPM;
     buildStateOptimizationPipeline(FPM, opts.deobfuscate);
-    addLiftedScopedFPM(std::move(FPM));
+    addLiftedStateScopedFPM(std::move(FPM));
   }
 
   if (opts.require_remill_normalization) {
@@ -8347,11 +9107,16 @@ static void buildPreResolutionPipeline(llvm::ModulePassManager &MPM,
     FPM.addPass(llvm::InstCombinePass());
     if (is_windows)
       FPM.addPass(ResolveIATCallsPass());
-    // In block-lift mode, keep constant dispatch_call/jump sites in their
-    // canonical form until IterativeBlockDiscoveryPass has a chance to lift
-    // the target block and turn the edge into direct lifted control flow.
-    if (!opts.use_block_lifting)
+    // Default no-ABI/file-backed lifts should resolve constant stack-/state-
+    // carried dispatch targets here, not only behind later IPCP epochs.
+    if (!opts.use_block_lifting) {
+      FPM.addPass(llvm::GVNPass());
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(IndirectCallResolverPass());
+      FPM.addPass(
+          ResolveAndLowerControlFlowPass(ResolvePhases::ResolveTargets));
       FPM.addPass(LowerRemillIntrinsicsPass(LowerCategories::ResolvedDispatch));
+    }
     addLiftedScopedFPM(std::move(FPM));
   }
 
@@ -8521,10 +9286,68 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
       if (!envDisabled("OMILL_SKIP_PREINLINE_REWRITE_CONST_MISSING_BLOCK_CALLS"))
         MPM.addPass(RewriteConstantMissingBlockCallsPass(
             /*only_when_noabi_mode=*/opts.no_abi_mode));
+      // Mark remill instruction-semantics templates (ADDI/MOVI/CALLI/...) that
+      // are reachable from closed-root-slice block helpers as alwaysinline so
+      // the upcoming AlwaysInlinerPass can inline them. Late VirtualCFG lifts
+      // create new blk_ bodies whose semantic callees are still protected
+      // (optnone+noinline) by ProtectRemillSemantics from Phase 0; without
+      // this marking step they would survive into the final IR.
+      // MarkClosedRootSliceSemanticHelpersForInlining handles small templates
+      // (<=96 instrs); MarkLateBlockReachableSemanticHelpers handles the
+      // remaining larger ones with no size limit. Both passes are idempotent
+      // and skip functions already marked.
+      MPM.addPass(MarkClosedRootSliceSemanticHelpersForInliningPass());
+      MPM.addPass(MarkLateBlockReachableSemanticHelpersPass());
       MPM.addPass(MarkClosedRootSliceHelpersForInliningPass());
       MPM.addPass(RepairBeforeInlinePass{});
       if (alwaysInlinerEnabled())
         MPM.addPass(llvm::AlwaysInlinerPass());
+      // Lower remill memory/flag/atomic/hyper intrinsics that the new
+      // semantic-template inlines just exposed in late-lifted blocks.
+      // Phase 1 only ran on the initial set of lifted functions; blocks
+      // discovered during VirtualCFG materialization (or any later lift)
+      // never went through it. Scope to lifted code only and use a
+      // function attribute as an idempotency guard so functions already
+      // processed are skipped on subsequent invocations.
+      {
+        llvm::FunctionPassManager FPM;
+        FPM.addPass(LowerRemillIntrinsicsPass(
+            LowerCategories::Phase1 | LowerCategories::ResolvedDispatch));
+        FPM.addPass(llvm::SimplifyCFGPass());
+        MPM.addPass(createScopedFPM(
+            std::move(FPM), [](llvm::Function &F) {
+              if (F.isDeclaration())
+                return false;
+              if (!isLiftedPipelineFunction(F))
+                return false;
+              if (F.hasFnAttribute("omill.late_intrinsics_lowered"))
+                return false;
+              // Cheap pre-check: only run when there is at least one
+              // remill intrinsic call left in the body. Avoids walking
+              // every lifted function on every cleanup invocation.
+              for (auto &BB : F) {
+                for (auto &I : BB) {
+                  auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+                  if (!call)
+                    continue;
+                  auto *callee = call->getCalledFunction();
+                  if (!callee)
+                    continue;
+                  auto name = callee->getName();
+                  if (name.starts_with("__remill_") &&
+                      name != "__remill_function_return" &&
+                      name != "__remill_function_call" &&
+                      name != "__remill_jump" &&
+                      name != "__remill_missing_block" &&
+                      name != "__remill_error") {
+                    F.addFnAttr("omill.late_intrinsics_lowered");
+                    return true;
+                  }
+                }
+              }
+              return false;
+            }));
+      }
       MPM.addPass(llvm::GlobalDCEPass());
       if (!envDisabled("OMILL_SKIP_POST_CLOSED_SLICE_REACHABILITY_MARK_1"))
         MPM.addPass(MarkReachableClosedRootSliceFunctionsPass{});
@@ -8548,9 +9371,20 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
         MPM.addPass(MarkReachableClosedRootSliceFunctionsPass{});
       if (opts.no_abi_mode && enableNoAbiClosedSliceContinuationRelift()) {
         if (opts.verify_generic_static_devirtualization)
-          MPM.addPass(VerifiedVirtualCFGMaterializationPass());
+          MPM.addPass(
+              VerifiedVirtualCFGMaterializationPass(opts.session_graph));
         else
-          MPM.addPass(VirtualCFGMaterializationPass());
+          MPM.addPass(VirtualCFGMaterializationPass(opts.session_graph));
+        // After the relift pass materializes new blk_/sub_ bodies, run
+        // LiftConstantContinuationDeclarationTargetsPass once more so the
+        // direct musttail calls those new bodies make to declared blk_*<pc>
+        // continuations get lifted before the rest of the cleanup runs.
+        // The pass's per-PC `scheduled` set is local to the pass invocation,
+        // so this re-run only attempts targets that were not already in the
+        // first pass's view, and the post-main repair loop picks up anything
+        // that still cannot be lifted.
+        if (!envDisabled("OMILL_SKIP_LIFT_CONST_CONTINUATION_DECL_TARGETS"))
+          MPM.addPass(LiftConstantContinuationDeclarationTargetsPass());
       }
       if (!envDisabled("OMILL_SKIP_POST_CLOSED_SLICE_REACHABILITY_MARK_4"))
         MPM.addPass(MarkReachableClosedRootSliceFunctionsPass{});
@@ -8588,9 +9422,10 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
     }
     if (!envDisabled("OMILL_SKIP_GENERIC_STATIC_MATERIALIZATION")) {
       if (opts.verify_generic_static_devirtualization)
-        MPM.addPass(VerifiedVirtualCFGMaterializationPass());
+        MPM.addPass(
+            VerifiedVirtualCFGMaterializationPass(opts.session_graph));
       else
-        MPM.addPass(VirtualCFGMaterializationPass());
+        MPM.addPass(VirtualCFGMaterializationPass(opts.session_graph));
     }
     MPM.addPass(DebugPrintSelectedFunctionsPass{});
     addClosedSliceShapeProbe(MPM, "phase3.8");
@@ -8607,9 +9442,10 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
       if (opts.no_abi_mode) {
         addPhaseMarker(MPM, "Phase 3.86: post-continuation materialization");
         if (opts.verify_generic_static_devirtualization)
-          MPM.addPass(VerifiedVirtualCFGMaterializationPass());
+          MPM.addPass(
+              VerifiedVirtualCFGMaterializationPass(opts.session_graph));
         else
-          MPM.addPass(VirtualCFGMaterializationPass());
+          MPM.addPass(VirtualCFGMaterializationPass(opts.session_graph));
         addClosedSliceShapeProbe(MPM, "phase3.86");
       }
     }
@@ -8639,9 +9475,10 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
                                     shouldRunClosedRootSliceCodeBearingPass));
       }
       if (opts.verify_generic_static_devirtualization)
-        MPM.addPass(VerifiedVirtualCFGMaterializationPass());
+        MPM.addPass(
+            VerifiedVirtualCFGMaterializationPass(opts.session_graph));
       else
-        MPM.addPass(VirtualCFGMaterializationPass());
+        MPM.addPass(VirtualCFGMaterializationPass(opts.session_graph));
       MPM.addPass(RebuildClosedRootSliceCodeScopePass{});
       MPM.addPass(CollapseSyntheticBlockContinuationCallsPass(
           /*rewrite_to_missing_block=*/true,
@@ -8662,10 +9499,54 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
       if (!envDisabled("OMILL_SKIP_PREINLINE_REWRITE_CONST_MISSING_BLOCK_CALLS"))
         MPM.addPass(RewriteConstantMissingBlockCallsPass(
             /*only_when_noabi_mode=*/true));
+      // Final inline+lower sweep for any blocks lifted after Phase 3.9
+      // (e.g. by the Phase 3.95 post-cleanup materialization or by the
+      // late LiftConstantContinuationDeclarationTargets above). The
+      // omill.late_intrinsics_lowered and omill.late_block_semantics_marked
+      // guards make these passes no-ops for blocks already processed by
+      // Phase 3.9 cleanup.
+      MPM.addPass(MarkClosedRootSliceSemanticHelpersForInliningPass());
+      MPM.addPass(MarkLateBlockReachableSemanticHelpersPass());
       MPM.addPass(MarkClosedRootSliceHelpersForInliningPass());
       MPM.addPass(RepairBeforeInlinePass{});
       if (alwaysInlinerEnabled())
         MPM.addPass(llvm::AlwaysInlinerPass());
+      {
+        llvm::FunctionPassManager FPM;
+        FPM.addPass(LowerRemillIntrinsicsPass(
+            LowerCategories::Phase1 | LowerCategories::ResolvedDispatch));
+        FPM.addPass(llvm::SimplifyCFGPass());
+        MPM.addPass(createScopedFPM(
+            std::move(FPM), [](llvm::Function &F) {
+              if (F.isDeclaration())
+                return false;
+              if (!isLiftedPipelineFunction(F))
+                return false;
+              if (F.hasFnAttribute("omill.late_intrinsics_lowered"))
+                return false;
+              for (auto &BB : F) {
+                for (auto &I : BB) {
+                  auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+                  if (!call)
+                    continue;
+                  auto *callee = call->getCalledFunction();
+                  if (!callee)
+                    continue;
+                  auto name = callee->getName();
+                  if (name.starts_with("__remill_") &&
+                      name != "__remill_function_return" &&
+                      name != "__remill_function_call" &&
+                      name != "__remill_jump" &&
+                      name != "__remill_missing_block" &&
+                      name != "__remill_error") {
+                    F.addFnAttr("omill.late_intrinsics_lowered");
+                    return true;
+                  }
+                }
+              }
+              return false;
+            }));
+      }
       addRecoveryAwareGlobalDCE(MPM, opts, RecoveryPipelinePhase::kResolve);
       MPM.addPass(MarkReachableClosedRootSliceFunctionsPass{});
       MPM.addPass(CollapseSyntheticBlockContinuationCallsPass(
@@ -8948,6 +9829,46 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM,
     FPM.addPass(llvm::InstCombinePass());
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
+
+  if (!opts.use_block_lifting &&
+      !envDisabled("OMILL_SKIP_LATE_DISPATCH_RESOLUTION")) {
+    const bool is_windows = isWindowsTargetOS(opts.target_os);
+    MPM.addPass(
+        llvm::RequireAnalysisPass<BinaryMemoryAnalysis, llvm::Module>());
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(FoldProgramCounterPass());
+    FPM.addPass(llvm::InstCombinePass());
+    if (is_windows)
+      FPM.addPass(ResolveIATCallsPass());
+    FPM.addPass(llvm::GVNPass());
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(IndirectCallResolverPass());
+    FPM.addPass(ResolveAndLowerControlFlowPass(
+        ResolvePhases::ResolveTargets | ResolvePhases::RecoverTables));
+    FPM.addPass(LowerRemillIntrinsicsPass(LowerCategories::ResolvedDispatch));
+    MPM.addPass(createScopedFPM(std::move(FPM), [](llvm::Function &F) {
+      for (auto &BB : F)
+        for (auto &I : BB)
+          if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
+            if (auto *Callee = CI->getCalledFunction())
+              if (isDispatchIntrinsicName(Callee->getName()))
+                return true;
+      return false;
+    }));
+  }
+  if (!envDisabled("OMILL_SKIP_LATE_DISPATCH_DCE")) {
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(llvm::SimplifyCFGPass());
+    FPM.addPass(llvm::ADCEPass());
+    FPM.addPass(llvm::SimplifyCFGPass());
+    MPM.addPass(createScopedFPM(std::move(FPM), [](llvm::Function &F) {
+      return isLiftedPipelineFunction(F);
+    }));
+    MPM.addPass(llvm::GlobalDCEPass());
+  }
+
+
+
 
   if (!envDisabled("OMILL_SKIP_DEFINED_TARGET_PATCH"))
     MPM.addPass(PatchDefinedControlTargetsPass{});
