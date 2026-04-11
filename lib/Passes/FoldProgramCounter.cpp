@@ -98,6 +98,8 @@ llvm::PreservedAnalyses FoldProgramCounterPass::run(
 
   uint64_t entry_va = extractEntryVA(F.getName());
   if (entry_va == 0)
+    entry_va = extractBlockPC(F.getName());
+  if (entry_va == 0)
     return llvm::PreservedAnalyses::all();
 
   if (pc_arg->use_empty())

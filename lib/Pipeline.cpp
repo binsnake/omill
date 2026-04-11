@@ -9339,6 +9339,58 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
               return false;
             }));
       }
+      // Late dispatch resolution for blocks lifted during Phase 3.8/3.86/3.95.
+      // Phase 3.5 already ran FoldProgramCounter + ResolveIATCalls on the
+      // initial lifted set, but late-lifted blocks (e.g. created by
+      // VirtualCFGMaterializationPass) still carry raw
+      //   `%t = add %program_counter, const; %p = inttoptr; %v = load %p;
+      //    dispatch_call(state, %v, memory)`
+      // patterns for IAT-indirect calls, plus constant dispatch_call/jump
+      // targets that would resolve given InstCombine+GVN. Run a scoped
+      // equivalent of Phase 3.5 here so those get lowered before
+      // CollapseSyntheticBlockContinuationCalls rewrites them into
+      // missing-block handlers. Attribute-guarded for idempotency.
+      if (!envDisabled("OMILL_SKIP_LATE_BLOCK_DISPATCH_RESOLUTION")) {
+        const bool is_windows = isWindowsTargetOS(opts.target_os);
+        MPM.addPass(
+            llvm::RequireAnalysisPass<BinaryMemoryAnalysis, llvm::Module>());
+        llvm::FunctionPassManager FPM;
+        FPM.addPass(FoldProgramCounterPass());
+        FPM.addPass(llvm::InstCombinePass());
+        if (is_windows)
+          FPM.addPass(ResolveIATCallsPass());
+        FPM.addPass(llvm::GVNPass());
+        FPM.addPass(llvm::InstCombinePass());
+        FPM.addPass(IndirectCallResolverPass());
+        FPM.addPass(
+            ResolveAndLowerControlFlowPass(ResolvePhases::ResolveTargets));
+        FPM.addPass(
+            LowerRemillIntrinsicsPass(LowerCategories::ResolvedDispatch));
+        MPM.addPass(createScopedFPM(
+            std::move(FPM), [](llvm::Function &F) {
+              if (F.isDeclaration())
+                return false;
+              if (!isLiftedPipelineFunction(F))
+                return false;
+              if (F.hasFnAttribute("omill.late_dispatch_resolved"))
+                return false;
+              for (auto &BB : F) {
+                for (auto &I : BB) {
+                  auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+                  if (!call)
+                    continue;
+                  auto *callee = call->getCalledFunction();
+                  if (!callee)
+                    continue;
+                  if (isDispatchIntrinsicName(callee->getName())) {
+                    F.addFnAttr("omill.late_dispatch_resolved");
+                    return true;
+                  }
+                }
+              }
+              return false;
+            }));
+      }
       MPM.addPass(llvm::GlobalDCEPass());
       if (!envDisabled("OMILL_SKIP_POST_CLOSED_SLICE_REACHABILITY_MARK_1"))
         MPM.addPass(MarkReachableClosedRootSliceFunctionsPass{});
@@ -9588,6 +9640,57 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
       }
       if (!envDisabled("OMILL_SKIP_IPDSE"))
         MPM.addPass(InterProceduralDeadStateStorePass());
+      // Fold program_counter to its entry VA for late-lifted blocks and
+      // resolve PC-relative IAT loads into concrete dispatch_call targets.
+      // Phase 3.5 runs the same pair but only on the initial lifted set;
+      // blocks that first appear during Phase 3.8/3.86/3.95 never see it.
+      // The SROA + InstCombine + GVN sweep above just exposed the canonical
+      // `%x = add %program_counter, const; %p = inttoptr; %v = load %p;
+      // dispatch_call(state, %v, memory)` pattern out of the raw lifter form,
+      // so this is the right point to run dispatch resolution. Scope to
+      // lifted functions containing a dispatch intrinsic; attribute-guarded
+      // for idempotency.
+      if (!envDisabled("OMILL_SKIP_PHASE397_DISPATCH_RESOLUTION")) {
+        const bool is_windows = isWindowsTargetOS(opts.target_os);
+        MPM.addPass(
+            llvm::RequireAnalysisPass<BinaryMemoryAnalysis, llvm::Module>());
+        llvm::FunctionPassManager FPM;
+        FPM.addPass(FoldProgramCounterPass());
+        FPM.addPass(llvm::InstCombinePass());
+        if (is_windows)
+          FPM.addPass(ResolveIATCallsPass());
+        FPM.addPass(llvm::GVNPass());
+        FPM.addPass(llvm::InstCombinePass());
+        FPM.addPass(IndirectCallResolverPass());
+        FPM.addPass(
+            ResolveAndLowerControlFlowPass(ResolvePhases::ResolveTargets));
+        FPM.addPass(
+            LowerRemillIntrinsicsPass(LowerCategories::ResolvedDispatch));
+        MPM.addPass(createScopedFPM(
+            std::move(FPM), [](llvm::Function &F) {
+              if (F.isDeclaration())
+                return false;
+              if (!isLiftedPipelineFunction(F))
+                return false;
+              if (F.hasFnAttribute("omill.phase397_dispatch_resolved"))
+                return false;
+              for (auto &BB : F) {
+                for (auto &I : BB) {
+                  auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+                  if (!call)
+                    continue;
+                  auto *callee = call->getCalledFunction();
+                  if (!callee)
+                    continue;
+                  if (isDispatchIntrinsicName(callee->getName())) {
+                    F.addFnAttr("omill.phase397_dispatch_resolved");
+                    return true;
+                  }
+                }
+              }
+              return false;
+            }));
+      }
       MPM.addPass(MarkReachableClosedRootSliceFunctionsPass{});
       MPM.addPass(CollapseSyntheticBlockContinuationCallsPass(
           /*rewrite_to_missing_block=*/true,
@@ -9870,8 +9973,7 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM,
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
-  if (!opts.use_block_lifting &&
-      !envDisabled("OMILL_SKIP_LATE_DISPATCH_RESOLUTION")) {
+  if (!envDisabled("OMILL_SKIP_LATE_DISPATCH_RESOLUTION")) {
     const bool is_windows = isWindowsTargetOS(opts.target_os);
     MPM.addPass(
         llvm::RequireAnalysisPass<BinaryMemoryAnalysis, llvm::Module>());

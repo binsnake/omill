@@ -60,10 +60,30 @@ void collectPossibleValues(llvm::Value *val, llvm::Value *pc_arg,
     results.push_back(ci->getZExtValue());
     return;
   }
+  if (auto *phi = llvm::dyn_cast<llvm::PHINode>(val)) {
+    for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i) {
+      collectPossibleValues(phi->getIncomingValue(i), pc_arg, entry_va, ctx_bb,
+                            results, depth + 1);
+    }
+    return;
+  }
 
-  // add(X, Y).
+  if (auto *cast = llvm::dyn_cast<llvm::CastInst>(val)) {
+    collectPossibleValues(cast->getOperand(0), pc_arg, entry_va, ctx_bb,
+                          results, depth + 1);
+    return;
+  }
+
+  if (auto *freeze = llvm::dyn_cast<llvm::FreezeInst>(val)) {
+    collectPossibleValues(freeze->getOperand(0), pc_arg, entry_va, ctx_bb,
+                          results, depth + 1);
+    return;
+  }
+
+  // add/sub(X, Y).
   if (auto *bin = llvm::dyn_cast<llvm::BinaryOperator>(val)) {
-    if (bin->getOpcode() == llvm::Instruction::Add) {
+    if (bin->getOpcode() == llvm::Instruction::Add ||
+        bin->getOpcode() == llvm::Instruction::Sub) {
       llvm::SmallVector<uint64_t, 4> lhs, rhs;
       collectPossibleValues(bin->getOperand(0), pc_arg, entry_va, ctx_bb,
                             lhs, depth + 1);
@@ -71,7 +91,8 @@ void collectPossibleValues(llvm::Value *val, llvm::Value *pc_arg,
                             rhs, depth + 1);
       for (uint64_t l : lhs)
         for (uint64_t r : rhs)
-          results.push_back(l + r);
+          results.push_back(bin->getOpcode() == llvm::Instruction::Add ? l + r
+                                                                      : l - r);
       return;
     }
   }
@@ -92,6 +113,7 @@ void collectPossibleValues(llvm::Value *val, llvm::Value *pc_arg,
     }
     return;
   }
+
 }
 
 /// Try to find a unique IAT import for a dispatch_call.
@@ -123,6 +145,31 @@ resolveIATTarget(llvm::CallInst *call, uint64_t entry_va,
   llvm::SmallVector<uint64_t, 4> addrs;
   collectPossibleValues(int_val, pc_arg, static_cast<int64_t>(entry_va),
                         ctx_bb, addrs);
+  if (addrs.empty()) {
+    auto inferred = collectPossiblePCValues(int_val, *F, 32);
+    addrs.append(inferred.begin(), inferred.end());
+  }
+
+  if (addrs.empty()) {
+    uint64_t block_pc = extractBlockPC(call->getParent()->getName());
+    if (block_pc != 0) {
+      if (auto *bin = llvm::dyn_cast<llvm::BinaryOperator>(int_val)) {
+        llvm::ConstantInt *ci = nullptr;
+        if (bin->getOpcode() == llvm::Instruction::Add) {
+          ci = llvm::dyn_cast<llvm::ConstantInt>(bin->getOperand(1));
+          if (!ci)
+            ci = llvm::dyn_cast<llvm::ConstantInt>(bin->getOperand(0));
+          if (ci)
+            addrs.push_back(block_pc + ci->getZExtValue());
+        } else if (bin->getOpcode() == llvm::Instruction::Sub) {
+          ci = llvm::dyn_cast<llvm::ConstantInt>(bin->getOperand(1));
+          if (ci)
+            addrs.push_back(block_pc - ci->getZExtValue());
+        }
+      }
+    }
+  }
+
 
   if (addrs.empty())
     return nullptr;
@@ -153,6 +200,8 @@ llvm::PreservedAnalyses ResolveIATCallsPass::run(
     return llvm::PreservedAnalyses::all();
 
   uint64_t entry_va = extractEntryVA(F.getName());
+  if (entry_va == 0)
+    entry_va = extractBlockPC(F.getName());
   if (entry_va == 0)
     return llvm::PreservedAnalyses::all();
 
