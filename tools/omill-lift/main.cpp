@@ -14,6 +14,8 @@
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar/ADCE.h>
+#include <llvm/Transforms/Scalar/DeadStoreElimination.h>
+#include <llvm/Transforms/Scalar/EarlyCSE.h>
 #include <llvm/Transforms/Scalar/GVN.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
 #include <llvm/Transforms/Scalar/SROA.h>
@@ -17834,15 +17836,192 @@ int main(int argc, char **argv) {
                 " blk_decls=" + llvm::Twine(blk_decls));
     }
 
-    // Post-repair cleanup: the restore loop added a large number of
-    // declarations and globals that the InstructionLifter construction
-    // path required but that the final output doesn't need (no lifted
-    // block in our closure actually calls the semantic helper via the
-    // ISEL_* global — that indirection is only used by the initial
-    // lifting, and our freshly-lifted blocks were already resolved by
-    // the block lifter). Erase ISEL_* globals first, then the orphaned
-    // semantic helper declarations and any unused __remill_*
-    // declarations.
+    // Link the fresh semantics module into main with `LinkOnlyNeeded`
+    // so the semantic template declarations referenced by the newly-
+    // lifted blocks (e.g. `_ZN12_GLOBAL__N_1<mangled>`) get their
+    // function bodies pulled in. `AlwaysInlinerPass` can then inline
+    // those templates into the lifted blocks, replacing each raw
+    // semantic call with its instruction-level body. After inlining,
+    // `LowerRemillIntrinsicsPass` converts the `__remill_read_memory_*`
+    // / `__remill_flag_*` / etc. calls into native LLVM IR. The
+    // result is closer in shape to the blocks the main pipeline
+    // produces and can be cleaned up by the usual SROA/GVN/DSE sweep.
+    //
+    // Semantic templates in the remill bitcode have `internal`
+    // linkage by default, which the linker treats as "not needed"
+    // even when main has matching external declarations. Promote
+    // them to external linkage before linking so `LinkOnlyNeeded`
+    // actually pulls in the bodies.
+    {
+      unsigned promoted = 0;
+      for (auto &F : *fresh_semantics) {
+        if (F.isDeclaration())
+          continue;
+        if (!F.hasInternalLinkage() && !F.hasPrivateLinkage())
+          continue;
+        F.setLinkage(llvm::GlobalValue::ExternalLinkage);
+        ++promoted;
+      }
+      debug_log(llvm::Twine("promoted ") + llvm::Twine(promoted) +
+                " fresh semantics functions to external linkage");
+
+      llvm::Linker linker(*module);
+      if (linker.linkInModule(std::move(fresh_semantics),
+                              llvm::Linker::Flags::LinkOnlyNeeded)) {
+        debug_log("link of fresh semantics failed; skipping lowering");
+        goto native_boundary_repair_lowering_done;
+      }
+
+      // Re-internalize every linked-in semantic template so GlobalDCE
+      // can erase any that end up unused after the AlwaysInliner pass
+      // below. They were only bumped to external linkage to make the
+      // linker match the matching external declarations in main; the
+      // templates are anonymous-namespace symbols in the source and
+      // have no external consumers.
+      unsigned internalized = 0;
+      for (auto &F : *module) {
+        if (F.isDeclaration())
+          continue;
+        auto name = F.getName();
+        if (!name.starts_with("_ZN12_GLOBAL__N_"))
+          continue;
+        if (F.hasInternalLinkage() || F.hasPrivateLinkage())
+          continue;
+        F.setLinkage(llvm::GlobalValue::InternalLinkage);
+        ++internalized;
+      }
+      debug_log(llvm::Twine("internalized ") + llvm::Twine(internalized) +
+                " linked-in semantic templates");
+
+      // The fresh semantics bitcode carries an `llvm.compiler.used`
+      // array referencing every `ISEL_*` global (which in turn points
+      // at every semantic template function). Without erasing it,
+      // GlobalDCE has to keep all ~2000 semantic template bodies
+      // alive. We don't need that retention — lifting is done.
+      if (auto *gv = module->getGlobalVariable("llvm.compiler.used", true))
+        gv->eraseFromParent();
+      if (auto *gv = module->getGlobalVariable("llvm.used", true))
+        gv->eraseFromParent();
+    }
+
+    // Mark every linked-in semantic template as `alwaysinline` so
+    // `AlwaysInlinerPass` can fold them into the lifted block bodies.
+    // The linked-in templates use the anonymous-namespace mangled
+    // prefix `_ZN12_GLOBAL__N_` — that's the most reliable signal,
+    // more reliable than `remill.function.type` metadata which
+    // doesn't always survive module linking.
+    {
+      unsigned marked = 0;
+      for (auto &F : *module) {
+        if (F.isDeclaration())
+          continue;
+        auto name = F.getName();
+        if (!name.starts_with("_ZN12_GLOBAL__N_"))
+          continue;
+        if (F.hasFnAttribute(llvm::Attribute::OptimizeNone))
+          F.removeFnAttr(llvm::Attribute::OptimizeNone);
+        if (F.hasFnAttribute(llvm::Attribute::NoInline))
+          F.removeFnAttr(llvm::Attribute::NoInline);
+        if (!F.hasFnAttribute(llvm::Attribute::AlwaysInline)) {
+          F.addFnAttr(llvm::Attribute::AlwaysInline);
+          ++marked;
+        }
+      }
+      debug_log(llvm::Twine("marked semantic templates alwaysinline=") +
+                llvm::Twine(marked));
+    }
+
+    // Erase the ISEL_* globals now (before cleanup_mpm) so GlobalDCE
+    // can reach the linked-in semantic template bodies. The ISEL
+    // globals were the only runtime references to those templates —
+    // they're the lookup table remill's InstructionLifter queries.
+    // With them gone, AlwaysInliner's post-inline erase can take the
+    // templates, and GlobalDCE mops up any stragglers.
+    {
+      llvm::SmallVector<llvm::GlobalVariable *, 16> pre_cleanup_isel_to_erase;
+      for (auto &gv : module->globals()) {
+        if (!gv.getName().starts_with("ISEL_"))
+          continue;
+        pre_cleanup_isel_to_erase.push_back(&gv);
+      }
+      for (auto *gv : pre_cleanup_isel_to_erase) {
+        gv->replaceAllUsesWith(
+            llvm::UndefValue::get(gv->getType()));
+        gv->eraseFromParent();
+      }
+      debug_log(llvm::Twine("pre-cleanup erased ") +
+                llvm::Twine(pre_cleanup_isel_to_erase.size()) +
+                " isel globals");
+    }
+
+    // Run AlwaysInliner + LowerRemillIntrinsics + standard cleanup on
+    // the enlarged module. The passes are idempotent on already-
+    // processed functions so they're safe to run module-wide.
+    {
+      MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+      llvm::ModulePassManager cleanup_mpm;
+      cleanup_mpm.addPass(llvm::AlwaysInlinerPass());
+      {
+        llvm::FunctionPassManager fpm;
+        fpm.addPass(omill::LowerRemillIntrinsicsPass(
+            omill::LowerCategories::Phase1 |
+            omill::LowerCategories::Phase3 |
+            omill::LowerCategories::Undefined |
+            omill::LowerCategories::ResolvedDispatch));
+        fpm.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+        fpm.addPass(llvm::EarlyCSEPass(/*UseMemorySSA=*/true));
+        fpm.addPass(llvm::InstCombinePass());
+        fpm.addPass(llvm::GVNPass());
+        fpm.addPass(llvm::DSEPass());
+        fpm.addPass(llvm::ADCEPass());
+        fpm.addPass(llvm::InstCombinePass());
+        fpm.addPass(llvm::SimplifyCFGPass());
+        cleanup_mpm.addPass(
+            llvm::createModuleToFunctionPassAdaptor(std::move(fpm)));
+      }
+      cleanup_mpm.addPass(llvm::GlobalDCEPass());
+      cleanup_mpm.run(*module, MAM);
+      MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+
+      // Run a second explicit GlobalDCE in case the first one raced
+      // with an analysis invalidation — the inline step frees up a
+      // lot of unused template bodies and we want them gone.
+      {
+        llvm::ModulePassManager second_dce;
+        second_dce.addPass(llvm::GlobalDCEPass());
+        second_dce.run(*module, MAM);
+        MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+      }
+
+      // Belt-and-braces: walk the module and erase any anonymous-
+      // namespace semantic template definition that's still unused
+      // after GlobalDCE. GlobalDCE is sometimes conservative with
+      // symbols that have unusual comdat / linkage combinations the
+      // remill bitcode attaches to its templates.
+      unsigned direct_erased = 0;
+      llvm::SmallVector<llvm::Function *, 32> templates_to_erase;
+      for (auto &F : *module) {
+        if (F.isDeclaration())
+          continue;
+        auto name = F.getName();
+        if (!name.starts_with("_ZN12_GLOBAL__N_"))
+          continue;
+        if (!F.use_empty())
+          continue;
+        templates_to_erase.push_back(&F);
+      }
+      for (auto *F : templates_to_erase) {
+        F->eraseFromParent();
+        ++direct_erased;
+      }
+      debug_log(llvm::Twine("direct-erased ") + llvm::Twine(direct_erased) +
+                " unused semantic templates");
+    }
+native_boundary_repair_lowering_done:;
+
+    // Post-repair cleanup: erase any remaining ISEL_* globals (they
+    // became unused after inlining) and any orphaned semantic helper
+    // declarations that GlobalDCE didn't catch.
     llvm::SmallVector<llvm::GlobalVariable *, 16> isel_globals_to_erase;
     for (auto &gv : module->globals()) {
       if (!gv.getName().starts_with("ISEL_"))
