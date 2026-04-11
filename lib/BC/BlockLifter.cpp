@@ -581,9 +581,22 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
     auto lift_status =
         inst.GetLifter()->LiftIntoBlock(inst, current_block, state_ptr);
     if (remill::kLiftedInstruction != lift_status) {
-      remill::AddTerminatingTailCall(current_block, intrinsics->error,
-                                     *intrinsics);
-      break;
+      // Remill has no ISEL for some control-flow categories that XED still
+      // decodes successfully — most notably FAR call (CALL_FAR_MEMp2 and
+      // CALL_FAR_PTRp_IMMw, see remill/lib/Arch/X86/Semantics/CALL_RET.cpp).
+      // Those instructions are categorized as kCategoryAsyncHyperCall, and
+      // the corresponding category handler below just emits
+      // intrinsics->async_hyper_call without depending on any
+      // semantic-side-effects of LiftIntoBlock. Letting the category switch
+      // run produces a clean trap (lowerAsyncHyperCall's default arm emits
+      // `ud2`) instead of leaking an __omill_error_handler call.
+      if (inst.category != remill::Instruction::kCategoryAsyncHyperCall) {
+        remill::AddTerminatingTailCall(current_block, intrinsics->error,
+                                       *intrinsics);
+        break;
+      }
+      // Fall through to the category switch with whatever partial NEXT_PC
+      // state remill set up; the AsyncHyperCall handler ignores it.
     }
 
     // Handle delayed instructions (SPARC, MIPS).
