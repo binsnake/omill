@@ -9546,6 +9546,29 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
             }));
       }
       addRecoveryAwareGlobalDCE(MPM, opts, RecoveryPipelinePhase::kResolve);
+      // Aggressive final cleanup for late-lifted blocks. The Phase 2 state
+      // optimization pipeline (PromoteStateToSSA, SROA, DSE) never ran on
+      // blocks discovered during Phase 3.8/3.86/3.95 materialization, so
+      // their bodies still carry the raw lifter state-store pattern:
+      //   - dead NEXT_PC/RETURN_PC allocas (stored, never loaded)
+      //   - state flush/reload round-trips (load X; ... ; store X back)
+      //   - repeated GEPs to the same State field
+      //   - parity-flag ctpop computations whose results are never read
+      // Running a tight SROA + InstCombine + GVN + DSE + ADCE + SimplifyCFG
+      // sweep collapses all of these. Idempotency is natural: the passes
+      // are no-ops on IR that's already been cleaned, and the scope
+      // predicate targets lifted functions only.
+      {
+        llvm::FunctionPassManager FPM;
+        FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+        FPM.addPass(llvm::InstCombinePass());
+        FPM.addPass(llvm::GVNPass());
+        FPM.addPass(llvm::DSEPass());
+        FPM.addPass(llvm::ADCEPass());
+        FPM.addPass(llvm::SimplifyCFGPass());
+        MPM.addPass(createScopedFPM(std::move(FPM),
+                                    shouldRunClosedRootSliceCodeBearingPass));
+      }
       MPM.addPass(MarkReachableClosedRootSliceFunctionsPass{});
       MPM.addPass(CollapseSyntheticBlockContinuationCallsPass(
           /*rewrite_to_missing_block=*/true,
