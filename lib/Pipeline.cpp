@@ -5338,8 +5338,8 @@ struct LiftConstantContinuationDeclarationTargetsPass
     // (tens of seconds per target). That loop is now skipped in the
     // large-noabi generic-static path, so we can safely iterate here
     // to pick up deeper continuation chains in a single cleanup call.
-    constexpr unsigned kMaxFixpointIterations = 8;
-    constexpr unsigned kMaxLiftsPerInvocation = 64;
+    constexpr unsigned kMaxFixpointIterations = 32;
+    constexpr unsigned kMaxLiftsPerInvocation = 512;
     unsigned lifts_this_invocation = 0;
     for (unsigned iteration = 0; iteration < kMaxFixpointIterations;
          ++iteration) {
