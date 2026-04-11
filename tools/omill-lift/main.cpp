@@ -18055,6 +18055,165 @@ native_boundary_repair_lowering_done:;
   }
 native_boundary_repair_done:;
 
+  // Force-inline every `blk_*` / `block_*` helper that is reachable
+  // from an output root into that root. The user-visible intent is:
+  // for a virtualized function, collapse the whole lifted CFG into a
+  // single monolithic function in the output so LLVM's standard -O2
+  // passes can then attack the unified body. Opt-in via
+  // `OMILL_ENABLE_OUTPUT_ROOT_FORCE_INLINE=1` because:
+  //   1. The naive approach creates significant code duplication
+  //      when a block is called from multiple sites.
+  //   2. Running the standard scalar cleanup sweep (InstCombine,
+  //      GVN, DSE, ADCE, SimplifyCFG) on the ~70k-instruction unified
+  //      body collapses the whole thing to a single `unreachable` —
+  //      a folding regression tied to how LLVM reasons about the
+  //      unified state pointer. Only the safest subset (SROA +
+  //      EarlyCSE + GlobalDCE) is applied here; InstCombine/GVN/
+  //      SimplifyCFG are left for follow-up investigation.
+  if (opts.no_abi_mode && opts.generic_static_devirtualize &&
+      parseBoolEnv("OMILL_ENABLE_OUTPUT_ROOT_FORCE_INLINE").value_or(false)) {
+    const bool debug_force_inline =
+        parseBoolEnv("OMILL_DEBUG_OUTPUT_ROOT_FORCE_INLINE").value_or(false);
+    auto debug_fi_log = [&](const llvm::Twine &msg) {
+      if (debug_force_inline) {
+        errs() << "[output-root-force-inline] " << msg << "\n";
+        errs().flush();
+      }
+    };
+
+    // Collect output roots and the set of helper functions reachable
+    // from them. A function is a "helper" if it has a lifted-style
+    // name (`blk_*` / `block_*`) and isn't itself the output root.
+    llvm::SmallPtrSet<llvm::Function *, 8> output_roots;
+    for (auto &F : *module) {
+      if (F.isDeclaration())
+        continue;
+      if (F.hasFnAttribute("omill.output_root") ||
+          F.hasFnAttribute("omill.closed_root_slice_root"))
+        output_roots.insert(&F);
+    }
+
+    llvm::SmallPtrSet<llvm::Function *, 32> reachable_helpers;
+    {
+      llvm::SmallPtrSet<llvm::Function *, 32> visited;
+      llvm::SmallVector<llvm::Function *, 32> worklist(
+          output_roots.begin(), output_roots.end());
+      while (!worklist.empty()) {
+        auto *cur = worklist.pop_back_val();
+        if (!visited.insert(cur).second)
+          continue;
+        for (auto &BB : *cur) {
+          for (auto &I : BB) {
+            auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+            auto *callee = CB ? CB->getCalledFunction() : nullptr;
+            if (!callee || callee->isDeclaration())
+              continue;
+            auto name = callee->getName();
+            // Only inline `blk_*` / `block_*` helpers — `sub_*`
+            // functions are lifted whole-function units and may be
+            // called from multiple places, inlining them would
+            // duplicate a lot of code. The output-root `sub_` is
+            // the container we're inlining INTO, not something to
+            // inline from.
+            if (!name.starts_with("blk_") && !name.starts_with("block_"))
+              continue;
+            if (output_roots.count(callee))
+              continue;
+            reachable_helpers.insert(callee);
+            worklist.push_back(callee);
+          }
+        }
+      }
+    }
+
+    unsigned marked_for_inline = 0;
+    for (auto *helper : reachable_helpers) {
+      if (helper->hasFnAttribute(llvm::Attribute::OptimizeNone))
+        helper->removeFnAttr(llvm::Attribute::OptimizeNone);
+      if (helper->hasFnAttribute(llvm::Attribute::NoInline))
+        helper->removeFnAttr(llvm::Attribute::NoInline);
+      if (!helper->hasFnAttribute(llvm::Attribute::AlwaysInline)) {
+        helper->addFnAttr(llvm::Attribute::AlwaysInline);
+        ++marked_for_inline;
+      }
+      // Internalize so AlwaysInliner's post-inline erase can fire.
+      if (!helper->hasLocalLinkage())
+        helper->setLinkage(llvm::GlobalValue::InternalLinkage);
+    }
+    debug_fi_log(llvm::Twine("output roots=") +
+                 llvm::Twine(output_roots.size()) +
+                 " reachable helpers=" +
+                 llvm::Twine(reachable_helpers.size()) +
+                 " marked alwaysinline=" + llvm::Twine(marked_for_inline));
+
+    if (!reachable_helpers.empty()) {
+      MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+      // First pass: just inline, no cleanup. Verify the post-inline
+      // module before running scalar passes, so a bad interaction
+      // between the inliner and the cleanup sweep (e.g. musttail chain
+      // collapsing to `unreachable`) is attributed to the right place.
+      {
+        llvm::ModulePassManager mpm;
+        mpm.addPass(llvm::AlwaysInlinerPass());
+        mpm.run(*module, MAM);
+        MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+      }
+
+      if (debug_force_inline) {
+        std::string err;
+        llvm::raw_string_ostream os(err);
+        if (llvm::verifyModule(*module, &os)) {
+          debug_fi_log(llvm::Twine("verify failed post-inline: ") +
+                       err.substr(0, 500));
+        } else {
+          debug_fi_log("verify ok post-inline");
+        }
+        // Check if sub_180001850 survived.
+        if (auto *F = module->getFunction("sub_180001850")) {
+          unsigned sz = 0;
+          for (auto &BB : *F)
+            sz += BB.size();
+          debug_fi_log(llvm::Twine("sub_180001850 post-inline inst count=") +
+                       llvm::Twine(sz));
+        }
+      }
+
+      // Conservative scalar cleanup on the unified body: SROA +
+      // EarlyCSE only. Anything more aggressive (InstCombine, GVN,
+      // DSE, ADCE, SimplifyCFG) collapses the 70k-instruction body
+      // into a single `unreachable` because LLVM's constant
+      // propagation through the unified state pointer sees the whole
+      // chain as simplifiable to a no-op. Root-causing that folding
+      // regression is future work; for now we stop at SROA/EarlyCSE
+      // and rely on the inliner's own DCE for the bulk of the win.
+      {
+        llvm::ModulePassManager mpm;
+        {
+          llvm::FunctionPassManager fpm;
+          fpm.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+          fpm.addPass(llvm::EarlyCSEPass(/*UseMemorySSA=*/true));
+          mpm.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(fpm)));
+        }
+        mpm.addPass(llvm::GlobalDCEPass());
+        mpm.run(*module, MAM);
+        MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+      }
+
+      if (debug_force_inline) {
+        unsigned post_defs = 0;
+        for (auto &F : *module) {
+          if (F.isDeclaration())
+            continue;
+          auto name = F.getName();
+          if (name.starts_with("blk_") || name.starts_with("block_"))
+            ++post_defs;
+        }
+        debug_fi_log(llvm::Twine("post-inline blk_/block_ defs remaining=") +
+                     llvm::Twine(post_defs));
+      }
+    }
+  }
+
   if (!RawBinary && !NoABI)
     unresolved_pc_output_roots = collectUnresolvedOutputRootPcCalls();
   bool repaired_after_finalization = false;
