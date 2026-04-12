@@ -10083,6 +10083,202 @@ static void buildFinalCleanupPipeline(llvm::ModulePassManager &MPM,
                  opts.scope_predicate});
   }
 
+  // Fold known Windows API opaque predicates.  VMProtect calls
+  // IsProcessorFeaturePresent(PF_FASTFAIL_AVAILABLE=23) and branches
+  // on the result: the always-true path leads to int $41 (fastfail) +
+  // unreachable.  The IAT resolver creates these calls during
+  // normalization; by this point they're fully materialized in the
+  // output root.  Folding to constant 1 + cleanup eliminates the dead
+  // branches, their associated int $1/int $41 traps, and any native
+  // boundary placeholders that were only reachable from dead paths.
+  if (!envDisabled("OMILL_SKIP_FOLD_KNOWN_IMPORT_CALLS")) {
+    struct FoldKnownImportCallsPass
+        : llvm::PassInfoMixin<FoldKnownImportCallsPass> {
+      llvm::PreservedAnalyses run(llvm::Module &M,
+                                   llvm::ModuleAnalysisManager &) {
+        auto &Ctx = M.getContext();
+        auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+        bool changed = false;
+
+        llvm::SmallVector<llvm::CallInst *, 8> to_fold;
+        for (auto &F : M) {
+          for (auto &BB : F) {
+            for (auto &I : BB) {
+              auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+              if (!call || call->arg_size() < 1)
+                continue;
+              if (call->getCalledOperand()->getName() !=
+                  "IsProcessorFeaturePresent")
+                continue;
+              auto *fid = llvm::dyn_cast<llvm::ConstantInt>(
+                  call->getArgOperand(0));
+              if (fid && fid->getZExtValue() == 23)
+                to_fold.push_back(call);
+            }
+          }
+        }
+
+        for (auto *call : to_fold) {
+          call->replaceAllUsesWith(llvm::ConstantInt::get(i64_ty, 1));
+          call->eraseFromParent();
+          changed = true;
+        }
+        return changed ? llvm::PreservedAnalyses::none()
+                       : llvm::PreservedAnalyses::all();
+      }
+      static bool isRequired() { return true; }
+    };
+    MPM.addPass(FoldKnownImportCallsPass{});
+
+    // Eliminate VMP opaque predicate branches.  VMP inserts conditional
+    // branches where one side (the dead path) contains an `int 1` or
+    // `int 3` debug/breakpoint trap, while the other side is the real
+    // continuation.  Detect this pattern and fold the branch to always
+    // take the non-trap side, then let ADCE + SimplifyCFG clean up.
+    if (opts.deobfuscate) {
+      struct EliminateVMPOpaquePredicatesPass
+          : llvm::PassInfoMixin<EliminateVMPOpaquePredicatesPass> {
+
+        static bool hasDebugTrap(llvm::BasicBlock &BB) {
+          for (auto &I : BB) {
+            auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+            if (!call || !call->isInlineAsm())
+              continue;
+            auto *asm_val =
+                llvm::dyn_cast<llvm::InlineAsm>(call->getCalledOperand());
+            if (!asm_val)
+              continue;
+            auto s = asm_val->getAsmString();
+            if (s == "int $$1" || s == "int $$3")
+              return true;
+          }
+          return false;
+        }
+
+        /// BFS from BB looking for an `int $1`/`int $3` trap within the
+        /// reachable subgraph, bounded to 64 blocks to avoid runaway
+        /// traversal.  Stops at the other_side block (the non-trap
+        /// branch target) to avoid crossing the merge point.
+        static bool subgraphContainsTrap(llvm::BasicBlock *BB,
+                                          llvm::BasicBlock *other_side) {
+          llvm::SmallPtrSet<llvm::BasicBlock *, 32> visited;
+          llvm::SmallVector<llvm::BasicBlock *, 16> worklist;
+          worklist.push_back(BB);
+          while (!worklist.empty() && visited.size() < 64) {
+            auto *cur = worklist.pop_back_val();
+            if (!visited.insert(cur).second)
+              continue;
+            if (cur == other_side)
+              continue;  // don't cross into the real side
+            if (hasDebugTrap(*cur))
+              return true;
+            for (auto *succ : llvm::successors(cur))
+              worklist.push_back(succ);
+          }
+          return false;
+        }
+
+        llvm::PreservedAnalyses run(llvm::Module &M,
+                                     llvm::ModuleAnalysisManager &) {
+          bool changed = false;
+          for (auto &F : M) {
+            for (auto &BB : F) {
+              auto *br = llvm::dyn_cast<llvm::BranchInst>(BB.getTerminator());
+              if (!br || !br->isConditional())
+                continue;
+              auto *true_bb = br->getSuccessor(0);
+              auto *false_bb = br->getSuccessor(1);
+              bool true_trap = subgraphContainsTrap(true_bb, false_bb);
+              bool false_trap = subgraphContainsTrap(false_bb, true_bb);
+              // Only fold when exactly one side has a trap.
+              if (true_trap == false_trap)
+                continue;
+              auto *keep = true_trap ? false_bb : true_bb;
+              auto *dead = true_trap ? true_bb : false_bb;
+              llvm::BranchInst::Create(keep, br->getIterator());
+              dead->removePredecessor(&BB);
+              br->eraseFromParent();
+              changed = true;
+            }
+          }
+          return changed ? llvm::PreservedAnalyses::none()
+                         : llvm::PreservedAnalyses::all();
+        }
+        static bool isRequired() { return true; }
+      };
+      MPM.addPass(EliminateVMPOpaquePredicatesPass{});
+
+      // Remove anti-debug and anti-VM inline asm artifacts.
+      //
+      // - `int $1` / `int $3`: debug/breakpoint traps that VMP's exception
+      //   handler catches and skips at runtime.  Without the handler they'd
+      //   crash, but the lifted control flow already has the correct
+      //   continuation (the branch after the trap).  Safe to erase.
+      //
+      // - `inl` / `inb`: port I/O used for VM-environment detection.
+      //   Results are stored to State but never used for real computation
+      //   (only as opaque predicate inputs).  Replace with constant 0 so
+      //   ADCE can eliminate downstream dead code.
+      struct RemoveAntiAnalysisAsmPass
+          : llvm::PassInfoMixin<RemoveAntiAnalysisAsmPass> {
+        llvm::PreservedAnalyses run(llvm::Module &M,
+                                     llvm::ModuleAnalysisManager &) {
+          bool changed = false;
+          auto &Ctx = M.getContext();
+          llvm::SmallVector<llvm::CallInst *, 16> to_erase;
+          llvm::SmallVector<std::pair<llvm::CallInst *, llvm::Value *>, 8>
+              to_replace;
+
+          for (auto &F : M) {
+            for (auto &BB : F) {
+              for (auto &I : BB) {
+                auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+                if (!call || !call->isInlineAsm())
+                  continue;
+                auto *asm_val = llvm::dyn_cast<llvm::InlineAsm>(
+                    call->getCalledOperand());
+                if (!asm_val)
+                  continue;
+                auto s = asm_val->getAsmString();
+                if (s == "int $$1" || s == "int $$3") {
+                  to_erase.push_back(call);
+                } else if (s.starts_with("inl ") || s.starts_with("inb ")) {
+                  auto *zero =
+                      llvm::Constant::getNullValue(call->getType());
+                  to_replace.push_back({call, zero});
+                }
+              }
+            }
+          }
+
+          for (auto *call : to_erase) {
+            call->eraseFromParent();
+            changed = true;
+          }
+          for (auto &[call, repl] : to_replace) {
+            call->replaceAllUsesWith(repl);
+            call->eraseFromParent();
+            changed = true;
+          }
+          return changed ? llvm::PreservedAnalyses::none()
+                         : llvm::PreservedAnalyses::all();
+        }
+        static bool isRequired() { return true; }
+      };
+      MPM.addPass(RemoveAntiAnalysisAsmPass{});
+    }
+
+    {
+      llvm::FunctionPassManager FPM;
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::GVNPass());
+      FPM.addPass(llvm::ADCEPass());
+      FPM.addPass(llvm::SimplifyCFGPass());
+      MPM.addPass(createScopedFPM(std::move(FPM),
+                                  shouldRunClosedRootSliceScopedPass));
+    }
+  }
+
   if (!opts.preserve_lifted_semantics)
     buildLiftInfrastructureCleanupPipeline(MPM);
 
