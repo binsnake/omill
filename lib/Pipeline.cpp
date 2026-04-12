@@ -9655,9 +9655,16 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
         // SROA+DSE sweep below never sees the resulting `freeze(poison)`
         // stores. Lowering them in this pass puts the dead stores in
         // reach of the cleanup.
+        // Include Return so __remill_function_return is lowered to `ret`
+        // BEFORE the late block inline. If left un-lowered, AlwaysInliner
+        // inlines the callee body containing the raw intrinsic call into
+        // the output root, and the kPreFinalize normalization then lowers
+        // it to a `ret` mid-body — terminating the root function early
+        // and making all continuation blocks unreachable.
         FPM.addPass(LowerRemillIntrinsicsPass(LowerCategories::Phase1 |
                                               LowerCategories::ResolvedDispatch |
-                                              LowerCategories::Undefined));
+                                              LowerCategories::Undefined |
+                                              LowerCategories::Return));
         FPM.addPass(llvm::SimplifyCFGPass());
         MPM.addPass(createScopedFPM(
             std::move(FPM), [](llvm::Function &F) {
@@ -9677,7 +9684,6 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
                     continue;
                   auto name = callee->getName();
                   if (name.starts_with("__remill_") &&
-                      name != "__remill_function_return" &&
                       name != "__remill_function_call" &&
                       name != "__remill_jump" &&
                       name != "__remill_missing_block" &&

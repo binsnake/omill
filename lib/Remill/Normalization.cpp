@@ -23,8 +23,8 @@ bool shouldNormalizeFunction(llvm::Function &F,
                              const RemillNormalizationRequest &request) {
   if (F.isDeclaration())
     return false;
-  if (request.scope_predicate && request.scope_predicate(F))
-    return true;
+  if (request.scope_predicate)
+    return request.scope_predicate(F);
   if (hasLiftedSignature(F))
     return true;
   if (!request.include_semantic_helpers)
@@ -197,10 +197,16 @@ void RemillNormalizationOrchestrator::appendToPipeline(
       for (auto &F : M) {
         if (!shouldNormalizeFunction(F, request))
           continue;
-        auto PA = FPM.run(F, FAM);
-        if (!PA.areAllPreserved()) {
+        __try {
+          auto PA = FPM.run(F, FAM);
+          if (!PA.areAllPreserved()) {
+            changed = true;
+            FAM.invalidate(F, PA);
+          }
+        } __except (1) {
           changed = true;
-          FAM.invalidate(F, PA);
+          F.addFnAttr("omill.normalization_crashed", "1");
+          FAM.invalidate(F, llvm::PreservedAnalyses::none());
         }
       }
       return changed ? llvm::PreservedAnalyses::none()
