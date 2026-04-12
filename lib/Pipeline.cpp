@@ -10279,6 +10279,23 @@ static void buildFinalCleanupPipeline(llvm::ModulePassManager &MPM,
     }
   }
 
+  // After deobfuscation and all inlining, promote remaining State struct
+  // field accesses (GEP+load/store through arg0) to local allocas, then
+  // SROA to SSA.  This eliminates the remill State pointer threading and
+  // produces clean scalar variables for register values.
+  if (opts.no_abi_mode && opts.use_block_lifting) {
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(OptimizeStatePass(OptimizePhases::Promote));
+    FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::GVNPass());
+    FPM.addPass(llvm::DSEPass());
+    FPM.addPass(llvm::ADCEPass());
+    FPM.addPass(llvm::SimplifyCFGPass());
+    MPM.addPass(createScopedFPM(std::move(FPM),
+                                shouldRunClosedRootSliceScopedPass));
+  }
+
   if (!opts.preserve_lifted_semantics)
     buildLiftInfrastructureCleanupPipeline(MPM);
 
