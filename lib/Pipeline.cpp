@@ -10279,6 +10279,64 @@ static void buildFinalCleanupPipeline(llvm::ModulePassManager &MPM,
     }
   }
 
+  // Eliminate missing_block_handler calls whose target was an executable
+  // address that failed to decode (omill.invalidated_executable_entry
+  // metadata).  This occurs when VMProtect manipulates the return address
+  // on the stack: the CALLI fall-through points to junk bytes that the
+  // VM's exception handler would redirect at runtime.  In deobfuscated
+  // output the path is unreachable — replace the handler + ret with
+  // unreachable so SimplifyCFG can fold the dead branch.
+  if (opts.deobfuscate) {
+    struct EliminateInvalidatedMissingBlockPass
+        : llvm::PassInfoMixin<EliminateInvalidatedMissingBlockPass> {
+      llvm::PreservedAnalyses run(llvm::Module &M,
+                                   llvm::ModuleAnalysisManager &) {
+        auto *handler_fn = M.getFunction("__omill_missing_block_handler");
+        if (!handler_fn || handler_fn->use_empty())
+          return llvm::PreservedAnalyses::all();
+
+        bool changed = false;
+        llvm::SmallVector<llvm::CallInst *, 4> to_remove;
+        for (auto &F : M) {
+          for (auto &BB : F) {
+            for (auto &I : BB) {
+              auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+              if (!call)
+                continue;
+              auto *callee = call->getCalledFunction();
+              if (callee != handler_fn)
+                continue;
+              if (!call->getMetadata("omill.invalidated_executable_entry"))
+                continue;
+              to_remove.push_back(call);
+            }
+          }
+        }
+
+        for (auto *call : to_remove) {
+          auto *BB = call->getParent();
+          // Erase everything from the call onward and insert unreachable.
+          while (&BB->back() != call)
+            BB->back().eraseFromParent();
+          call->eraseFromParent();
+          new llvm::UnreachableInst(M.getContext(), BB);
+          changed = true;
+        }
+        return changed ? llvm::PreservedAnalyses::none()
+                       : llvm::PreservedAnalyses::all();
+      }
+      static bool isRequired() { return true; }
+    };
+    MPM.addPass(EliminateInvalidatedMissingBlockPass{});
+    {
+      llvm::FunctionPassManager FPM;
+      FPM.addPass(llvm::ADCEPass());
+      FPM.addPass(llvm::SimplifyCFGPass());
+      MPM.addPass(createScopedFPM(std::move(FPM),
+                                  shouldRunClosedRootSliceScopedPass));
+    }
+  }
+
   // After deobfuscation and all inlining, promote remaining State struct
   // field accesses (GEP+load/store through arg0) to local allocas, then
   // SROA to SSA.  This eliminates the remill State pointer threading and
