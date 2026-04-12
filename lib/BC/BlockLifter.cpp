@@ -871,6 +871,15 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
               call_target_decision.effective_target_pc
                   ? *call_target_decision.effective_target_pc
                   : call_target;
+
+          // Add the call target to discovered_targets so
+          // LiftReachable's BFS lifts the callee's full reachable
+          // scope — not just its entry block.  Without this, deep
+          // call targets (e.g. VM exit handlers) end up partially
+          // lifted with missing successor blocks.
+          if (call_pc != 0)
+            discovered_targets.push_back(call_pc);
+
           auto *pc_val = llvm::ConstantInt::get(word_type, call_pc);
           auto *lifted_fn_ty = func->getFunctionType();
           auto dispatch = module->getOrInsertFunction(
@@ -1015,6 +1024,12 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
               call_target_decision.effective_target_pc
                   ? *call_target_decision.effective_target_pc
                   : call_target;
+
+          // See kCategoryDirectFunctionCall: add call target so
+          // LiftReachable lifts the callee's full reachable scope.
+          if (dispatch_pc != 0)
+            discovered_targets.push_back(dispatch_pc);
+
           auto *pc_val = llvm::ConstantInt::get(word_type, dispatch_pc);
           auto *lifted_fn_ty = func->getFunctionType();
           auto dispatch = module->getOrInsertFunction(
