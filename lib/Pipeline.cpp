@@ -9708,37 +9708,115 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
       // so the chain collapses into its enclosing `sub_<pc>` entries.
       // Only functions carrying the `omill.block_lifter` attribute are
       // touched — TraceLifter-produced `sub_<pc>` are untouched.
+      //
+      // Cyclic blk_<pc> (back-edges in the lifted CFG) are intentionally
+      // *excluded*: inlining a block that is part of a musttail cycle
+      // collapses the entire cycle into a single self-recursive function,
+      // which LLVM then cannot lower into a natural loop and whose body
+      // has no visible exit.  We detect cyclic blocks by walking the
+      // transitive musttail call graph and skip alwaysinline for any
+      // block that can reach itself.
       if (!envDisabled("OMILL_SKIP_LATE_BLOCK_INLINE")) {
         struct MarkBlockLifterBlocksAlwaysInlinePass
             : llvm::PassInfoMixin<MarkBlockLifterBlocksAlwaysInlinePass> {
+          static bool isBlockLifterBlock(const llvm::Function &F) {
+            if (F.isDeclaration())
+              return false;
+            if (!F.hasFnAttribute("omill.block_lifter"))
+              return false;
+            return F.getName().starts_with("blk_");
+          }
+
           llvm::PreservedAnalyses run(llvm::Module &M,
                                        llvm::ModuleAnalysisManager &) {
+            // 1. Collect all BlockLifter-produced blk_<pc> functions.
+            llvm::SmallVector<llvm::Function *, 64> blks;
+            for (auto &F : M) {
+              if (isBlockLifterBlock(F))
+                blks.push_back(&F);
+            }
+            if (blks.empty())
+              return llvm::PreservedAnalyses::all();
+
+            // 2. Build the musttail successor map restricted to blk_<pc>.
+            llvm::DenseMap<llvm::Function *,
+                           llvm::SmallVector<llvm::Function *, 2>>
+                succs;
+            for (auto *F : blks) {
+              for (auto &BB : *F) {
+                for (auto &I : BB) {
+                  auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+                  if (!call)
+                    continue;
+                  if (call->getTailCallKind() !=
+                      llvm::CallInst::TCK_MustTail)
+                    continue;
+                  auto *callee = call->getCalledFunction();
+                  if (!callee || !isBlockLifterBlock(*callee))
+                    continue;
+                  succs[F].push_back(callee);
+                }
+              }
+            }
+
+            // 3. For every blk_<pc>, BFS its musttail successors and
+            //    record whether it can reach itself.  Functions in a
+            //    cycle are *not* tagged alwaysinline — inlining them
+            //    would collapse the cycle into a self-recursive
+            //    musttail with no visible exit.
+            llvm::SmallPtrSet<llvm::Function *, 16> in_cycle;
+            for (auto *F : blks) {
+              llvm::SmallPtrSet<llvm::Function *, 16> visited;
+              llvm::SmallVector<llvm::Function *, 16> stack;
+              for (auto *s : succs.lookup(F)) {
+                if (s == F) {
+                  in_cycle.insert(F);
+                  break;
+                }
+                if (visited.insert(s).second)
+                  stack.push_back(s);
+              }
+              while (!in_cycle.count(F) && !stack.empty()) {
+                auto *g = stack.pop_back_val();
+                for (auto *s : succs.lookup(g)) {
+                  if (s == F) {
+                    in_cycle.insert(F);
+                    break;
+                  }
+                  if (visited.insert(s).second)
+                    stack.push_back(s);
+                }
+              }
+            }
+
+            // 4. Tag non-cyclic blocks alwaysinline and strip any
+            //    attributes that would block inlining.
             bool changed = false;
             unsigned tagged = 0;
-            for (auto &F : M) {
-              if (F.isDeclaration())
+            unsigned skipped_cyclic = 0;
+            for (auto *F : blks) {
+              if (in_cycle.count(F)) {
+                ++skipped_cyclic;
                 continue;
-              if (!F.hasFnAttribute("omill.block_lifter"))
-                continue;
-              if (!F.getName().starts_with("blk_"))
-                continue;
-              if (F.hasFnAttribute(llvm::Attribute::NoInline))
-                F.removeFnAttr(llvm::Attribute::NoInline);
-              if (F.hasFnAttribute(llvm::Attribute::OptimizeNone))
-                F.removeFnAttr(llvm::Attribute::OptimizeNone);
-              if (!F.hasFnAttribute(llvm::Attribute::AlwaysInline)) {
-                F.addFnAttr(llvm::Attribute::AlwaysInline);
+              }
+              if (F->hasFnAttribute(llvm::Attribute::NoInline))
+                F->removeFnAttr(llvm::Attribute::NoInline);
+              if (F->hasFnAttribute(llvm::Attribute::OptimizeNone))
+                F->removeFnAttr(llvm::Attribute::OptimizeNone);
+              if (!F->hasFnAttribute(llvm::Attribute::AlwaysInline)) {
+                F->addFnAttr(llvm::Attribute::AlwaysInline);
                 changed = true;
                 ++tagged;
               }
-              if (!F.hasLocalLinkage()) {
-                F.setLinkage(llvm::GlobalValue::InternalLinkage);
+              if (!F->hasLocalLinkage()) {
+                F->setLinkage(llvm::GlobalValue::InternalLinkage);
                 changed = true;
               }
             }
             if (std::getenv("OMILL_DEBUG_LATE_BLOCK_INLINE") != nullptr)
               llvm::errs() << "[late-block-inline] tagged " << tagged
-                           << " blk_<pc> functions alwaysinline\n";
+                           << " blk_<pc> alwaysinline; kept "
+                           << skipped_cyclic << " cyclic blk_<pc>\n";
             return changed ? llvm::PreservedAnalyses::none()
                            : llvm::PreservedAnalyses::all();
           }
