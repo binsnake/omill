@@ -1528,6 +1528,80 @@ void emitInlineDiagMarker(llvm::CallBase &call, llvm::Function &callee,
   llvm::appendToUsed(M, {str_gv, sink});
 }
 
+/// When a __remill_missing_block call targets a constant address inside
+/// a non-executable PE section (e.g. .rdata import name table), the
+/// block cannot be lifted — the target is a VM-internal token, not
+/// code.  Rewrite those terminal calls to `ret ptr %memory` so the
+/// enclosing function has a proper return path instead of collapsing
+/// to `body: unreachable` via PropagateUnreachableCallsPass later.
+struct RewriteNonExecutableMissingBlockToRetPass
+    : llvm::PassInfoMixin<RewriteNonExecutableMissingBlockToRetPass> {
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                               llvm::ModuleAnalysisManager &MAM) {
+    auto *binary_memory = MAM.getCachedResult<BinaryMemoryAnalysis>(M);
+    if (!binary_memory || !binary_memory->imageBase())
+      return llvm::PreservedAnalyses::all();
+
+    auto *missing_fn = M.getFunction("__remill_missing_block");
+    if (!missing_fn || missing_fn->use_empty())
+      return llvm::PreservedAnalyses::all();
+
+    llvm::SmallVector<llvm::CallInst *, 8> to_rewrite;
+    for (auto *user : missing_fn->users()) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(user);
+      if (!call || call->arg_size() < 2)
+        continue;
+      auto *pc_const =
+          llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+      if (!pc_const)
+        continue;
+      uint64_t target_pc = pc_const->getZExtValue();
+      if (target_pc == 0)
+        continue;
+      if (isInImageRange(*binary_memory, target_pc) &&
+          !isTargetExecutable(*binary_memory, target_pc)) {
+        to_rewrite.push_back(call);
+      }
+    }
+
+    if (to_rewrite.empty())
+      return llvm::PreservedAnalyses::all();
+
+    unsigned rewritten = 0;
+    for (auto *call : to_rewrite) {
+      auto *BB = call->getParent();
+      auto *F = BB->getParent();
+      llvm::Value *memory = nullptr;
+      if (F->arg_size() >= 3)
+        memory = F->getArg(2);
+      if (!memory || !memory->getType()->isPointerTy())
+        continue;
+
+      call->replaceAllUsesWith(memory);
+      llvm::SmallVector<llvm::BasicBlock *, 2> succs;
+      if (BB->getTerminator())
+        for (auto *S : llvm::successors(BB))
+          succs.push_back(S);
+      while (&BB->back() != call)
+        BB->back().eraseFromParent();
+      call->eraseFromParent();
+      for (auto *S : succs)
+        S->removePredecessor(BB);
+      llvm::IRBuilder<> Builder(BB);
+      Builder.CreateRet(memory);
+      ++rewritten;
+    }
+
+    if (rewritten > 0 &&
+        std::getenv("OMILL_DEBUG_NONEXEC_REWRITE") != nullptr)
+      llvm::errs() << "[nonexec-missing-block] rewrote " << rewritten
+                   << " non-executable missing_block calls to ret\n";
+    return rewritten > 0 ? llvm::PreservedAnalyses::none()
+                         : llvm::PreservedAnalyses::all();
+  }
+  static bool isRequired() { return true; }
+};
+
 /// Split large [N x i8] allocas into per-region allocas based on
 /// constant-offset GEP clustering.  Enables SROA on oversized allocas
 /// (e.g., 69KB native_stack from ABI recovery) that SROA skips.
@@ -9235,6 +9309,17 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
   addPhaseMarker(MPM, "Phase 3.6: iterative target resolution");
   if (opts.use_block_lifting) {
     MPM.addPass(IterativeBlockDiscoveryPass(opts.max_resolution_iterations));
+    // Early non-executable missing-block rewrite: if a
+    // __remill_missing_block call targets a constant address in a
+    // non-executable section (e.g. .rdata import names from a
+    // VMProtect thunk token), convert it to `ret ptr %memory` now —
+    // before later passes collapse the enclosing function body to
+    // `unreachable` and cascade that upward through the call chain.
+    if (!envDisabled("OMILL_SKIP_NONEXEC_MISSING_BLOCK_TO_RET")) {
+      MPM.addPass(
+          llvm::RequireAnalysisPass<BinaryMemoryAnalysis, llvm::Module>());
+      MPM.addPass(RewriteNonExecutableMissingBlockToRetPass{});
+    }
     if (opts.merge_block_functions_after_fixpoint) {
       MPM.addPass(MergeBlockFunctionsPass());
       addRecoveryAwareGlobalDCE(MPM, opts, RecoveryPipelinePhase::kResolve);
@@ -9700,6 +9785,15 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
           RewriteConstantMissingBlockCallsPass(/*only_when_noabi_mode=*/true));
       addRecoveryAwareGlobalDCE(MPM, opts, RecoveryPipelinePhase::kResolve);
       MPM.addPass(MarkReachableClosedRootSliceFunctionsPass{});
+
+      // When a block's only successor is a constant non-executable
+      // Catch any remaining non-executable missing-block targets that
+      // survived into Phase 3.97 (e.g. from late materialization).
+      if (!envDisabled("OMILL_SKIP_NONEXEC_MISSING_BLOCK_TO_RET")) {
+        MPM.addPass(
+            llvm::RequireAnalysisPass<BinaryMemoryAnalysis, llvm::Module>());
+        MPM.addPass(RewriteNonExecutableMissingBlockToRetPass{});
+      }
 
       // Late block-inlining: BlockLifter emits one function per basic
       // block (`blk_<pc>`) plus `sub_<pc>` for direct call targets.

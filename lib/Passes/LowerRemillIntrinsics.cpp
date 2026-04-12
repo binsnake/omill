@@ -1255,14 +1255,17 @@ bool lowerErrorAndMissing(llvm::Function &F, IntrinsicTable &table) {
       replacement_call = Builder.CreateCall(missing_handler, {pc});
     replacement_call->copyMetadata(*CI);
 
+    // Return the incoming memory token (arg 2) rather than poison so
+    // that callers who inline this function observe a clean return
+    // instead of propagating poison through the memory-threading chain.
+    // Poison would cause LLVM to eliminate the entire call subtree as
+    // undefined, collapsing exit handlers to `body: unreachable`.
     llvm::Instruction *new_term;
     if (F.getReturnType()->isVoidTy())
       new_term = Builder.CreateRetVoid();
     else
-      new_term = Builder.CreateRet(llvm::PoisonValue::get(F.getReturnType()));
+      new_term = Builder.CreateRet(CI->getArgOperand(2));
 
-    // Preserve the threaded Memory* token instead of introducing poison.
-    // Some lifted traces still feed this value into fallback dispatch paths.
     CI->replaceAllUsesWith(CI->getArgOperand(2));
     CI->eraseFromParent();
 
