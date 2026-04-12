@@ -21,12 +21,22 @@ namespace omill {
 
 namespace {
 
-/// Prefix used by BlockLifter for block-function names.
+/// Prefixes used by BlockLifter for block-function names.  Plain block
+/// bodies use `blk_<pc>`; function entry points (direct call targets and
+/// top-level LiftReachable entries) use `sub_<pc>`.  Both carry the
+/// `omill.block_lifter` function attribute so we never conflate them
+/// with TraceLifter-produced `sub_<pc>` functions that may live in the
+/// same module during late-stage cleanup.
 static constexpr const char *kBlockPrefix = "blk_";
+static constexpr const char *kSubPrefix = "sub_";
+static constexpr const char *kBlockLifterAttr = "omill.block_lifter";
 
-/// Check if a function is a block-function.
+/// Check if a function is a block-function produced by BlockLifter.
 bool isBlockFunction(const llvm::Function &F) {
-  return F.getName().starts_with(kBlockPrefix) && !F.isDeclaration();
+  if (F.isDeclaration() || !F.hasFnAttribute(kBlockLifterAttr))
+    return false;
+  auto name = F.getName();
+  return name.starts_with(kBlockPrefix) || name.starts_with(kSubPrefix);
 }
 
 bool isDiscoveryFunction(const llvm::Function &F) {
@@ -35,11 +45,16 @@ bool isDiscoveryFunction(const llvm::Function &F) {
 
 std::optional<uint64_t> parseBlockAddr(const llvm::Function &F) {
   auto name = F.getName();
-  if (!name.starts_with(kBlockPrefix))
+  llvm::StringRef rest;
+  if (name.starts_with(kBlockPrefix))
+    rest = name.drop_front(4);
+  else if (name.starts_with(kSubPrefix))
+    rest = name.drop_front(4);
+  else
     return std::nullopt;
 
   uint64_t addr = 0;
-  if (name.drop_front(4).getAsInteger(16, addr))
+  if (rest.getAsInteger(16, addr))
     return std::nullopt;
   return addr;
 }
@@ -50,6 +65,19 @@ std::optional<uint64_t> parseDiscoveryAddr(const llvm::Function &F) {
   if (isLiftedFunction(F))
     return extractEntryVA(F.getName());
   return std::nullopt;
+}
+
+/// Look up a block-function by PC, accepting both the `sub_` and `blk_`
+/// naming conventions produced by BlockLifter.
+llvm::Function *lookupBlockFunction(llvm::Module &M, uint64_t pc) {
+  char name[64];
+  snprintf(name, sizeof(name), "sub_%llx", (unsigned long long)pc);
+  if (auto *fn = M.getFunction(name); fn && !fn->isDeclaration())
+    return fn;
+  snprintf(name, sizeof(name), "blk_%llx", (unsigned long long)pc);
+  if (auto *fn = M.getFunction(name); fn && !fn->isDeclaration())
+    return fn;
+  return nullptr;
 }
 
 void recordBlockGraphState(llvm::Module &M, IterativeLiftingSession &session) {
@@ -78,9 +106,9 @@ void recordBlockGraphState(llvm::Module &M, IterativeLiftingSession &session) {
         edge.source_pc = *source_pc;
 
         if (isDispatchIntrinsicName(callee->getName())) {
-          edge.kind = isDispatchCallName(callee->getName())
-                          ? LiftEdgeKind::kIndirectCall
-                          : LiftEdgeKind::kIndirectBranch;
+          const bool is_call = isDispatchCallName(callee->getName());
+          edge.kind = is_call ? LiftEdgeKind::kIndirectCall
+                              : LiftEdgeKind::kIndirectBranch;
           if (call->arg_size() >= 2) {
             if (auto *pc_arg =
                     llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1))) {
@@ -135,12 +163,9 @@ llvm::DenseSet<uint64_t> collectNewTargetPCs(llvm::Module &M) {
         uint64_t target_pc = pc_arg->getZExtValue();
         if (target_pc == 0)
           continue;
-        // Check if a block-function already exists for this target.
-        char target_name[64];
-        snprintf(target_name, sizeof(target_name), "blk_%llx",
-                 (unsigned long long)target_pc);
-        auto *target_fn = M.getFunction(target_name);
-        if (!target_fn || target_fn->isDeclaration())
+        // Check if a block-function already exists for this target under
+        // either the `sub_` or `blk_` naming convention.
+        if (!lookupBlockFunction(M, target_pc))
           new_pcs.insert(target_pc);
       }
     }
@@ -205,12 +230,9 @@ bool resolveConstantDispatches(llvm::Module &M) {
         if (target_pc == 0)
           continue;
 
-        // Find the corresponding block-function.
-        char target_name[64];
-        snprintf(target_name, sizeof(target_name), "blk_%llx",
-                 (unsigned long long)target_pc);
-        auto *target_fn = M.getFunction(target_name);
-        if (!target_fn || target_fn->isDeclaration())
+        // Find the corresponding block-function under either naming.
+        auto *target_fn = lookupBlockFunction(M, target_pc);
+        if (!target_fn)
           continue;
 
         to_replace.push_back({call, target_fn});

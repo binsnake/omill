@@ -25,6 +25,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <llvm/ADT/SmallVector.h>
 
@@ -57,8 +58,21 @@ class BlockManager {
  public:
   virtual ~BlockManager();
 
-  /// Name for a block-function.  Default: "blk_<hex>".
+  /// Name for a block-function.  Default: "sub_<hex>" for PCs that have
+  /// been marked as function entries via MarkFunctionEntry (e.g. direct
+  /// call targets), otherwise "blk_<hex>".  This lets BlockLifter emit
+  /// canonical `sub_*` names for function entry points up front so
+  /// downstream passes which gate on the `sub_` prefix (inliner, ABI
+  /// recovery, calling-convention analysis, etc.) can recognize them
+  /// without waiting for MergeBlockFunctionsPass to rename.
   virtual std::string BlockName(uint64_t addr);
+
+  /// Mark \p addr as a function entry point so BlockName emits a
+  /// canonical `sub_<hex>` name for it.  Idempotent.
+  virtual void MarkFunctionEntry(uint64_t addr);
+
+  /// True when \p addr was previously marked as a function entry.
+  virtual bool IsFunctionEntry(uint64_t addr) const;
 
   /// Called when a block has been lifted (defined).
   virtual void SetLiftedBlockDefinition(uint64_t addr,
@@ -94,6 +108,9 @@ class BlockManager {
   virtual void ForEachDevirtualizedTarget(
       const remill::Instruction &inst,
       std::function<void(uint64_t, DevirtualizedTargetKind)> func);
+
+ protected:
+  std::unordered_set<uint64_t> function_entry_pcs_;
 };
 
 /// Lifts individual basic blocks as separate LLVM functions.

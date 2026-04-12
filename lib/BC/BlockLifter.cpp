@@ -133,8 +133,16 @@ BlockManager::~BlockManager() {}
 
 std::string BlockManager::BlockName(uint64_t addr) {
   std::stringstream ss;
-  ss << "blk_" << std::hex << addr;
+  ss << (IsFunctionEntry(addr) ? "sub_" : "blk_") << std::hex << addr;
   return ss.str();
+}
+
+void BlockManager::MarkFunctionEntry(uint64_t addr) {
+  function_entry_pcs_.insert(addr);
+}
+
+bool BlockManager::IsFunctionEntry(uint64_t addr) const {
+  return function_entry_pcs_.count(addr) != 0;
 }
 
 llvm::Function *BlockManager::GetLiftedBlockDeclaration(uint64_t) {
@@ -204,6 +212,10 @@ class BlockLifter::Impl {
 
   /// Get existing declaration or create one.
   llvm::Function *GetOrDeclareBlockFunction(uint64_t addr);
+
+  /// Mark \p addr as a function entry (so it is named `sub_<pc>`) and
+  /// rename any previously-declared `blk_<pc>` stub to match.
+  void MarkFunctionEntryAndUpgradeName(uint64_t addr);
 
   /// Emit a musttail call to a block-function and ret.
   /// This is the standard inter-block transfer for direct jumps/branches.
@@ -339,7 +351,34 @@ llvm::Function *BlockLifter::Impl::GetOrDeclareBlockFunction(uint64_t addr) {
   if (auto *fn = module->getFunction(name)) {
     return fn;
   }
+  // Fall back: if this PC is now a function entry (sub_<pc>) but was
+  // earlier declared as a plain block (blk_<pc>), rename the existing
+  // declaration so every call site and cache entry continues to point
+  // at the same llvm::Function.
+  if (manager.IsFunctionEntry(addr)) {
+    std::stringstream legacy;
+    legacy << "blk_" << std::hex << addr;
+    if (auto *existing = module->getFunction(legacy.str())) {
+      existing->setName(name);
+      return existing;
+    }
+  }
   return DeclareBlockFunction(addr);
+}
+
+void BlockLifter::Impl::MarkFunctionEntryAndUpgradeName(uint64_t addr) {
+  const bool was_entry = manager.IsFunctionEntry(addr);
+  manager.MarkFunctionEntry(addr);
+  if (was_entry) {
+    return;
+  }
+  // If the PC was previously declared as a blk_<pc>, rename it so the
+  // function carries its canonical sub_<pc> name going forward.
+  std::stringstream legacy;
+  legacy << "blk_" << std::hex << addr;
+  if (auto *existing = module->getFunction(legacy.str())) {
+    existing->setName(manager.BlockName(addr));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -508,6 +547,12 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
   // Initialize the function with remill's standard entry setup:
   // BRANCH_TAKEN, RETURN_PC, MONITOR allocas.
   arch->InitializeEmptyLiftedFunction(func);
+
+  // Mark the function as a BlockLifter output so MergeBlockFunctionsPass
+  // (and IterativeBlockDiscoveryPass) can safely distinguish BlockLifter
+  // entries (both `sub_<pc>` and `blk_<pc>`) from TraceLifter-produced
+  // `sub_<pc>` functions that may live in the same module.
+  func->addFnAttr("omill.block_lifter");
 
   auto *state_ptr = remill::NthArgument(func, remill::kStatePointerArgNum);
   auto *entry_block = &func->front();
@@ -738,6 +783,18 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
             current_pc, fallthrough, LiftTargetEdgeKind::kCallFallthrough);
         auto call_target_decision = manager.ResolveLiftTarget(
             current_pc, call_target, LiftTargetEdgeKind::kDirectCallTarget);
+
+        // Direct call targets are canonical function entries — name them
+        // `sub_<pc>` up front so downstream inlining / ABI recovery /
+        // calling-convention passes recognize them without waiting for
+        // MergeBlockFunctionsPass to rename.
+        if (const uint64_t entry_pc =
+                call_target_decision.effective_target_pc
+                    ? *call_target_decision.effective_target_pc
+                    : call_target;
+            entry_pc != 0) {
+          MarkFunctionEntryAndUpgradeName(entry_pc);
+        }
 
         // VMProtect-style virtual-return-address thunks appear as the
         // direct call target of native CALL instructions.  Both the

@@ -18,21 +18,35 @@ namespace omill {
 
 namespace {
 
-/// Prefix used by BlockLifter for block-function names.
+/// Prefixes used by BlockLifter for block-function names.  `blk_<pc>` is
+/// a plain block body; `sub_<pc>` is a direct-call target or top-level
+/// function entry emitted by BlockLifter.  Both are identified by the
+/// `omill.block_lifter` function attribute so we never confuse a
+/// TraceLifter-produced `sub_<pc>` with a BlockLifter one.
 static constexpr const char *kBlockPrefix = "blk_";
+static constexpr const char *kSubPrefix = "sub_";
+static constexpr const char *kBlockLifterAttr = "omill.block_lifter";
 
 /// Check if a function is a block-function (produced by BlockLifter).
 bool isBlockFunction(const llvm::Function &F) {
-  return F.getName().starts_with(kBlockPrefix) && !F.isDeclaration();
+  if (F.isDeclaration() || !F.hasFnAttribute(kBlockLifterAttr))
+    return false;
+  auto name = F.getName();
+  return name.starts_with(kBlockPrefix) || name.starts_with(kSubPrefix);
 }
 
-/// Extract the block address from a block-function name like "blk_140001000".
+/// Extract the block address from a block-function name like
+/// "blk_140001000" or "sub_140001000".
 std::optional<uint64_t> parseBlockAddr(llvm::StringRef name) {
-  if (!name.starts_with(kBlockPrefix))
+  llvm::StringRef rest;
+  if (name.starts_with(kBlockPrefix))
+    rest = name.drop_front(4);
+  else if (name.starts_with(kSubPrefix))
+    rest = name.drop_front(4);
+  else
     return std::nullopt;
-  auto hex_part = name.drop_front(4);  // skip "blk_"
   uint64_t addr;
-  if (hex_part.getAsInteger(16, addr))
+  if (rest.getAsInteger(16, addr))
     return std::nullopt;
   return addr;
 }
@@ -92,6 +106,22 @@ void collectReachableBlocks(
   }
 }
 
+llvm::SmallVector<uint64_t, 16> getMergeOrder(
+    uint64_t entry_addr, const llvm::DenseSet<uint64_t> &group_addrs) {
+  llvm::SmallVector<uint64_t, 16> ordered_addrs;
+  ordered_addrs.reserve(group_addrs.size());
+  if (group_addrs.contains(entry_addr))
+    ordered_addrs.push_back(entry_addr);
+  for (uint64_t addr : group_addrs) {
+    if (addr != entry_addr)
+      ordered_addrs.push_back(addr);
+  }
+  if (ordered_addrs.size() > 1)
+    llvm::sort(ordered_addrs.begin() + 1, ordered_addrs.end());
+  return ordered_addrs;
+}
+
+
 /// Build a merged function from a group of block-functions.
 /// The entry block-function becomes the merged function; all other
 /// block-functions are inlined.
@@ -130,6 +160,18 @@ llvm::Function *mergeBlockGroup(
   char name_buf[64];
   snprintf(name_buf, sizeof(name_buf), "sub_%llx",
            (unsigned long long)entry_addr);
+
+  // BlockLifter may already have produced `sub_<entry_addr>` for this
+  // function entry (direct-call target or top-level lift target).  In
+  // that case, temporarily rename the pre-existing function so the new
+  // merged function can claim the canonical name, then RAUW external
+  // users over to the merged function once the clone is complete.
+  llvm::Function *pre_existing = M.getFunction(name_buf);
+  if (pre_existing && pre_existing != entry_fn)
+    pre_existing = nullptr;  // unrelated collision — leave it alone
+  if (pre_existing)
+    pre_existing->setName(llvm::Twine(name_buf) + ".premerge");
+
   auto *merged_fn =
       llvm::Function::Create(fn_type, llvm::GlobalValue::ExternalLinkage,
                              name_buf, &M);
@@ -141,11 +183,15 @@ llvm::Function *mergeBlockGroup(
   if (entry_fn->hasFnAttribute("omill.closed_root_slice_root"))
     merged_fn->addFnAttr("omill.closed_root_slice_root", "1");
 
+  // Keep the chosen root as the actual function entry block instead of
+  // inheriting DenseSet iteration order.
+  auto group_order = getMergeOrder(entry_addr, group_addrs);
+
   // Map: block addr -> BasicBlock in the merged function.
   llvm::DenseMap<uint64_t, llvm::BasicBlock *> block_map;
 
   // Create one BasicBlock per block-function in the merged function.
-  for (uint64_t addr : group_addrs) {
+  for (uint64_t addr : group_order) {
     char bb_name[64];
     snprintf(bb_name, sizeof(bb_name), "block_%llx",
              (unsigned long long)addr);
@@ -153,7 +199,7 @@ llvm::Function *mergeBlockGroup(
     block_map[addr] = bb;
   }
 
-  for (uint64_t addr : group_addrs) {
+  for (uint64_t addr : group_order) {
     auto fn_it = addr_to_fn.find(addr);
     if (fn_it == addr_to_fn.end())
       continue;
@@ -264,6 +310,14 @@ llvm::Function *mergeBlockGroup(
             llvm::PoisonValue::get(fn_type->getReturnType()));
       }
     }
+  }
+
+  // Redirect external users of the pre-existing `sub_<entry_addr>` to
+  // the merged function; the now-orphaned `.premerge` stub is left for
+  // the outer loop / GlobalDCE to clean up alongside the other group
+  // members.
+  if (pre_existing) {
+    pre_existing->replaceAllUsesWith(merged_fn);
   }
 
   return merged_fn;
