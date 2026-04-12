@@ -11384,6 +11384,71 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
   buildLateCleanupPipeline(MPM, PipelineOptions{});
 }
 
+unsigned eliminateBodyUnreachableFunctions(llvm::Module &M) {
+  // Find every `define` whose body is exactly one `unreachable` (which
+  // would compile to an orphaned `ud2` in the final binary), and rewrite
+  // the body into a no-op pass-through that returns its `memory`
+  // argument.  That matches the remill lifted-function calling
+  // convention — callers continue to thread the memory token through
+  // and observe a clean return instead of a trap.  We never erase the
+  // functions or touch their callers, so this cannot cascade into
+  // upstream functions or break the output-root closure.
+  //
+  // Only signatures matching `ptr (ptr, i64, ptr) -> ptr` (i.e. the
+  // remill lifted convention) are rewritten; anything else is left
+  // alone.
+  auto &Ctx = M.getContext();
+  auto *ptr_ty = llvm::PointerType::getUnqual(Ctx);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+
+  auto hasLiftedRemillSignature = [&](llvm::Function &F) -> bool {
+    auto *FT = F.getFunctionType();
+    if (FT->getNumParams() != 3)
+      return false;
+    if (FT->getReturnType() != ptr_ty)
+      return false;
+    if (FT->getParamType(0) != ptr_ty)
+      return false;
+    if (FT->getParamType(1) != i64_ty)
+      return false;
+    if (FT->getParamType(2) != ptr_ty)
+      return false;
+    return true;
+  };
+
+  auto isBodyUnreachable = [](const llvm::Function &F) -> bool {
+    if (F.isDeclaration() || F.empty())
+      return false;
+    if (F.size() != 1)
+      return false;
+    const auto &entry = F.getEntryBlock();
+    return entry.size() == 1 &&
+           llvm::isa<llvm::UnreachableInst>(entry.front());
+  };
+
+  unsigned rewritten = 0;
+  for (auto &F : M) {
+    if (!isBodyUnreachable(F))
+      continue;
+    if (!hasLiftedRemillSignature(F))
+      continue;
+    F.deleteBody();
+    auto *entry = llvm::BasicBlock::Create(Ctx, "body", &F);
+    llvm::IRBuilder<> Builder(entry);
+    Builder.CreateRet(F.getArg(2));
+    if (F.hasFnAttribute(llvm::Attribute::NoReturn))
+      F.removeFnAttr(llvm::Attribute::NoReturn);
+    ++rewritten;
+  }
+
+  if (rewritten > 0 &&
+      std::getenv("OMILL_DEBUG_DEAD_PROPAGATE") != nullptr) {
+    llvm::errs() << "[dead-propagate] rewrote " << rewritten
+                 << " body:unreachable functions to ret memory\n";
+  }
+  return rewritten;
+}
+
 void buildPostPatchCleanupPipeline(llvm::ModulePassManager &MPM,
                                    unsigned inline_threshold) {
   if (moduleInlinerEnabled()) {
