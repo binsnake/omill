@@ -4,6 +4,7 @@
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
+#include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
@@ -11,6 +12,7 @@
 #include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
 
+#include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/IterativeLiftingSession.h"
 #include "omill/Passes/ConstantMemoryFolding.h"
 #include "omill/Passes/CombinedFixedPointDevirt.h"
@@ -322,6 +324,78 @@ void canonicalizePhiIncomingEdges(llvm::Function &F) {
   }
 }
 
+/// Function-pass that rewrites musttail @__remill_missing_block calls whose
+/// constant PC target falls in a non-executable section to `ret ptr %memory`.
+/// This must run inside IterativeBlockDiscovery's per-round FPM so that
+/// non-executable targets are caught *before* collapse passes kill the body.
+struct RewriteNonExecMissingBlockFPM
+    : llvm::PassInfoMixin<RewriteNonExecMissingBlockFPM> {
+  llvm::PreservedAnalyses run(llvm::Function &F,
+                              llvm::FunctionAnalysisManager &AM) {
+    auto &MAMProxy =
+        AM.getResult<llvm::ModuleAnalysisManagerFunctionProxy>(F);
+    auto *binary_memory =
+        MAMProxy.getCachedResult<BinaryMemoryAnalysis>(*F.getParent());
+    if (!binary_memory || !binary_memory->imageBase())
+      return llvm::PreservedAnalyses::all();
+
+    auto *missing_fn = F.getParent()->getFunction("__remill_missing_block");
+    if (!missing_fn || missing_fn->use_empty())
+      return llvm::PreservedAnalyses::all();
+
+    if (F.arg_size() < 3 || !F.getArg(2)->getType()->isPointerTy())
+      return llvm::PreservedAnalyses::all();
+
+    llvm::Value *memory = F.getArg(2);
+    const auto image_base = binary_memory->imageBase();
+    const auto image_size = binary_memory->imageSize();
+
+    llvm::SmallVector<llvm::CallInst *, 4> to_rewrite;
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+        if (!call || call->getCalledFunction() != missing_fn)
+          continue;
+        if (call->arg_size() < 2)
+          continue;
+        auto *pc_const =
+            llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+        if (!pc_const)
+          continue;
+        uint64_t target_pc = pc_const->getZExtValue();
+        if (target_pc == 0)
+          continue;
+        bool in_image = target_pc >= image_base &&
+                        target_pc < (image_base + image_size);
+        if (in_image && !binary_memory->isExecutable(target_pc, 1))
+          to_rewrite.push_back(call);
+      }
+    }
+
+    if (to_rewrite.empty())
+      return llvm::PreservedAnalyses::all();
+
+    for (auto *call : to_rewrite) {
+      auto *BB = call->getParent();
+      call->replaceAllUsesWith(memory);
+      llvm::SmallVector<llvm::BasicBlock *, 2> succs;
+      if (BB->getTerminator())
+        for (auto *S : llvm::successors(BB))
+          succs.push_back(S);
+      while (&BB->back() != call)
+        BB->back().eraseFromParent();
+      call->eraseFromParent();
+      for (auto *S : succs)
+        S->removePredecessor(BB);
+      llvm::IRBuilder<> Builder(BB);
+      Builder.CreateRet(memory);
+    }
+    return llvm::PreservedAnalyses::none();
+  }
+
+  static bool isRequired() { return true; }
+};
+
 void runDiscoveryFPM(llvm::Module &M, llvm::ModuleAnalysisManager &MAM,
                      llvm::FunctionPassManager &&FPM) {
   auto &FAM =
@@ -383,6 +457,7 @@ llvm::PreservedAnalyses IterativeBlockDiscoveryPass::run(
       FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
       FPM.addPass(CombinedFixedPointDevirtPass());
       FPM.addPass(llvm::ADCEPass());
+      FPM.addPass(RewriteNonExecMissingBlockFPM());
       FPM.addPass(llvm::SimplifyCFGPass());
       runDiscoveryFPM(M, MAM, std::move(FPM));
     }
