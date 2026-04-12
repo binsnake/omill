@@ -6,8 +6,12 @@
 #include "omill/BC/BlockLifter.h"
 #include "omill/BC/DecodeInstruction.h"
 
+#include "omill/Analysis/VMTraceEmulator.h"
+#include "omill/BC/LiftDatabase.h"
 #include "omill/Devirtualization/ExecutableTargetFact.h"
 #include "omill/Utils/LiftedNames.h"
+
+#include <llvm/ADT/DenseMap.h>
 
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Constants.h>
@@ -49,78 +53,6 @@ static void PushUnique(llvm::SmallVectorImpl<T> &values, const T &value) {
   if (std::find(values.begin(), values.end(), value) == values.end()) {
     values.push_back(value);
   }
-}
-
-/// Detect a VMProtect-style virtual-return-address thunk at \p pc, which
-/// may appear in either of two forms:
-///
-///   push imm32; jmp rel32                                (10 bytes)
-///   push imm32; lea rsp, [rsp+disp8]; jmp rel32          (15 bytes)
-///
-/// The second form is a "push retaddr + adjust RSP" redirect emitted by
-/// VMProtect to leave the controlled return slot below the caller-visible
-/// stack pointer.  Both forms hand control to a VM handler that ultimately
-/// consumes the pushed imm32 via a later `ret`.  Recognizing the pattern
-/// at lift time lets BlockLifter model the stack effect inline at the
-/// call site without ever emitting an `omill_native_boundary_<pc>`
-/// placeholder declaration.
-///
-/// On success, populates \p pushed_imm_out with the immediate that would
-/// be pushed, \p rsp_lea_disp_out with the (signed) RSP adjustment applied
-/// by the lea (zero for the 10-byte variant), and \p jump_target_out with
-/// the final jmp destination.
-static bool IsVmProtectPushImmThunk(BlockManager &manager, uint64_t pc,
-                                    int32_t *pushed_imm_out,
-                                    int32_t *rsp_lea_disp_out,
-                                    uint64_t *jump_target_out) {
-  uint8_t bytes[16] = {};
-  for (unsigned i = 0; i < sizeof(bytes); ++i) {
-    if (!manager.TryReadExecutableByte(pc + i, &bytes[i])) {
-      return false;
-    }
-  }
-  if (bytes[0] != 0x68) {
-    return false;
-  }
-  int32_t pushed_imm = 0;
-  std::memcpy(&pushed_imm, &bytes[1], sizeof(pushed_imm));
-
-  // 10-byte variant: push imm32; jmp rel32.
-  if (bytes[5] == 0xE9) {
-    int32_t rel32 = 0;
-    std::memcpy(&rel32, &bytes[6], sizeof(rel32));
-    const uint64_t jump_target_pc = static_cast<uint64_t>(
-        static_cast<int64_t>(pc) + 10 + static_cast<int64_t>(rel32));
-    uint8_t probe = 0;
-    if (!manager.TryReadExecutableByte(jump_target_pc, &probe)) {
-      return false;
-    }
-    if (pushed_imm_out) *pushed_imm_out = pushed_imm;
-    if (rsp_lea_disp_out) *rsp_lea_disp_out = 0;
-    if (jump_target_out) *jump_target_out = jump_target_pc;
-    return true;
-  }
-
-  // 15-byte variant: push imm32; lea rsp, [rsp+disp8]; jmp rel32.
-  if (bytes[5] == 0x48 && bytes[6] == 0x8D && bytes[7] == 0x64 &&
-      bytes[8] == 0x24 && bytes[10] == 0xE9) {
-    const int32_t lea_disp =
-        static_cast<int32_t>(static_cast<int8_t>(bytes[9]));
-    int32_t rel32 = 0;
-    std::memcpy(&rel32, &bytes[11], sizeof(rel32));
-    const uint64_t jump_target_pc = static_cast<uint64_t>(
-        static_cast<int64_t>(pc) + 15 + static_cast<int64_t>(rel32));
-    uint8_t probe = 0;
-    if (!manager.TryReadExecutableByte(jump_target_pc, &probe)) {
-      return false;
-    }
-    if (pushed_imm_out) *pushed_imm_out = pushed_imm;
-    if (rsp_lea_disp_out) *rsp_lea_disp_out = lea_disp;
-    if (jump_target_out) *jump_target_out = jump_target_pc;
-    return true;
-  }
-
-  return false;
 }
 
 }  // namespace
@@ -264,6 +196,20 @@ class BlockLifter::Impl {
   remill::Instruction inst;
   remill::Instruction delayed_inst;
   const LiftDatabase *lift_db = nullptr;
+
+  /// Cached results of analyzeCallTargetBridgeEffect keyed by call-target
+  /// PC.  Populated lazily when lift_db has no descriptor for a direct
+  /// call.  Entries may be std::nullopt to indicate a previously-rejected
+  /// target that should not be re-analyzed.
+  llvm::DenseMap<uint64_t, std::optional<CallTargetBridgeEffect>>
+      bridge_cache;
+
+  /// Try to obtain a call-target bridge descriptor for a direct-call
+  /// target.  Prefers the lift-db record; falls back to an in-process run
+  /// of the analyzer using the BlockManager's BinaryMemoryMap when
+  /// available.
+  std::optional<CallTargetBridgeEffect> LookupBridgeEffect(
+      uint64_t call_instruction_pc, uint64_t call_target_pc);
 };
 
 BlockLifter::Impl::Impl(const remill::Arch *arch_, BlockManager &manager_)
@@ -315,6 +261,54 @@ bool BlockLifter::Impl::PopulateProjectedTargets(
   }
 
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Call-target bridge lookup
+// ---------------------------------------------------------------------------
+
+std::optional<CallTargetBridgeEffect> BlockLifter::Impl::LookupBridgeEffect(
+    uint64_t call_instruction_pc, uint64_t call_target_pc) {
+  if (!call_target_pc) {
+    return std::nullopt;
+  }
+
+  // Prefer the persistent descriptor on the lift-db instruction record.
+  if (lift_db) {
+    if (const auto *rec = lift_db->instruction(call_instruction_pc);
+        rec && rec->call_target_bridge.has_value()) {
+      const auto &bridge = *rec->call_target_bridge;
+      CallTargetBridgeEffect effect;
+      effect.stack_writes.reserve(bridge.stack_writes.size());
+      for (const auto &w : bridge.stack_writes) {
+        BridgeStackWrite e;
+        e.rsp_offset = w.rsp_offset;
+        e.size_bytes = w.size_bytes;
+        e.value = w.value;
+        effect.stack_writes.push_back(e);
+      }
+      effect.net_rsp_delta = bridge.net_rsp_delta;
+      effect.final_jump_target_pc = bridge.final_jump_target_pc;
+      effect.terminator =
+          static_cast<CallTargetBridgeEffect::Terminator>(bridge.terminator);
+      effect.instructions_modeled = bridge.instructions_modeled;
+      return effect;
+    }
+  }
+
+  // In-process fallback: use the BlockManager's BinaryMemoryMap.
+  const auto *memory_map = manager.GetBinaryMemoryMap();
+  if (!memory_map) {
+    return std::nullopt;
+  }
+
+  auto it = bridge_cache.find(call_target_pc);
+  if (it != bridge_cache.end()) {
+    return it->second;
+  }
+  auto effect = analyzeCallTargetBridgeEffect(*memory_map, call_target_pc);
+  bridge_cache[call_target_pc] = effect;
+  return effect;
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +376,22 @@ void BlockLifter::Impl::MarkFunctionEntryAndUpgradeName(uint64_t addr) {
 }
 
 // ---------------------------------------------------------------------------
+// Memory token helper
+// ---------------------------------------------------------------------------
+
+/// Load the current memory token from the MEMORY alloca if it exists,
+/// otherwise fall back to the raw memory function argument.  Decode-failure
+/// stub blocks have no MEMORY alloca, so the fallback is necessary.
+static llvm::Value *LoadCurrentMemoryToken(
+    llvm::IRBuilder<> &ir, llvm::Function *func,
+    const remill::IntrinsicTable &intrinsics) {
+  auto [mem_ref, _] = remill::FindVarInFunction(func, "MEMORY", true);
+  if (mem_ref)
+    return ir.CreateLoad(intrinsics.mem_ptr_type, mem_ref);
+  return remill::NthArgument(func, remill::kMemoryPointerArgNum);
+}
+
+// ---------------------------------------------------------------------------
 // Terminator emission
 // ---------------------------------------------------------------------------
 
@@ -390,9 +400,9 @@ void BlockLifter::Impl::EmitMusttailToBlock(llvm::BasicBlock *from_bb,
                                             uint64_t target_pc) {
   auto *func = from_bb->getParent();
   auto *state_ptr = remill::NthArgument(func, remill::kStatePointerArgNum);
-  auto *mem_ptr = remill::NthArgument(func, remill::kMemoryPointerArgNum);
 
   llvm::IRBuilder<> ir(from_bb);
+  auto *mem_ptr = LoadCurrentMemoryToken(ir, func, *intrinsics);
   auto *pc_val = llvm::ConstantInt::get(word_type, target_pc);
   auto *call = ir.CreateCall(target_fn->getFunctionType(), target_fn,
                              {state_ptr, pc_val, mem_ptr});
@@ -405,9 +415,9 @@ llvm::CallInst *BlockLifter::Impl::EmitMusttailToMissingBlock(
     const LiftTargetDecision *decision) {
   auto *func = from_bb->getParent();
   auto *state_ptr = remill::NthArgument(func, remill::kStatePointerArgNum);
-  auto *mem_ptr = remill::NthArgument(func, remill::kMemoryPointerArgNum);
 
   llvm::IRBuilder<> ir(from_bb);
+  auto *mem_ptr = LoadCurrentMemoryToken(ir, func, *intrinsics);
   auto *pc_val = llvm::ConstantInt::get(word_type, target_pc);
   auto *call = ir.CreateCall(intrinsics->missing_block->getFunctionType(),
                              intrinsics->missing_block,
@@ -435,7 +445,6 @@ static void annotateLiftTargetDecisionMetadata(llvm::CallInst &call,
 void BlockLifter::Impl::EmitDispatchJump(llvm::BasicBlock *bb) {
   auto *func = bb->getParent();
   auto *state_ptr = remill::NthArgument(func, remill::kStatePointerArgNum);
-  auto *mem_ptr = remill::NthArgument(func, remill::kMemoryPointerArgNum);
 
   // Load the computed target PC from NEXT_PC (set by instruction semantics).
   auto *next_pc = remill::LoadNextProgramCounter(bb, *intrinsics);
@@ -447,6 +456,7 @@ void BlockLifter::Impl::EmitDispatchJump(llvm::BasicBlock *bb) {
       lifted_fn_ty);
 
   llvm::IRBuilder<> ir(bb);
+  auto *mem_ptr = LoadCurrentMemoryToken(ir, func, *intrinsics);
   auto *result = ir.CreateCall(dispatch, {state_ptr, next_pc, mem_ptr});
   ir.CreateRet(result);
 }
@@ -458,7 +468,6 @@ void BlockLifter::Impl::EmitDispatchCallAndFallthrough(
     llvm::SmallVectorImpl<uint64_t> &targets) {
   auto *func = bb->getParent();
   auto *state_ptr = remill::NthArgument(func, remill::kStatePointerArgNum);
-  auto *mem_ptr = remill::NthArgument(func, remill::kMemoryPointerArgNum);
 
   // Load the target PC for the call.
   auto *call_pc = remill::LoadNextProgramCounter(bb, *intrinsics);
@@ -470,6 +479,7 @@ void BlockLifter::Impl::EmitDispatchCallAndFallthrough(
       lifted_fn_ty);
 
   llvm::IRBuilder<> ir(bb);
+  auto *mem_ptr = LoadCurrentMemoryToken(ir, func, *intrinsics);
   auto *call_result = ir.CreateCall(dispatch, {state_ptr, call_pc, mem_ptr});
 
   // The call returns Memory*.  Now musttail to the fall-through block.
@@ -549,9 +559,8 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
   arch->InitializeEmptyLiftedFunction(func);
 
   // Mark the function as a BlockLifter output so MergeBlockFunctionsPass
-  // (and IterativeBlockDiscoveryPass) can safely distinguish BlockLifter
-  // entries (both `sub_<pc>` and `blk_<pc>`) from TraceLifter-produced
-  // `sub_<pc>` functions that may live in the same module.
+  // can safely distinguish block-lifter entries (both `sub_<pc>` and
+  // `blk_<pc>`) from TraceLifter-produced `sub_<pc>` functions.
   func->addFnAttr("omill.block_lifter");
 
   auto *state_ptr = remill::NthArgument(func, remill::kStatePointerArgNum);
@@ -796,72 +805,77 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
           MarkFunctionEntryAndUpgradeName(entry_pc);
         }
 
-        // VMProtect-style virtual-return-address thunks appear as the
-        // direct call target of native CALL instructions.  Both the
-        // 10-byte `push imm32; jmp rel32` form and the 15-byte
-        // `push imm32; lea rsp,[rsp+disp8]; jmp rel32` form are
-        // recognized; the latter is the "push retaddr + adjust RSP"
-        // pattern that leaves the controlled return slot below the
-        // caller-visible stack.  Model the stack effect inline here so
-        // no `omill_native_boundary_<thunk_pc>` placeholder ever needs
-        // to exist: write imm32 to the (pre-adjustment) top-of-stack,
-        // apply the net RSP delta, stash RETURN_PC into NEXT_PC, then
-        // musttail to the caller's fallthrough as if the call returned
-        // immediately.  The pushed imm32 stays on the simulated stack
-        // and will be consumed by a later lifted `ret`.
-        {
-          int32_t thunk_imm = 0;
-          int32_t thunk_lea_disp = 0;
-          uint64_t thunk_jump_target_pc = 0;
-          if (IsVmProtectPushImmThunk(manager, call_target, &thunk_imm,
-                                      &thunk_lea_disp,
-                                      &thunk_jump_target_pc)) {
-            auto [rsp_addr, rsp_type] =
-                arch->DefaultLifter(*intrinsics)
-                    ->LoadRegAddress(current_block, state_ptr, "RSP");
+        // Generic call-target bridge path.  StaticLiftBuilder (or the
+        // in-process fallback analyzer) probe-decodes the target's
+        // prologue; if it turns out to be a deterministic stack-effect
+        // thunk (VMProtect-style return-address manipulation and
+        // similar), we replay the stack writes inline at the call site
+        // so no `omill_native_boundary_<thunk_pc>` placeholder ever
+        // needs to exist.  Any written constants stay on the simulated
+        // stack and will be consumed by a later lifted `ret`; the
+        // caller then resumes at its own fallthrough as if the call had
+        // returned immediately.
+        if (auto bridge = LookupBridgeEffect(current_pc, call_target);
+            bridge && bridge->terminator ==
+                          CallTargetBridgeEffect::Terminator::kJmpConst) {
+          auto [rsp_addr, rsp_type] =
+              arch->DefaultLifter(*intrinsics)
+                  ->LoadRegAddress(current_block, state_ptr, "RSP");
 
-            llvm::IRBuilder<> ir(current_block);
-            auto *rsp_val =
-                ir.CreateLoad(word_type, rsp_addr, "rsp.cur");
-            auto *push_slot_rsp = ir.CreateSub(
-                rsp_val, llvm::ConstantInt::get(word_type, 8),
-                "rsp.pushed");
-            auto *stack_slot = ir.CreateIntToPtr(
-                push_slot_rsp, llvm::PointerType::getUnqual(context),
-                "rsp.slot");
-            auto *pushed_val = llvm::ConstantInt::get(
-                word_type,
-                static_cast<uint64_t>(static_cast<int64_t>(thunk_imm)),
+          llvm::IRBuilder<> ir(current_block);
+          auto *entry_rsp =
+              ir.CreateLoad(word_type, rsp_addr, "rsp.entry");
+
+          for (const auto &write : bridge->stack_writes) {
+            auto *offset_val = llvm::ConstantInt::get(
+                word_type, static_cast<uint64_t>(write.rsp_offset),
                 /*isSigned=*/true);
-            ir.CreateStore(pushed_val, stack_slot);
-
-            // Net RSP delta is (-8) from the push plus the lea's
-            // displacement.  For the 10-byte variant lea_disp is 0.
-            const int64_t net_rsp_delta =
-                static_cast<int64_t>(thunk_lea_disp) - 8;
-            auto *new_rsp = ir.CreateAdd(
-                rsp_val,
-                llvm::ConstantInt::get(
-                    word_type, static_cast<uint64_t>(net_rsp_delta),
-                    /*isSigned=*/true),
-                "rsp.new");
-            ir.CreateStore(new_rsp, rsp_addr);
-
-            // Mirror the normal direct-call semantics for the
-            // fallthrough: move RETURN_PC into NEXT_PC so the caller
-            // resumes at the instruction following the original CALL.
-            auto *ret_pc_ref =
-                remill::LoadReturnProgramCounterRef(current_block);
-            auto *next_pc_ref =
-                remill::LoadNextProgramCounterRef(current_block);
-            ir.CreateStore(ir.CreateLoad(word_type, ret_pc_ref),
-                           next_pc_ref);
-
-            (void)thunk_jump_target_pc;
-            EmitDecisionEdge(current_block, fallthrough,
-                             fallthrough_target, discovered_targets);
-            goto done;
+            auto *slot_rsp = ir.CreateAdd(entry_rsp, offset_val,
+                                           "rsp.bridge.slot");
+            auto *slot_ptr = ir.CreateIntToPtr(
+                slot_rsp, llvm::PointerType::getUnqual(context),
+                "rsp.bridge.ptr");
+            llvm::Type *store_ty = nullptr;
+            switch (write.size_bytes) {
+              case 1:
+                store_ty = llvm::Type::getInt8Ty(context);
+                break;
+              case 2:
+                store_ty = llvm::Type::getInt16Ty(context);
+                break;
+              case 4:
+                store_ty = llvm::Type::getInt32Ty(context);
+                break;
+              case 8:
+              default:
+                store_ty = word_type;
+                break;
+            }
+            auto *stored = llvm::ConstantInt::get(
+                store_ty, write.value, /*isSigned=*/false);
+            ir.CreateStore(stored, slot_ptr);
           }
+
+          auto *new_rsp = ir.CreateAdd(
+              entry_rsp,
+              llvm::ConstantInt::get(
+                  word_type, static_cast<uint64_t>(bridge->net_rsp_delta),
+                  /*isSigned=*/true),
+              "rsp.bridge.new");
+          ir.CreateStore(new_rsp, rsp_addr);
+
+          // Mirror the normal direct-call semantics for the fallthrough:
+          // move RETURN_PC into NEXT_PC so the caller resumes at the
+          // instruction following the original CALL.
+          auto *ret_pc_ref =
+              remill::LoadReturnProgramCounterRef(current_block);
+          auto *next_pc_ref =
+              remill::LoadNextProgramCounterRef(current_block);
+          ir.CreateStore(ir.CreateLoad(word_type, ret_pc_ref), next_pc_ref);
+
+          EmitDecisionEdge(current_block, fallthrough, fallthrough_target,
+                           discovered_targets);
+          goto done;
         }
 
         // Emit: dispatch_call(state, call_target_pc, mem)
@@ -876,7 +890,8 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
           // LiftReachable's BFS lifts the callee's full reachable
           // scope — not just its entry block.  Without this, deep
           // call targets (e.g. VM exit handlers) end up partially
-          // lifted with missing successor blocks.
+          // lifted with missing successor blocks, which later passes
+          // collapse to `body: unreachable`.
           if (call_pc != 0)
             discovered_targets.push_back(call_pc);
 
@@ -888,9 +903,9 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
               lifted_fn_ty);
 
           auto *sp = remill::NthArgument(func, remill::kStatePointerArgNum);
-          auto *mp = remill::NthArgument(func, remill::kMemoryPointerArgNum);
 
           llvm::IRBuilder<> ir(current_block);
+          auto *mp = LoadCurrentMemoryToken(ir, func, *intrinsics);
           auto *call_result = ir.CreateCall(dispatch, {sp, pc_val, mp});
 
           // Store RETURN_PC into NEXT_PC for the fall-through.
@@ -923,9 +938,9 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
             lifted_fn_ty);
 
         auto *sp = remill::NthArgument(func, remill::kStatePointerArgNum);
-        auto *mp = remill::NthArgument(func, remill::kMemoryPointerArgNum);
 
         llvm::IRBuilder<> ir(current_block);
+        auto *mp = LoadCurrentMemoryToken(ir, func, *intrinsics);
         auto *call_result = ir.CreateCall(dispatch, {sp, call_pc, mp});
 
         // Store RETURN_PC into NEXT_PC for the fall-through.
@@ -1038,9 +1053,9 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
               lifted_fn_ty);
 
           auto *sp = remill::NthArgument(func, remill::kStatePointerArgNum);
-          auto *mp = remill::NthArgument(func, remill::kMemoryPointerArgNum);
 
           llvm::IRBuilder<> ir(do_call_bb);
+          auto *mp = LoadCurrentMemoryToken(ir, func, *intrinsics);
           auto *call_result = ir.CreateCall(dispatch, {sp, pc_val, mp});
 
           auto *ret_pc_ref =
@@ -1099,9 +1114,9 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
               lifted_fn_ty);
 
           auto *sp = remill::NthArgument(func, remill::kStatePointerArgNum);
-          auto *mp = remill::NthArgument(func, remill::kMemoryPointerArgNum);
 
           llvm::IRBuilder<> ir(do_call_bb);
+          auto *mp = LoadCurrentMemoryToken(ir, func, *intrinsics);
           auto *call_result = ir.CreateCall(dispatch, {sp, call_pc, mp});
 
           auto *ret_pc_ref =
