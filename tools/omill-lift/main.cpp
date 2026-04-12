@@ -2258,6 +2258,10 @@ class BufferBlockManager : public omill::BlockManager {
 
   llvm::Module *GetLiftedBlockModule() override { return module_; }
 
+  const omill::BinaryMemoryMap *GetBinaryMemoryMap() const override {
+    return memory_map_;
+  }
+
 private:
   omill::LiftTargetPolicy *getLiftTargetPolicy() {
     if (!lift_target_policy_ ||
@@ -5842,6 +5846,7 @@ int main(int argc, char **argv) {
   opts.target_arch = target_arch;
   opts.target_os = target_os_str;
   opts.recover_abi = false;
+  opts.no_abi_mode = NoABI;
   opts.deobfuscate = Deobfuscate;
   opts.resolve_indirect_targets = ResolveTargets;
   opts.max_resolution_iterations = MaxIterations;
@@ -5856,6 +5861,12 @@ int main(int argc, char **argv) {
       env_verify_generic_static_devirtualize;
   devirtualization_orchestrator.applyDriverCompatPlan(
       devirtualization_compat_plan, opts);
+  // Restore CLI-driven flags that applyDriverCompatPlan may have
+  // overwritten with the compat plan's values.
+  if (NoABI)
+    opts.no_abi_mode = true;
+  if (GenericStaticDevirtualize)
+    opts.generic_static_devirtualize = true;
   if (devirtualization_plan.enable_devirtualization)
     opts.session_graph = &devirtualization_orchestrator.session().graph;
   if (devirtualization_compat_plan.suppress_legacy_vm_mode) {
@@ -5905,8 +5916,12 @@ int main(int argc, char **argv) {
   const bool auto_skip_always_inline_for_internal_root =
       devirtualization_compat_plan.auto_skip_always_inline;
   std::unique_ptr<ScopedEnvOverride> auto_skip_always_inline_guard;
-  if (auto_skip_always_inline_for_internal_root ||
-      stable_no_gsd_export_root_fallback) {
+  // Don't suppress the always-inliner when block-lifting is active —
+  // the block lifter emits one function per basic block, and those
+  // must be inlined into the output root to produce coherent IR.
+  if ((auto_skip_always_inline_for_internal_root ||
+       stable_no_gsd_export_root_fallback) &&
+      !use_block_lift_mode) {
     auto_skip_always_inline_guard =
         std::make_unique<ScopedEnvOverride>("OMILL_SKIP_ALWAYS_INLINE", "1");
     errs() << "Always-inliner suppressed after selecting a stable non-GSD "
@@ -18676,6 +18691,24 @@ native_boundary_repair_done:;
     MAM.invalidate(*module, llvm::PreservedAnalyses::none());
   if (eraseUnusedModeledPlaceholderDeclarationsInCurrentModule())
     MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+  // Final dead-function sweep: rewrite any remaining `body: unreachable`
+  // shells (which would compile to orphaned `ud2` stubs) into no-op
+  // pass-throughs that return their memory argument.  Preserves the
+  // call graph shape — callers continue to thread the memory token
+  // through without observing a trap.  The rewritten stubs are tagged
+  // `alwaysinline`, so a follow-up AlwaysInliner + GlobalDCE folds
+  // each of them directly into every remaining caller.
+  if (unsigned rewritten = omill::eliminateBodyUnreachableFunctions(*module);
+      rewritten > 0) {
+    MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+    if (std::getenv("OMILL_DEBUG_DEAD_PROPAGATE") != nullptr)
+      errs() << "[dead-propagate:final] rewrote " << rewritten
+             << " body:unreachable functions to ret memory\n";
+    ModulePassManager CleanupMPM;
+    CleanupMPM.addPass(llvm::AlwaysInlinerPass());
+    CleanupMPM.addPass(llvm::GlobalDCEPass());
+    CleanupMPM.run(*module, MAM);
+  }
   std::error_code EC;
   events.emitInfo("output_write_started", "writing final output",
                   {{"path", OutputFilename}});
