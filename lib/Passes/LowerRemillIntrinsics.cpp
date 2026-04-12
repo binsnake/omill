@@ -1646,7 +1646,12 @@ bool lowerResolvedDispatchCalls(llvm::Function &F) {
 
     buildStateStore(Builder, state_ptr, kRAXOffset, result);
 
-    call->replaceAllUsesWith(llvm::PoisonValue::get(call->getType()));
+    // The dispatch_call returned the memory token (ptr).  After
+    // rewriting to a native Win64 ABI call (which returns i64 in
+    // RAX), the memory token is unchanged — thread the incoming
+    // memory argument through so downstream blocks don't receive
+    // poison and collapse to `body: unreachable`.
+    call->replaceAllUsesWith(call->getArgOperand(2));
     call->eraseFromParent();
   }
   return true;
