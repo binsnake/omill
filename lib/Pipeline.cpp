@@ -9699,6 +9699,57 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
           RewriteConstantMissingBlockCallsPass(/*only_when_noabi_mode=*/true));
       addRecoveryAwareGlobalDCE(MPM, opts, RecoveryPipelinePhase::kResolve);
       MPM.addPass(MarkReachableClosedRootSliceFunctionsPass{});
+
+      // Late block-inlining: BlockLifter emits one function per basic
+      // block (`blk_<pc>`) plus `sub_<pc>` for direct call targets.
+      // After every normalization, resolution, and cleanup pass has
+      // operated on that per-block representation, tag the non-entry
+      // `blk_<pc>` bodies as `alwaysinline` and run the always-inliner
+      // so the chain collapses into its enclosing `sub_<pc>` entries.
+      // Only functions carrying the `omill.block_lifter` attribute are
+      // touched — TraceLifter-produced `sub_<pc>` are untouched.
+      if (!envDisabled("OMILL_SKIP_LATE_BLOCK_INLINE")) {
+        struct MarkBlockLifterBlocksAlwaysInlinePass
+            : llvm::PassInfoMixin<MarkBlockLifterBlocksAlwaysInlinePass> {
+          llvm::PreservedAnalyses run(llvm::Module &M,
+                                       llvm::ModuleAnalysisManager &) {
+            bool changed = false;
+            unsigned tagged = 0;
+            for (auto &F : M) {
+              if (F.isDeclaration())
+                continue;
+              if (!F.hasFnAttribute("omill.block_lifter"))
+                continue;
+              if (!F.getName().starts_with("blk_"))
+                continue;
+              if (F.hasFnAttribute(llvm::Attribute::NoInline))
+                F.removeFnAttr(llvm::Attribute::NoInline);
+              if (F.hasFnAttribute(llvm::Attribute::OptimizeNone))
+                F.removeFnAttr(llvm::Attribute::OptimizeNone);
+              if (!F.hasFnAttribute(llvm::Attribute::AlwaysInline)) {
+                F.addFnAttr(llvm::Attribute::AlwaysInline);
+                changed = true;
+                ++tagged;
+              }
+              if (!F.hasLocalLinkage()) {
+                F.setLinkage(llvm::GlobalValue::InternalLinkage);
+                changed = true;
+              }
+            }
+            if (std::getenv("OMILL_DEBUG_LATE_BLOCK_INLINE") != nullptr)
+              llvm::errs() << "[late-block-inline] tagged " << tagged
+                           << " blk_<pc> functions alwaysinline\n";
+            return changed ? llvm::PreservedAnalyses::none()
+                           : llvm::PreservedAnalyses::all();
+          }
+          static bool isRequired() { return true; }
+        };
+        MPM.addPass(MarkBlockLifterBlocksAlwaysInlinePass{});
+        if (alwaysInlinerEnabled())
+          MPM.addPass(llvm::AlwaysInlinerPass());
+        MPM.addPass(llvm::GlobalDCEPass());
+      }
+
       addClosedSliceShapeProbe(MPM, "phase3.97");
     }
 
