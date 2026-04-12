@@ -9704,15 +9704,16 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
       // Late block-inlining: BlockLifter emits one function per basic
       // block (`blk_<pc>`) plus `sub_<pc>` for direct call targets.
       // After every normalization, resolution, and cleanup pass has
-      // operated on that per-block representation, tag every
-      // `blk_<pc>` body as `alwaysinline` and run the always-inliner
-      // so the entire musttail chain collapses into its enclosing
-      // `sub_<pc>` entries.  Cyclic back-edges that can't be inlined
-      // further (self-recursive musttail after the SCC collapses)
-      // are converted into natural loops by a TailCallElim sweep
-      // afterwards.  Only functions carrying the `omill.block_lifter`
-      // attribute are touched — TraceLifter-produced `sub_<pc>` are
-      // untouched.
+      // operated on that per-block representation, tag *every*
+      // BlockLifter output (both `blk_<pc>` and non-root `sub_<pc>`)
+      // as `alwaysinline` and run the always-inliner so the full
+      // call graph collapses into the single `omill.output_root`
+      // entry.  Cyclic back-edges that survive inlining (self-
+      // recursive musttail after SCC collapse) are converted into
+      // natural loops by a TailCallElim sweep afterwards.  Only
+      // functions carrying the `omill.block_lifter` attribute are
+      // touched — TraceLifter-produced `sub_<pc>` and the output
+      // root itself stay where they are.
       if (!envDisabled("OMILL_SKIP_LATE_BLOCK_INLINE")) {
         struct MarkBlockLifterBlocksAlwaysInlinePass
             : llvm::PassInfoMixin<MarkBlockLifterBlocksAlwaysInlinePass> {
@@ -9721,13 +9722,19 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
               return false;
             if (!F.hasFnAttribute("omill.block_lifter"))
               return false;
-            return F.getName().starts_with("blk_");
+            // Protect the output root — it is the function we are
+            // inlining *into*, not one we want to collapse away.
+            if (F.hasFnAttribute("omill.output_root"))
+              return false;
+            auto name = F.getName();
+            return name.starts_with("blk_") || name.starts_with("sub_");
           }
 
           llvm::PreservedAnalyses run(llvm::Module &M,
                                        llvm::ModuleAnalysisManager &) {
             bool changed = false;
-            unsigned tagged = 0;
+            unsigned tagged_blk = 0;
+            unsigned tagged_sub = 0;
             for (auto &F : M) {
               if (!isBlockLifterBlock(F))
                 continue;
@@ -9738,7 +9745,10 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
               if (!F.hasFnAttribute(llvm::Attribute::AlwaysInline)) {
                 F.addFnAttr(llvm::Attribute::AlwaysInline);
                 changed = true;
-                ++tagged;
+                if (F.getName().starts_with("blk_"))
+                  ++tagged_blk;
+                else
+                  ++tagged_sub;
               }
               if (!F.hasLocalLinkage()) {
                 F.setLinkage(llvm::GlobalValue::InternalLinkage);
@@ -9746,8 +9756,10 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
               }
             }
             if (std::getenv("OMILL_DEBUG_LATE_BLOCK_INLINE") != nullptr)
-              llvm::errs() << "[late-block-inline] tagged " << tagged
-                           << " blk_<pc> alwaysinline (force)\n";
+              llvm::errs() << "[late-block-inline] tagged "
+                           << tagged_blk << " blk_<pc> + "
+                           << tagged_sub << " sub_<pc> alwaysinline "
+                           << "(force, protect output_root)\n";
             return changed ? llvm::PreservedAnalyses::none()
                            : llvm::PreservedAnalyses::all();
           }
@@ -9756,11 +9768,11 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
         MPM.addPass(MarkBlockLifterBlocksAlwaysInlinePass{});
         if (alwaysInlinerEnabled())
           MPM.addPass(llvm::AlwaysInlinerPass());
-        // After forcing every acyclic blk_<pc> chain into its
-        // enclosing sub_<pc>, any SCC that could not be inlined
-        // further collapses into a self-recursive musttail — convert
-        // those into natural loops so the final IR has no
-        // infinite-tail-recursion patterns left.
+        // After forcing every acyclic blk_<pc> + sub_<pc> chain into
+        // the output root, any SCC that could not be inlined further
+        // collapses into a self-recursive musttail — convert those
+        // into natural loops so the final IR has no infinite-tail-
+        // recursion patterns left.
         {
           llvm::FunctionPassManager FPM;
           FPM.addPass(llvm::TailCallElimPass());
@@ -11375,12 +11387,29 @@ unsigned eliminateBodyUnreachableFunctions(llvm::Module &M) {
       continue;
     if (!hasLiftedRemillSignature(F))
       continue;
+    // `deleteBody()` strips every attribute on the function and its
+    // arguments, so remember the caller-observable ones we care about
+    // before we rebuild the body.
     F.deleteBody();
     auto *entry = llvm::BasicBlock::Create(Ctx, "body", &F);
     llvm::IRBuilder<> Builder(entry);
     Builder.CreateRet(F.getArg(2));
     if (F.hasFnAttribute(llvm::Attribute::NoReturn))
       F.removeFnAttr(llvm::Attribute::NoReturn);
+    if (F.hasFnAttribute(llvm::Attribute::NoInline))
+      F.removeFnAttr(llvm::Attribute::NoInline);
+    if (F.hasFnAttribute(llvm::Attribute::OptimizeNone))
+      F.removeFnAttr(llvm::Attribute::OptimizeNone);
+    // Tag the now-trivial stub as alwaysinline so a subsequent
+    // AlwaysInlinerPass can fold it directly into every caller.
+    // Output roots stay external and retain their body so callers
+    // from outside the module can still target them.
+    if (!F.hasFnAttribute("omill.output_root")) {
+      if (!F.hasFnAttribute(llvm::Attribute::AlwaysInline))
+        F.addFnAttr(llvm::Attribute::AlwaysInline);
+      if (!F.hasLocalLinkage())
+        F.setLinkage(llvm::GlobalValue::InternalLinkage);
+    }
     ++rewritten;
   }
 
