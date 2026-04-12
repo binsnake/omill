@@ -446,8 +446,12 @@ void BlockLifter::Impl::EmitDispatchJump(llvm::BasicBlock *bb) {
   auto *func = bb->getParent();
   auto *state_ptr = remill::NthArgument(func, remill::kStatePointerArgNum);
 
-  // Load the computed target PC from NEXT_PC (set by instruction semantics).
-  auto *next_pc = remill::LoadNextProgramCounter(bb, *intrinsics);
+  // Load the target PC.  For indirect jumps, the JMP semantic template
+  // writes the target to REG_PC (State+2472) inside an opaque call.
+  // Create a fresh load from State.PC at the current insertion point
+  // (after the semantic call) — GVN will forward the template's store
+  // to this load after the template is inlined by AlwaysInlinerPass.
+  auto *next_pc = remill::LoadProgramCounter(bb, *intrinsics);
 
   // Get or create the configured unresolved jump dispatcher.
   auto *lifted_fn_ty = func->getFunctionType();
@@ -714,7 +718,19 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
 
       case remill::Instruction::kCategoryIndirectJump: {
         try_add_delay_slot(true, current_block);
-        EmitDispatchJump(current_block);
+        // The JMP semantic was already lifted (line 638).  It calls
+        // __remill_jump(state, target, memory) internally, which
+        // sets PC = target.  Don't call EmitDispatchJump — the
+        // template call is opaque and PC/NEXT_PC hold stale values.
+        // Instead, terminate with the __remill_jump that the
+        // semantic template emits (visible after AlwaysInliner).
+        // Phase 3 LowerRemillIntrinsics will convert it to
+        // dispatch_jump with the correct target.
+        {
+          llvm::IRBuilder<> ir(current_block);
+          auto *mem = LoadCurrentMemoryToken(ir, func, *intrinsics);
+          ir.CreateRet(mem);
+        }
 
         llvm::SmallVector<uint64_t, 8> projected_targets;
         if (PopulateProjectedTargets(addr, projected_targets) &&

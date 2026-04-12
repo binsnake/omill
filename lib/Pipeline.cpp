@@ -4103,10 +4103,17 @@ struct SanitizeModeledBoundaryPoisonMemoryArgsPass
         for (auto &I : BB) {
           auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
           auto *callee = CB ? CB->getCalledFunction() : nullptr;
-          if (!callee || CB->arg_size() < 3 ||
-              !isModeledStructuralBoundaryTarget(*callee)) {
+          if (!callee || CB->arg_size() < 3)
             continue;
-          }
+          // Sanitize memory args for both boundary targets and
+          // remill intrinsics that carry memory tokens.
+          auto cname = callee->getName();
+          bool is_target = isModeledStructuralBoundaryTarget(*callee) ||
+                           cname.starts_with("__remill_") ||
+                           cname.starts_with("__omill_dispatch") ||
+                           isLiftedPipelineFunction(*callee);
+          if (!is_target)
+            continue;
 
           auto *old_memory_arg = CB->getArgOperand(2);
           if (!llvm::isa<llvm::PoisonValue>(old_memory_arg) &&
@@ -9712,6 +9719,10 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
       {
         llvm::FunctionPassManager FPM;
         // Pass 1: get state into SSA form and do the first cleanup round.
+        // SimplifyCFG first to remove unreachable blocks created by
+        // inlining — prevents their poison PHI contributions from
+        // infecting branch conditions in InstCombine.
+        FPM.addPass(llvm::SimplifyCFGPass());
         FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
         FPM.addPass(llvm::EarlyCSEPass(/*UseMemorySSA=*/true));
         FPM.addPass(llvm::InstCombinePass());
@@ -10343,8 +10354,13 @@ static void buildFinalCleanupPipeline(llvm::ModulePassManager &MPM,
   // produces clean scalar variables for register values.
   if (opts.no_abi_mode && opts.use_block_lifting) {
     llvm::FunctionPassManager FPM;
+    // Fold program_counter to its VA constant first — enables
+    // ConstantMemoryFolding to resolve VM bytecode reads and
+    // State promotion to produce meaningful SSA names.
+    FPM.addPass(FoldProgramCounterPass());
     FPM.addPass(OptimizeStatePass(OptimizePhases::Promote));
     FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+    FPM.addPass(CombinedFixedPointDevirtPass());
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(llvm::GVNPass());
     FPM.addPass(llvm::DSEPass());

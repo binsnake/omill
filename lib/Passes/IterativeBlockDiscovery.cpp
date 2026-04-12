@@ -9,6 +9,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar/ADCE.h>
+#include <llvm/Transforms/Scalar/GVN.h>
 #include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
 
@@ -16,6 +17,9 @@
 #include "omill/Analysis/IterativeLiftingSession.h"
 #include "omill/Passes/ConstantMemoryFolding.h"
 #include "omill/Passes/CombinedFixedPointDevirt.h"
+#include "omill/Passes/FoldProgramCounter.h"
+#include "omill/Passes/RecoverStackFrame.h"
+#include "omill/Passes/InterProceduralConstProp.h"
 #include "omill/BC/BlockLifterAnalysis.h"
 #include "omill/Utils/LiftedNames.h"
 
@@ -402,7 +406,7 @@ void runDiscoveryFPM(llvm::Module &M, llvm::ModuleAnalysisManager &MAM,
       MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M).getManager();
   llvm::SmallVector<llvm::Function *, 32> worklist;
   for (auto &F : M) {
-    if (!isDiscoveryFunction(F))
+    if (!isDiscoveryFunction(F) && !F.hasFnAttribute("omill.output_root"))
       continue;
     worklist.push_back(&F);
   }
@@ -448,14 +452,23 @@ llvm::PreservedAnalyses IterativeBlockDiscoveryPass::run(
 
   bool ever_changed = false;
   unsigned iteration = 0;
+  // Static: persists across multiple invocations of the pass within the
+  // same pipeline.  IterativeBlockDiscoveryPass runs twice (before and
+  // after MergeBlockFunctions), and derived constants from the first
+  // invocation must be available in the second.
+  static DerivedStateConstants ipcp_derived;
 
   do {
     auto dirty_before = session ? session->graph().dirtyNodes().size() : 0u;
+
     // Step 1: Run lightweight optimization on all block-functions.
     {
       llvm::FunctionPassManager FPM;
+      FPM.addPass(FoldProgramCounterPass());
       FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
       FPM.addPass(CombinedFixedPointDevirtPass());
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::GVNPass());
       FPM.addPass(llvm::ADCEPass());
       FPM.addPass(RewriteNonExecMissingBlockFPM());
       FPM.addPass(llvm::SimplifyCFGPass());
@@ -474,6 +487,55 @@ llvm::PreservedAnalyses IterativeBlockDiscoveryPass::run(
             session->noteLiftedTarget(pc);
           ever_changed = true;
         }
+      }
+      // Note: do NOT run FPM on newly-lifted blocks here — the State
+      // constant propagation in Step 2.5 needs raw loads from State
+      // GEPs to be present for replacement.  The optimization happens
+      // inside cloneWithStateConstants (inline + GVN).
+    }
+
+    // Step 2.5: Propagate constant State field values into dispatch_call
+    // targets in a fixed-point loop.  Derived constants (pass-through
+    // and MOVI) persist across rounds.  Between rounds, lift any
+    // musttail targets that are still declarations.
+    {
+      for (unsigned ipcp_round = 0; ipcp_round < 8; ++ipcp_round) {
+        bool ipcp_changed = propagateStateConstantsThroughDispatches(
+            M, M.getDataLayout(), &MAM, &ipcp_derived);
+        // Lift musttail target declarations so the next round can
+        // process them.
+        bool lifted_mt = false;
+        if (lift_block) {
+          llvm::SmallVector<uint64_t, 4> mt_pcs;
+          for (auto &F : M) {
+            if (F.isDeclaration()) continue;
+            for (auto &BB : F) {
+              auto *term = BB.getTerminator();
+              if (!llvm::isa<llvm::ReturnInst>(term)) continue;
+              if (auto *prev = term->getPrevNode()) {
+                if (auto *mci = llvm::dyn_cast<llvm::CallInst>(prev)) {
+                  if (!mci->isMustTailCall() && !mci->isTailCall())
+                    continue;
+                  auto *fn = mci->getCalledFunction();
+                  if (fn && fn->isDeclaration()) {
+                    uint64_t pc = extractBlockPC(fn->getName());
+                    if (pc == 0) pc = extractEntryVA(fn->getName());
+                    if (pc != 0) mt_pcs.push_back(pc);
+                  }
+                }
+              }
+            }
+          }
+          for (uint64_t pc : mt_pcs) {
+            if (lift_block(pc)) {
+              if (session) session->noteLiftedTarget(pc);
+              ever_changed = true;
+              lifted_mt = true;
+            }
+          }
+        }
+        if (!ipcp_changed && !lifted_mt) break;
+        if (ipcp_changed) ever_changed = true;
       }
     }
 

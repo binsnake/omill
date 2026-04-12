@@ -329,7 +329,8 @@ static bool promoteStateToSSA(llvm::Function &F, const llvm::DataLayout &DL) {
   // around these calls can over-constrain NEXT_PC/state flow and collapse
   // traces to incorrect self-loops.
   if (F.getName().starts_with("sub_") && hasRemillControlTransfer(F) &&
-      !F.hasFnAttribute("omill.vm_handler"))
+      !F.hasFnAttribute("omill.vm_handler") &&
+      !F.hasFnAttribute("omill.output_root"))
     return false;
 
   struct FieldInfo {

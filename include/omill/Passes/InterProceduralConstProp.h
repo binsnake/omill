@@ -1,5 +1,9 @@
 #pragma once
 
+#include <llvm/ADT/DenseMap.h>
+#include <llvm/IR/Constants.h>
+#include <map>
+#include <llvm/IR/DataLayout.h>
 #include <llvm/IR/PassManager.h>
 
 namespace omill {
@@ -23,5 +27,19 @@ class InterProceduralConstPropPass
 
   static llvm::StringRef name() { return "InterProceduralConstPropPass"; }
 };
+
+/// Propagate constant State field values from callers into dispatch_call
+/// targets by cloning shared callees.  For each dispatch_call site with
+/// a constant PC target, collects constant stores to State fields in the
+/// same BB before the call, clones the resolved callee with those constants
+/// folded into entry-block loads, and rewrites the dispatch_call to a
+/// direct call to the clone.  Returns true if any changes were made.
+/// Persistent map of derived constants that survives across rounds.
+using DerivedStateConstants = std::map<unsigned, llvm::ConstantInt *>;
+
+bool propagateStateConstantsThroughDispatches(
+    llvm::Module &M, const llvm::DataLayout &DL,
+    llvm::ModuleAnalysisManager *MAM = nullptr,
+    DerivedStateConstants *persistent_derived = nullptr);
 
 }  // namespace omill

@@ -106,13 +106,15 @@ llvm::PreservedAnalyses FoldProgramCounterPass::run(
     return llvm::PreservedAnalyses::all();
 
   auto *constant = llvm::ConstantInt::get(pc_arg->getType(), entry_va);
-  bool changed = false;
-  for (llvm::Use &U : llvm::make_early_inc_range(pc_arg->uses())) {
-    if (!isSafePCUse(U))
-      continue;
-    U.set(constant);
-    changed = true;
-  }
+  // Replace ALL uses unconditionally.  The VA is derived from the
+  // function name — it IS the correct program_counter value.
+  // The previous isSafePCUse guard was too conservative: it rejected
+  // uses in store-data position (e.g., LEA RCX, [RIP+const] → store
+  // to State+2248), preventing VM bytecode address folding.
+  bool has_uses = !pc_arg->use_empty();
+  if (has_uses)
+    pc_arg->replaceAllUsesWith(constant);
+  bool changed = has_uses;
 
   return changed ? llvm::PreservedAnalyses::none()
                  : llvm::PreservedAnalyses::all();
