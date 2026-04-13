@@ -69,6 +69,7 @@ enum class ContinuationImportDisposition {
 enum class ChildImportClass {
   kTrustedTerminalEntry,
   kClosedSliceRoot,
+  kBoundedContinuationSlice,
   kBoundaryModeledChild,
   kRuntimeLeakingChild,
   kTerminalOnlyUnknown,

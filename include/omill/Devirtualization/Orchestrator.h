@@ -27,7 +27,7 @@ class Function;
 
 namespace omill {
 
-class BlockLifter;
+class RemillProjectionLifter;
 
 enum class DevirtualizationOutputMode {
   kABI,
@@ -204,6 +204,21 @@ struct ExitEvidence {
   std::string invalidation_reason;
 };
 
+struct SolverStateValueFact {
+  std::string name;
+  unsigned bit_width = 0;
+  std::vector<uint64_t> values;
+};
+
+struct SolverEdgeMetadata {
+  std::vector<uint64_t> possible_target_pcs;
+  std::optional<bool> branch_taken;
+  std::vector<SolverStateValueFact> state_values;
+  std::optional<uint64_t> handler_va;
+  std::optional<uint64_t> incoming_hash;
+  std::optional<std::string> overlay_key;
+};
+
 struct UnresolvedExitSite {
   UnresolvedExitKind kind = UnresolvedExitKind::kUnknownContinuation;
   ExitCompleteness completeness = ExitCompleteness::kIncomplete;
@@ -244,11 +259,15 @@ struct FrontierWorkItem {
   std::string failure_reason;
   std::string identity;
   bool from_boundary_continuation = false;
+  std::optional<SolverEdgeMetadata> solver_metadata;
 };
 
 struct SessionHandlerNode {
   std::string function_name;
   std::optional<uint64_t> entry_va;
+  std::optional<uint64_t> overlay_handler_va;
+  std::optional<uint64_t> overlay_incoming_hash;
+  std::optional<std::string> overlay_key;
   llvm::stable_hash fingerprint = 0;
   bool is_defined = false;
   bool is_output_root = false;
@@ -293,6 +312,7 @@ struct SessionEdgeFact {
   FrontierWorkStatus status = FrontierWorkStatus::kPending;
   unsigned retry_count = 0;
   std::string failure_reason;
+  std::optional<SolverEdgeMetadata> solver_metadata;
   bool is_dirty = true;
   bool from_unresolved_exit = false;
   bool from_output_root_closure = false;
@@ -332,6 +352,7 @@ struct SessionRegionNode {
 struct SessionGraphState {
   std::map<std::string, SessionHandlerNode> handler_nodes;
   std::map<std::string, SessionEdgeFact> edge_facts_by_identity;
+  uint64_t edge_fact_revision = 0;
   std::map<uint64_t, SessionBoundaryFact> boundary_facts_by_target;
   std::map<uint64_t, SessionRootSlice> root_slices_by_va;
   std::map<uint64_t, SessionRegionNode> region_nodes_by_entry_pc;
@@ -472,14 +493,7 @@ struct DevirtualizationSession {
   std::vector<uint64_t> root_slice;
   std::vector<uint64_t> discovered_continuations;
   std::vector<std::string> discovered_continuation_identities;
-  std::vector<uint64_t> late_frontier;
-  std::vector<std::string> late_frontier_identities;
   std::vector<uint64_t> discovered_root_pcs;
-  std::vector<uint64_t> discovered_frontier_pcs;
-  std::vector<std::string> discovered_frontier_identities;
-  std::vector<FrontierWorkItem> discovered_frontier_work_items;
-  std::vector<FrontierWorkItem> late_frontier_work_items;
-  std::map<std::string, FrontierWorkItem> frontier_work_by_identity;
   std::set<uint64_t> attempted_vm_enter_child_import_pcs;
   std::map<uint64_t, std::string> imported_vm_enter_child_roots;
   std::vector<std::string> dirty_functions;
@@ -491,6 +505,17 @@ struct DevirtualizationSession {
   DevirtualizationRoundTelemetry latest_round;
   std::vector<DevirtualizationEpochSummary> epochs;
 };
+
+std::vector<FrontierWorkItem> collectOrderedSessionFrontierWorkItems(
+    const DevirtualizationSession &session);
+std::vector<FrontierWorkItem> collectSessionFrontierWorkItems(
+    const DevirtualizationSession &session);
+std::vector<std::string> collectSessionFrontierIdentities(
+    const DevirtualizationSession &session);
+std::vector<uint64_t> collectSessionFrontierTargets(
+    const DevirtualizationSession &session);
+std::vector<FrontierWorkItem> collectPendingSessionFrontierWorkItems(
+    const DevirtualizationSession &session);
 
 struct DevirtualizationExecutionPlan {
   bool enable_devirtualization = false;
@@ -559,17 +584,14 @@ class DevirtualizationOrchestrator {
   bool requeueBoundaryEdgesForTarget(const llvm::Module &M, uint64_t target_pc,
                                      llvm::StringRef reason = {});
   FrontierAdvanceSummary advanceFrontierWork(
-      llvm::Module &M, BlockLifter &block_lifter,
-      IterativeLiftingSession &iterative_session,
+      llvm::Module &M, RemillProjectionLifter &projection_lifter,
       const FrontierCallbacks &callbacks);
   FrontierRoundSummary runFrontierRound(
-      llvm::Module &M, BlockLifter &block_lifter,
-      IterativeLiftingSession &iterative_session,
+      llvm::Module &M, RemillProjectionLifter &projection_lifter,
       const FrontierCallbacks &callbacks,
       FrontierDiscoveryPhase phase = FrontierDiscoveryPhase::kCombined);
   FrontierIterationSummary runFrontierIterations(
-      llvm::Module &M, BlockLifter &block_lifter,
-      IterativeLiftingSession &iterative_session,
+      llvm::Module &M, RemillProjectionLifter &projection_lifter,
       const FrontierCallbacks &frontier_callbacks, FrontierDiscoveryPhase phase,
       unsigned max_rounds, const FrontierIterationCallbacks &iteration_callbacks,
       const VmEnterChildImportCallbacks *vm_enter_import_callbacks = nullptr);
@@ -610,9 +632,5 @@ const char *toString(FrontierDiscoveryPhase phase);
 const char *toString(FrontierWorkKind kind);
 const char *toString(FrontierWorkStatus status);
 
-void publishSessionGraphProjection(const llvm::Module &M,
-                                   const SessionGraphState &state);
-const SessionGraphState *findSessionGraphProjection(const llvm::Module &M);
-SessionGraphState *findMutableSessionGraphProjection(llvm::Module &M);
 
 }  // namespace omill

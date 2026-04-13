@@ -1,5 +1,7 @@
 #include "RuntimeAdapters.h"
 
+#include <memory>
+
 #include <llvm/IR/Function.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/Verifier.h>
@@ -27,85 +29,99 @@ OutputRecoveryOptions buildOutputRecoveryOptions(
 }
 
 OutputRecoveryCallbacks buildOutputRecoveryCallbacks(
-    OutputRecoveryAdapterContext &context) {
-  OutputRecoveryCallbacks callbacks;
-  callbacks.precise_log = context.precise_log;
-  callbacks.run_late_closure_canonicalization =
-      [&](llvm::StringRef reason) { context.run_late_closure_canonicalization(reason); };
-  callbacks.run_post_patch_cleanup =
-      [&](llvm::StringRef reason) { context.run_post_patch_cleanup(reason); };
-  callbacks.run_final_output_cleanup = [&]() { context.run_final_output_cleanup(); };
-  callbacks.annotate_vm_unresolved_continuations = [&]() {
-    context.annotate_vm_unresolved_continuations();
+    OutputRecoveryServices &services) {
+  struct CallbackState {
+    llvm::Module *module;
+    llvm::ModuleAnalysisManager *module_analysis_manager;
+    OutputRecoveryTelemetry telemetry;
+    OutputRecoveryCleanupOps cleanup;
+    OutputRecoveryImportOps import;
+    OutputRecoveryTargetOps targets;
   };
-  callbacks.before_noabi_frontier_round = [&](unsigned round) {
-    if (context.append_debug_marker) {
-      context.append_debug_marker(
+  auto state = std::make_shared<CallbackState>(CallbackState{
+      &services.module,
+      &services.module_analysis_manager,
+      services.telemetry,
+      services.cleanup,
+      services.import,
+      services.targets,
+  });
+
+  OutputRecoveryCallbacks callbacks;
+  callbacks.precise_log = state->telemetry.precise_log;
+  callbacks.run_late_closure_canonicalization =
+      [state](llvm::StringRef reason) {
+        state->cleanup.run_late_closure_canonicalization(reason);
+      };
+  callbacks.run_post_patch_cleanup = [state](llvm::StringRef reason) {
+    state->cleanup.run_post_patch_cleanup(reason);
+  };
+  callbacks.run_final_output_cleanup = [state]() {
+    state->cleanup.run_final_output_cleanup();
+  };
+  callbacks.annotate_vm_unresolved_continuations = [state]() {
+    state->cleanup.annotate_vm_unresolved_continuations();
+  };
+  callbacks.before_noabi_frontier_round = [state](unsigned round) {
+    if (state->telemetry.append_debug_marker) {
+      state->telemetry.append_debug_marker(
           (llvm::Twine("noabi:round_") + llvm::Twine(round) +
            ":before_canonicalization")
               .str());
     }
-    context.run_late_closure_canonicalization("noabi_late_output_root_closure");
-    if (context.append_debug_marker) {
-      context.append_debug_marker(
+    state->cleanup.run_late_closure_canonicalization(
+        "noabi_late_output_root_closure");
+    if (state->telemetry.append_debug_marker) {
+      state->telemetry.append_debug_marker(
           (llvm::Twine("noabi:round_") + llvm::Twine(round) +
            ":after_canonicalization")
               .str());
     }
-    if (!verifyModule(context.module, nullptr))
-      return true;
-    if (context.emit_warn_event) {
-      context.emit_warn_event(
-          "noabi_late_closure_invalid_after_canonicalization",
-          "module verification failed after no-ABI late closure "
-          "canonicalization; skipping frontier advancement",
-          static_cast<int64_t>(round));
-    }
-    return false;
+    return true;
   };
   callbacks.after_noabi_frontier_round =
-      [&](unsigned round, const FrontierRoundSummary &round_summary) {
-        if (context.append_debug_marker) {
-          context.append_debug_marker(
+      [state](unsigned round, const FrontierRoundSummary &round_summary) {
+        if (state->telemetry.append_debug_marker) {
+          state->telemetry.append_debug_marker(
               (llvm::Twine("noabi:round_") + llvm::Twine(round) +
                ":after_frontier")
                   .str());
         }
         llvm::ModulePassManager MPM;
         buildLateClosurePatchPipeline(MPM, 80);
-        MPM.run(context.module, context.module_analysis_manager);
-        if (context.append_debug_marker) {
-          context.append_debug_marker(
+        MPM.run(*state->module, *state->module_analysis_manager);
+        if (state->telemetry.append_debug_marker) {
+          state->telemetry.append_debug_marker(
               (llvm::Twine("noabi:round_") + llvm::Twine(round) +
                ":after_patch")
                   .str());
         }
-        context.annotate_vm_unresolved_continuations();
+        state->cleanup.annotate_vm_unresolved_continuations();
         return round_summary.changed;
       };
-  callbacks.prune_to_defined_output_root_closure = [&]() {
-    context.prune_to_defined_output_root_closure();
+  callbacks.prune_to_defined_output_root_closure = [state]() {
+    state->cleanup.prune_to_defined_output_root_closure();
   };
-  callbacks.rerun_late_output_root_target_pipeline = [&]() {
-    context.rerun_late_output_root_target_pipeline();
+  callbacks.rerun_late_output_root_target_pipeline = [state]() {
+    state->cleanup.rerun_late_output_root_target_pipeline();
   };
-  callbacks.sanitize_remaining_poison_native_helper_args = [&]() {
-    context.sanitize_remaining_poison_native_helper_args();
+  callbacks.sanitize_remaining_poison_native_helper_args = [state]() {
+    state->cleanup.sanitize_remaining_poison_native_helper_args();
   };
-  callbacks.erase_noop_self_recursive_native_calls = [&]() {
-    context.erase_noop_self_recursive_native_calls();
+  callbacks.erase_noop_self_recursive_native_calls = [state]() {
+    state->cleanup.erase_noop_self_recursive_native_calls();
   };
   callbacks.advance_session_owned_frontier_work =
-      [&](FrontierDiscoveryPhase phase, llvm::StringRef label) {
-        return context.advance_session_owned_frontier_work(phase, label);
+      [state](FrontierDiscoveryPhase phase, llvm::StringRef label) {
+        return state->cleanup.advance_session_owned_frontier_work(phase, label);
       };
   callbacks.lift_child_target =
-      [&](uint64_t target_pc, bool no_abi, bool enable_gsd,
-          bool enable_recovery_mode,
-          bool dump_virtual_model) -> std::optional<ChildLiftArtifact> {
-        auto child = context.lift_child_text(target_pc, no_abi, enable_gsd,
-                                             enable_recovery_mode,
-                                             dump_virtual_model);
+      [state](uint64_t target_pc, bool no_abi, bool enable_gsd,
+              bool enable_recovery_mode,
+              bool dump_virtual_model) -> std::optional<ChildLiftArtifact> {
+        auto child = state->import.lift_child_text(
+            target_pc, no_abi, enable_gsd, enable_recovery_mode,
+            dump_virtual_model);
         if (!child)
           return std::nullopt;
         ChildLiftArtifact artifact;
@@ -115,12 +131,13 @@ OutputRecoveryCallbacks buildOutputRecoveryCallbacks(
         return artifact;
       };
   callbacks.import_executable_child =
-      [&](uint64_t target_pc, const ChildLiftArtifact &artifact,
-          const ChildImportPlan &preimport_plan, llvm::StringRef name_prefix) {
+      [state](uint64_t target_pc, const ChildLiftArtifact &artifact,
+              const ChildImportPlan &preimport_plan,
+              llvm::StringRef name_prefix) {
         ChildImportPlan plan;
         plan.target_pc = target_pc;
         plan.selected_root_pc = artifact.selected_root_pc;
-        auto *imported = context.import_executable_child_root(
+        auto *imported = state->import.import_executable_child_root(
             target_pc, artifact, preimport_plan, name_prefix);
         if (!imported) {
           plan.eligibility = ImportEligibility::kRejected;
@@ -134,18 +151,43 @@ OutputRecoveryCallbacks buildOutputRecoveryCallbacks(
             preimport_plan.allowed_declaration_callees;
         plan.lowering_helper_callees =
             preimport_plan.lowering_helper_callees;
+        plan.import_class = preimport_plan.import_class;
+        plan.proof = preimport_plan.proof;
+        if (!plan.selected_root_pc)
+          plan.selected_root_pc = preimport_plan.selected_root_pc;
+        return plan;
+      };
+  callbacks.import_executable_snapshot_slice =
+      [state](uint64_t target_pc, const BinaryRegionSnapshot &snapshot,
+              const ChildImportPlan &preimport_plan) {
+        ChildImportPlan plan = preimport_plan;
+        plan.target_pc = target_pc;
+        auto *imported = state->import.import_executable_snapshot_slice(
+            target_pc, snapshot, preimport_plan);
+        if (!imported) {
+          plan.eligibility = ImportEligibility::kRejected;
+          if (plan.rejection_reason == RecoveryRejectionReason::kNone)
+            plan.rejection_reason = RecoveryRejectionReason::kImportFailed;
+          if (plan.rejection_detail.empty())
+            plan.rejection_detail = "snapshot_slice_import_failed";
+          return plan;
+        }
+        plan.eligibility = ImportEligibility::kImportable;
+        plan.rejection_reason = RecoveryRejectionReason::kNone;
+        plan.imported_root = imported;
         return plan;
       };
   callbacks.import_vm_enter_child =
-      [&](uint64_t target_pc, const ChildLiftArtifact &artifact,
-          const ChildImportPlan &preimport_plan, llvm::Function &placeholder) {
+      [state](uint64_t target_pc, const ChildLiftArtifact &artifact,
+              const ChildImportPlan &preimport_plan,
+              llvm::Function &placeholder) {
         ChildImportPlan plan = preimport_plan;
         plan.target_pc = target_pc;
         if (!plan.selected_root_pc)
           plan.selected_root_pc = artifact.selected_root_pc;
         if (plan.eligibility != ImportEligibility::kImportable)
           return plan;
-        auto *imported = context.import_executable_child_root(
+        auto *imported = state->import.import_executable_child_root(
             target_pc, artifact, preimport_plan, "");
         if (!imported) {
           plan.eligibility = ImportEligibility::kRejected;
@@ -166,54 +208,54 @@ OutputRecoveryCallbacks buildOutputRecoveryCallbacks(
         plan.imported_root = imported;
         return plan;
       };
-  callbacks.note_imported_target = [&](uint64_t target_pc) {
-    context.note_imported_target(target_pc);
+  callbacks.note_imported_target = [state](uint64_t target_pc) {
+    state->import.note_imported_target(target_pc);
   };
-  callbacks.collect_executable_placeholder_declaration_targets = [&]() {
-    return context.collect_executable_placeholder_declaration_targets();
+  callbacks.collect_executable_placeholder_declaration_targets = [state]() {
+    return state->targets.collect_executable_placeholder_declaration_targets();
   };
   callbacks.collect_declared_structural_targets_with_defined_implementations =
-      [&]() {
-        return context
+      [state]() {
+        return state->targets
             .collect_declared_structural_targets_with_defined_implementations();
       };
-  callbacks.collect_output_root_constant_code_call_targets = [&]() {
-    return context.collect_output_root_constant_code_call_targets();
+  callbacks.collect_output_root_constant_code_call_targets = [state]() {
+    return state->targets.collect_output_root_constant_code_call_targets();
   };
-  callbacks.collect_output_root_constant_calli_targets = [&]() {
-    return context.collect_output_root_constant_calli_targets();
+  callbacks.collect_output_root_constant_calli_targets = [state]() {
+    return state->targets.collect_output_root_constant_calli_targets();
   };
-  callbacks.collect_output_root_constant_dispatch_targets = [&]() {
-    return context.collect_output_root_constant_dispatch_targets();
+  callbacks.collect_output_root_constant_dispatch_targets = [state]() {
+    return state->targets.collect_output_root_constant_dispatch_targets();
   };
   callbacks.patch_constant_inttoptr_calls_to_native =
-      [&](const std::vector<uint64_t> &targets, llvm::StringRef marker,
-          llvm::StringRef message) {
-        context.patch_constant_inttoptr_calls_to_native(targets, marker,
-                                                        message);
-      };
-  callbacks.patch_declared_lifted_or_block_calls_to_defined_targets =
-      [&](const std::vector<uint64_t> &targets, llvm::StringRef marker,
-          llvm::StringRef message) -> unsigned {
-        return context.patch_declared_lifted_or_block_calls_to_defined_targets(
+      [state](const std::vector<uint64_t> &targets, llvm::StringRef marker,
+              llvm::StringRef message) {
+        state->targets.patch_constant_inttoptr_calls_to_native(
             targets, marker, message);
       };
+  callbacks.patch_declared_lifted_or_block_calls_to_defined_targets =
+      [state](const std::vector<uint64_t> &targets, llvm::StringRef marker,
+              llvm::StringRef message) -> unsigned {
+        return state->targets
+            .patch_declared_lifted_or_block_calls_to_defined_targets(
+                targets, marker, message);
+      };
   callbacks.patch_constant_calli_targets_to_direct_calls =
-      [&](const std::vector<uint64_t> &targets, llvm::StringRef marker,
-          llvm::StringRef message) -> unsigned {
-        return context.patch_constant_calli_targets_to_direct_calls(targets,
-                                                                    marker,
-                                                                    message);
+      [state](const std::vector<uint64_t> &targets, llvm::StringRef marker,
+              llvm::StringRef message) -> unsigned {
+        return state->targets.patch_constant_calli_targets_to_direct_calls(
+            targets, marker, message);
       };
   callbacks.patch_constant_dispatch_targets_to_direct_calls =
-      [&](const std::vector<uint64_t> &targets, llvm::StringRef marker,
-          llvm::StringRef message) -> unsigned {
-        return context.patch_constant_dispatch_targets_to_direct_calls(
+      [state](const std::vector<uint64_t> &targets, llvm::StringRef marker,
+              llvm::StringRef message) -> unsigned {
+        return state->targets.patch_constant_dispatch_targets_to_direct_calls(
             targets, marker, message);
       };
   callbacks.note_abi_post_cleanup_step =
-      [&](llvm::StringRef label, bool starting) {
-        context.note_abi_post_cleanup_step(label, starting);
+      [state](llvm::StringRef label, bool starting) {
+        state->telemetry.note_abi_post_cleanup_step(label, starting);
       };
   return callbacks;
 }

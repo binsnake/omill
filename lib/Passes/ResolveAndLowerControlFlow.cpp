@@ -401,12 +401,13 @@ bool recoverJumpTables(llvm::Function &F,
         llvm::errs() << "\n";
       }
 
-      auto *table_load = jt::extractUnderlyingLoad(load_val);
+      auto *table_load = jt::extractUnderlyingLoad(load_val, &F);
       if (!table_load) {
         if (debugJumpTables())
           llvm::errs() << "[resolve-cf-jt] reject:no-table-load\n";
         continue;
       }
+
 
       // Decompose load pointer into base + idx * stride.
       auto addr_info =
@@ -572,7 +573,7 @@ std::optional<TableAccess> analyzeTarget(llvm::Value *target,
   if (image_base == 0)
     jt::trySplitDynamicRVAConversion(target, dynamic_rva_base, load_val);
 
-  auto *table_load = jt::extractUnderlyingLoad(load_val);
+  auto *table_load = jt::extractUnderlyingLoad(load_val, &F);
   if (!table_load)
     return std::nullopt;
 

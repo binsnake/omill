@@ -56,6 +56,32 @@ ContinuationResolutionResult ExecutableContinuationResolver::resolve(
   if (request.proof &&
       request.proof->resolution_kind ==
           ContinuationResolutionKind::kBoundaryModeled) {
+    const bool controlled_return_region =
+        request.proof->suppresses_normal_fallthrough &&
+        request.proof->return_address_control_kind !=
+            VirtualReturnAddressControlKind::kUnknown &&
+        result.region_snapshot.entry_pc != 0 &&
+        !result.region_snapshot.blocks_by_pc.empty();
+    if (controlled_return_region) {
+      if (result.region_snapshot.closure_kind == BinaryRegionClosureKind::kClosed) {
+        result.disposition =
+            ContinuationResolutionDisposition::kImportableClosedSliceRoot;
+        result.updated_proof.import_disposition =
+            ContinuationImportDisposition::kImportable;
+        result.updated_proof.selected_root_import_class =
+            ChildImportClass::kBoundedContinuationSlice;
+        result.rationale = "boundary_modeled_controlled_return_closed_region";
+      } else {
+        result.disposition =
+            ContinuationResolutionDisposition::kRetryableOpenRegion;
+        result.updated_proof.import_disposition =
+            ContinuationImportDisposition::kRetryable;
+        result.updated_proof.selected_root_import_class =
+            ChildImportClass::kBoundedContinuationSlice;
+        result.rationale = "boundary_modeled_controlled_return_region";
+      }
+      return result;
+    }
     result.disposition =
         ContinuationResolutionDisposition::kBoundaryModeledChild;
     result.updated_proof.import_disposition =

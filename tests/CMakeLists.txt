@@ -110,6 +110,7 @@ add_executable(omill-unit-tests
   unit/VirtualMachineModelTest.cpp
   unit/VirtualCFGMaterializationTest.cpp
   unit/BinaryMemoryMapTest.cpp
+  unit/CallTargetBridgeTest.cpp
   unit/VMDispatchResolutionTest.cpp
   unit/VMTraceMapTest.cpp
   unit/VirtualCalleeRegistryTest.cpp

@@ -228,6 +228,51 @@ TEST(BinaryRegionReconstructorTest,
 }
 
 TEST(BinaryRegionReconstructorTest,
+     FallsBackToRawBytesWhenSummaryDecodeFailsForControlledReturnRegion) {
+  omill::BinaryRegionReconstructor reconstructor;
+  omill::BinaryRegionReconstructionRequest request;
+  request.root_target_pc = 0x401010u;
+  omill::DescentReturnAddressState state;
+  state.call_site_pc = 0x401000u;
+  state.original_return_pc = 0x401005u;
+  state.effective_return_pc = 0x401099u;
+  state.control_kind =
+      omill::VirtualReturnAddressControlKind::kRedirectedConstant;
+  state.suppresses_normal_fallthrough = true;
+  request.initial_return_address_state = state;
+
+  omill::FrontierCallbacks callbacks;
+  callbacks.can_decode_target = [](uint64_t) { return true; };
+  callbacks.decode_target_summary = [](uint64_t)
+      -> std::optional<omill::FrontierCallbacks::DecodedTargetSummary> {
+    return std::nullopt;
+  };
+  callbacks.read_target_bytes = [](uint64_t pc, uint8_t *out, size_t size) {
+    if (!size)
+      return false;
+    std::fill(out, out + size, 0x90);
+    if (pc == 0x401010u) {
+      out[0] = 0xC3;
+      return true;
+    }
+    if (pc == 0x401099u) {
+      out[0] = 0x90;
+      return true;
+    }
+    return false;
+  };
+  callbacks.is_executable_target = [](uint64_t pc) {
+    return pc == 0x401010u || pc == 0x401099u;
+  };
+
+  auto snapshot = reconstructor.reconstruct(request, callbacks);
+  ASSERT_EQ(snapshot.blocks_by_pc.count(0x401010u), 1u);
+  EXPECT_EQ(snapshot.blocks_by_pc.at(0x401010u).outgoing_edges.front().target_pc,
+            std::optional<uint64_t>(0x401099u));
+}
+
+
+TEST(BinaryRegionReconstructorTest,
      ExecutableResolverMarksTrustedExactFallthroughImportable) {
   omill::ExecutableContinuationResolver resolver;
   omill::ContinuationResolutionRequest request;

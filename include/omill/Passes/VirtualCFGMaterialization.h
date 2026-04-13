@@ -4,6 +4,8 @@
 
 namespace omill {
 
+struct SessionGraphState;
+
 /// Generic static-devirtualization pass that consumes VirtualMachineModel
 /// summaries and lowers proven constant virtual dispatches to direct CFG edges.
 ///
@@ -12,10 +14,17 @@ namespace omill {
 class VirtualCFGMaterializationPass
     : public llvm::PassInfoMixin<VirtualCFGMaterializationPass> {
  public:
+  explicit VirtualCFGMaterializationPass(
+      const SessionGraphState *session_graph = nullptr)
+      : session_graph_(session_graph) {}
+
   llvm::PreservedAnalyses run(llvm::Module &M,
                               llvm::ModuleAnalysisManager &AM);
 
   static llvm::StringRef name() { return "VirtualCFGMaterializationPass"; }
+
+ private:
+  const SessionGraphState *session_graph_ = nullptr;
 };
 
 /// Validation wrapper for VirtualCFGMaterializationPass.
@@ -25,12 +34,19 @@ class VirtualCFGMaterializationPass
 class VerifiedVirtualCFGMaterializationPass
     : public llvm::PassInfoMixin<VerifiedVirtualCFGMaterializationPass> {
  public:
+  explicit VerifiedVirtualCFGMaterializationPass(
+      const SessionGraphState *session_graph = nullptr)
+      : session_graph_(session_graph) {}
+
   llvm::PreservedAnalyses run(llvm::Module &M,
                               llvm::ModuleAnalysisManager &AM);
 
   static llvm::StringRef name() {
     return "VerifiedVirtualCFGMaterializationPass";
   }
+
+ private:
+  const SessionGraphState *session_graph_ = nullptr;
 };
 
 }  // namespace omill

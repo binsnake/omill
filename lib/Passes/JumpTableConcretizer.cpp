@@ -70,7 +70,7 @@ findJumpTableCandidates(llvm::Function &F, const BinaryMemoryMap *map) {
                      << "\n";
       }
 
-      auto *table_load = jt::extractUnderlyingLoad(load_val);
+      auto *table_load = jt::extractUnderlyingLoad(load_val, &F);
       if (!table_load) {
         if (debugJumpTables())
           llvm::errs() << "[jt-concretizer] reject:no-table-load\n";

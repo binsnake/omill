@@ -12,6 +12,7 @@ class Module;
 
 namespace omill {
 
+struct SessionGraphState;
 struct VirtualModelRunTelemetry {
   bool dirty_scope_requested = false;
   bool session_graph_projection_used = false;
@@ -99,6 +100,8 @@ class VirtualMachineModelAnalysis
   using Result = VirtualMachineModel;
 
   Result run(llvm::Module &M, llvm::ModuleAnalysisManager &MAM);
+  Result run(llvm::Module &M, llvm::ModuleAnalysisManager &MAM,
+             const SessionGraphState *session_graph);
 };
 
 }  // namespace omill

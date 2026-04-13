@@ -38,24 +38,15 @@ struct OutputRecoveryOptionInputs {
   unsigned late_abi_closure_rounds = 4;
 };
 
-struct OutputRecoveryAdapterContext {
-  OutputRecoveryAdapterContext(llvm::Module &module_,
-                               llvm::LLVMContext &llvm_context_,
-                               llvm::ModuleAnalysisManager
-                                   &module_analysis_manager_)
-      : module(module_),
-        llvm_context(llvm_context_),
-        module_analysis_manager(module_analysis_manager_) {}
-
-  llvm::Module &module;
-  llvm::LLVMContext &llvm_context;
-  llvm::ModuleAnalysisManager &module_analysis_manager;
-
+struct OutputRecoveryTelemetry {
   std::function<void(llvm::StringRef)> append_debug_marker;
   std::function<void(llvm::StringRef, llvm::StringRef, std::optional<int64_t>)>
       emit_warn_event;
   std::function<void(const RuntimePreciseLogEvent &)> precise_log;
+  std::function<void(llvm::StringRef, bool)> note_abi_post_cleanup_step;
+};
 
+struct OutputRecoveryCleanupOps {
   std::function<void(llvm::StringRef)> run_late_closure_canonicalization;
   std::function<void(llvm::StringRef)> run_post_patch_cleanup;
   std::function<void()> run_final_output_cleanup;
@@ -66,7 +57,9 @@ struct OutputRecoveryAdapterContext {
   std::function<void()> erase_noop_self_recursive_native_calls;
   std::function<bool(FrontierDiscoveryPhase, llvm::StringRef)>
       advance_session_owned_frontier_work;
+};
 
+struct OutputRecoveryImportOps {
   std::function<std::optional<ChildLiftTextArtifact>(uint64_t, bool, bool, bool,
                                                      bool)>
       lift_child_text;
@@ -74,10 +67,15 @@ struct OutputRecoveryAdapterContext {
                                  const omill::ChildImportPlan &,
                                  llvm::StringRef)>
       import_executable_child_root;
+  std::function<llvm::Function *(uint64_t, const omill::BinaryRegionSnapshot &,
+                                 const omill::ChildImportPlan &)>
+      import_executable_snapshot_slice;
   std::function<llvm::Function *(llvm::StringRef, uint64_t, std::string *)>
       import_recovered_terminal_boundary_function;
   std::function<void(uint64_t)> note_imported_target;
+};
 
+struct OutputRecoveryTargetOps {
   std::function<std::vector<uint64_t>()>
       collect_executable_placeholder_declaration_targets;
   std::function<std::vector<uint64_t>()>
@@ -88,7 +86,6 @@ struct OutputRecoveryAdapterContext {
       collect_output_root_constant_calli_targets;
   std::function<std::vector<uint64_t>()>
       collect_output_root_constant_dispatch_targets;
-
   std::function<void(const std::vector<uint64_t> &, llvm::StringRef,
                      llvm::StringRef)>
       patch_constant_inttoptr_calls_to_native;
@@ -101,13 +98,21 @@ struct OutputRecoveryAdapterContext {
   std::function<unsigned(const std::vector<uint64_t> &, llvm::StringRef,
                          llvm::StringRef)>
       patch_constant_dispatch_targets_to_direct_calls;
-  std::function<void(llvm::StringRef, bool)> note_abi_post_cleanup_step;
+};
+
+struct OutputRecoveryServices {
+  llvm::Module &module;
+  llvm::ModuleAnalysisManager &module_analysis_manager;
+  OutputRecoveryTelemetry telemetry;
+  OutputRecoveryCleanupOps cleanup;
+  OutputRecoveryImportOps import;
+  OutputRecoveryTargetOps targets;
 };
 
 OutputRecoveryOptions buildOutputRecoveryOptions(
     const OutputRecoveryOptionInputs &inputs);
 
 OutputRecoveryCallbacks buildOutputRecoveryCallbacks(
-    OutputRecoveryAdapterContext &context);
+    OutputRecoveryServices &services);
 
 }  // namespace omill::tooling

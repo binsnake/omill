@@ -3183,6 +3183,99 @@ TEST_F(PipelineTest,
   }
   EXPECT_FALSE(has_reachable_write_memory);
 }
+TEST_F(PipelineTest, AbiRecoveryDropsDeadTrivialSelfLoopPlaceholderCalls) {
+  auto M = createModule();
+
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *lifted_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+
+  auto *loop_leaf = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::InternalLinkage,
+      "__omill_recovered_child___omill_recovered_child_sub_401060", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", loop_leaf);
+    llvm::IRBuilder<> B(entry);
+    B.CreateBr(entry);
+  }
+
+  auto *dead_forwarder = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::InternalLinkage,
+      "__omill_recovered_child_sub_401050", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", dead_forwarder);
+    llvm::IRBuilder<> B(entry);
+    auto *call = B.CreateCall(loop_leaf, {dead_forwarder->getArg(0),
+                                          dead_forwarder->getArg(1),
+                                          dead_forwarder->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  auto *live_helper = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage, "blk_401020", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", live_helper);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(live_helper->getArg(2));
+  }
+
+  auto *root = llvm::Function::Create(
+      lifted_ty, llvm::GlobalValue::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateCall(dead_forwarder, {root->getArg(0), root->getArg(1), root->getArg(2)});
+    auto *tail = B.CreateCall(live_helper,
+                              {root->getArg(0), root->getArg(1), root->getArg(2)});
+    tail->setTailCallKind(llvm::CallInst::TCK_MustTail);
+    B.CreateRet(tail);
+  }
+
+  setEnv("OMILL_SKIP_ABI_RECOVER_SIGNATURES", "1");
+  setEnv("OMILL_SKIP_ABI_ALWAYS_INLINE", "1");
+  setEnv("OMILL_SKIP_ABI_REWRITE_LIFTED_LATE", "1");
+  setEnv("OMILL_SKIP_ABI_FINAL_OPT", "1");
+  setEnv("OMILL_SKIP_ABI_INLINE_VM_HANDLERS", "1");
+  setEnv("OMILL_SKIP_POST_ABI_INLINE", "1");
+
+  llvm::ModulePassManager MPM;
+  omill::PipelineOptions opts;
+  omill::buildABIRecoveryPipeline(MPM, opts);
+  runMPM(MPM, *M);
+
+  unsetEnv("OMILL_SKIP_ABI_RECOVER_SIGNATURES");
+  unsetEnv("OMILL_SKIP_ABI_ALWAYS_INLINE");
+  unsetEnv("OMILL_SKIP_ABI_REWRITE_LIFTED_LATE");
+  unsetEnv("OMILL_SKIP_ABI_FINAL_OPT");
+  unsetEnv("OMILL_SKIP_ABI_INLINE_VM_HANDLERS");
+  unsetEnv("OMILL_SKIP_POST_ABI_INLINE");
+
+  auto *internal_root = M->getFunction("__omill_internal_output_root_sub_401000");
+  ASSERT_NE(internal_root, nullptr);
+  bool calls_dead_forwarder = false;
+  bool calls_loop_leaf = false;
+  for (auto &BB : *internal_root) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *callee = CI->getCalledFunction();
+      if (!callee)
+        continue;
+      if (callee->getName() == "__omill_recovered_child_sub_401050")
+        calls_dead_forwarder = true;
+      if (callee->getName() ==
+          "__omill_recovered_child___omill_recovered_child_sub_401060")
+        calls_loop_leaf = true;
+    }
+  }
+  EXPECT_FALSE(calls_dead_forwarder);
+  EXPECT_FALSE(calls_loop_leaf);
+}
+
+
 
 TEST_F(PipelineTest,
        AbiPipelineAnnotatesTerminalMissingBlockHandlerClassification) {

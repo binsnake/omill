@@ -78,7 +78,7 @@ BinaryLiftTargetPolicy::BinaryLiftTargetPolicy(const BinaryMemoryMap *memory_map
     : memory_map_(memory_map), arch_(arch) {}
 
 LiftTargetDecision BinaryLiftTargetPolicy::ResolveLiftTarget(
-    uint64_t, uint64_t raw_target_pc, LiftTargetEdgeKind) const {
+    uint64_t, uint64_t raw_target_pc, LiftTargetEdgeKind edge_kind) const {
   LiftTargetDecision decision;
   decision.raw_target_pc = raw_target_pc;
 
@@ -91,6 +91,36 @@ LiftTargetDecision BinaryLiftTargetPolicy::ResolveLiftTarget(
   const bool exact_fallthrough =
       arch_ == TargetArch::kX86_64 &&
       isExactX86DirectControlFlowFallthrough(memory_map_, raw_target_pc);
+  auto decodable =
+      isDecodableLiftTargetEntry(memory_map_, raw_target_pc, arch_);
+
+  const bool preserve_exact_sequential_target =
+      edge_kind == LiftTargetEdgeKind::kTraceNext ||
+      edge_kind == LiftTargetEdgeKind::kConditionalNotTaken ||
+      edge_kind == LiftTargetEdgeKind::kCallFallthrough;
+  const bool preserve_exact_target =
+      (preserve_exact_sequential_target &&
+       isExecutableLiftTarget(memory_map_, raw_target_pc)) ||
+      (decodable.has_value() && *decodable &&
+       (edge_kind == LiftTargetEdgeKind::kConditionalTaken ||
+        edge_kind == LiftTargetEdgeKind::kDirectJump ||
+        edge_kind == LiftTargetEdgeKind::kDirectCallTarget ||
+        edge_kind == LiftTargetEdgeKind::kIndirectTarget ||
+        edge_kind == LiftTargetEdgeKind::kDecodeFailureContinuation));
+
+  if (preserve_exact_target) {
+    decision.effective_target_pc = raw_target_pc;
+    decision.is_exact_fallthrough = exact_fallthrough;
+    if (exact_fallthrough) {
+      decision.classification = LiftTargetClassification::kExactFallthroughEntry;
+      decision.trust = LiftTargetTrust::kExactFallthrough;
+    } else {
+      decision.classification = LiftTargetClassification::kLiftableEntry;
+      decision.trust = LiftTargetTrust::kTrustedEntry;
+    }
+    return decision;
+  }
+
   auto canonical =
       canonicalizeLiftTargetForOverlap(memory_map_, raw_target_pc, arch_);
 
@@ -117,8 +147,6 @@ LiftTargetDecision BinaryLiftTargetPolicy::ResolveLiftTarget(
     return decision;
   }
 
-  auto decodable =
-      isDecodableLiftTargetEntry(memory_map_, raw_target_pc, arch_);
   if (decodable.has_value() && *decodable) {
     decision.classification = LiftTargetClassification::kLiftableEntry;
     decision.trust = LiftTargetTrust::kTrustedEntry;
@@ -128,6 +156,53 @@ LiftTargetDecision BinaryLiftTargetPolicy::ResolveLiftTarget(
   decision.classification = LiftTargetClassification::kExecutablePlaceholder;
   decision.trust = LiftTargetTrust::kUntrustedExecutable;
   return decision;
+}
+
+// Recover wrappers that immediately call a real target before branching into
+// invalidated junk bytes.
+std::optional<uint64_t> recoverWrappedX86DirectCallTarget(
+    const BinaryMemoryMap *memory_map, uint64_t source_pc, uint64_t failed_pc) {
+  if (!memory_map || failed_pc <= source_pc || (failed_pc - source_pc) > 16)
+    return std::nullopt;
+
+  const uint64_t start_pc = source_pc > 16 ? (source_pc - 16) : 1;
+  for (uint64_t call_pc = source_pc; call_pc > start_pc; --call_pc) {
+    const uint64_t candidate_pc = call_pc - 1;
+    uint8_t bytes[8] = {};
+    if (!memory_map->read(candidate_pc, bytes, sizeof(bytes)) || bytes[0] != 0xE8)
+      continue;
+
+    int32_t rel = 0;
+    std::memcpy(&rel, bytes + 1, sizeof(rel));
+    const uint64_t fallthrough_pc = candidate_pc + 5;
+    const uint64_t target_pc = static_cast<uint64_t>(
+        static_cast<int64_t>(fallthrough_pc) + static_cast<int64_t>(rel));
+    if (!memory_map->isExecutable(target_pc, 1) || fallthrough_pc >= source_pc)
+      continue;
+
+    uint8_t branch_bytes[6] = {};
+    if (!memory_map->read(fallthrough_pc, branch_bytes, sizeof(branch_bytes)))
+      continue;
+
+    std::optional<uint64_t> branch_target;
+    if (branch_bytes[0] >= 0x70 && branch_bytes[0] <= 0x7F) {
+      int8_t rel8 = static_cast<int8_t>(branch_bytes[1]);
+      branch_target = static_cast<uint64_t>(
+          static_cast<int64_t>(fallthrough_pc + 2) + static_cast<int64_t>(rel8));
+    } else if (branch_bytes[0] == 0x0F &&
+               (branch_bytes[1] & 0xF0u) == 0x80u) {
+      int32_t rel32 = 0;
+      std::memcpy(&rel32, branch_bytes + 2, sizeof(rel32));
+      branch_target = static_cast<uint64_t>(
+          static_cast<int64_t>(fallthrough_pc + 6) + static_cast<int64_t>(rel32));
+    }
+    if (!branch_target.has_value() || *branch_target <= failed_pc)
+      continue;
+
+    return target_pc;
+  }
+
+  return std::nullopt;
 }
 
 DecodeFailureDecision BinaryLiftTargetPolicy::ResolveDecodeFailure(
@@ -153,6 +228,20 @@ DecodeFailureDecision BinaryLiftTargetPolicy::ResolveDecodeFailure(
          looksLikeSuspiciousX86EntryBytes(memory_map_, source_pc) ||
          isLikelyX86CallMetadataWindow(memory_map_, failed_pc) ||
          looksLikeSuspiciousX86EntryBytes(memory_map_, failed_pc))) {
+      if (auto wrapped_call_target =
+              recoverWrappedX86DirectCallTarget(memory_map_, source_pc, failed_pc)) {
+        decision.action = DecodeFailureAction::kRedirectToTarget;
+        decision.target.raw_target_pc = source_pc;
+        decision.target.effective_target_pc = *wrapped_call_target;
+        decision.target.classification = LiftTargetClassification::kCanonicalOwner;
+        decision.target.trust = LiftTargetTrust::kNearbyOwner;
+        decision.target.owner_pc = *wrapped_call_target;
+        decision.target.fallback_pc = source_pc;
+        decision.target.invalidated_entry_source_pc = source_pc;
+        decision.target.invalidated_entry_failed_pc = failed_pc;
+        return decision;
+      }
+
       decision.action = DecodeFailureAction::kInvalidateEntry;
       decision.target.raw_target_pc = source_pc;
       decision.target.effective_target_pc = source_pc;

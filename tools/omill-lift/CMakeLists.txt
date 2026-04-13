@@ -2,6 +2,7 @@ add_executable(omill-lift
   InputLoader.cpp
   main.cpp
   RuntimeAdapters.cpp
+  RecoveryBindings.cpp
 )
 
 target_link_libraries(omill-lift

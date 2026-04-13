@@ -18,8 +18,8 @@ class Module;
 
 namespace omill {
 
-class BlockLifter;
 class IterativeLiftingSession;
+class RemillProjectionLifter;
 
 enum class OutputRootClosureSourceKind {
   kConstantCodeTarget,
@@ -80,7 +80,7 @@ std::vector<uint64_t> collectLateLiftableOutputRootClosureTargets(
     llvm::function_ref<bool(uint64_t)> should_skip_target);
 
 unsigned lateLiftTargets(llvm::ArrayRef<uint64_t> targets,
-                         BlockLifter &block_lifter,
+                         RemillProjectionLifter &projection_lifter,
                          IterativeLiftingSession &session,
                          llvm::function_ref<bool(uint64_t)> has_defined_target,
                          llvm::function_ref<bool(uint64_t)> is_executable_target,

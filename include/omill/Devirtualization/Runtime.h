@@ -22,8 +22,8 @@ class Module;
 
 namespace omill {
 
-class BlockLifter;
 class IterativeLiftingSession;
+class RemillProjectionLifter;
 
 enum class ImportEligibility {
   kImportable,
@@ -243,6 +243,22 @@ struct RoundArtifactBundle {
   std::vector<std::string> remill_runtime_callees;
   std::vector<std::string> external_callees;
   std::vector<std::string> lowering_helper_callees;
+  struct SolverEdgeArtifact {
+    std::string identity;
+    std::string owner_function;
+    unsigned site_index = 0;
+    std::optional<uint64_t> site_pc;
+    std::optional<uint64_t> target_pc;
+    std::string kind;
+    std::string status;
+    std::vector<uint64_t> possible_target_pcs;
+    std::optional<bool> branch_taken;
+    std::vector<SolverStateValueFact> state_values;
+    std::optional<uint64_t> handler_va;
+    std::optional<uint64_t> incoming_hash;
+    std::optional<std::string> overlay_key;
+  };
+  std::vector<SolverEdgeArtifact> solver_edges;
   std::vector<uint64_t> imported_targets;
   std::vector<RejectedImportArtifact> rejected_imports;
   std::vector<ImportDecisionArtifact> import_decisions;
@@ -339,6 +355,12 @@ struct ChildImportPlan {
   std::vector<std::string> lowering_helper_callees;
 };
 
+struct SelectedChildImportArtifact {
+  ChildLiftArtifact artifact;
+  ChildImportPlan plan;
+  bool used_prepared_variant = false;
+};
+
 struct ChildArtifactCacheKey {
   uint64_t target_pc = 0;
   bool no_abi = false;
@@ -420,6 +442,9 @@ struct OutputRecoveryCallbacks {
   std::function<ChildImportPlan(uint64_t, const ChildLiftArtifact &,
                                 const ChildImportPlan &, llvm::StringRef)>
       import_executable_child;
+  std::function<ChildImportPlan(uint64_t, const BinaryRegionSnapshot &,
+                                const ChildImportPlan &)>
+      import_executable_snapshot_slice;
   std::function<ChildImportPlan(uint64_t, const ChildLiftArtifact &,
                                 const ChildImportPlan &, llvm::Function &)>
       import_vm_enter_child;
@@ -469,30 +494,14 @@ class DevirtualizationRuntime {
   explicit DevirtualizationRuntime(DevirtualizationOrchestrator &orchestrator)
       : orchestrator_(orchestrator) {}
 
-  FrontierRoundSummary runFrontierRound(
-      llvm::Module &M, BlockLifter &block_lifter,
-      IterativeLiftingSession &iterative_session,
-      const FrontierCallbacks &callbacks, FrontierDiscoveryPhase phase) const;
-
   FrontierIterationSummary runFrontierIterations(
-      llvm::Module &M, BlockLifter &block_lifter,
-      IterativeLiftingSession &iterative_session,
+      llvm::Module &M, RemillProjectionLifter &projection_lifter,
       const FrontierCallbacks &frontier_callbacks, FrontierDiscoveryPhase phase,
       unsigned max_rounds, const FrontierIterationCallbacks &iteration_callbacks,
       const VmEnterChildImportCallbacks *vm_enter_import_callbacks =
           nullptr) const;
-
-  FrontierIterationSummary runPrimaryDevirtualization(
-      llvm::Module &M, BlockLifter &block_lifter,
-      IterativeLiftingSession &iterative_session,
-      const FrontierCallbacks &frontier_callbacks, FrontierDiscoveryPhase phase,
-      unsigned max_rounds, const FrontierIterationCallbacks &iteration_callbacks,
-      const VmEnterChildImportCallbacks *vm_enter_import_callbacks =
-          nullptr) const;
-
   OutputRecoverySummary runOutputRecovery(
-      llvm::Module &M, BlockLifter *block_lifter,
-      IterativeLiftingSession *iterative_session,
+      llvm::Module &M, RemillProjectionLifter *projection_lifter,
       const FrontierCallbacks *frontier_callbacks,
       const OutputRecoveryOptions &options,
       const OutputRecoveryCallbacks &callbacks) const;
@@ -523,6 +532,9 @@ class DevirtualizationRuntime {
   const std::vector<RoundArtifactBundle> &roundArtifactBundles() const {
     return round_artifact_bundles_;
   }
+  const DevirtualizationOrchestrator &orchestrator() const {
+    return orchestrator_;
+  }
   void clearRoundArtifactBundles() const {
     round_artifact_bundles_.clear();
     vm_enter_child_import_plan_cache_.clear();
@@ -539,6 +551,10 @@ class DevirtualizationRuntime {
 };
 
 bool isLoweringHelperCalleeName(llvm::StringRef name);
+
+SelectedChildImportArtifact selectExecutableChildImportArtifactForPlanning(
+    llvm::LLVMContext &llvm_context, const ChildLiftArtifact &raw_artifact,
+    bool no_abi_mode);
 
 const char *toString(FinalStateRecoveryActionKind kind);
 const char *toString(FinalStateRecoveryDisposition disposition);

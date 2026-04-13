@@ -403,6 +403,214 @@ TEST_F(CallingConventionAnalysisTest, VoidReturnWrapper) {
   EXPECT_TRUE(abi->isVoid());
 }
 
+TEST_F(CallingConventionAnalysisTest, PublicOutputRootUsesReachableClosureForParamsAndReturn) {
+  auto M = std::make_unique<llvm::Module>("closure_test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *state_ty = llvm::StructType::create(Ctx, "struct.State");
+  auto *arr_ty = llvm::ArrayType::get(llvm::Type::getInt8Ty(Ctx), 3504);
+  state_ty->setBody({arr_ty});
+
+  auto *bb_fn_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *bb_fn = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "__remill_basic_block", *M);
+  auto *bb_entry = llvm::BasicBlock::Create(Ctx, "entry", bb_fn);
+  llvm::IRBuilder<> BBB(bb_entry);
+  auto *bb_state = bb_fn->getArg(0);
+  struct RegDef { const char *name; unsigned offset; };
+  RegDef all_regs[] = {{"RAX", 0}, {"RBX", 8}, {"RCX", 16}, {"RDX", 24},
+                       {"RSI", 32}, {"RDI", 40}, {"RSP", 48}, {"RBP", 56},
+                       {"R8", 64},  {"R9", 72},  {"R10", 80}, {"R11", 88},
+                       {"R12", 96}, {"R13", 104}, {"R14", 112},
+                       {"R15", 120}, {"RIP", 128}};
+  for (auto &reg : all_regs) {
+    auto *gep = BBB.CreateGEP(BBB.getInt64Ty(), bb_state,
+                              BBB.getInt64(reg.offset / 8));
+    gep->setName(reg.name);
+  }
+  BBB.CreateRet(bb_fn->getArg(2));
+
+  auto *fn_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *helper = llvm::Function::Create(
+      fn_ty, llvm::Function::InternalLinkage, "blk_401020", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", helper);
+    llvm::IRBuilder<> B(entry);
+    auto *state = helper->getArg(0);
+    auto *rcx_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 16);
+    (void)B.CreateLoad(i64_ty, rcx_gep);
+    auto *rax_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 0);
+    B.CreateStore(B.getInt64(42), rax_gep);
+    B.CreateRet(helper->getArg(2));
+  }
+
+  auto *root = llvm::Function::Create(
+      fn_ty, llvm::Function::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    auto *call = B.CreateCall(helper, {root->getArg(0), root->getArg(1), root->getArg(2)});
+    B.CreateRet(call);
+  }
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+
+  auto result = MAM.getResult<omill::CallingConventionAnalysis>(*M);
+  auto *abi = result.getABI(root);
+  ASSERT_NE(abi, nullptr);
+  EXPECT_EQ(abi->cc, omill::DetectedCC::kWin64);
+  ASSERT_GE(abi->numParams(), 1u);
+  EXPECT_EQ(abi->params[0].reg_name, "RCX");
+  ASSERT_TRUE(abi->ret.has_value());
+  EXPECT_EQ(abi->ret->reg_name, "RAX");
+}
+
+
+TEST_F(CallingConventionAnalysisTest, PublicOutputRootUsesRequestedEntrySeedHint) {
+  auto M = std::make_unique<llvm::Module>("seed_hint_test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *state_ty = llvm::StructType::create(Ctx, "struct.State");
+  auto *arr_ty = llvm::ArrayType::get(llvm::Type::getInt8Ty(Ctx), 3504);
+  state_ty->setBody({arr_ty});
+
+  auto *bb_fn_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *bb_fn = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "__remill_basic_block", *M);
+  auto *bb_entry = llvm::BasicBlock::Create(Ctx, "entry", bb_fn);
+  llvm::IRBuilder<> BBB(bb_entry);
+  auto *bb_state = bb_fn->getArg(0);
+  struct RegDef {
+    const char *name;
+    unsigned offset;
+  };
+  RegDef all_regs[] = {{"RAX", 0}, {"RBX", 8}, {"RCX", 16}, {"RDX", 24},
+                       {"RSI", 32}, {"RDI", 40}, {"RSP", 48}, {"RBP", 56},
+                       {"R8", 64},  {"R9", 72},  {"R10", 80}, {"R11", 88},
+                       {"R12", 96}, {"R13", 104}, {"R14", 112},
+                       {"R15", 120}, {"RIP", 128}};
+  for (auto &reg : all_regs) {
+    auto *gep = BBB.CreateGEP(BBB.getInt64Ty(), bb_state,
+                              BBB.getInt64(reg.offset / 8));
+    gep->setName(reg.name);
+  }
+  BBB.CreateRet(bb_fn->getArg(2));
+
+  auto *root = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  root->addFnAttr("omill.export_entry_seed_exprs", "RBX=param(0)");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(root->getArg(2));
+  }
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+
+  auto result = MAM.getResult<omill::CallingConventionAnalysis>(*M);
+  auto *abi = result.getABI(root);
+  ASSERT_NE(abi, nullptr);
+  EXPECT_EQ(abi->cc, omill::DetectedCC::kWin64);
+  ASSERT_GE(abi->numParams(), 1u);
+  EXPECT_EQ(abi->params[0].reg_name, "RCX");
+}
+
+
+TEST_F(CallingConventionAnalysisTest, PublicOutputRootUsesRequestedRaxReturnHint) {
+  auto M = std::make_unique<llvm::Module>("return_hint_test", Ctx);
+  M->setDataLayout(
+      "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-"
+      "n8:16:32:64-S128");
+
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *ptr_ty = llvm::PointerType::get(Ctx, 0);
+
+  auto *bb_fn_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+  auto *bb_fn = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "__remill_basic_block", *M);
+  auto *bb_entry = llvm::BasicBlock::Create(Ctx, "entry", bb_fn);
+  llvm::IRBuilder<> BBB(bb_entry);
+  auto *bb_state = bb_fn->getArg(0);
+  struct RegDef {
+    const char *name;
+    unsigned offset;
+  };
+  RegDef all_regs[] = {{"RAX", 0}, {"RBX", 8}, {"RCX", 16}, {"RDX", 24},
+                       {"RSI", 32}, {"RDI", 40}, {"RSP", 48}, {"RBP", 56},
+                       {"R8", 64},  {"R9", 72},  {"R10", 80}, {"R11", 88},
+                       {"R12", 96}, {"R13", 104}, {"R14", 112},
+                       {"R15", 120}, {"RIP", 128}};
+  for (auto &reg : all_regs) {
+    auto *gep = BBB.CreateGEP(BBB.getInt64Ty(), bb_state,
+                              BBB.getInt64(reg.offset / 8));
+    gep->setName(reg.name);
+  }
+  BBB.CreateRet(bb_fn->getArg(2));
+
+  auto *root = llvm::Function::Create(
+      bb_fn_ty, llvm::Function::ExternalLinkage, "sub_401000", *M);
+  root->addFnAttr("omill.output_root");
+  root->addFnAttr("omill.requested_root_rax_return_hint", "1");
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", root);
+    llvm::IRBuilder<> B(entry);
+    B.CreateRet(root->getArg(2));
+  }
+
+  llvm::PassBuilder PB;
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+
+  auto result = MAM.getResult<omill::CallingConventionAnalysis>(*M);
+  auto *abi = result.getABI(root);
+  ASSERT_NE(abi, nullptr);
+  ASSERT_TRUE(abi->ret.has_value());
+  EXPECT_EQ(abi->ret->reg_name, "RAX");
+}
+
+
 // ===----------------------------------------------------------------------===
 // Test: Callsite-driven param count refinement
 // ===----------------------------------------------------------------------===

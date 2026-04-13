@@ -45,6 +45,8 @@ namespace omill {
 
 /// DevirtualizedTargetKind is reused from TraceLifter.h.
 enum class DevirtualizedTargetKind;
+class LiftDatabase;
+class BinaryMemoryMap;
 
 /// Maps block VA → block LLVM Function.
 using BlockMap = std::unordered_map<uint64_t, llvm::Function *>;
@@ -60,11 +62,12 @@ class BlockManager {
 
   /// Name for a block-function.  Default: "sub_<hex>" for PCs that have
   /// been marked as function entries via MarkFunctionEntry (e.g. direct
-  /// call targets), otherwise "blk_<hex>".  This lets BlockLifter emit
-  /// canonical `sub_*` names for function entry points up front so
-  /// downstream passes which gate on the `sub_` prefix (inliner, ABI
-  /// recovery, calling-convention analysis, etc.) can recognize them
-  /// without waiting for MergeBlockFunctionsPass to rename.
+  /// call targets and top-level LiftReachable entries), otherwise
+  /// "blk_<hex>".  This allows BlockLifter to produce canonical
+  /// `sub_*` names for function entry points up front so that downstream
+  /// passes which gate on the `sub_` prefix (inliner, ABI recovery,
+  /// calling-convention analysis, etc.) can recognize them without
+  /// waiting for MergeBlockFunctionsPass to rename.
   virtual std::string BlockName(uint64_t addr);
 
   /// Mark \p addr as a function entry point so BlockName emits a
@@ -103,6 +106,11 @@ class BlockManager {
   /// If null, BlockLifter falls back to the Remill intrinsic module.
   virtual llvm::Module *GetLiftedBlockModule();
 
+  /// Optional binary memory map used by BlockLifter to run call-target
+  /// bridge analysis when no lift database descriptor is available.
+  /// Default: nullptr (no fallback analysis).
+  virtual const BinaryMemoryMap *GetBinaryMemoryMap() const { return nullptr; }
+
   /// Provide devirtualized targets for an indirect jump/call.
   /// Default: no-op (no targets).
   virtual void ForEachDevirtualizedTarget(
@@ -127,6 +135,8 @@ class BlockLifter {
  public:
   BlockLifter(const remill::Arch *arch, BlockManager &manager);
   ~BlockLifter();
+
+  void SetLiftDatabase(const LiftDatabase *db);
 
   /// Lift a single basic block at \p addr.  The block-function is
   /// created in the module that holds the remill intrinsics.

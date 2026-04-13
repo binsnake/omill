@@ -105,6 +105,48 @@ TEST(OutputRootClosureTest, IncludesDefinedRemillJumpTargetsForPatchOnlyPasses) 
   EXPECT_EQ(patchable.constant_code_targets.front(), 0x180001020u);
 }
 
+TEST(OutputRootClosureTest, ResolvesRelativeCalliTargetsFromRootPc) {
+  llvm::LLVMContext ctx;
+  llvm::Module module("test", ctx);
+
+  auto *ptr_ty = llvm::PointerType::getUnqual(ctx);
+  auto *i64_ty = llvm::Type::getInt64Ty(ctx);
+  auto *lifted_ty =
+      llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, ptr_ty}, false);
+
+  auto *root = llvm::Function::Create(lifted_ty, llvm::GlobalValue::ExternalLinkage,
+                                      "sub_180001850", module);
+  root->addFnAttr("omill.output_root");
+  auto *entry = llvm::BasicBlock::Create(ctx, "entry", root);
+  llvm::IRBuilder<> builder(entry);
+
+  auto *calli_ty = llvm::FunctionType::get(ptr_ty, {ptr_ty, i64_ty, i64_ty}, false);
+  auto *calli = llvm::Function::Create(
+      calli_ty, llvm::GlobalValue::ExternalLinkage,
+      "_ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_",
+      module);
+
+  auto args = root->args().begin();
+  llvm::Value *state = &*args++;
+  llvm::Value *pc = &*args++;
+  llvm::Value *memory = &*args++;
+  auto *relative_target = builder.CreateAdd(
+      pc, llvm::ConstantInt::get(i64_ty, 0x2Au));
+  auto *call = builder.CreateCall(calli, {state, pc, relative_target});
+  builder.CreateRet(call);
+
+  auto targets = omill::collectOutputRootClosureTargets(
+      module,
+      [&](uint64_t target) { return target >= 0x180001000 && target < 0x180002000; },
+      [&](uint64_t) { return false; },
+      [&](uint64_t target) { return target; },
+      /*include_defined_targets=*/false);
+
+  ASSERT_EQ(targets.constant_calli_targets.size(), 1u);
+  EXPECT_EQ(targets.constant_calli_targets.front(), 0x18000187Au);
+}
+
+
 TEST(OutputRootClosureTest, ProducesTypedWorkItemsForConstantJumpTargets) {
   llvm::LLVMContext ctx;
   llvm::Module module("test", ctx);

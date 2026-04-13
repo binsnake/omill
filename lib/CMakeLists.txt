@@ -154,6 +154,11 @@ if(OMILL_ENABLE_Z3)
   target_compile_definitions(omill PUBLIC OMILL_ENABLE_Z3=1)
 endif()
 
+if(OMILL_ENABLE_UNICORN)
+  target_link_libraries(omill PUBLIC unicorn)
+  target_compile_definitions(omill PUBLIC OMILL_ENABLE_UNICORN=1)
+endif()
+
 if(OMILL_ENABLE_SIMPLIFIER)
   target_sources(omill PRIVATE
     Simplifier/LLVMTranslator.cpp

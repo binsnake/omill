@@ -13,14 +13,17 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <optional>
 #include <set>
 
+#include "omill/Analysis/RemillStateVariableSolver.h"
 #include "omill/Analysis/VMTraceEmulator.h"
 #include "Analysis/VirtualModel/CoreDecls.h"
-#include "omill/BC/BlockLifter.h"
+#include "omill/BC/LiftDatabase.h"
+#include "omill/BC/RemillProjectionLifter.h"
 #include "omill/Devirtualization/BoundaryFact.h"
 #include "omill/Devirtualization/ExecutableTargetFact.h"
 #include "omill/Devirtualization/OutputRootClosure.h"
@@ -31,6 +34,115 @@ namespace omill {
 
 namespace {
 
+static std::optional<uint64_t> extractHexStringAttr(const llvm::Function &F,
+                                                    llvm::StringRef name) {
+  auto attr = F.getFnAttribute(name);
+  if (!attr.isValid() || !attr.isStringAttribute())
+    return std::nullopt;
+  uint64_t value = 0;
+  if (attr.getValueAsString().getAsInteger(16, value))
+    return std::nullopt;
+  return value;
+}
+
+static void applyHandlerOverlayContext(const SessionGraphState &graph,
+                                       FrontierWorkItem &item) {
+  auto handler_it = graph.handler_nodes.find(item.owner_function);
+  if (handler_it == graph.handler_nodes.end())
+    return;
+  const auto &handler = handler_it->second;
+  if (!handler.overlay_handler_va && !handler.overlay_incoming_hash &&
+      !handler.overlay_key) {
+    return;
+  }
+  if (!item.solver_metadata)
+    item.solver_metadata = SolverEdgeMetadata{};
+  if (handler.overlay_handler_va)
+    item.solver_metadata->handler_va = handler.overlay_handler_va;
+  if (handler.overlay_incoming_hash)
+    item.solver_metadata->incoming_hash = handler.overlay_incoming_hash;
+  if (handler.overlay_key)
+    item.solver_metadata->overlay_key = handler.overlay_key;
+}
+
+static SolverEdgeMetadata buildSolverMetadata(
+    const RemillControlTransferSolution &solution,
+    const std::optional<SolverEdgeMetadata> &existing = std::nullopt) {
+  SolverEdgeMetadata metadata = existing.value_or(SolverEdgeMetadata{});
+  metadata.possible_target_pcs.assign(solution.possible_target_pcs.begin(),
+                                      solution.possible_target_pcs.end());
+  metadata.branch_taken = solution.branch_taken;
+  metadata.state_values.clear();
+  for (const auto &entry : solution.named_state_values) {
+    SolverStateValueFact fact;
+    fact.name = entry.getKey().str();
+    fact.bit_width = entry.getValue().bit_width;
+    fact.values.assign(entry.getValue().values.begin(),
+                       entry.getValue().values.end());
+    metadata.state_values.push_back(std::move(fact));
+  }
+  std::sort(metadata.state_values.begin(), metadata.state_values.end(),
+            [](const SolverStateValueFact &lhs,
+               const SolverStateValueFact &rhs) { return lhs.name < rhs.name; });
+  return metadata;
+}
+
+static llvm::SmallVector<uint64_t, 4> collectOverlayTargetsForSource(
+    const LiftDatabase &db, const SolverEdgeMetadata &metadata,
+    uint64_t source_block_va) {
+  llvm::SmallVector<uint64_t, 4> targets;
+  if (!metadata.overlay_key)
+    return targets;
+  const auto *overlay = db.traceOverlay(*metadata.overlay_key);
+  if (!overlay)
+    return targets;
+  for (const auto &edge : overlay->constrained_edges) {
+    if (edge.source_block_va == source_block_va && edge.target_block_va != 0) {
+      if (std::find(targets.begin(), targets.end(), edge.target_block_va) ==
+          targets.end()) {
+        targets.push_back(edge.target_block_va);
+      }
+    }
+  }
+  if (!targets.empty())
+    return targets;
+
+  for (size_t i = 0; i + 1 < overlay->path_block_entries.size(); ++i) {
+    if (overlay->path_block_entries[i] != source_block_va)
+      continue;
+    const uint64_t next_block_va = overlay->path_block_entries[i + 1];
+    if (next_block_va != 0 &&
+        std::find(targets.begin(), targets.end(), next_block_va) ==
+            targets.end()) {
+      targets.push_back(next_block_va);
+    }
+  }
+  return targets;
+}
+
+static void refineSolverTargetsWithOverlay(const LiftDatabase &db,
+                                           SolverEdgeMetadata &metadata,
+                                           uint64_t source_block_va) {
+  auto overlay_targets = collectOverlayTargetsForSource(db, metadata,
+                                                        source_block_va);
+  if (overlay_targets.empty())
+    return;
+  if (metadata.possible_target_pcs.empty()) {
+    metadata.possible_target_pcs.assign(overlay_targets.begin(),
+                                        overlay_targets.end());
+    return;
+  }
+  std::vector<uint64_t> filtered;
+  for (uint64_t target : metadata.possible_target_pcs) {
+    if (std::find(overlay_targets.begin(), overlay_targets.end(), target) !=
+        overlay_targets.end()) {
+      filtered.push_back(target);
+    }
+  }
+  if (!filtered.empty())
+    metadata.possible_target_pcs = std::move(filtered);
+}
+
 unsigned countUnresolvedDispatches(const llvm::Module &M,
                                    std::vector<uint64_t> *frontier_pcs);
 
@@ -38,41 +150,6 @@ bool isDispatchName(llvm::StringRef name) {
   return isDispatchIntrinsicName(name);
 }
 
-struct SessionGraphProjectionCacheEntry {
-  llvm::stable_hash module_fingerprint = 0;
-  uint64_t projection_serial = 0;
-  SessionGraphState state;
-};
-
-constexpr const char *kSessionGraphProjectionSerialMetadata =
-    "omill.session_graph_projection.serial";
-
-uint64_t nextSessionGraphProjectionSerial() {
-  static uint64_t serial = 1;
-  return serial++;
-}
-
-std::optional<uint64_t> moduleSessionGraphProjectionSerial(
-    const llvm::Module &M) {
-  auto *named = M.getNamedMetadata(kSessionGraphProjectionSerialMetadata);
-  if (!named || named->getNumOperands() == 0)
-    return std::nullopt;
-  auto *tuple = named->getOperand(0);
-  if (!tuple || tuple->getNumOperands() == 0)
-    return std::nullopt;
-  auto *meta =
-      llvm::mdconst::dyn_extract_or_null<llvm::ConstantInt>(tuple->getOperand(0));
-  if (!meta)
-    return std::nullopt;
-  return meta->getZExtValue();
-}
-
-std::map<const llvm::Module *, SessionGraphProjectionCacheEntry> &
-sessionGraphProjectionCache() {
-  static auto *cache =
-      new std::map<const llvm::Module *, SessionGraphProjectionCacheEntry>();
-  return *cache;
-}
 
 VirtualExitDisposition boundaryDisposition(
     const std::optional<BoundaryFact> &fact) {
@@ -411,6 +488,22 @@ std::pair<VipTrackingStatus, std::optional<uint64_t>> classifyVipTrackingForFunc
           std::nullopt};
 }
 
+std::pair<VipTrackingStatus, std::optional<uint64_t>> classifyVipTrackingForFunction(
+    llvm::StringRef function_name, const SessionGraphState &graph) {
+  bool saw_symbolic = false;
+  for (const auto &[identity, edge] : graph.edge_facts_by_identity) {
+    (void)identity;
+    if (!edge.from_unresolved_exit || edge.owner_function != function_name)
+      continue;
+    if (edge.vip_pc.has_value())
+      return {VipTrackingStatus::kResolved, edge.vip_pc};
+    saw_symbolic = saw_symbolic || edge.vip_symbolic;
+  }
+  return {saw_symbolic ? VipTrackingStatus::kSymbolic : VipTrackingStatus::kUnknown,
+          std::nullopt};
+}
+
+
 std::string unresolvedExitIdentity(const UnresolvedExitSite &site) {
   std::string key = site.owner_function + ":" +
                     std::to_string(site.site_index) + ":" +
@@ -505,6 +598,26 @@ std::string buildVipContextFingerprint(
   return fingerprint;
 }
 
+std::string buildVipContextFingerprint(llvm::StringRef function_name,
+                                       const SessionGraphState &graph) {
+  std::vector<std::string> identities;
+  for (const auto &[identity, edge] : graph.edge_facts_by_identity) {
+    (void)identity;
+    if (!edge.from_unresolved_exit || edge.owner_function != function_name)
+      continue;
+    identities.push_back(edge.identity);
+  }
+  std::sort(identities.begin(), identities.end());
+  std::string fingerprint;
+  for (size_t i = 0; i < identities.size(); ++i) {
+    if (i)
+      fingerprint += ";";
+    fingerprint += identities[i];
+  }
+  return fingerprint;
+}
+
+
 unsigned boundaryContinuationSiteIndex(uint64_t boundary_pc,
                                        uint64_t continuation_pc) {
   const uint64_t mixed =
@@ -514,22 +627,8 @@ unsigned boundaryContinuationSiteIndex(uint64_t boundary_pc,
 
 void promoteBoundaryReentrySeed(DevirtualizationSession &session,
                                 uint64_t target_pc) {
-  auto promoteItem = [&](FrontierWorkItem &edge_like) {
-    if (!edge_like.target_pc || *edge_like.target_pc != target_pc ||
-        edge_like.from_boundary_continuation) {
-      return;
-    }
-    edge_like.continuation_confidence = ContinuationConfidence::kTrusted;
-    edge_like.continuation_liveness = ContinuationLiveness::kLive;
-    edge_like.scheduling_class = FrontierSchedulingClass::kTrustedLive;
-    edge_like.continuation_rationale = "boundary_reentry_nearby_seed";
-    if (edge_like.status == FrontierWorkStatus::kInvalidated ||
-        edge_like.failure_reason == "quarantined_selector_arm_deferred") {
-      edge_like.status = FrontierWorkStatus::kPending;
-      edge_like.failure_reason.clear();
-    }
-  };
 
+  bool revised = false;
   auto promoteEdge = [&](SessionEdgeFact &edge_like) {
     if (!edge_like.target_pc || *edge_like.target_pc != target_pc ||
         edge_like.from_boundary_continuation) {
@@ -563,14 +662,15 @@ void promoteBoundaryReentrySeed(DevirtualizationSession &session,
     proof.rationale = "boundary_reentry_nearby_seed";
     edge_like.continuation_proof = std::move(proof);
     edge_like.is_dirty = true;
+    revised = true;
   };
 
-  for (auto &existing : session.late_frontier_work_items)
-    promoteItem(existing);
   for (auto &[identity, edge] : session.graph.edge_facts_by_identity) {
     (void)identity;
     promoteEdge(edge);
   }
+  if (revised)
+    ++session.graph.edge_fact_revision;
 }
 
 std::string makeBoundaryContinuationIdentity(
@@ -646,7 +746,13 @@ FrontierWorkItem makeBoundaryContinuationWorkItem(const BoundaryFact &boundary,
   return item;
 }
 
-FrontierWorkItem makeFrontierWorkItem(const UnresolvedExitSite &site) {
+ExitCompleteness effectiveUnresolvedExitCompleteness(
+    const UnresolvedExitSite &site, const SessionGraphState *graph);
+llvm::StringRef unresolvedExitFailureReason(const UnresolvedExitSite &site,
+                                            const SessionGraphState *graph);
+llvm::StringRef unresolvedExitFailureReason(const UnresolvedExitSite &site);
+FrontierWorkItem makeFrontierWorkItem(const UnresolvedExitSite &site,
+                                      const SessionGraphState *graph) {
   FrontierWorkItem item;
   item.owner_function = site.owner_function;
   item.site_index = site.site_index;
@@ -679,28 +785,15 @@ FrontierWorkItem makeFrontierWorkItem(const UnresolvedExitSite &site) {
                                             : BoundaryKind::kContinuation));
   item.boundary = fact;
   item.identity = unresolvedExitIdentity(site);
-  item.status = site.completeness == ExitCompleteness::kInvalidated
+  item.status = effectiveUnresolvedExitCompleteness(site, graph) ==
+                        ExitCompleteness::kInvalidated
                     ? FrontierWorkStatus::kInvalidated
                     : FrontierWorkStatus::kPending;
+  item.failure_reason = unresolvedExitFailureReason(site, graph).str();
   classifyContinuationCandidate(item);
   return item;
 }
 
-std::vector<FrontierWorkItem> collectFrontierWorkItems(
-    llvm::ArrayRef<UnresolvedExitSite> unresolved_exits) {
-  std::vector<FrontierWorkItem> work_items;
-  for (const auto &site : unresolved_exits) {
-    if (!site.target_pc)
-      continue;
-    if (site.kind != UnresolvedExitKind::kDispatchJump &&
-        site.kind != UnresolvedExitKind::kDispatchCall &&
-        site.kind != UnresolvedExitKind::kUnknownContinuation) {
-      continue;
-    }
-    work_items.push_back(makeFrontierWorkItem(site));
-  }
-  return work_items;
-}
 
 FrontierWorkItem makeClosureFrontierWorkItem(
     const OutputRootClosureWorkItem &closure_item) {
@@ -743,6 +836,7 @@ FrontierWorkItem frontierWorkItemFromEdgeFact(const SessionEdgeFact &edge) {
   item.failure_reason = edge.failure_reason;
   item.identity = edge.identity;
   item.from_boundary_continuation = edge.from_boundary_continuation;
+  item.solver_metadata = edge.solver_metadata;
   if (edge.continuation_proof) {
     item.continuation_confidence = edge.continuation_proof->confidence;
     item.continuation_liveness = edge.continuation_proof->liveness;
@@ -773,6 +867,8 @@ void syncEdgeFactFromFrontierWorkItem(SessionEdgeFact &edge,
   edge.retry_count = item.retry_count;
   edge.failure_reason = item.failure_reason;
   edge.from_boundary_continuation = item.from_boundary_continuation;
+  if (item.solver_metadata)
+    edge.solver_metadata = item.solver_metadata;
   edge.is_dirty = false;
 }
 
@@ -998,6 +1094,45 @@ struct SessionGraphRefreshSummary {
 
 std::optional<ContinuationCandidate> continuationCandidateFromEdge(
     const SessionEdgeFact &edge);
+std::optional<BoundaryFact> findRelatedBoundaryEvidence(
+    const DevirtualizationSession &session, uint64_t target_pc) {
+  std::optional<BoundaryFact> related_boundary;
+  auto absorb = [&](uint64_t boundary_target,
+                    const std::optional<BoundaryFact> &fact) {
+    if (!fact)
+      return;
+    const bool matches_target =
+        boundary_target == target_pc ||
+        (fact->boundary_pc && *fact->boundary_pc == target_pc) ||
+        (fact->native_target_pc && *fact->native_target_pc == target_pc);
+    if (!matches_target)
+      return;
+    related_boundary = related_boundary
+                           ? mergeBoundaryFacts(*related_boundary, *fact)
+                           : *fact;
+  };
+  for (const auto &[boundary_target, entry] : session.graph.boundary_facts_by_target)
+    absorb(boundary_target, entry.boundary);
+  for (const auto &[identity, edge] : session.graph.edge_facts_by_identity) {
+    (void)identity;
+    absorb(edge.target_pc.value_or(0), edge.boundary);
+  }
+  return related_boundary;
+}
+
+void mergeRelatedBoundaryEvidence(const DevirtualizationSession &session,
+                                  FrontierWorkItem &item) {
+  if (!item.target_pc || item.from_boundary_continuation)
+    return;
+  auto related_boundary = findRelatedBoundaryEvidence(session, *item.target_pc);
+  if (!related_boundary)
+    return;
+  item.boundary = item.boundary
+                      ? std::optional<BoundaryFact>(
+                            mergeBoundaryFacts(*item.boundary, *related_boundary))
+                      : related_boundary;
+}
+
 ProtectorModel buildProtectorModelFromSession(
     const DevirtualizationSession &session);
 void applyProtectorModelToSession(DevirtualizationSession &session,
@@ -1035,6 +1170,7 @@ void collectDirtyFunctionsAndSites(DevirtualizationSession &session,
       graph.dirty_function_names.insert(edge.owner_function);
   }
 
+
   for (uint64_t root_va : session.root_slice)
     graph.dirty_root_vas.insert(root_va);
 
@@ -1049,6 +1185,70 @@ void collectDirtyFunctionsAndSites(DevirtualizationSession &session,
         graph.dirty_root_vas.insert(*entry_va);
     }
   }
+}
+
+DevirtualizationRoundTelemetry summarizeRoundTelemetry(
+    llvm::ArrayRef<UnresolvedExitSite> unresolved_exits,
+    const SessionGraphState &graph,
+    const std::map<NormalizedLiftUnitCacheKey, NormalizedLiftUnitCacheEntry> &cache,
+    const RemillNormalizationSummary &normalization_summary);
+bool isResolvedFrontierStatus(FrontierWorkStatus status);
+bool graphUnresolvedExitViewMatches(
+    llvm::StringRef function_name, llvm::ArrayRef<UnresolvedExitSite> unresolved_exits,
+    const SessionGraphState &graph);
+
+ExitCompleteness unresolvedExitCompletenessFromFrontierStatus(
+    FrontierWorkStatus status) {
+  switch (status) {
+    case FrontierWorkStatus::kLifted:
+    case FrontierWorkStatus::kClassifiedNativeExit:
+    case FrontierWorkStatus::kClassifiedTerminal:
+    case FrontierWorkStatus::kClassifiedVmEnter:
+    case FrontierWorkStatus::kSkippedMaterialized:
+      return ExitCompleteness::kComplete;
+    case FrontierWorkStatus::kInvalidated:
+      return ExitCompleteness::kInvalidated;
+    case FrontierWorkStatus::kPending:
+    case FrontierWorkStatus::kFailedDecode:
+    case FrontierWorkStatus::kFailedLift:
+      return ExitCompleteness::kIncomplete;
+  }
+  return ExitCompleteness::kIncomplete;
+}
+
+const SessionEdgeFact *findSessionEdgeFactForUnresolvedExit(
+    const UnresolvedExitSite &site, const SessionGraphState *graph) {
+  if (!graph)
+    return nullptr;
+  auto it = graph->edge_facts_by_identity.find(unresolvedExitIdentity(site));
+  if (it == graph->edge_facts_by_identity.end() || !it->second.from_unresolved_exit)
+    return nullptr;
+  return &it->second;
+}
+
+ExitCompleteness effectiveUnresolvedExitCompleteness(
+    const UnresolvedExitSite &site, const SessionGraphState *graph) {
+  if (const auto *edge = findSessionEdgeFactForUnresolvedExit(site, graph)) {
+    if (edge->status != FrontierWorkStatus::kPending)
+      return unresolvedExitCompletenessFromFrontierStatus(edge->status);
+  }
+  return site.completeness;
+}
+
+llvm::StringRef unresolvedExitFailureReason(const UnresolvedExitSite &site,
+                                            const SessionGraphState *graph) {
+  if (effectiveUnresolvedExitCompleteness(site, graph) !=
+      ExitCompleteness::kInvalidated)
+    return {};
+  if (const auto *edge = findSessionEdgeFactForUnresolvedExit(site, graph);
+      edge && !edge->failure_reason.empty()) {
+    return edge->failure_reason;
+  }
+  return site.evidence.invalidation_reason;
+}
+
+llvm::StringRef unresolvedExitFailureReason(const UnresolvedExitSite &site) {
+  return unresolvedExitFailureReason(site, nullptr);
 }
 
 void refreshHandlerLocalFacts(DevirtualizationSession &session,
@@ -1079,6 +1279,19 @@ void refreshHandlerLocalFacts(DevirtualizationSession &session,
     const bool fingerprint_changed = node->fingerprint != new_fingerprint;
     node->function_name = name;
     node->entry_va = extractLiftUnitVA(F);
+    node->overlay_handler_va = extractHexStringAttr(F, "omill.vm_handler_va");
+    if (!node->overlay_handler_va && F.hasFnAttribute("omill.vm_handler"))
+      node->overlay_handler_va = node->entry_va;
+    node->overlay_incoming_hash =
+        extractHexStringAttr(F, "omill.vm_trace_in_hash");
+    if (!node->overlay_incoming_hash)
+      node->overlay_incoming_hash = extractHexStringAttr(F, "omill.vm_trace_hash");
+    if (node->overlay_handler_va && node->overlay_incoming_hash) {
+      node->overlay_key = LiftDbOverlayKey(*node->overlay_handler_va,
+                                           *node->overlay_incoming_hash);
+    } else {
+      node->overlay_key.reset();
+    }
     node->fingerprint = new_fingerprint;
     node->is_defined = !F.isDeclaration();
     node->is_output_root = F.hasFnAttribute("omill.output_root");
@@ -1099,12 +1312,15 @@ void refreshHandlerLocalFacts(DevirtualizationSession &session,
     node->is_initial_seed = virtual_model::detail::isVirtualModelInitialSeedFunction(F);
     node->is_code_bearing = virtual_model::detail::isVirtualModelCodeBearingFunction(F);
     if (node->is_defined) {
-      if (!node->local_summary.has_value() || node->is_dirty ||
-          fingerprint_changed ||
-          node->local_summary->function_name != name ||
-          node->local_summary->entry_va != node->entry_va) {
-        node->local_summary = virtual_model::detail::summarizeFunction(
-            const_cast<llvm::Function &>(F));
+      // Do not eagerly summarize every lifted helper during compat/session refresh.
+      // The compact corpus can materialize thousands of `sub_*` functions here, and
+      // `summarizeFunction` is only needed later by consumers that already tolerate
+      // a missing cached summary and recompute on demand.
+      if (node->local_summary.has_value() &&
+          (node->is_dirty || fingerprint_changed ||
+           node->local_summary->function_name != name ||
+           node->local_summary->entry_va != node->entry_va)) {
+        node->local_summary.reset();
       }
     } else {
       node->local_summary.reset();
@@ -1158,7 +1374,8 @@ SessionGraphRefreshSummary refreshSessionEdgesAndFrontier(
         site.kind != UnresolvedExitKind::kUnknownContinuation) {
       continue;
     }
-    FrontierWorkItem work_item = makeFrontierWorkItem(site);
+    FrontierWorkItem work_item = makeFrontierWorkItem(site, &graph);
+    applyHandlerOverlayContext(graph, work_item);
     active_unresolved_edges.insert(work_item.identity);
     auto it = graph.edge_facts_by_identity.find(work_item.identity);
     bool inserted = false;
@@ -1187,6 +1404,7 @@ SessionGraphRefreshSummary refreshSessionEdgesAndFrontier(
     const auto preserved_status = edge.status;
     const auto preserved_retry_count = edge.retry_count;
     const auto preserved_failure_reason = edge.failure_reason;
+    const auto preserved_solver_metadata = edge.solver_metadata;
     bool edge_dirty = false;
     if (inserted) {
       edge.identity = work_item.identity;
@@ -1203,11 +1421,17 @@ SessionGraphRefreshSummary refreshSessionEdgesAndFrontier(
         edge.status != FrontierWorkStatus::kInvalidated &&
         work_item.status != FrontierWorkStatus::kInvalidated;
     syncEdgeFactFromFrontierWorkItem(edge, work_item);
+    ++graph.edge_fact_revision;
+    if (const auto reason = unresolvedExitFailureReason(site); !reason.empty())
+      edge.failure_reason = reason.str();
     if (!inserted && (!edge_dirty || preserve_frontier_outcome)) {
       edge.kind = preserved_kind;
       edge.status = preserved_status;
       edge.retry_count = preserved_retry_count;
       edge.failure_reason = preserved_failure_reason;
+      edge.solver_metadata = preserved_solver_metadata;
+    } else if (edge_dirty) {
+      edge.solver_metadata.reset();
     }
     edge.is_dirty = edge_dirty || inserted ||
                     session.graph.dirty_function_names.count(edge.owner_function) !=
@@ -1232,6 +1456,7 @@ SessionGraphRefreshSummary refreshSessionEdgesAndFrontier(
     if (it->second.target_pc)
       dirty_boundary_targets.insert(*it->second.target_pc);
     it = graph.edge_facts_by_identity.erase(it);
+    ++graph.edge_fact_revision;
   }
 
   std::set<uint64_t> active_boundary_targets;
@@ -1442,51 +1667,7 @@ SessionGraphRefreshSummary refreshDerivedViewsAndLoweringInputs(
   return summary;
 }
 
-void publishSessionGraphProjectionImpl(const llvm::Module &M,
-                                       const SessionGraphState &state) {
-  SessionGraphProjectionCacheEntry entry;
-  entry.module_fingerprint = llvm::StructuralHash(M);
-  entry.projection_serial = nextSessionGraphProjectionSerial();
-  entry.state = state;
-  auto &mutable_module = const_cast<llvm::Module &>(M);
-  auto *named =
-      mutable_module.getOrInsertNamedMetadata(kSessionGraphProjectionSerialMetadata);
-  named->clearOperands();
-  named->addOperand(llvm::MDTuple::get(
-      mutable_module.getContext(),
-      {llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
-          llvm::Type::getInt64Ty(mutable_module.getContext()),
-          entry.projection_serial))}));
-  sessionGraphProjectionCache()[&M] = std::move(entry);
-}
 
-const SessionGraphState *findSessionGraphProjectionImpl(
-    const llvm::Module &M) {
-  auto &cache = sessionGraphProjectionCache();
-  auto it = cache.find(&M);
-  if (it == cache.end())
-    return nullptr;
-  if (it->second.module_fingerprint != llvm::StructuralHash(M) ||
-      moduleSessionGraphProjectionSerial(M) != it->second.projection_serial) {
-    cache.erase(it);
-    return nullptr;
-  }
-  return &it->second.state;
-}
-
-SessionGraphState *findMutableSessionGraphProjectionImpl(llvm::Module &M) {
-  auto &cache = sessionGraphProjectionCache();
-  auto it = cache.find(&M);
-  if (it == cache.end())
-    return nullptr;
-  const llvm::stable_hash fingerprint = llvm::StructuralHash(M);
-  if (it->second.module_fingerprint != fingerprint ||
-      moduleSessionGraphProjectionSerial(M) != it->second.projection_serial) {
-    cache.erase(it);
-    return nullptr;
-  }
-  return &it->second.state;
-}
 
 void refreshSessionGraphState(DevirtualizationSession &session,
                               const llvm::Module &M) {
@@ -1508,7 +1689,22 @@ void refreshSessionGraphState(DevirtualizationSession &session,
   session.latest_round.rebuilt_regions = derived_summary.rebuilt_regions;
   session.protector_model = buildProtectorModelFromSession(session);
   applyProtectorModelToSession(session, session.protector_model);
-  publishSessionGraphProjectionImpl(M, session.graph);
+  RemillNormalizationOrchestrator normalization;
+  auto round = summarizeRoundTelemetry(
+      session.unresolved_exits, session.graph, session.normalized_unit_cache,
+      normalization.summarize(M));
+  session.latest_round.units_lifted = round.units_lifted;
+  session.latest_round.units_reused = round.units_reused;
+  session.latest_round.unresolved_exits_complete =
+      round.unresolved_exits_complete;
+  session.latest_round.unresolved_exits_incomplete =
+      round.unresolved_exits_incomplete;
+  session.latest_round.unresolved_exits_invalidated =
+      round.unresolved_exits_invalidated;
+  session.latest_round.normalization_failures = round.normalization_failures;
+  session.latest_round.dispatches_materialized = round.dispatches_materialized;
+  session.latest_round.leaked_runtime_artifacts =
+      round.leaked_runtime_artifacts;
 }
 
 std::optional<ContinuationCandidate> continuationCandidateFromEdge(
@@ -1559,6 +1755,39 @@ ProtectorModel buildProtectorModelFromSession(
     auto candidate = continuationCandidateFromEdge(edge);
     if (!candidate)
       continue;
+    if (candidate->raw_target_pc) {
+      if (auto related_boundary =
+              findRelatedBoundaryEvidence(session, *candidate->raw_target_pc)) {
+        candidate->boundary = candidate->boundary
+                                 ? std::optional<BoundaryFact>(mergeBoundaryFacts(
+                                       *candidate->boundary, *related_boundary))
+                                 : related_boundary;
+        candidate->return_address_control_kind =
+            candidate->boundary->return_address_control_kind;
+        candidate->controlled_return_pc =
+            candidate->boundary->controlled_return_pc;
+        candidate->suppresses_normal_fallthrough =
+            candidate->boundary->suppresses_normal_fallthrough;
+        FrontierWorkItem item = frontierWorkItemFromEdgeFact(edge);
+        item.boundary = candidate->boundary;
+        classifyContinuationCandidate(item);
+        candidate->provenance = classifyContinuationProvenance(item);
+        candidate->confidence = item.continuation_confidence;
+        candidate->liveness = item.continuation_liveness;
+        candidate->scheduling_class = item.scheduling_class;
+        if (candidate->rationale.empty() ||
+            candidate->rationale == "selector_derived" ||
+            candidate->rationale == "executable_placeholder") {
+          candidate->rationale = item.continuation_rationale;
+        }
+        if ((!candidate->effective_target_pc ||
+             candidate->provenance ==
+                 ContinuationProvenance::kReturnAddressControlled) &&
+            candidate->controlled_return_pc) {
+          candidate->effective_target_pc = candidate->controlled_return_pc;
+        }
+      }
+    }
     model.continuation_candidates.push_back(*candidate);
     std::string site_key = edge.owner_function + ":" +
                            std::to_string(edge.site_index) + ":";
@@ -1691,6 +1920,7 @@ ProtectorModel buildProtectorModelFromSession(
 
 void applyProtectorModelToSession(DevirtualizationSession &session,
                                   const ProtectorModel &model) {
+  bool revised = false;
   for (const auto &candidate : model.continuation_candidates) {
     auto it = session.graph.edge_facts_by_identity.find(candidate.edge_identity);
     if (it == session.graph.edge_facts_by_identity.end())
@@ -1700,7 +1930,10 @@ void applyProtectorModelToSession(DevirtualizationSession &session,
     it->second.scheduling_class = candidate.scheduling_class;
     it->second.continuation_rationale = candidate.rationale;
     it->second.continuation_proof = candidate.proof;
+    revised = true;
   }
+  if (revised)
+    ++session.graph.edge_fact_revision;
 }
 
 bool looksLikeNativeCallBoundary(uint64_t target_pc,
@@ -2211,6 +2444,20 @@ llvm::FunctionType *inferFrontierFunctionType(llvm::Module &M,
                callee->getName() == "__remill_jump" ||
                isDispatchIntrinsicName(callee->getName())) &&
               call->arg_size() >= 2) {
+            if (auto executable_fact = readExecutableTargetFact(*call)) {
+              call_target = executable_fact->effective_target_pc
+                                ? executable_fact->effective_target_pc
+                                : std::optional<uint64_t>(
+                                      executable_fact->raw_target_pc);
+            }
+            if (!call_target) {
+              if (auto solved_targets = readSolvedTargetSet(*call)) {
+                for (uint64_t solved_target : *solved_targets) {
+                  if (solved_target == *item.target_pc)
+                    return call->getFunctionType();
+                }
+              }
+            }
             if (auto *pc =
                     llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1))) {
               call_target = pc->getZExtValue();
@@ -2489,12 +2736,15 @@ void mergeFrontierItems(
     DevirtualizationSession &session, llvm::ArrayRef<FrontierWorkItem> items,
     FrontierAdvanceSummary *summary = nullptr) {
   auto &edge_facts = session.graph.edge_facts_by_identity;
-  for (const auto &item : items) {
+  for (const auto &item_ref : items) {
+    FrontierWorkItem item = item_ref;
+    applyHandlerOverlayContext(session.graph, item);
     auto existing = edge_facts.find(item.identity);
     if (existing == edge_facts.end()) {
       SessionEdgeFact edge;
       edge.identity = item.identity;
       syncEdgeFactFromFrontierWorkItem(edge, item);
+      ++session.graph.edge_fact_revision;
       edge.is_dirty = true;
       edge.from_output_root_closure = item.identity.find("closure:") == 0;
       edge.from_vm_continuation = item.owner_function == "__frontier__";
@@ -2516,17 +2766,22 @@ void mergeFrontierItems(
     const auto preserved_status = edge.status;
     const auto preserved_retry_count = edge.retry_count;
     const auto preserved_failure_reason = edge.failure_reason;
+    const auto preserved_solver_metadata = edge.solver_metadata;
     if (edge.status == FrontierWorkStatus::kInvalidated || changed) {
       edge.status = FrontierWorkStatus::kPending;
       edge.failure_reason.clear();
       edge.is_dirty = true;
+      if (changed)
+        edge.solver_metadata.reset();
     }
     syncEdgeFactFromFrontierWorkItem(edge, item);
+    ++session.graph.edge_fact_revision;
     if (edge.status != FrontierWorkStatus::kInvalidated && !changed) {
       edge.kind = preserved_kind;
       edge.status = preserved_status;
       edge.retry_count = preserved_retry_count;
       edge.failure_reason = preserved_failure_reason;
+      edge.solver_metadata = preserved_solver_metadata;
     }
     edge.from_output_root_closure =
         edge.from_output_root_closure || item.identity.find("closure:") == 0;
@@ -2540,72 +2795,36 @@ void mergeFrontierItems(
   }
 }
 
+int frontierSchedulingRankImpl(FrontierSchedulingClass scheduling_class) {
+  switch (scheduling_class) {
+    case FrontierSchedulingClass::kTrustedLive:
+      return 0;
+    case FrontierSchedulingClass::kWeakExecutable:
+      return 1;
+    case FrontierSchedulingClass::kNativeOrVmEnterBoundary:
+      return 2;
+    case FrontierSchedulingClass::kTerminalModeled:
+      return 3;
+    case FrontierSchedulingClass::kQuarantinedSelectorArm:
+      return 4;
+  }
+  return 99;
+}
+
+
 void refreshFrontierCompatibilityViews(DevirtualizationSession &session) {
   const bool debug_frontier =
       (std::getenv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS") != nullptr);
-  session.discovered_frontier_work_items.clear();
-  session.late_frontier_work_items.clear();
-  session.discovered_frontier_identities.clear();
-  session.late_frontier_identities.clear();
-  session.discovered_frontier_pcs.clear();
-  session.late_frontier.clear();
-  session.frontier_work_by_identity.clear();
-
-  for (const auto &[identity, edge] : session.graph.edge_facts_by_identity) {
-    (void)identity;
-    auto item = frontierWorkItemFromEdgeFact(edge);
-    session.frontier_work_by_identity.emplace(item.identity, item);
-    session.discovered_frontier_work_items.push_back(item);
-    session.discovered_frontier_identities.push_back(item.identity);
-    if (item.target_pc)
-      session.discovered_frontier_pcs.push_back(*item.target_pc);
-    if (item.status == FrontierWorkStatus::kPending ||
-        item.status == FrontierWorkStatus::kInvalidated) {
-      session.late_frontier_work_items.push_back(item);
-      session.late_frontier_identities.push_back(item.identity);
-      if (item.target_pc)
-        session.late_frontier.push_back(*item.target_pc);
-    }
-  }
-
-  auto scheduling_rank = [](FrontierSchedulingClass scheduling_class) {
-    switch (scheduling_class) {
-      case FrontierSchedulingClass::kTrustedLive:
-        return 0;
-      case FrontierSchedulingClass::kWeakExecutable:
-        return 1;
-      case FrontierSchedulingClass::kNativeOrVmEnterBoundary:
-        return 2;
-      case FrontierSchedulingClass::kTerminalModeled:
-        return 3;
-      case FrontierSchedulingClass::kQuarantinedSelectorArm:
-        return 4;
-    }
-    return 99;
-  };
-  std::stable_sort(
-      session.late_frontier_work_items.begin(),
-      session.late_frontier_work_items.end(),
-      [&](const FrontierWorkItem &lhs, const FrontierWorkItem &rhs) {
-        return scheduling_rank(lhs.scheduling_class) <
-               scheduling_rank(rhs.scheduling_class);
-      });
-  session.late_frontier_identities.clear();
-  session.late_frontier.clear();
-  for (const auto &item : session.late_frontier_work_items) {
-    session.late_frontier_identities.push_back(item.identity);
-    if (item.target_pc)
-      session.late_frontier.push_back(*item.target_pc);
-  }
 
   if (debug_frontier) {
-    for (const auto &[identity, item] : session.frontier_work_by_identity) {
-      llvm::errs() << "[frontier-refresh] id=" << identity;
+    for (const auto &item : collectOrderedSessionFrontierWorkItems(session)) {
+      llvm::errs() << "[frontier-refresh] id=" << item.identity;
       if (item.target_pc)
         llvm::errs() << " target=0x" << llvm::utohexstr(*item.target_pc);
       llvm::errs() << " kind=" << toString(item.kind)
                    << " status=" << toString(item.status)
-                   << " sched=" << static_cast<int>(item.scheduling_class);
+                   << " sched=" << frontierSchedulingRankImpl(
+                          item.scheduling_class);
       if (!item.failure_reason.empty())
         llvm::errs() << " reason=" << item.failure_reason;
       llvm::errs() << "\n";
@@ -2613,24 +2832,38 @@ void refreshFrontierCompatibilityViews(DevirtualizationSession &session) {
   }
 }
 
-bool isContinuationCandidate(const UnresolvedExitSite &site) {
-  if (!site.target_pc || site.completeness != ExitCompleteness::kComplete)
+
+
+bool isContinuationCandidate(const UnresolvedExitSite &site,
+                             const SessionGraphState *graph) {
+  if (!site.target_pc ||
+      effectiveUnresolvedExitCompleteness(site, graph) !=
+          ExitCompleteness::kComplete) {
     return false;
+  }
   return site.kind == UnresolvedExitKind::kDispatchCall ||
          site.kind == UnresolvedExitKind::kDispatchJump ||
          site.kind == UnresolvedExitKind::kUnknownContinuation;
 }
 
+
 std::vector<std::string> collectContinuationIdentities(
-    llvm::ArrayRef<UnresolvedExitSite> unresolved_exits) {
+    llvm::ArrayRef<UnresolvedExitSite> unresolved_exits,
+    const SessionGraphState *graph) {
   std::set<std::string> identities;
+  auto use_graph_for_site = [&](const UnresolvedExitSite &site) {
+    return graph && !graph->edge_facts_by_identity.empty() &&
+           graphUnresolvedExitViewMatches(site.owner_function, unresolved_exits, *graph);
+  };
   for (const auto &site : unresolved_exits) {
-    if (!isContinuationCandidate(site))
+    const auto *site_graph = use_graph_for_site(site) ? graph : nullptr;
+    if (!isContinuationCandidate(site, site_graph))
       continue;
     identities.insert(unresolvedExitIdentity(site));
   }
   return {identities.begin(), identities.end()};
 }
+
 
 std::map<std::string, UnresolvedExitSite> buildUnresolvedExitIndex(
     const std::vector<UnresolvedExitSite> &sites) {
@@ -2641,48 +2874,11 @@ std::map<std::string, UnresolvedExitSite> buildUnresolvedExitIndex(
 }
 
 std::vector<UnresolvedExitSite> collectUnresolvedExitSites(
-    const llvm::Module &M, const std::vector<UnresolvedExitSite> &previous) {
+    const llvm::Module &M, const std::vector<UnresolvedExitSite> &previous,
+    const SessionGraphState *previous_graph) {
   std::vector<UnresolvedExitSite> sites;
   const auto previous_index = buildUnresolvedExitIndex(previous);
   std::map<std::string, unsigned> next_site_index;
-
-  auto applyPreviousState = [&](UnresolvedExitSite &site) {
-    const auto key = unresolvedExitStableSiteKey(site);
-    auto it = previous_index.find(key);
-    if (it == previous_index.end())
-      return;
-    const auto &prior = it->second;
-    if (prior.evidence.predecessor_count != site.evidence.predecessor_count) {
-      site.completeness = ExitCompleteness::kInvalidated;
-      site.evidence.invalidation_reason = "predecessor_count_changed";
-    } else if (prior.target_pc != site.target_pc) {
-      site.completeness = ExitCompleteness::kInvalidated;
-      site.evidence.invalidation_reason = "target_changed";
-    } else if (prior.vip_pc != site.vip_pc) {
-      site.completeness = ExitCompleteness::kInvalidated;
-      site.evidence.invalidation_reason = "vip_changed";
-    } else if (prior.continuation_vip_pc != site.continuation_vip_pc) {
-      site.completeness = ExitCompleteness::kInvalidated;
-      site.evidence.invalidation_reason = "continuation_vip_changed";
-    } else if (prior.continuation_slot_id != site.continuation_slot_id) {
-      site.completeness = ExitCompleteness::kInvalidated;
-      site.evidence.invalidation_reason = "continuation_slot_changed";
-    } else if (prior.continuation_stack_cell_id !=
-               site.continuation_stack_cell_id) {
-      site.completeness = ExitCompleteness::kInvalidated;
-      site.evidence.invalidation_reason = "continuation_stack_cell_changed";
-    } else if (prior.vip_symbolic != site.vip_symbolic) {
-      site.completeness = ExitCompleteness::kInvalidated;
-      site.evidence.invalidation_reason = "vip_symbolic_changed";
-    } else if (prior.exit_disposition != site.exit_disposition) {
-      site.completeness = ExitCompleteness::kInvalidated;
-      site.evidence.invalidation_reason = "exit_disposition_changed";
-    } else if (prior.completeness == ExitCompleteness::kComplete &&
-               site.completeness == ExitCompleteness::kIncomplete) {
-      site.completeness = ExitCompleteness::kInvalidated;
-      site.evidence.invalidation_reason = "resolved_target_missing";
-    }
-  };
 
   auto carryForwardDerivedBoundaryState = [&](UnresolvedExitSite &site,
                                               bool has_explicit_boundary_fact) {
@@ -2693,19 +2889,51 @@ std::vector<UnresolvedExitSite> collectUnresolvedExitSites(
     if (it == previous_index.end())
       return;
     const auto &prior = it->second;
+    const SessionEdgeFact *prior_edge = nullptr;
+    if (previous_graph) {
+      auto edge_it =
+          previous_graph->edge_facts_by_identity.find(unresolvedExitIdentity(prior));
+      if (edge_it != previous_graph->edge_facts_by_identity.end() &&
+          edge_it->second.from_unresolved_exit) {
+        prior_edge = &edge_it->second;
+      }
+    }
     if (prior.target_pc != site.target_pc)
       return;
+    const auto prior_exit_disposition =
+        prior_edge && prior_edge->boundary
+            ? boundaryDisposition(prior_edge->boundary)
+            : prior.exit_disposition;
+    const auto prior_continuation_vip =
+        prior_edge && prior_edge->boundary
+            ? boundaryContinuationVipPc(prior_edge->boundary)
+            : prior.continuation_vip_pc;
+    const auto prior_continuation_slot =
+        prior_edge && prior_edge->boundary
+            ? boundaryContinuationSlotId(prior_edge->boundary)
+            : prior.continuation_slot_id;
+    const auto prior_continuation_stack_cell =
+        prior_edge && prior_edge->boundary
+            ? boundaryContinuationStackCellId(prior_edge->boundary)
+            : prior.continuation_stack_cell_id;
+    const auto prior_vip_pc =
+        prior_edge && prior_edge->vip_pc ? prior_edge->vip_pc : prior.vip_pc;
+    const bool prior_vip_symbolic =
+        prior_edge ? prior_edge->vip_symbolic : prior.vip_symbolic;
     if ((site.exit_disposition == VirtualExitDisposition::kUnknown ||
          site.exit_disposition == VirtualExitDisposition::kStayInVm) &&
-        prior.exit_disposition != VirtualExitDisposition::kUnknown) {
-      site.exit_disposition = prior.exit_disposition;
+        prior_exit_disposition != VirtualExitDisposition::kUnknown) {
+      site.exit_disposition = prior_exit_disposition;
     }
     if (!site.continuation_vip_pc)
-      site.continuation_vip_pc = prior.continuation_vip_pc;
+      site.continuation_vip_pc = prior_continuation_vip;
     if (!site.continuation_slot_id)
-      site.continuation_slot_id = prior.continuation_slot_id;
+      site.continuation_slot_id = prior_continuation_slot;
     if (!site.continuation_stack_cell_id)
-      site.continuation_stack_cell_id = prior.continuation_stack_cell_id;
+      site.continuation_stack_cell_id = prior_continuation_stack_cell;
+    if (!site.vip_pc)
+      site.vip_pc = prior_vip_pc;
+    site.vip_symbolic = site.vip_symbolic || prior_vip_symbolic;
   };
 
   for (const auto &F : M) {
@@ -2759,7 +2987,6 @@ std::vector<UnresolvedExitSite> collectUnresolvedExitSites(
             site.target_pc && hasKnownMaterializedTarget(M, *site.target_pc)
                 ? ExitCompleteness::kComplete
                 : ExitCompleteness::kIncomplete;
-        applyPreviousState(site);
         sites.push_back(std::move(site));
       }
     }
@@ -2776,11 +3003,74 @@ std::vector<UnresolvedExitSite> collectUnresolvedExitSites(
         DevirtualizationEpoch::kDetectionSeedExtraction;
     site.exit_disposition = VirtualExitDisposition::kVmExitTerminal;
     site.completeness = ExitCompleteness::kIncomplete;
-    applyPreviousState(site);
     sites.push_back(std::move(site));
   }
 
   return sites;
+}
+
+void reconcilePreviousUnresolvedExitState(
+    std::vector<UnresolvedExitSite> &sites,
+    const std::vector<UnresolvedExitSite> &previous,
+    const SessionGraphState *previous_graph) {
+  const auto previous_index = buildUnresolvedExitIndex(previous);
+  for (auto &site : sites) {
+    const auto key = unresolvedExitStableSiteKey(site);
+    auto it = previous_index.find(key);
+    if (it == previous_index.end())
+      continue;
+    const auto &prior = it->second;
+    const SessionEdgeFact *prior_edge = nullptr;
+    if (previous_graph) {
+      auto edge_it =
+          previous_graph->edge_facts_by_identity.find(unresolvedExitIdentity(prior));
+      if (edge_it != previous_graph->edge_facts_by_identity.end() &&
+          edge_it->second.from_unresolved_exit) {
+        prior_edge = &edge_it->second;
+      }
+    }
+    const auto prior_completeness =
+        prior_edge ? unresolvedExitCompletenessFromFrontierStatus(
+                         prior_edge->status)
+                   : prior.completeness;
+    const llvm::StringRef prior_invalidation_reason =
+        prior_edge && !prior_edge->failure_reason.empty()
+            ? llvm::StringRef(prior_edge->failure_reason)
+            : llvm::StringRef(prior.evidence.invalidation_reason);
+    if (prior.evidence.predecessor_count != site.evidence.predecessor_count) {
+      site.completeness = ExitCompleteness::kInvalidated;
+      site.evidence.invalidation_reason = "predecessor_count_changed";
+    } else if (prior.target_pc != site.target_pc) {
+      site.completeness = ExitCompleteness::kInvalidated;
+      site.evidence.invalidation_reason = "target_changed";
+    } else if (prior.vip_pc != site.vip_pc) {
+      site.completeness = ExitCompleteness::kInvalidated;
+      site.evidence.invalidation_reason = "vip_changed";
+    } else if (prior.continuation_vip_pc != site.continuation_vip_pc) {
+      site.completeness = ExitCompleteness::kInvalidated;
+      site.evidence.invalidation_reason = "continuation_vip_changed";
+    } else if (prior.continuation_slot_id != site.continuation_slot_id) {
+      site.completeness = ExitCompleteness::kInvalidated;
+      site.evidence.invalidation_reason = "continuation_slot_changed";
+    } else if (prior.continuation_stack_cell_id !=
+               site.continuation_stack_cell_id) {
+      site.completeness = ExitCompleteness::kInvalidated;
+      site.evidence.invalidation_reason = "continuation_stack_cell_changed";
+    } else if (prior.vip_symbolic != site.vip_symbolic) {
+      site.completeness = ExitCompleteness::kInvalidated;
+      site.evidence.invalidation_reason = "vip_symbolic_changed";
+    } else if (prior.exit_disposition != site.exit_disposition) {
+      site.completeness = ExitCompleteness::kInvalidated;
+      site.evidence.invalidation_reason = "exit_disposition_changed";
+    } else if (prior_completeness == ExitCompleteness::kInvalidated) {
+      site.completeness = ExitCompleteness::kInvalidated;
+      site.evidence.invalidation_reason = prior_invalidation_reason.str();
+    } else if (prior_completeness == ExitCompleteness::kComplete &&
+               site.completeness == ExitCompleteness::kIncomplete) {
+      site.completeness = ExitCompleteness::kInvalidated;
+      site.evidence.invalidation_reason = "resolved_target_missing";
+    }
+  }
 }
 
 void addUnknownContinuationSites(const llvm::Module &M,
@@ -2811,16 +3101,59 @@ void addUnknownContinuationSites(const llvm::Module &M,
   }
 }
 
+bool graphUnresolvedExitViewMatches(
+    llvm::StringRef function_name, llvm::ArrayRef<UnresolvedExitSite> unresolved_exits,
+    const SessionGraphState &graph) {
+  std::vector<std::string> unresolved_ids;
+  for (const auto &site : unresolved_exits) {
+    if (site.owner_function != function_name)
+      continue;
+    unresolved_ids.push_back(unresolvedExitIdentity(site));
+  }
+  std::vector<std::string> graph_ids;
+  for (const auto &[identity, edge] : graph.edge_facts_by_identity) {
+    (void)identity;
+    if (!edge.from_unresolved_exit || edge.owner_function != function_name)
+      continue;
+    graph_ids.push_back(edge.identity);
+  }
+  std::sort(unresolved_ids.begin(), unresolved_ids.end());
+  std::sort(graph_ids.begin(), graph_ids.end());
+  return unresolved_ids == graph_ids;
+}
+
 std::map<NormalizedLiftUnitCacheKey, NormalizedLiftUnitCacheEntry>
 collectNormalizedLiftUnitCache(
     const llvm::Module &M,
     const std::map<NormalizedLiftUnitCacheKey, NormalizedLiftUnitCacheEntry>
         &previous_cache,
     llvm::ArrayRef<UnresolvedExitSite> unresolved_exits,
+    const SessionGraphState *graph,
     std::vector<std::string> &newly_lifted_functions,
     std::vector<std::string> &dirty_functions) {
   std::map<NormalizedLiftUnitCacheKey, NormalizedLiftUnitCacheEntry> cache;
   std::set<std::string> dirty_set;
+
+  auto use_graph_for_function = [&](llvm::StringRef function_name) {
+    return graph && !graph->edge_facts_by_identity.empty() &&
+           graphUnresolvedExitViewMatches(function_name, unresolved_exits, *graph);
+  };
+
+  auto count_unresolved_for_function = [&](llvm::StringRef function_name) {
+    if (use_graph_for_function(function_name)) {
+      return static_cast<unsigned>(std::count_if(
+          graph->edge_facts_by_identity.begin(), graph->edge_facts_by_identity.end(),
+          [&](const auto &entry) {
+            const auto &edge = entry.second;
+            return edge.from_unresolved_exit && edge.owner_function == function_name;
+          }));
+    }
+    return static_cast<unsigned>(std::count_if(
+        unresolved_exits.begin(), unresolved_exits.end(),
+        [&](const UnresolvedExitSite &site) {
+          return site.owner_function == function_name;
+        }));
+  };
 
   for (const auto &F : M) {
     if (!isTrackedLiftUnit(F))
@@ -2840,17 +3173,17 @@ collectNormalizedLiftUnitCache(
     entry.live_runtime_intrinsics = snapshot.live_runtime_intrinsics;
     entry.legacy_dispatch_intrinsics = snapshot.legacy_dispatch_intrinsics;
     entry.dirty_dependencies = snapshot.dirty_dependencies;
-    entry.unresolved_exit_count = static_cast<unsigned>(std::count_if(
-        unresolved_exits.begin(), unresolved_exits.end(),
-        [&](const UnresolvedExitSite &site) {
-          return site.owner_function == entry.function_name;
-        }));
+    entry.unresolved_exit_count = count_unresolved_for_function(entry.function_name);
     auto [vip_status, vip_pc] =
-        classifyVipTrackingForFunction(entry.function_name, unresolved_exits);
+        use_graph_for_function(entry.function_name)
+            ? classifyVipTrackingForFunction(entry.function_name, *graph)
+            : classifyVipTrackingForFunction(entry.function_name, unresolved_exits);
     entry.vip_status = vip_status;
     entry.vip_pc = vip_pc;
     entry.vip_context_fingerprint =
-        buildVipContextFingerprint(entry.function_name, unresolved_exits);
+        use_graph_for_function(entry.function_name)
+            ? buildVipContextFingerprint(entry.function_name, *graph)
+            : buildVipContextFingerprint(entry.function_name, unresolved_exits);
 
     auto previous_it = previous_cache.find(entry.key);
     if (previous_it == previous_cache.end()) {
@@ -2886,10 +3219,29 @@ collectNormalizedLiftUnitCache(
   return cache;
 }
 
+bool isResolvedFrontierStatus(FrontierWorkStatus status) {
+  switch (status) {
+    case FrontierWorkStatus::kLifted:
+    case FrontierWorkStatus::kClassifiedNativeExit:
+    case FrontierWorkStatus::kClassifiedTerminal:
+    case FrontierWorkStatus::kClassifiedVmEnter:
+    case FrontierWorkStatus::kSkippedMaterialized:
+      return true;
+    case FrontierWorkStatus::kPending:
+    case FrontierWorkStatus::kFailedDecode:
+    case FrontierWorkStatus::kFailedLift:
+    case FrontierWorkStatus::kInvalidated:
+      return false;
+  }
+  return false;
+}
+
+
+
 DevirtualizationRoundTelemetry summarizeRoundTelemetry(
     llvm::ArrayRef<UnresolvedExitSite> unresolved_exits,
-    const std::map<NormalizedLiftUnitCacheKey, NormalizedLiftUnitCacheEntry>
-        &cache,
+    const SessionGraphState &graph,
+    const std::map<NormalizedLiftUnitCacheKey, NormalizedLiftUnitCacheEntry> &cache,
     const RemillNormalizationSummary &normalization_summary) {
   DevirtualizationRoundTelemetry telemetry;
   for (const auto &[key, entry] : cache) {
@@ -2901,14 +3253,15 @@ DevirtualizationRoundTelemetry summarizeRoundTelemetry(
     if (!entry.normalization_gate_passed)
       ++telemetry.normalization_failures;
   }
+  auto use_graph_for_site = [&](const UnresolvedExitSite &site) {
+    return !graph.edge_facts_by_identity.empty() &&
+           graphUnresolvedExitViewMatches(site.owner_function, unresolved_exits, graph);
+  };
   for (const auto &site : unresolved_exits) {
-    switch (site.completeness) {
+    const auto *site_graph = use_graph_for_site(site) ? &graph : nullptr;
+    switch (effectiveUnresolvedExitCompleteness(site, site_graph)) {
       case ExitCompleteness::kComplete:
         ++telemetry.unresolved_exits_complete;
-        if (site.kind == UnresolvedExitKind::kDispatchCall ||
-            site.kind == UnresolvedExitKind::kDispatchJump) {
-          ++telemetry.dispatches_materialized;
-        }
         break;
       case ExitCompleteness::kIncomplete:
         ++telemetry.unresolved_exits_incomplete;
@@ -2917,6 +3270,13 @@ DevirtualizationRoundTelemetry summarizeRoundTelemetry(
         ++telemetry.unresolved_exits_invalidated;
         break;
     }
+  }
+  for (const auto &[identity, edge] : graph.edge_facts_by_identity) {
+    (void)identity;
+    if (!edge.from_unresolved_exit)
+      continue;
+    if (isResolvedFrontierStatus(edge.status))
+      ++telemetry.dispatches_materialized;
   }
   telemetry.leaked_runtime_artifacts =
       normalization_summary.live_memory_intrinsics +
@@ -2930,8 +3290,8 @@ void refreshSessionCoreState(DevirtualizationSession &session,
   std::vector<uint64_t> frontier_pcs;
   auto previous_unresolved_exits = session.unresolved_exits;
   (void)countUnresolvedDispatches(M, &frontier_pcs);
-  session.unresolved_exits =
-      collectUnresolvedExitSites(M, previous_unresolved_exits);
+  session.unresolved_exits = collectUnresolvedExitSites(
+      M, previous_unresolved_exits, &session.graph);
   addUnknownContinuationSites(M, session.unresolved_exits, frontier_pcs);
   std::set<std::string> known_site_keys;
   for (const auto &site : session.unresolved_exits)
@@ -2945,33 +3305,36 @@ void refreshSessionCoreState(DevirtualizationSession &session,
       session.unresolved_exits.push_back(site);
   }
 
+  reconcilePreviousUnresolvedExitState(
+      session.unresolved_exits, previous_unresolved_exits, &session.graph);
+
   auto previous_cache = session.normalized_unit_cache;
   session.newly_lifted_functions.clear();
   session.dirty_functions.clear();
   session.normalized_unit_cache = collectNormalizedLiftUnitCache(
-      M, previous_cache, session.unresolved_exits,
+      M, previous_cache, session.unresolved_exits, &session.graph,
       session.newly_lifted_functions, session.dirty_functions);
 
   std::set<uint64_t> continuation_targets;
+  auto use_graph_for_site = [&](const UnresolvedExitSite &site) {
+    return !session.graph.edge_facts_by_identity.empty() &&
+           graphUnresolvedExitViewMatches(site.owner_function,
+                                          session.unresolved_exits, session.graph);
+  };
   for (const auto &site : session.unresolved_exits) {
-    if (!isContinuationCandidate(site))
+    const auto *site_graph = use_graph_for_site(site) ? &session.graph : nullptr;
+    if (!isContinuationCandidate(site, site_graph))
       continue;
     continuation_targets.insert(*site.target_pc);
   }
   session.discovered_continuations.assign(continuation_targets.begin(),
                                           continuation_targets.end());
   session.discovered_continuation_identities =
-      collectContinuationIdentities(session.unresolved_exits);
-
-  RemillNormalizationOrchestrator normalization;
-  session.latest_round = summarizeRoundTelemetry(
-      session.unresolved_exits, session.normalized_unit_cache,
-      normalization.summarize(M));
-  refreshSessionGraphState(session, M);
+      collectContinuationIdentities(session.unresolved_exits, &session.graph);
 }
 
-void linkFrontierItemToUnresolvedExit(DevirtualizationSession &session,
-                                      const FrontierWorkItem &item) {
+void syncFrontierDiscoveryMetadata(DevirtualizationSession &session,
+                                   const FrontierWorkItem &item) {
   auto matches = [&](const UnresolvedExitSite &site) {
     if (site.owner_function != item.owner_function)
       return false;
@@ -2979,6 +3342,8 @@ void linkFrontierItemToUnresolvedExit(DevirtualizationSession &session,
       return false;
     return site.target_pc == item.target_pc;
   };
+
+
 
   for (auto &site : session.unresolved_exits) {
     if (!matches(site))
@@ -2990,11 +3355,6 @@ void linkFrontierItemToUnresolvedExit(DevirtualizationSession &session,
         boundaryContinuationStackCellId(item.boundary);
     site.vip_pc = item.vip_pc;
     site.vip_symbolic = item.vip_symbolic;
-    site.completeness = item.status == FrontierWorkStatus::kLifted ||
-                                item.status == FrontierWorkStatus::kSkippedMaterialized
-                            ? ExitCompleteness::kComplete
-                            : ExitCompleteness::kIncomplete;
-    site.evidence.invalidation_reason = item.failure_reason;
     return;
   }
 
@@ -3013,11 +3373,6 @@ void linkFrontierItemToUnresolvedExit(DevirtualizationSession &session,
       boundaryContinuationStackCellId(item.boundary);
   site.vip_symbolic = item.vip_symbolic;
   site.exit_disposition = boundaryDisposition(item.boundary);
-  site.completeness = item.status == FrontierWorkStatus::kLifted ||
-                              item.status == FrontierWorkStatus::kSkippedMaterialized
-                          ? ExitCompleteness::kComplete
-                          : ExitCompleteness::kIncomplete;
-  site.evidence.invalidation_reason = item.failure_reason;
   session.unresolved_exits.push_back(std::move(site));
 }
 
@@ -3084,18 +3439,73 @@ bool hasClosedSliceWrapperLadder(const llvm::Module &M) {
 
 }  // namespace
 
-void publishSessionGraphProjection(const llvm::Module &M,
-                                   const SessionGraphState &state) {
-  publishSessionGraphProjectionImpl(M, state);
+
+
+std::vector<FrontierWorkItem> collectOrderedSessionFrontierWorkItems(
+    const DevirtualizationSession &session) {
+  std::vector<FrontierWorkItem> items;
+  items.reserve(session.graph.edge_facts_by_identity.size());
+  for (const auto &[identity, edge] : session.graph.edge_facts_by_identity) {
+    (void)identity;
+    items.push_back(frontierWorkItemFromEdgeFact(edge));
+  }
+  std::stable_sort(items.begin(), items.end(),
+                   [&](const FrontierWorkItem &lhs,
+                       const FrontierWorkItem &rhs) {
+                     return frontierSchedulingRankImpl(lhs.scheduling_class) <
+                            frontierSchedulingRankImpl(rhs.scheduling_class);
+                   });
+  return items;
 }
 
-const SessionGraphState *findSessionGraphProjection(const llvm::Module &M) {
-  return findSessionGraphProjectionImpl(M);
+std::vector<FrontierWorkItem> collectSessionFrontierWorkItems(
+    const DevirtualizationSession &session) {
+  return collectOrderedSessionFrontierWorkItems(session);
 }
 
-SessionGraphState *findMutableSessionGraphProjection(llvm::Module &M) {
-  return findMutableSessionGraphProjectionImpl(M);
+std::vector<std::string> collectSessionFrontierIdentities(
+    const DevirtualizationSession &session) {
+  std::vector<std::string> identities;
+  identities.reserve(session.graph.edge_facts_by_identity.size());
+  for (const auto &[identity, edge] : session.graph.edge_facts_by_identity) {
+    (void)edge;
+    identities.push_back(identity);
+  }
+  return identities;
 }
+
+std::vector<uint64_t> collectSessionFrontierTargets(
+    const DevirtualizationSession &session) {
+  std::vector<uint64_t> targets;
+  targets.reserve(session.graph.edge_facts_by_identity.size());
+  for (const auto &[identity, edge] : session.graph.edge_facts_by_identity) {
+    (void)identity;
+    if (edge.target_pc)
+      targets.push_back(*edge.target_pc);
+  }
+  return targets;
+}
+
+std::vector<FrontierWorkItem> collectPendingSessionFrontierWorkItems(
+    const DevirtualizationSession &session) {
+  std::vector<FrontierWorkItem> items;
+  items.reserve(session.graph.edge_facts_by_identity.size());
+  for (const auto &[identity, edge] : session.graph.edge_facts_by_identity) {
+    (void)identity;
+    if (edge.status == FrontierWorkStatus::kPending ||
+        edge.status == FrontierWorkStatus::kInvalidated) {
+      items.push_back(frontierWorkItemFromEdgeFact(edge));
+    }
+  }
+  std::stable_sort(items.begin(), items.end(),
+                   [&](const FrontierWorkItem &lhs,
+                       const FrontierWorkItem &rhs) {
+                     return frontierSchedulingRankImpl(lhs.scheduling_class) <
+                            frontierSchedulingRankImpl(rhs.scheduling_class);
+                   });
+  return items;
+}
+
 
 DevirtualizationOrchestrator::DevirtualizationOrchestrator(
     DevirtualizationPolicy policy,
@@ -3103,6 +3513,20 @@ DevirtualizationOrchestrator::DevirtualizationOrchestrator(
     : policy_(std::move(policy)) {
   session_.iterative_session = std::move(session);
 }
+
+namespace {
+bool shouldAutoEnableGenericStaticForLargeNoAbiRoot(
+    const omill::DevirtualizationDetectionResult &result,
+    const omill::DevirtualizationCompatInputs &compat_inputs) {
+  constexpr unsigned kDenseUnresolvedDispatchThreshold = 128;
+  constexpr uint64_t kLargeExecutableSectionBytes = 256ull << 10;
+  return compat_inputs.no_abi &&
+         compat_inputs.executable_section_count > 1 &&
+         compat_inputs.largest_executable_section_size >= kLargeExecutableSectionBytes &&
+         result.unresolved_dispatches >= kDenseUnresolvedDispatchThreshold;
+}
+}  // namespace
+
 
 DevirtualizationDetectionResult DevirtualizationOrchestrator::detect(
     const llvm::Module &M, const DevirtualizationRequest &request,
@@ -3142,6 +3566,13 @@ DevirtualizationDetectionResult DevirtualizationOrchestrator::detect(
       result.confidence = DevirtualizationConfidence::kHigh;
       result.reasons.emplace_back("unresolved_dispatch_frontier");
     }
+    if (!has_vm_like_signal &&
+        shouldAutoEnableGenericStaticForLargeNoAbiRoot(result, compat_inputs)) {
+      result.should_devirtualize = true;
+      if (result.confidence == DevirtualizationConfidence::kLow)
+        result.confidence = DevirtualizationConfidence::kMedium;
+      result.reasons.emplace_back("large_noabi_unresolved_dispatch_frontier");
+    }
     if (result.protected_boundaries > 0) {
       result.should_devirtualize = true;
       if (result.confidence == DevirtualizationConfidence::kLow)
@@ -3174,7 +3605,6 @@ DevirtualizationExecutionPlan DevirtualizationOrchestrator::buildExecutionPlan(
   session_.root_slice = request.root_vas;
   session_.discovered_root_pcs = plan.detection.seed_roots;
   refreshSessionCoreState(session_, M);
-  mergeFrontierItems(session_, collectFrontierWorkItems(session_.unresolved_exits));
   refreshSessionGraphState(session_, M);
   refreshFrontierCompatibilityViews(session_);
 
@@ -3182,7 +3612,9 @@ DevirtualizationExecutionPlan DevirtualizationOrchestrator::buildExecutionPlan(
     return plan;
 
   plan.use_block_lift = policy_.force_block_lift;
-  plan.use_generic_static_devirtualization = policy_.force_generic_static;
+  plan.use_generic_static_devirtualization =
+      policy_.force_generic_static ||
+      shouldAutoEnableGenericStaticForLargeNoAbiRoot(plan.detection, compat_inputs);
   plan.disable_legacy_vm_path = policy_.disable_legacy_vm_path;
   return plan;
 }
@@ -3209,9 +3641,11 @@ DevirtualizationOrchestrator::buildDriverCompatPlan(
     compat_plan.legacy_vm_mode_reason =
         DevirtualizationCompatReason::kLegacyVmPathSuppressed;
   }
-
   compat_plan.root_local_generic_static_devirtualization_shape =
-      moduleHasRootLocalGenericStaticDevirtualizationShape(M);
+      compat_inputs.export_root_has_hidden_entry_seed_exprs ||
+      moduleHasRootLocalGenericStaticDevirtualizationShape(M) ||
+      shouldAutoEnableGenericStaticForLargeNoAbiRoot(
+          compat_plan.execution.detection, compat_inputs);
 
   const bool known_unstable_large_default_export_root =
       compat_inputs.requested_root_is_export &&
@@ -3292,7 +3726,6 @@ DevirtualizationOrchestrator::buildDriverCompatPlan(
 
 void DevirtualizationOrchestrator::refreshSessionState(const llvm::Module &M) {
   refreshSessionCoreState(session_, M);
-  mergeFrontierItems(session_, collectFrontierWorkItems(session_.unresolved_exits));
   refreshSessionGraphState(session_, M);
   refreshFrontierCompatibilityViews(session_);
 }
@@ -3328,25 +3761,25 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::discoverFrontierWork(
     FrontierDiscoveryPhase phase) {
   FrontierAdvanceSummary summary;
   if (phase == FrontierDiscoveryPhase::kUnresolvedOnly) {
+    const auto pending_items = collectPendingSessionFrontierWorkItems(session_);
     const bool has_pending_boundary_continuation =
-        llvm::any_of(session_.late_frontier_work_items, [](const FrontierWorkItem &item) {
+        llvm::any_of(pending_items, [](const FrontierWorkItem &item) {
           return item.from_boundary_continuation &&
                  item.status == FrontierWorkStatus::kPending;
         });
     if (has_pending_boundary_continuation) {
       refreshFrontierCompatibilityViews(session_);
-      summary.pending =
-          static_cast<unsigned>(session_.late_frontier_work_items.size());
+      summary.pending = static_cast<unsigned>(pending_items.size());
       return summary;
     }
   }
-  refreshSessionCoreState(session_, M);
+  const bool include_unresolved =
+      phase == FrontierDiscoveryPhase::kUnresolvedOnly ||
+      phase == FrontierDiscoveryPhase::kCombined;
 
-  if (phase == FrontierDiscoveryPhase::kUnresolvedOnly ||
-      phase == FrontierDiscoveryPhase::kCombined) {
-    mergeFrontierItems(session_, collectFrontierWorkItems(session_.unresolved_exits),
-                       &summary);
-  }
+  refreshSessionCoreState(session_, M);
+  if (include_unresolved)
+    refreshSessionGraphState(session_, M);
 
   if ((phase == FrontierDiscoveryPhase::kVmUnresolvedContinuations ||
        phase == FrontierDiscoveryPhase::kCombined) &&
@@ -3377,12 +3810,14 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::discoverFrontierWork(
     mergeFrontierItems(session_, frontier_items, &summary);
   }
 
-  refreshDerivedViewsAndLoweringInputs(session_, M);
-  session_.protector_model = buildProtectorModelFromSession(session_);
-  applyProtectorModelToSession(session_, session_.protector_model);
+  if (!include_unresolved) {
+    refreshDerivedViewsAndLoweringInputs(session_, M);
+    session_.protector_model = buildProtectorModelFromSession(session_);
+    applyProtectorModelToSession(session_, session_.protector_model);
+  }
   refreshFrontierCompatibilityViews(session_);
   summary.pending =
-      static_cast<unsigned>(session_.late_frontier_work_items.size());
+      static_cast<unsigned>(collectPendingSessionFrontierWorkItems(session_).size());
   return summary;
 }
 
@@ -3417,7 +3852,7 @@ bool DevirtualizationOrchestrator::enqueueBoundaryContinuationWork(
       }
     };
 
-    for (const auto &existing : session_.late_frontier_work_items)
+    for (const auto &existing : collectPendingSessionFrontierWorkItems(session_))
       consider_target(existing.target_pc, existing.from_boundary_continuation);
     for (const auto &[identity, edge] : session_.graph.edge_facts_by_identity) {
       (void)identity;
@@ -3426,6 +3861,7 @@ bool DevirtualizationOrchestrator::enqueueBoundaryContinuationWork(
     return best_target;
   };
 
+  std::optional<uint64_t> promoted_nearby_seed;
   if (item.executable_target) {
     if (auto covered_pc =
             recoverCoveredTargetEntryPc(const_cast<llvm::Module &>(M),
@@ -3442,6 +3878,7 @@ bool DevirtualizationOrchestrator::enqueueBoundaryContinuationWork(
       item.executable_target->effective_target_pc = *covered_pc;
       item.continuation_rationale = "boundary_reentry_intra_owner_seed";
       item.kind = FrontierWorkKind::kIntraOwnerContinuation;
+      promoted_nearby_seed = *covered_pc;
       promoteBoundaryReentrySeed(session_, *covered_pc);
     } else if (auto nearby_seed = findNearbyTrackedSeed(*item.target_pc)) {
       item.target_pc = *nearby_seed;
@@ -3457,6 +3894,7 @@ bool DevirtualizationOrchestrator::enqueueBoundaryContinuationWork(
       item.executable_target->effective_target_pc = *nearby_seed;
       item.continuation_rationale = "boundary_reentry_intra_owner_nearby_seed";
       item.kind = FrontierWorkKind::kIntraOwnerContinuation;
+      promoted_nearby_seed = *nearby_seed;
       promoteBoundaryReentrySeed(session_, *nearby_seed);
     }
   }
@@ -3471,6 +3909,8 @@ bool DevirtualizationOrchestrator::enqueueBoundaryContinuationWork(
   refreshDerivedViewsAndLoweringInputs(session_, M);
   session_.protector_model = buildProtectorModelFromSession(session_);
   applyProtectorModelToSession(session_, session_.protector_model);
+  if (promoted_nearby_seed)
+    promoteBoundaryReentrySeed(session_, *promoted_nearby_seed);
   refreshFrontierCompatibilityViews(session_);
   return true;
 }
@@ -3524,8 +3964,7 @@ bool DevirtualizationOrchestrator::requeueBoundaryEdgesForTarget(
 }
 
 FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
-    llvm::Module &M, BlockLifter &block_lifter,
-    IterativeLiftingSession &iterative_session,
+    llvm::Module &M, RemillProjectionLifter &projection_lifter,
     const FrontierCallbacks &callbacks) {
   FrontierAdvanceSummary summary;
   const bool debug_frontier =
@@ -3536,8 +3975,9 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
   session_.protector_model = buildProtectorModelFromSession(session_);
   applyProtectorModelToSession(session_, session_.protector_model);
   std::vector<std::string> identities;
-  identities.reserve(session_.late_frontier_work_items.size());
-  for (const auto &item : session_.late_frontier_work_items)
+  const auto pending_items = collectPendingSessionFrontierWorkItems(session_);
+  identities.reserve(pending_items.size());
+  for (const auto &item : pending_items)
     identities.push_back(item.identity);
   auto scheduling_rank = [&](const std::string &identity) {
     auto it = session_.graph.edge_facts_by_identity.find(identity);
@@ -3563,7 +4003,7 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
       return maybe_target && *maybe_target == target_pc &&
              !from_boundary_continuation;
     };
-    for (const auto &existing : session_.late_frontier_work_items) {
+    for (const auto &existing : collectPendingSessionFrontierWorkItems(session_)) {
       if (matches_target(existing.target_pc, existing.from_boundary_continuation))
         return true;
     }
@@ -3605,6 +4045,7 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
       item.failure_reason = "quarantined_selector_arm_deferred";
       item.continuation_rationale = "deferred_until_trusted_progress_stalls";
       syncEdgeFactFromFrontierWorkItem(edge_it->second, item);
+      ++session_.graph.edge_fact_revision;
       summary.notes.push_back("deferred_quarantined:" + item.identity);
       continue;
     }
@@ -3631,7 +4072,7 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
           item.failure_reason.clear();
           ++summary.skipped_materialized;
           summary.changed = true;
-          linkFrontierItemToUnresolvedExit(session_, item);
+          syncFrontierDiscoveryMetadata(session_, item);
           return true;
         }
         switch (item.kind) {
@@ -3641,7 +4082,7 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
               item.status = FrontierWorkStatus::kFailedDecode;
               item.failure_reason = "boundary_continuation_missing_boundary";
               ++summary.failed_decode;
-              linkFrontierItemToUnresolvedExit(session_, item);
+              syncFrontierDiscoveryMetadata(session_, item);
               return true;
             }
             const bool intra_owner =
@@ -3676,7 +4117,7 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
               item.failure_reason =
                   "boundary_continuation_target_resolution_crashed";
               ++summary.failed_decode;
-              linkFrontierItemToUnresolvedExit(session_, item);
+              syncFrontierDiscoveryMetadata(session_, item);
               return true;
             }
             if (intra_owner) {
@@ -3723,7 +4164,7 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
                   "boundary_continuation_redirected_to_nearby_seed";
               ++summary.skipped_materialized;
               summary.changed = true;
-              linkFrontierItemToUnresolvedExit(session_, item);
+              syncFrontierDiscoveryMetadata(session_, item);
               return true;
             }
             if (intra_owner && item.boundary->covered_entry_pc &&
@@ -3745,19 +4186,15 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
                   "boundary_continuation_redirected_to_covered_entry_seed";
               ++summary.skipped_materialized;
               summary.changed = true;
-              linkFrontierItemToUnresolvedExit(session_, item);
+              syncFrontierDiscoveryMetadata(session_, item);
               return true;
             }
             const uint64_t boundary_pc = *item.boundary->boundary_pc;
             const bool continuation_materialized =
-                intra_owner ? hasExactMaterializedTarget(M, continuation_pc)
-                            : canMaterializeFrontierTarget(M, continuation_pc,
-                                                           callbacks);
+                hasExactMaterializedTarget(M, continuation_pc);
             const bool lift_target_materialized =
                 lift_target_pc != continuation_pc &&
-                (intra_owner ? hasExactMaterializedTarget(M, lift_target_pc)
-                             : canMaterializeFrontierTarget(M, lift_target_pc,
-                                                            callbacks));
+                hasExactMaterializedTarget(M, lift_target_pc);
             if (continuation_materialized || lift_target_materialized) {
               if (debug_frontier) {
                 llvm::errs()
@@ -3781,14 +4218,14 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
                 item.failure_reason = "boundary_continuation_bridge_missing";
                 ++summary.failed_decode;
               }
-              linkFrontierItemToUnresolvedExit(session_, item);
+              syncFrontierDiscoveryMetadata(session_, item);
               return true;
             }
             if (!safeCanDecodeTarget(lift_target_pc, callbacks)) {
               item.status = FrontierWorkStatus::kFailedDecode;
               item.failure_reason = "boundary_continuation_not_decodable";
               ++summary.failed_decode;
-              linkFrontierItemToUnresolvedExit(session_, item);
+              syncFrontierDiscoveryMetadata(session_, item);
               return true;
             }
             if (debug_frontier) {
@@ -3808,7 +4245,7 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
             item.failure_reason = "non_liftable_terminal_boundary";
             ++summary.classified_terminal;
             summary.changed = true;
-            linkFrontierItemToUnresolvedExit(session_, item);
+            syncFrontierDiscoveryMetadata(session_, item);
             return true;
           case FrontierWorkKind::kVmEnterBoundary:
             item.status = FrontierWorkStatus::kClassifiedVmEnter;
@@ -3823,7 +4260,7 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
             item.failure_reason = "vm_entry_boundary";
             ++summary.classified_vm_enter;
             summary.changed = true;
-            linkFrontierItemToUnresolvedExit(session_, item);
+            syncFrontierDiscoveryMetadata(session_, item);
             return true;
           case FrontierWorkKind::kNativeCallBoundary:
             if (!item.boundary)
@@ -3862,7 +4299,7 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
             }
             ++summary.classified_native_exit;
             summary.changed = true;
-            linkFrontierItemToUnresolvedExit(session_, item);
+            syncFrontierDiscoveryMetadata(session_, item);
             return true;
           case FrontierWorkKind::kUnknownExecutableTarget:
             if (getOrInsertExecutableTargetFunction(M, item)) {
@@ -3875,7 +4312,7 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
               item.failure_reason = "executable_target_not_decodable";
               ++summary.failed_decode;
             }
-            linkFrontierItemToUnresolvedExit(session_, item);
+            syncFrontierDiscoveryMetadata(session_, item);
             return true;
           case FrontierWorkKind::kLiftableBlock:
             if (recovery_mode) {
@@ -3884,7 +4321,7 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
               ++item.retry_count;
               ++summary.failed_lift;
               summary.changed = true;
-              linkFrontierItemToUnresolvedExit(session_, item);
+              syncFrontierDiscoveryMetadata(session_, item);
               return true;
             }
             break;
@@ -3928,7 +4365,7 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
             item.failure_reason =
                 "boundary_continuation_target_resolution_crashed";
             ++summary.failed_decode;
-            linkFrontierItemToUnresolvedExit(session_, item);
+            syncFrontierDiscoveryMetadata(session_, item);
             return true;
           }
           if (intra_owner) {
@@ -3958,7 +4395,8 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
         bool lift_crashed = false;
         llvm::Function *lifted = nullptr;
         __try {
-          lifted = block_lifter.LiftBlock(lift_target_pc, discovered_targets);
+          lifted =
+              projection_lifter.LiftBlock(lift_target_pc, discovered_targets);
         } __except (1) {
           lift_crashed = true;
         }
@@ -3972,7 +4410,7 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
           item.failure_reason = "block_lift_crashed";
           ++item.retry_count;
           ++summary.failed_lift;
-          linkFrontierItemToUnresolvedExit(session_, item);
+          syncFrontierDiscoveryMetadata(session_, item);
           return true;
         }
         if (debug_frontier) {
@@ -3982,14 +4420,79 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
                        << " discovered=" << discovered_targets.size() << "\n";
         }
         if (lifted) {
+          RemillStateVariableSolver solver(M);
+          RemillControlTransferSolution solver_solution;
+          const bool annotated_solver_result =
+              solver.annotateSolvedControlTransfer(*lifted, lift_target_pc,
+                                                  &solver_solution);
+          if (annotated_solver_result) {
+            item.solver_metadata = buildSolverMetadata(
+                solver_solution, item.solver_metadata);
+          }
+          if (item.solver_metadata && projection_lifter.database()) {
+            refineSolverTargetsWithOverlay(*projection_lifter.database(),
+                                           *item.solver_metadata,
+                                           lift_target_pc);
+          }
+          auto queueSolvedTarget = [&](uint64_t solved_target_pc) {
+            uint64_t normalized_target =
+                callbacks.normalize_target_pc
+                    ? callbacks.normalize_target_pc(solved_target_pc)
+                    : solved_target_pc;
+            if (!normalized_target)
+              return;
+            if (callbacks.is_code_address &&
+                !callbacks.is_code_address(normalized_target))
+              return;
+            if (callbacks.is_executable_target &&
+                !callbacks.is_executable_target(normalized_target))
+              return;
+            if (callbacks.can_decode_target &&
+                !callbacks.can_decode_target(normalized_target))
+              return;
+            if (std::find(discovered_targets.begin(), discovered_targets.end(),
+                          normalized_target) == discovered_targets.end()) {
+              discovered_targets.push_back(normalized_target);
+            }
+            if (session_.iterative_session &&
+                (!callbacks.has_defined_target ||
+                 !callbacks.has_defined_target(normalized_target))) {
+              session_.iterative_session->queueTarget(normalized_target);
+            }
+          };
+          if (item.solver_metadata) {
+            for (uint64_t solved_target_pc :
+                 item.solver_metadata->possible_target_pcs) {
+              queueSolvedTarget(solved_target_pc);
+            }
+          }
+          if (annotated_solver_result) {
+            summary.changed = true;
+            if (item.solver_metadata &&
+                !item.solver_metadata->possible_target_pcs.empty()) {
+              summary.notes.push_back(
+                  (llvm::Twine("solver:0x") +
+                   llvm::utohexstr(lift_target_pc) + ":" +
+                   llvm::Twine(item.solver_metadata->possible_target_pcs.size()))
+                      .str());
+            }
+          }
+          if (item.executable_target &&
+              item.solver_metadata &&
+              item.solver_metadata->possible_target_pcs.size() == 1) {
+            item.executable_target->effective_target_pc =
+                item.solver_metadata->possible_target_pcs.front();
+          }
           if (debug_frontier) {
             llvm::errs() << "[frontier-advance] note-lifted-target id="
                          << item.identity << " target=0x"
                          << llvm::utohexstr(target_pc) << "\n";
           }
-          iterative_session.noteLiftedTarget(target_pc);
-          if (lift_target_pc != target_pc)
-            iterative_session.noteLiftedTarget(lift_target_pc);
+          if (session_.iterative_session) {
+            session_.iterative_session->noteLiftedTarget(target_pc);
+            if (lift_target_pc != target_pc)
+              session_.iterative_session->noteLiftedTarget(lift_target_pc);
+          }
           if (debug_frontier) {
             llvm::errs() << "[frontier-advance] noted-lifted-target id="
                          << item.identity << " target=0x"
@@ -4013,7 +4516,7 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
           ++item.retry_count;
           ++summary.lifted;
           summary.changed = true;
-          linkFrontierItemToUnresolvedExit(session_, item);
+          syncFrontierDiscoveryMetadata(session_, item);
           return true;
         }
 
@@ -4021,7 +4524,7 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
         item.failure_reason = "block_lift_returned_null";
         ++item.retry_count;
         ++summary.failed_lift;
-        linkFrontierItemToUnresolvedExit(session_, item);
+        syncFrontierDiscoveryMetadata(session_, item);
         return true;
       };
       item_handled = process_item();
@@ -4039,12 +4542,15 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
       ++summary.failed_lift;
       summary.changed = true;
       summary.notes.push_back("crashed:" + item.identity);
-      linkFrontierItemToUnresolvedExit(session_, item);
+      syncFrontierDiscoveryMetadata(session_, item);
       syncEdgeFactFromFrontierWorkItem(edge_it->second, item);
+      ++session_.graph.edge_fact_revision;
       continue;
     }
     if (item_handled)
       syncEdgeFactFromFrontierWorkItem(edge_it->second, item);
+    if (item_handled)
+      ++session_.graph.edge_fact_revision;
   }
 
   if (debug_frontier)
@@ -4054,19 +4560,17 @@ FrontierAdvanceSummary DevirtualizationOrchestrator::advanceFrontierWork(
     llvm::errs() << "[frontier-advance] refresh-frontier-compatibility\n";
   refreshFrontierCompatibilityViews(session_);
   summary.pending =
-      static_cast<unsigned>(session_.late_frontier_work_items.size());
+      static_cast<unsigned>(collectPendingSessionFrontierWorkItems(session_).size());
   return summary;
 }
 
 FrontierRoundSummary DevirtualizationOrchestrator::runFrontierRound(
-    llvm::Module &M, BlockLifter &block_lifter,
-    IterativeLiftingSession &iterative_session,
+    llvm::Module &M, RemillProjectionLifter &projection_lifter,
     const FrontierCallbacks &callbacks, FrontierDiscoveryPhase phase) {
   FrontierRoundSummary summary;
   __try {
     summary.discover = discoverFrontierWork(M, callbacks, phase);
-    summary.advance =
-        advanceFrontierWork(M, block_lifter, iterative_session, callbacks);
+    summary.advance = advanceFrontierWork(M, projection_lifter, callbacks);
   } __except (1) {
     summary.crashed = true;
     return summary;
@@ -4076,21 +4580,18 @@ FrontierRoundSummary DevirtualizationOrchestrator::runFrontierRound(
 }
 
 FrontierIterationSummary DevirtualizationOrchestrator::runFrontierIterations(
-    llvm::Module &M, BlockLifter &block_lifter,
-    IterativeLiftingSession &iterative_session,
+    llvm::Module &M, RemillProjectionLifter &projection_lifter,
     const FrontierCallbacks &frontier_callbacks, FrontierDiscoveryPhase phase,
     unsigned max_rounds, const FrontierIterationCallbacks &iteration_callbacks,
     const VmEnterChildImportCallbacks *vm_enter_import_callbacks) {
   FrontierIterationSummary summary;
   for (unsigned round = 0; round < max_rounds; ++round) {
     if (iteration_callbacks.before_frontier_round &&
-        !iteration_callbacks.before_frontier_round(round)) {
+        !iteration_callbacks.before_frontier_round(round))
       break;
-    }
 
     auto round_summary =
-        runFrontierRound(M, block_lifter, iterative_session, frontier_callbacks,
-                         phase);
+        runFrontierRound(M, projection_lifter, frontier_callbacks, phase);
     summary.round_summaries.push_back(round_summary);
     if (round_summary.crashed) {
       summary.crashed = true;
@@ -4120,6 +4621,8 @@ FrontierIterationSummary DevirtualizationOrchestrator::runFrontierIterations(
   }
   return summary;
 }
+
+
 
 VmEnterChildImportSummary DevirtualizationOrchestrator::importNestedVmEnterChildren(
     llvm::Module &M, const VmEnterChildImportCallbacks &callbacks) {
@@ -4153,6 +4656,7 @@ VmEnterChildImportSummary DevirtualizationOrchestrator::importNestedVmEnterChild
            boundaryDisposition(fact) == VirtualExitDisposition::kNestedVmEnter;
   };
 
+
   auto isVmEnterCandidate = [&](const FrontierWorkItem &item) {
     if (!item.target_pc || item.from_boundary_continuation)
       return false;
@@ -4163,6 +4667,7 @@ VmEnterChildImportSummary DevirtualizationOrchestrator::importNestedVmEnterChild
   llvm::SmallVector<FrontierWorkItem, 8> import_candidates;
   llvm::SmallDenseMap<uint64_t, unsigned, 8> candidate_index_by_target;
   auto mergeCandidate = [&](FrontierWorkItem item) {
+    mergeRelatedBoundaryEvidence(session_, item);
     if (!isVmEnterCandidate(item))
       return;
     if (item.kind != FrontierWorkKind::kVmEnterBoundary)
@@ -4199,8 +4704,44 @@ VmEnterChildImportSummary DevirtualizationOrchestrator::importNestedVmEnterChild
       existing.owner_function = item.owner_function;
     if (!existing.site_pc && item.site_pc)
       existing.site_pc = item.site_pc;
-    if (!existing.boundary && item.boundary)
+    if (!existing.vip_pc && item.vip_pc)
+      existing.vip_pc = item.vip_pc;
+    existing.vip_symbolic = existing.vip_symbolic || item.vip_symbolic;
+    if (existing.boundary && item.boundary) {
+      existing.boundary = mergeBoundaryFacts(*existing.boundary, *item.boundary);
+    } else if (item.boundary) {
       existing.boundary = item.boundary;
+    }
+    if (existing.executable_target && item.executable_target) {
+      auto merged_fact = *existing.executable_target;
+      if (!merged_fact.effective_target_pc)
+        merged_fact.effective_target_pc = item.executable_target->effective_target_pc;
+      if (!merged_fact.canonical_owner_pc)
+        merged_fact.canonical_owner_pc = item.executable_target->canonical_owner_pc;
+      if (merged_fact.kind == ExecutableTargetKind::kExecutablePlaceholder &&
+          item.executable_target->kind != ExecutableTargetKind::kExecutablePlaceholder) {
+        merged_fact.kind = item.executable_target->kind;
+      }
+      if (merged_fact.trust == ExecutableTargetTrust::kUntrustedExecutable &&
+          item.executable_target->trust != ExecutableTargetTrust::kUntrustedExecutable) {
+        merged_fact.trust = item.executable_target->trust;
+      }
+      merged_fact.exact_fallthrough_target =
+          merged_fact.exact_fallthrough_target ||
+          item.executable_target->exact_fallthrough_target;
+      merged_fact.invalidated_executable_entry =
+          merged_fact.invalidated_executable_entry ||
+          item.executable_target->invalidated_executable_entry;
+      if (!merged_fact.invalidated_entry_source_pc)
+        merged_fact.invalidated_entry_source_pc =
+            item.executable_target->invalidated_entry_source_pc;
+      if (!merged_fact.invalidated_entry_failed_pc)
+        merged_fact.invalidated_entry_failed_pc =
+            item.executable_target->invalidated_entry_failed_pc;
+      existing.executable_target = merged_fact;
+    } else if (item.executable_target) {
+      existing.executable_target = item.executable_target;
+    }
     if (existing.kind != FrontierWorkKind::kVmEnterBoundary &&
         item.kind == FrontierWorkKind::kVmEnterBoundary)
       existing.kind = item.kind;
@@ -4208,6 +4749,13 @@ VmEnterChildImportSummary DevirtualizationOrchestrator::importNestedVmEnterChild
         item.status == FrontierWorkStatus::kClassifiedVmEnter) {
       existing.status = item.status;
       existing.failure_reason = item.failure_reason;
+    }
+    if (existing.scheduling_class != FrontierSchedulingClass::kTrustedLive &&
+        item.scheduling_class == FrontierSchedulingClass::kTrustedLive) {
+      existing.scheduling_class = item.scheduling_class;
+      existing.continuation_confidence = item.continuation_confidence;
+      existing.continuation_liveness = item.continuation_liveness;
+      existing.continuation_rationale = item.continuation_rationale;
     }
   };
 
@@ -4218,7 +4766,7 @@ VmEnterChildImportSummary DevirtualizationOrchestrator::importNestedVmEnterChild
     FrontierWorkItem item = frontierWorkItemFromEdgeFact(edge);
     mergeCandidate(std::move(item));
   }
-  for (const auto &item : session_.late_frontier_work_items)
+  for (const auto &item : collectOrderedSessionFrontierWorkItems(session_))
     mergeCandidate(item);
 
   unsigned imported = 0;
@@ -4238,7 +4786,7 @@ VmEnterChildImportSummary DevirtualizationOrchestrator::importNestedVmEnterChild
         continue;
       edge.failure_reason = failure_reason.str();
     }
-    for (auto &item : session_.late_frontier_work_items) {
+    for (const auto &item : collectOrderedSessionFrontierWorkItems(session_)) {
       if (!item.target_pc || *item.target_pc != target_pc)
         continue;
       const bool is_vm_enter_item =
@@ -4249,17 +4797,32 @@ VmEnterChildImportSummary DevirtualizationOrchestrator::importNestedVmEnterChild
             item.boundary->kind == BoundaryKind::kNestedVmEnterBoundary));
       if (!is_vm_enter_item)
         continue;
-      item.failure_reason = failure_reason.str();
+
     }
   };
-  for (const auto &candidate : import_candidates) {
+  for (auto candidate : import_candidates) {
     if (!candidate.target_pc)
       continue;
     const uint64_t target_pc = *candidate.target_pc;
     if (!candidate.identity.empty()) {
       auto &edge = session_.graph.edge_facts_by_identity[candidate.identity];
       edge.identity = candidate.identity;
+      if (candidate.boundary && edge.boundary)
+        candidate.boundary = mergeBoundaryFacts(*candidate.boundary, *edge.boundary);
+      if (candidate.target_pc) {
+        auto boundary_it =
+            session_.graph.boundary_facts_by_target.find(*candidate.target_pc);
+        if (boundary_it != session_.graph.boundary_facts_by_target.end() &&
+            boundary_it->second.boundary) {
+          candidate.boundary = candidate.boundary
+                                 ? std::optional<BoundaryFact>(mergeBoundaryFacts(
+                                       *candidate.boundary,
+                                       *boundary_it->second.boundary))
+                                 : boundary_it->second.boundary;
+        }
+      }
       syncEdgeFactFromFrontierWorkItem(edge, candidate);
+      ++session_.graph.edge_fact_revision;
       if (candidate.identity.find("closure:") == 0)
         edge.from_output_root_closure = true;
     }
@@ -4319,6 +4882,25 @@ VmEnterChildImportSummary DevirtualizationOrchestrator::importNestedVmEnterChild
       continue;
     }
 
+    if (candidate.boundary) {
+      for (auto &[identity, edge] : session_.graph.edge_facts_by_identity) {
+        (void)identity;
+        if (!edge.target_pc || *edge.target_pc != target_pc)
+          continue;
+        const bool is_vm_enter_edge =
+            edge.kind == FrontierWorkKind::kVmEnterBoundary ||
+            (edge.boundary &&
+             (edge.boundary->is_vm_enter || edge.boundary->is_nested_vm_enter ||
+              edge.boundary->kind == BoundaryKind::kVmEnterBoundary ||
+              edge.boundary->kind == BoundaryKind::kNestedVmEnterBoundary));
+        if (!is_vm_enter_edge)
+          continue;
+        edge.boundary = edge.boundary
+                            ? std::optional<BoundaryFact>(mergeBoundaryFacts(
+                                  *edge.boundary, *candidate.boundary))
+                            : candidate.boundary;
+      }
+    }
     placeholder->replaceAllUsesWith(imported_root);
     if (placeholder->use_empty())
       placeholder->eraseFromParent();
@@ -4344,6 +4926,18 @@ VmEnterChildImportSummary DevirtualizationOrchestrator::importNestedVmEnterChild
       region.kind = SessionRegionKind::kNestedVmEnter;
       region.status = SessionRegionStatus::kImported;
       region.imported_root_function = imported_name;
+      region.frontier_edge_identities.clear();
+      for (const auto &[identity, edge] : session_.graph.edge_facts_by_identity) {
+        if (!edge.target_pc || *edge.target_pc != target_pc)
+          continue;
+        region.frontier_edge_identities.push_back(identity);
+        auto handler_it = session_.graph.handler_nodes.find(edge.owner_function);
+        if (handler_it != session_.graph.handler_nodes.end() &&
+            handler_it->second.entry_va) {
+          region.parent_entry_pc = handler_it->second.entry_va;
+        }
+        region.parent_target_pc = edge.target_pc;
+      }
     }
     refreshFrontierCompatibilityViews(session_);
   }
@@ -4548,7 +5142,8 @@ void DevirtualizationOrchestrator::recordEpoch(DevirtualizationEpoch epoch,
                                                DevirtualizationOutputMode mode,
                                                bool changed,
                                                std::string note) {
-  if (!policy_.emit_epoch_summaries)
+  if (!policy_.emit_epoch_summaries ||
+      std::getenv("OMILL_SKIP_DEVIRTUALIZATION_EPOCH_RECORDING") != nullptr)
     return;
   session_.epochs.push_back(
       summarizeEpoch(epoch, M, mode, changed, std::move(note)));

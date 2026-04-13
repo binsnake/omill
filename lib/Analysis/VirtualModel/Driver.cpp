@@ -1,12 +1,12 @@
 #include "Analysis/VirtualModel/Internal.h"
 
+#include <llvm/ADT/STLFunctionalExtras.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/StructuralHash.h>
-
 #include <chrono>
 #include <cstdlib>
 #include <limits>
@@ -17,7 +17,6 @@
 #include "omill/Utils/LiftedNames.h"
 #include "omill/Analysis/VMTraceMap.h"
 #include "omill/Devirtualization/Orchestrator.h"
-
 namespace omill {
 
 namespace {
@@ -40,6 +39,15 @@ uint64_t ensureVirtualModelCacheSerial(llvm::Module &M) {
   const uint64_t serial = nextVirtualModelCacheSerial();
   M.addModuleFlag(llvm::Module::Warning, kVirtualModelCacheSerialFlag, serial);
   return serial;
+}
+
+static bool isLargeNoAbiGenericStaticScopeModule(const llvm::Module &M) {
+  auto *flag = M.getModuleFlag("omill.large_noabi_generic_static_scope");
+  if (!flag)
+    return false;
+  if (auto *value = llvm::mdconst::dyn_extract<llvm::ConstantInt>(flag))
+    return value->getZExtValue() != 0;
+  return false;
 }
 
 static bool vmModelImportDebugEnabled() {
@@ -296,17 +304,32 @@ static VirtualValueExpr constantPcExpr(std::optional<uint64_t> pc) {
   return expr;
 }
 
+static std::optional<uint64_t> effectiveBoundaryContinuationForModel(
+    const std::optional<BoundaryFact> &boundary) {
+  if (!boundary)
+    return std::nullopt;
+  if (boundary->continuation_entry_transform &&
+      boundary->continuation_entry_transform->jump_target_pc) {
+    return boundary->continuation_entry_transform->jump_target_pc;
+  }
+  return boundary->continuation_pc;
+}
+
 static void applyProjectedExitSummary(VirtualExitSummary &exit,
                                       const SessionEdgeFact &edge) {
+
+
   const auto disposition =
       edge.boundary
           ? virtualExitDispositionFromBoundaryDisposition(
                 edge.boundary->exit_disposition)
           : VirtualExitDisposition::kUnknown;
   const auto continuation_vip_pc =
-      edge.boundary ? edge.boundary->continuation_vip_pc : std::nullopt;
-  const auto continuation_pc =
-      edge.boundary ? edge.boundary->continuation_pc : std::nullopt;
+      edge.boundary && edge.boundary->continuation_entry_transform &&
+              edge.boundary->continuation_entry_transform->jump_target_pc
+          ? edge.boundary->continuation_entry_transform->jump_target_pc
+          : (edge.boundary ? edge.boundary->continuation_vip_pc : std::nullopt);
+  const auto continuation_pc = effectiveBoundaryContinuationForModel(edge.boundary);
   const auto controlled_return_pc =
       edge.boundary ? edge.boundary->controlled_return_pc : std::nullopt;
   exit.disposition = disposition;
@@ -343,11 +366,19 @@ static void applyProjectedExitSummary(VirtualExitSummary &exit,
   exit.continuation_pc =
       continuation_pc.has_value() ? continuation_pc : continuation_vip_pc;
   if (exit.return_address_control.suppresses_normal_fallthrough) {
-    exit.continuation_pc = controlled_return_pc;
-    if (controlled_return_pc)
-      exit.continuation_vip.resolved_pc = controlled_return_pc;
-    else
-      exit.continuation_vip.symbolic = true;
+    if (edge.boundary && edge.boundary->continuation_entry_transform &&
+        edge.boundary->continuation_entry_transform->jump_target_pc) {
+      exit.continuation_pc =
+          edge.boundary->continuation_entry_transform->jump_target_pc;
+      exit.continuation_vip.resolved_pc =
+          edge.boundary->continuation_entry_transform->jump_target_pc;
+    } else {
+      exit.continuation_pc = controlled_return_pc;
+      if (controlled_return_pc)
+        exit.continuation_vip.resolved_pc = controlled_return_pc;
+      else
+        exit.continuation_vip.symbolic = true;
+    }
   }
 
   switch (disposition) {
@@ -592,38 +623,6 @@ static bool projectCanonicalStateFromSessionGraph(const SessionGraphState &graph
   return true;
 }
 
-static void publishCanonicalStateToSessionGraph(llvm::Module &M,
-                                                const VirtualMachineModel &model) {
-  auto *graph = findMutableSessionGraphProjection(M);
-  if (!graph)
-    return;
-  graph->canonical_slots = model.slots().vec();
-  graph->canonical_stack_cells = model.stackCells().vec();
-  for (const auto &handler : model.handlers()) {
-    auto node_it = graph->handler_nodes.find(handler.function_name);
-    if (node_it == graph->handler_nodes.end() ||
-        !node_it->second.local_summary.has_value()) {
-      continue;
-    }
-    auto &summary = *node_it->second.local_summary;
-    summary.is_candidate = handler.is_candidate;
-    summary.state_slots = handler.state_slots;
-    summary.stack_cells = handler.stack_cells;
-    summary.state_transfers = handler.state_transfers;
-    summary.stack_transfers = handler.stack_transfers;
-    summary.live_in_slot_ids = handler.live_in_slot_ids;
-    summary.written_slot_ids = handler.written_slot_ids;
-    summary.live_in_stack_cell_ids = handler.live_in_stack_cell_ids;
-    summary.written_stack_cell_ids = handler.written_stack_cell_ids;
-    summary.specialization_facts = handler.specialization_facts;
-    summary.specialization_stack_facts = handler.specialization_stack_facts;
-    summary.incoming_argument_facts = handler.incoming_argument_facts;
-    summary.incoming_slot_phis = handler.incoming_slot_phis;
-    summary.has_unsupported_stack_memory = handler.has_unsupported_stack_memory;
-    summary.incoming_stack_phis = handler.incoming_stack_phis;
-    summary.stack_memory_budget_exceeded = handler.stack_memory_budget_exceeded;
-  }
-}
 
 static unsigned projectPropagationFactsFromSessionGraph(
     const SessionGraphState &graph, VirtualMachineModel &model) {
@@ -654,38 +653,6 @@ static unsigned projectPropagationFactsFromSessionGraph(
     ++projected;
   }
   return projected;
-}
-
-static void publishPropagationFactsToSessionGraph(llvm::Module &M,
-                                                  const VirtualMachineModel &model) {
-  auto *graph = findMutableSessionGraphProjection(M);
-  if (!graph)
-    return;
-  for (const auto &handler : model.handlers()) {
-    auto node_it = graph->handler_nodes.find(handler.function_name);
-    if (node_it == graph->handler_nodes.end())
-      continue;
-    auto &node = node_it->second;
-    node.incoming_argument_facts = handler.incoming_argument_facts;
-    node.incoming_slot_phis = handler.incoming_slot_phis;
-    node.incoming_facts = handler.incoming_facts;
-    node.outgoing_facts = handler.outgoing_facts;
-    node.incoming_stack_phis = handler.incoming_stack_phis;
-    node.incoming_stack_facts = handler.incoming_stack_facts;
-    node.outgoing_stack_facts = handler.outgoing_stack_facts;
-    node.stack_memory_budget_exceeded = handler.stack_memory_budget_exceeded;
-    if (node.local_summary.has_value()) {
-      node.local_summary->incoming_argument_facts = handler.incoming_argument_facts;
-      node.local_summary->incoming_slot_phis = handler.incoming_slot_phis;
-      node.local_summary->incoming_facts = handler.incoming_facts;
-      node.local_summary->outgoing_facts = handler.outgoing_facts;
-      node.local_summary->incoming_stack_phis = handler.incoming_stack_phis;
-      node.local_summary->incoming_stack_facts = handler.incoming_stack_facts;
-      node.local_summary->outgoing_stack_facts = handler.outgoing_stack_facts;
-      node.local_summary->stack_memory_budget_exceeded =
-          handler.stack_memory_budget_exceeded;
-    }
-  }
 }
 
 static bool projectHandlerLocalSummaryFromSessionGraph(
@@ -803,8 +770,13 @@ llvm::AnalysisKey VirtualMachineModelAnalysis::Key;
 
 VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
     llvm::Module &M, llvm::ModuleAnalysisManager &MAM) {
+  return run(M, MAM, nullptr);
+}
+
+VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
+    llvm::Module &M, llvm::ModuleAnalysisManager &MAM,
+    const SessionGraphState *session_graph) {
   VirtualMachineModel model;
-  vmModelStageDebugLog("run: begin");
   const auto &binary_memory = MAM.getResult<BinaryMemoryAnalysis>(M);
   vmModelStageDebugLog("run: binary-memory-ready");
   const auto run_begin = std::chrono::steady_clock::now();
@@ -818,10 +790,12 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
     module_cache.module_fingerprint = module_fingerprint;
     module_cache.module_instance_serial = module_instance_serial;
   }
-  const auto *session_graph = findSessionGraphProjection(M);
   auto &telemetry = model.mutableTelemetry();
+  const bool large_noabi_generic_static_scope =
+      isLargeNoAbiGenericStaticScopeModule(M);
   bool explicit_dirty_scope =
-      session_graph && !session_graph->dirty_function_names.empty();
+      session_graph && !session_graph->dirty_function_names.empty() &&
+      !large_noabi_generic_static_scope;
   if (!explicit_dirty_scope) {
     for (auto &F : M) {
       if (F.isDeclaration())
@@ -912,11 +886,15 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
           ? terminalBoundaryRecoveryGuaranteedCodeBearingDepth()
           : 0u;
   const unsigned max_helper_closure_depth =
-      terminal_boundary_recovery_mode ? 1u : kMaxClosedSliceHelperClosureDepth;
+      terminal_boundary_recovery_mode
+          ? 1u
+          : (large_noabi_generic_static_scope ? 0u
+                                              : kMaxClosedSliceHelperClosureDepth);
   const unsigned max_code_bearing_depth =
       terminal_boundary_recovery_mode
           ? std::max(1u, recovery_guaranteed_code_bearing_depth)
-          : std::numeric_limits<unsigned>::max();
+          : (large_noabi_generic_static_scope ? 1u
+                                              : std::numeric_limits<unsigned>::max());
   auto is_guaranteed_recovery_seed = [&](unsigned helper_depth,
                                          unsigned code_bearing_depth) {
     if (!terminal_boundary_recovery_mode)
@@ -927,6 +905,14 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
   };
   auto enqueue_interesting = [&](llvm::StringRef name, unsigned helper_depth,
                                  unsigned code_bearing_depth) {
+    // Never seed or walk remill instruction-semantics templates — they have
+    // no VM-specific structure and only add work. This catch-all sits at
+    // every entry point into the interesting-handler set.
+    if (auto *candidate = M.getFunction(name);
+        candidate &&
+        virtual_model::detail::isRemillSemanticsTemplateFunction(*candidate)) {
+      return;
+    }
     std::string key = name.str();
     auto [it, inserted_depth] =
         worklist_depths.emplace(key,
@@ -1061,14 +1047,171 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
     }
   }
   if (interesting_handlers.empty() && !session_graph_handler_scope_used) {
-    if (!enqueue_session_graph_handlers([&](const SessionHandlerNode &node) {
-          if (!node.is_preferred_seed)
-            return false;
-          if (!explicit_dirty_scope)
-            return true;
-          return node.is_output_root || node.is_closed_root_slice_root ||
-                 node.is_dirty;
-        })) {
+    if (large_noabi_generic_static_scope) {
+      bool requested_root_seeded = false;
+      vmModelStageDebugLog("run: large-noabi-root-seeding begin");
+      if (const char *requested_root = std::getenv("OMILL_REQUESTED_ROOT_VA")) {
+        uint64_t requested_root_va = 0;
+        auto requested_root_text = llvm::StringRef(requested_root);
+        if (requested_root_text.consume_front("0x") ||
+            requested_root_text.consume_front("0X")) {
+        }
+        if (!requested_root_text.getAsInteger(16, requested_root_va)) {
+          vmModelStageDebugLog((llvm::Twine("run: requested-root-va=0x") +
+                               llvm::Twine::utohexstr(requested_root_va))
+                                  .str());
+          auto *requested_root_fn =
+              findLiftedOrCoveredFunctionByPC(M, requested_root_va);
+          if (!requested_root_fn) {
+            vmModelStageDebugLog(
+                "run: requested-root exact-lookup miss, trying nearby");
+            if (auto nearby_pc =
+                    findNearestCoveredLiftedOrBlockPC(M, requested_root_va, 0x80)) {
+              vmModelStageDebugLog(
+                  (llvm::Twine("run: requested-root nearby-pc=0x") +
+                   llvm::Twine::utohexstr(*nearby_pc))
+                      .str());
+              requested_root_fn =
+                  findLiftedOrCoveredFunctionByPC(M, *nearby_pc);
+            } else {
+              vmModelStageDebugLog(
+                  "run: requested-root nearby-lookup miss within 0x80");
+            }
+          }
+          if (requested_root_fn && !requested_root_fn->isDeclaration()) {
+            vmModelStageDebugLog((llvm::Twine("run: requested-root-hit=") +
+                                 requested_root_fn->getName())
+                                    .str());
+            enqueue_interesting(requested_root_fn->getName(), /*helper_depth=*/0,
+                                /*code_bearing_depth=*/0);
+            requested_root_seeded = true;
+          } else {
+            for (llvm::StringRef prefix : {"sub_", "blk_", "block_"}) {
+              std::string stem = (prefix + llvm::Twine::utohexstr(requested_root_va)).str();
+              if (auto *decl = M.getFunction(stem); decl && decl->isDeclaration()) {
+                for (auto *U : decl->users()) {
+                  auto *I = llvm::dyn_cast<llvm::Instruction>(U);
+                  auto *owner = I ? I->getFunction() : nullptr;
+                  if (!owner || owner->isDeclaration())
+                    continue;
+                  vmModelStageDebugLog((llvm::Twine("run: requested-root-user-hit=") +
+                                       owner->getName())
+                                          .str());
+                  enqueue_interesting(owner->getName(), /*helper_depth=*/0,
+                                      /*code_bearing_depth=*/0);
+                  requested_root_seeded = true;
+                  break;
+                }
+              }
+              if (requested_root_seeded)
+                break;
+              for (auto &Cand : M) {
+                if (!Cand.getName().starts_with(stem) || Cand.isDeclaration())
+                  continue;
+                vmModelStageDebugLog((llvm::Twine("run: requested-root-prefix-hit=") +
+                                     Cand.getName())
+                                        .str());
+                enqueue_interesting(Cand.getName(), /*helper_depth=*/0,
+                                    /*code_bearing_depth=*/0);
+                requested_root_seeded = true;
+                break;
+              }
+              if (requested_root_seeded)
+                break;
+            }
+          }
+          // Final, signature-agnostic authoritative walk: no
+          // hasLiftedSignature filter, no name-prefix limit. This catches
+          // ABI-recovered roots, _native suffixes, structural-target
+          // wrappers, and basic-block PC matches that the earlier helpers
+          // skip.
+          if (!requested_root_seeded) {
+            const std::string requested_root_hex =
+                llvm::Twine::utohexstr(requested_root_va).str();
+            for (auto &F : M) {
+              if (F.isDeclaration())
+                continue;
+              auto fn_name = F.getName();
+              uint64_t entry_va = extractEntryVA(fn_name);
+              uint64_t block_pc = extractBlockPC(fn_name);
+              uint64_t structural_pc = extractStructuralCodeTargetPC(F);
+              bool name_carries_pc =
+                  fn_name.contains(requested_root_hex);
+              if (entry_va != requested_root_va &&
+                  block_pc != requested_root_va &&
+                  structural_pc != requested_root_va && !name_carries_pc) {
+                bool bb_match = false;
+                for (const auto &BB : F) {
+                  if (extractBlockPC(BB.getName()) == requested_root_va) {
+                    bb_match = true;
+                    break;
+                  }
+                }
+                if (!bb_match)
+                  continue;
+              }
+              vmModelStageDebugLog((llvm::Twine("run: requested-root-walk-hit=") +
+                                   fn_name)
+                                      .str());
+              enqueue_interesting(fn_name, /*helper_depth=*/0,
+                                  /*code_bearing_depth=*/0);
+              requested_root_seeded = true;
+              break;
+            }
+            if (!requested_root_seeded) {
+              vmModelStageDebugLog(
+                  "run: requested-root authoritative walk miss");
+            }
+          }
+        }
+      }
+      if (!requested_root_seeded) {
+        std::string requested_root_hex;
+        if (const char *requested_root = std::getenv("OMILL_REQUESTED_ROOT_VA")) {
+          auto requested_root_text = llvm::StringRef(requested_root);
+          if (requested_root_text.consume_front("0x") ||
+              requested_root_text.consume_front("0X")) {
+          }
+          requested_root_hex = requested_root_text.str();
+        }
+        for (auto &Cand : M) {
+          if ((!requested_root_hex.empty() &&
+               Cand.getName().contains(requested_root_hex)) ||
+              Cand.hasFnAttribute("omill.output_root") ||
+              Cand.hasFnAttribute("omill.internal_output_root") ||
+              Cand.hasFnAttribute("omill.closed_root_slice_root")) {
+            vmModelStageDebugLog((llvm::Twine("run: root-candidate=") +
+                                 Cand.getName())
+                                    .str());
+          }
+        }
+      }
+      if (!requested_root_seeded) {
+        unsigned attr_seed_count = 0;
+        for (auto &F : M) {
+          if (F.isDeclaration())
+            continue;
+          if (!F.hasFnAttribute("omill.output_root") &&
+              !F.hasFnAttribute("omill.internal_output_root") &&
+              !F.hasFnAttribute("omill.closed_root_slice_root")) {
+            continue;
+          }
+          ++attr_seed_count;
+          enqueue_interesting(F.getName(), /*helper_depth=*/0,
+                              /*code_bearing_depth=*/0);
+        }
+        vmModelStageDebugLog((llvm::Twine("run: attr-root-seeds=") +
+                             llvm::Twine(attr_seed_count))
+                                .str());
+      }
+    } else if (!enqueue_session_graph_handlers([&](const SessionHandlerNode &node) {
+                 if (!node.is_preferred_seed)
+                   return false;
+                 if (!explicit_dirty_scope)
+                   return true;
+                 return node.is_output_root || node.is_closed_root_slice_root ||
+                        node.is_dirty;
+               })) {
       for (auto &F : M) {
         if (F.isDeclaration() ||
             F.hasFnAttribute("omill.localized_continuation_shim") ||
@@ -1085,8 +1228,8 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
       }
     }
   }
-  if (interesting_handlers.empty() && !explicit_dirty_scope &&
-      !session_graph_handler_scope_used) {
+  if (!large_noabi_generic_static_scope && interesting_handlers.empty() &&
+      !explicit_dirty_scope && !session_graph_handler_scope_used) {
     if (!enqueue_session_graph_handlers(
             [&](const SessionHandlerNode &node) { return node.is_initial_seed; })) {
       for (auto &F : M) {
@@ -1096,13 +1239,14 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
                             /*code_bearing_depth=*/0);
       }
     }
-  } else if (interesting_handlers.empty() && explicit_dirty_scope &&
-             !session_graph_handler_scope_used) {
+  }
+  if (interesting_handlers.empty() && explicit_dirty_scope &&
+      !session_graph_handler_scope_used) {
     vmModelStageDebugLog(
         "run: initial-seed fallback skipped due to explicit dirty scope");
   }
 
-  if (!explicit_dirty_scope) {
+  if (!explicit_dirty_scope && !large_noabi_generic_static_scope) {
     for (const auto &boundary : model.boundaries_) {
       if (!boundary.target_va.has_value())
         continue;
@@ -1134,8 +1278,7 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
       }
     }
   } else {
-    vmModelStageDebugLog("run: boundary-target-seeding skipped due to explicit "
-                         "dirty scope");
+    vmModelStageDebugLog("run: boundary-target-seeding skipped due to scoped mode");
   }
 
   telemetry.seed_handler_count =
@@ -1154,6 +1297,14 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
       continue;
     for (const auto &callee_name : get_direct_callees(*current_fn)) {
       auto *callee = M.getFunction(callee_name);
+      // Skip remill instruction-semantics templates entirely — their
+      // "CALLI" (etc.) mangled names would otherwise match
+      // isCallSiteHelper and pull thousands of irrelevant helpers into
+      // the analysis closure.
+      if (callee &&
+          virtual_model::detail::isRemillSemanticsTemplateFunction(*callee)) {
+        continue;
+      }
       const bool callee_code_bearing =
           callee && isVirtualModelCodeBearingFunction(*callee);
       const bool callee_vm_helper =
@@ -1167,11 +1318,12 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
           callee_code_bearing ? 0u : helper_depth + 1u;
       unsigned next_code_bearing_depth =
           callee_code_bearing ? code_bearing_depth + 1u : code_bearing_depth;
-      if ((closed_slice_scope || terminal_boundary_recovery_mode) &&
+      if ((closed_slice_scope || terminal_boundary_recovery_mode ||
+           large_noabi_generic_static_scope) &&
           !callee_code_bearing && next_helper_depth > max_helper_closure_depth) {
         continue;
       }
-      if (terminal_boundary_recovery_mode &&
+      if ((terminal_boundary_recovery_mode || large_noabi_generic_static_scope) &&
           next_code_bearing_depth > max_code_bearing_depth) {
         continue;
       }
@@ -1260,11 +1412,20 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
       auto *F = M.getFunction(name);
       if (!F)
         continue;
+      if (virtual_model::detail::isRemillSemanticsTemplateFunction(*F))
+        continue;
       functions_to_summarize.push_back(F);
     }
   } else {
-    for (auto &F : M)
+    // No scoped seeding produced any handlers. Fall back to summarizing
+    // every function in the module, but skip remill instruction-semantics
+    // templates (`_ZN12_GLOBAL__N_1*`) — there are thousands of them and
+    // they contribute no VM-specific facts.
+    for (auto &F : M) {
+      if (virtual_model::detail::isRemillSemanticsTemplateFunction(F))
+        continue;
       functions_to_summarize.push_back(&F);
+    }
   }
   for (auto *F : functions_to_summarize) {
     if (!F)
@@ -1346,7 +1507,6 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
     telemetry.session_graph_canonical_state_projection_used = true;
   } else {
     canonicalizeVirtualState(model);
-    publishCanonicalStateToSessionGraph(M, model);
   }
   vmModelStageDebugLog("run: canonicalize-done ms=" +
                        llvm::Twine(elapsedMilliseconds(
@@ -1366,7 +1526,6 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
     telemetry.session_graph_propagation_projection_used = true;
   } else {
     propagateVirtualStateFacts(M, model, binary_memory, &module_cache);
-    publishPropagationFactsToSessionGraph(M, model);
   }
   vmModelStageDebugLog("run: propagate-done ms=" +
                        llvm::Twine(elapsedMilliseconds(
@@ -1451,10 +1610,8 @@ VirtualMachineModelAnalysis::Result VirtualMachineModelAnalysis::run(
                            .str());
   vmModelStageDebugLog("run: root-slices-begin");
   const auto root_slices_begin = std::chrono::steady_clock::now();
-  if (const auto *session_graph =
-          can_use_session_graph_projection ? findSessionGraphProjection(M)
-                                           : nullptr;
-      session_graph && !session_graph->root_slices_by_va.empty()) {
+  if (session_graph && can_use_session_graph_projection &&
+      !session_graph->root_slices_by_va.empty()) {
     projectRootSlicesFromSessionGraph(*session_graph, model);
     telemetry.session_graph_projection_used = true;
     telemetry.root_slice_cache_hits = 0u;

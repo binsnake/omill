@@ -1,5 +1,6 @@
 #include "omill/Analysis/CallingConventionAnalysis.h"
 
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/DenseSet.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
@@ -46,6 +47,12 @@ static constexpr const char *kWin64ParamRegs[] = {
 static constexpr unsigned kWin64ParamCount = 4;
 static constexpr llvm::StringLiteral kExportCallsiteWin64ParamCountAttr =
     "omill.export_callsite_win64_gpr_count";
+static constexpr llvm::StringLiteral kRootEntrySeedExprsAttr =
+    "omill.export_entry_seed_exprs";
+static constexpr llvm::StringLiteral kRequestedRootRaxReturnHintAttr =
+    "omill.requested_root_rax_return_hint";
+
+
 
 /// Win64 callee-saved (nonvolatile) registers.
 static constexpr const char *kWin64CalleeSaved[] = {
@@ -56,6 +63,29 @@ static constexpr unsigned kWin64CalleeSavedCount =
 
 /// Win64 shadow space size: 32 bytes (4 x 8) reserved by caller.
 static constexpr unsigned kWin64ShadowSpaceSize = 32;
+
+std::optional<unsigned> maxWin64ParamCountFromSeedExprs(
+    llvm::StringRef seed_exprs) {
+  unsigned max_index = 0;
+  bool found = false;
+  size_t pos = 0;
+  while ((pos = seed_exprs.find("param(", pos)) != llvm::StringRef::npos) {
+    auto rest = seed_exprs.drop_front(pos + 6);
+    auto end = rest.find(')');
+    if (end == llvm::StringRef::npos)
+      break;
+    unsigned index = 0;
+    if (!rest.take_front(end).getAsInteger(10, index) &&
+        index < kWin64ParamCount) {
+      max_index = std::max(max_index, index);
+      found = true;
+    }
+    pos += 6;
+  }
+  if (!found)
+    return std::nullopt;
+  return max_index + 1;
+}
 
 /// Resolve a pointer to its State byte offset. Returns -1 if not resolvable.
 int64_t resolveStateOffset(llvm::Value *ptr, const llvm::DataLayout &DL) {
@@ -246,6 +276,64 @@ unsigned scoreWin64ParamsFromReadBeforeWritePaths(llvm::Function &F,
   }
   return matched;
 }
+llvm::SmallVector<llvm::Function *, 16> collectReachableDefinedFunctions(
+    llvm::Function &F) {
+  llvm::SmallVector<llvm::Function *, 16> functions;
+  llvm::SmallVector<llvm::Function *, 16> worklist = {&F};
+  llvm::DenseSet<llvm::Function *> seen;
+  while (!worklist.empty()) {
+    auto *current = worklist.pop_back_val();
+    if (!current || current->isDeclaration() || !seen.insert(current).second)
+      continue;
+    functions.push_back(current);
+    for (auto &BB : *current) {
+      for (auto &I : BB) {
+        auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+        auto *callee = CB ? CB->getCalledFunction() : nullptr;
+        if (!callee || callee->isDeclaration())
+          continue;
+        if (callee->getParent() != F.getParent())
+          continue;
+        worklist.push_back(callee);
+      }
+    }
+  }
+  return functions;
+}
+
+void computeClosureLiveness(llvm::Function &F, const llvm::DataLayout &DL,
+                           llvm::DenseSet<unsigned> &live_in,
+                           llvm::DenseSet<unsigned> &live_out,
+                           llvm::DenseSet<unsigned> &entry_live_in) {
+  for (auto *current : collectReachableDefinedFunctions(F)) {
+    llvm::DenseSet<unsigned> local_live_in, local_live_out, local_entry_live_in;
+    computeLiveness(*current, DL, local_live_in, local_live_out, local_entry_live_in);
+    live_in.insert(local_live_in.begin(), local_live_in.end());
+    live_out.insert(local_live_out.begin(), local_live_out.end());
+    entry_live_in.insert(local_entry_live_in.begin(),
+                         local_entry_live_in.end());
+  }
+}
+
+unsigned scoreWin64ParamsFromReachableClosure(llvm::Function &F,
+                                              const llvm::DataLayout &DL,
+                                              const StateFieldMap &field_map) {
+  unsigned matched = 0;
+  auto reachable = collectReachableDefinedFunctions(F);
+  for (unsigned i = 0; i < kWin64ParamCount; ++i) {
+    auto field = field_map.fieldByName(kWin64ParamRegs[i]);
+    if (!field)
+      break;
+    const bool found = llvm::any_of(reachable, [&](llvm::Function *current) {
+      return hasStateReadBeforeWritePath(*current, field->offset, DL);
+    });
+    if (!found)
+      break;
+    ++matched;
+  }
+  return matched;
+}
+
 
 FunctionABI analyzeFunction(llvm::Function &F, const llvm::DataLayout &DL,
                             const StateFieldMap &field_map) {
@@ -260,20 +348,36 @@ FunctionABI analyzeFunction(llvm::Function &F, const llvm::DataLayout &DL,
 
   llvm::DenseSet<unsigned> live_in, live_out, entry_live_in;
   computeLiveness(F, DL, live_in, live_out, entry_live_in);
+  if (is_public_output_root) {
+    computeClosureLiveness(F, DL, live_in, live_out, entry_live_in);
+  }
 
   // Win64 detection: use entry-block read-before-write signals only.
   // Non-entry reads are often transformed temporaries, not true ABI params.
   unsigned win64_score = scoreWin64Params(entry_live_in, field_map);
 
   // Exported roots commonly branch into local lifted closures before touching
-  // the original parameter registers. For those, fall back to a path-sensitive
-  // read-before-first-write check instead of whole-function liveness.
+  // the original parameter registers. For those, fall back to closure-aware
+  // read-before-first-write checks instead of restricting analysis to the
+  // root entry block alone.
   if (win64_score == 0 && is_public_output_root) {
     win64_score =
         scoreWin64ParamsFromReadBeforeWritePaths(F, DL, field_map);
   }
+  if (win64_score == 0 && is_public_output_root) {
+    win64_score =
+        scoreWin64ParamsFromReachableClosure(F, DL, field_map);
+  }
 
   if (is_public_output_root) {
+    auto seed_attr = F.getFnAttribute(kRootEntrySeedExprsAttr);
+    if (seed_attr.isValid() && seed_attr.isStringAttribute()) {
+      if (auto hinted_count =
+              maxWin64ParamCountFromSeedExprs(seed_attr.getValueAsString())) {
+        win64_score = std::max(win64_score, *hinted_count);
+      }
+    }
+
     auto attr = F.getFnAttribute(kExportCallsiteWin64ParamCountAttr);
     if (attr.isValid() && attr.isStringAttribute()) {
       unsigned attr_count = 0;
@@ -353,6 +457,19 @@ FunctionABI analyzeFunction(llvm::Function &F, const llvm::DataLayout &DL,
       }
     }
   }
+
+  if (!abi.ret.has_value() && is_public_output_root) {
+    auto attr = F.getFnAttribute(kRequestedRootRaxReturnHintAttr);
+    if (attr.isValid() && rax_field) {
+      RecoveredReturn ret;
+      ret.reg_name = "RAX";
+      ret.state_offset = rax_field->offset;
+      ret.size = rax_field->size;
+      ret.is_vector = false;
+      abi.ret = ret;
+    }
+  }
+
 
   // Detect XMM/vector live-ins.  In Win64 ABI, only XMM0-XMM3 can be
   // parameters (positions 0-3), and each position uses EITHER a GPR or an

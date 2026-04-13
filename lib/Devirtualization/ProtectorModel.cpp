@@ -110,6 +110,8 @@ const char *toString(ChildImportClass import_class) {
       return "trusted_terminal_entry";
     case ChildImportClass::kClosedSliceRoot:
       return "closed_slice_root";
+    case ChildImportClass::kBoundedContinuationSlice:
+      return "bounded_continuation_slice";
     case ChildImportClass::kBoundaryModeledChild:
       return "boundary_modeled_child";
     case ChildImportClass::kRuntimeLeakingChild:

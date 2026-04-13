@@ -245,4 +245,32 @@ discoverImageBaseRelativeTargets(const BinaryMemoryMap &mem,
   return targets;
 }
 
+inline std::vector<uint64_t> discoverJumpTableTargetsForInstruction(
+    const BinaryMemoryMap &mem, uint64_t inst_pc,
+    size_t scan_window = 4096) {
+  std::vector<uint64_t> targets;
+  const uint64_t image_base = mem.imageBase();
+  if (image_base != 0) {
+    targets = discoverImageBaseRelativeTargets(mem, image_base, inst_pc);
+  }
+
+  const uint64_t scan_start =
+      (inst_pc > scan_window) ? (inst_pc - scan_window) : 0;
+  const size_t scan_len = static_cast<size_t>(inst_pc - scan_start) + 64;
+
+  if (targets.empty() && image_base != 0) {
+    targets =
+        discoverImageBaseRelativeTargetsInRegion(mem, image_base, scan_start,
+                                                 scan_len);
+  }
+  if (targets.empty()) {
+    targets = discoverJumpTableTargets(mem, scan_start, scan_len);
+  }
+
+  std::sort(targets.begin(), targets.end());
+  targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+  return targets;
+}
+
+
 }  // namespace omill

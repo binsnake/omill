@@ -48,12 +48,14 @@ class VirtualMachineModelTest : public ::testing::Test {
   }
 
   omill::VirtualMachineModel runAnalysis(
-      llvm::Module &M, omill::BinaryMemoryMap map = {}) {
-    return runAnalysis(M, std::move(map), omill::VMTraceMap());
+      llvm::Module &M, omill::BinaryMemoryMap map = {},
+      const omill::SessionGraphState *session_graph = nullptr) {
+    return runAnalysis(M, std::move(map), omill::VMTraceMap(), session_graph);
   }
 
   omill::VirtualMachineModel runAnalysis(
-      llvm::Module &M, omill::BinaryMemoryMap map, omill::VMTraceMap trace_map) {
+      llvm::Module &M, omill::BinaryMemoryMap map, omill::VMTraceMap trace_map,
+      const omill::SessionGraphState *session_graph = nullptr) {
     llvm::PassBuilder PB;
     llvm::LoopAnalysisManager LAM;
     llvm::FunctionAnalysisManager FAM;
@@ -74,6 +76,8 @@ class VirtualMachineModelTest : public ::testing::Test {
     PB.registerLoopAnalyses(LAM);
     PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
+    if (session_graph)
+      return omill::VirtualMachineModelAnalysis().run(M, MAM, session_graph);
     return MAM.getResult<omill::VirtualMachineModelAnalysis>(M);
   }
 
@@ -513,7 +517,7 @@ TEST_F(VirtualMachineModelTest,
   (void)orchestrator.discoverFrontierWork(
       *M, callbacks, omill::FrontierDiscoveryPhase::kOutputRootClosure);
 
-  auto model = runAnalysis(*M);
+  auto model = runAnalysis(*M, {}, &orchestrator.session().graph);
   EXPECT_TRUE(model.telemetry().session_graph_projection_used);
   auto *slice = model.lookupRootSlice(0x401000ULL);
   ASSERT_NE(slice, nullptr);
@@ -574,9 +578,8 @@ TEST_F(VirtualMachineModelTest,
                                 std::move(unrelated_node));
   }
   graph.dirty_function_names.insert("sub_401000");
-  publishSessionGraphProjection(*M, graph);
 
-  auto model = runAnalysis(*M);
+  auto model = runAnalysis(*M, {}, &graph);
   EXPECT_TRUE(model.telemetry().dirty_scope_requested);
   EXPECT_TRUE(model.telemetry().session_graph_handler_scope_used);
   EXPECT_TRUE(model.telemetry().selected_handler_iteration_used);
@@ -646,9 +649,8 @@ TEST_F(VirtualMachineModelTest,
     graph.handler_nodes.emplace(helper_node.function_name, std::move(helper_node));
   }
   graph.dirty_function_names.insert("sub_401000");
-  publishSessionGraphProjection(*M, graph);
 
-  auto model = runAnalysis(*M);
+  auto model = runAnalysis(*M, {}, &graph);
   EXPECT_TRUE(model.telemetry().dirty_scope_requested);
   EXPECT_TRUE(model.telemetry().session_graph_handler_scope_used);
   EXPECT_TRUE(model.telemetry().session_graph_direct_callee_projection_used);
@@ -689,9 +691,8 @@ TEST_F(VirtualMachineModelTest,
   }
   graph.handler_nodes.emplace(node.function_name, std::move(node));
   graph.dirty_function_names.insert("custom_handler");
-  publishSessionGraphProjection(*M, graph);
 
-  auto model = runAnalysis(*M);
+  auto model = runAnalysis(*M, {}, &graph);
   EXPECT_TRUE(model.telemetry().dirty_scope_requested);
   EXPECT_TRUE(model.telemetry().session_graph_seed_projection_used);
   EXPECT_NE(model.lookupHandler("custom_handler"), nullptr);
@@ -737,9 +738,8 @@ TEST_F(VirtualMachineModelTest,
   }
   graph.handler_nodes.emplace(root_node.function_name, std::move(root_node));
   graph.dirty_function_names.insert("sub_401000");
-  publishSessionGraphProjection(*M, graph);
 
-  auto model = runAnalysis(*M);
+  auto model = runAnalysis(*M, {}, &graph);
   EXPECT_TRUE(model.telemetry().session_graph_handler_projection_used);
   auto *handler = model.lookupHandler("sub_401000");
   ASSERT_NE(handler, nullptr);
@@ -803,9 +803,8 @@ TEST_F(VirtualMachineModelTest,
       omill::VirtualSlotFact{0, omill::virtual_model::detail::constantExpr(0x20, 64)});
   graph.handler_nodes.emplace(root_node.function_name, std::move(root_node));
   graph.dirty_function_names.insert("sub_401000");
-  publishSessionGraphProjection(*M, graph);
 
-  auto model = runAnalysis(*M);
+  auto model = runAnalysis(*M, {}, &graph);
   EXPECT_TRUE(model.telemetry().session_graph_handler_projection_used);
   EXPECT_TRUE(model.telemetry().session_graph_propagation_projection_used);
   auto *handler = model.lookupHandler("sub_401000");
@@ -869,9 +868,8 @@ TEST_F(VirtualMachineModelTest,
       omill::VirtualStateSlotInfo{0, "state", 8, 64, false, false, {"sub_401000"}});
   graph.handler_nodes.emplace(root_node.function_name, std::move(root_node));
   graph.dirty_function_names.insert("sub_401000");
-  publishSessionGraphProjection(*M, graph);
 
-  auto model = runAnalysis(*M);
+  auto model = runAnalysis(*M, {}, &graph);
   EXPECT_TRUE(model.telemetry().session_graph_canonical_state_projection_used);
   auto *slot = model.lookupSlot(0);
   ASSERT_NE(slot, nullptr);
@@ -944,9 +942,8 @@ TEST_F(VirtualMachineModelTest,
     graph.boundary_facts_by_target.emplace(boundary.target_pc, std::move(boundary));
   }
   graph.dirty_function_names.insert("sub_401000");
-  publishSessionGraphProjection(*M, graph);
 
-  auto model = runAnalysis(*M);
+  auto model = runAnalysis(*M, {}, &graph);
   EXPECT_TRUE(model.telemetry().session_graph_boundary_projection_used);
   EXPECT_TRUE(model.telemetry().session_graph_vip_projection_used);
   auto *boundary = model.lookupBoundary("omill_vm_enter_target_401220");
@@ -1004,9 +1001,8 @@ TEST_F(VirtualMachineModelTest,
     graph.region_nodes_by_entry_pc.emplace(region.entry_pc, std::move(region));
   }
   graph.dirty_function_names.insert("sub_401000");
-  publishSessionGraphProjection(*M, graph);
 
-  auto model = runAnalysis(*M);
+  auto model = runAnalysis(*M, {}, &graph);
   ASSERT_EQ(model.regions().size(), 1u);
   EXPECT_EQ(model.regions()[0].handler_names.size(), 1u);
   EXPECT_EQ(model.regions()[0].handler_names[0], "tbrec_sub_401330");

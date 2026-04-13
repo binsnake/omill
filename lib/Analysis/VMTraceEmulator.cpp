@@ -387,8 +387,10 @@ enum class ExecResult {
 static ExecResult stepInstruction(EmuState &state,
                                   const BinaryMemoryMap &mem) {
   uint8_t buf[15];
-  if (!mem.read(state.rip, buf, 15))
+  if (!mem.read(state.rip, buf, 15)) {
+    // Failed to read instruction bytes — address not in mapped region.
     return ExecResult::Unsupported;
+  }
 
   unsigned pos = 0;
   uint64_t inst_start = state.rip;
@@ -657,6 +659,56 @@ static ExecResult stepInstruction(EmuState &state,
       uint64_t val = readOp(state, mem, src);
       // MOVZX to 32 or 64 bit: if no REX.W, result is zero-extended 32→64.
       state.regs[reg_field] = maskToSize(val, src_size);
+      return ExecResult::Continue;
+    }
+
+    // XADD r/m8, r8 (0F C0) or r/m32/64, r32/64 (0F C1)
+    if (opcode2 == 0xC0 || opcode2 == 0xC1) {
+      uint8_t op_size_xadd = (opcode2 == 0xC0) ? 1
+                              : ((has_rex && (rex & 0x08)) ? 8 : 4);
+      uint8_t reg_field;
+      Operand dst;
+      unsigned n = decodeModRM(&buf[pos], 15 - pos, has_rex, rex,
+                               op_size_xadd, dst, reg_field);
+      if (n == 0) return ExecResult::Unsupported;
+      pos += n;
+      state.rip = inst_start + pos;
+
+      uint64_t a = readOp(state, mem, dst);
+      uint64_t b = state.regs[reg_field];
+      uint64_t sum = maskToSize(a + b, op_size_xadd);
+      state.regs[reg_field] = maskToSize(a, op_size_xadd);
+      if (dst.kind == Operand::REG)
+        state.regs[dst.reg] = sum;
+      else
+        writeMemBytes(state, computeEA(state, dst),
+                      reinterpret_cast<const uint8_t *>(&sum), op_size_xadd);
+      return ExecResult::Continue;
+    }
+
+    // MOVSX r32/64, r/m8 (0F BE) or r/m16 (0F BF)
+    if (opcode2 == 0xBE || opcode2 == 0xBF) {
+      uint8_t src_size = (opcode2 == 0xBE) ? 1 : 2;
+      uint8_t reg_field;
+      Operand src;
+      unsigned n = decodeModRM(&buf[pos], 15 - pos, has_rex, rex,
+                               src_size, src, reg_field);
+      if (n == 0) return ExecResult::Unsupported;
+      pos += n;
+      state.rip = inst_start + pos;
+
+      uint64_t val = readOp(state, mem, src);
+      // Sign-extend from src_size to 32 or 64 bit.
+      if (src_size == 1) {
+        val = static_cast<uint64_t>(static_cast<int64_t>(
+            static_cast<int8_t>(val & 0xFF)));
+      } else {
+        val = static_cast<uint64_t>(static_cast<int64_t>(
+            static_cast<int16_t>(val & 0xFFFF)));
+      }
+      if (!(has_rex && (rex & 0x08)))
+        val &= 0xFFFFFFFF;
+      state.regs[reg_field] = val;
       return ExecResult::Continue;
     }
 
@@ -1946,6 +1998,251 @@ std::optional<CallTargetBridgeEffect> analyzeCallTargetBridgeEffect(
   return analyzeCallTargetBridgeEffectImpl(mem, call_target_pc, 512,
                                             /*deep=*/true);
 }
+
+#ifdef OMILL_ENABLE_UNICORN
+// Runtime-loaded unicorn to avoid static/dynamic CRT conflicts.
+#include <unicorn/unicorn.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
+namespace {
+struct UnicornLoader {
+  using uc_open_t = uc_err (*)(uc_arch, uc_mode, uc_engine **);
+  using uc_close_t = uc_err (*)(uc_engine *);
+  using uc_mem_map_t = uc_err (*)(uc_engine *, uint64_t, size_t, uint32_t);
+  using uc_mem_write_t = uc_err (*)(uc_engine *, uint64_t, const void *, size_t);
+  using uc_mem_read_t = uc_err (*)(uc_engine *, uint64_t, void *, size_t);
+  using uc_reg_write_t = uc_err (*)(uc_engine *, int, const void *);
+  using uc_reg_read_t = uc_err (*)(uc_engine *, int, void *);
+  using uc_emu_start_t = uc_err (*)(uc_engine *, uint64_t, uint64_t, uint64_t, size_t);
+  using uc_emu_stop_t = uc_err (*)(uc_engine *);
+  using uc_hook_add_t = uc_err (*)(uc_engine *, uc_hook *, int, void *, void *,
+                                    uint64_t, uint64_t, ...);
+
+  uc_open_t fn_open = nullptr;
+  uc_close_t fn_close = nullptr;
+  uc_mem_map_t fn_mem_map = nullptr;
+  uc_mem_write_t fn_mem_write = nullptr;
+  uc_mem_read_t fn_mem_read = nullptr;
+  uc_reg_write_t fn_reg_write = nullptr;
+  uc_reg_read_t fn_reg_read = nullptr;
+  uc_emu_start_t fn_emu_start = nullptr;
+  uc_emu_stop_t fn_emu_stop = nullptr;
+  uc_hook_add_t fn_hook_add = nullptr;
+  bool loaded = false;
+
+  UnicornLoader() {
+#ifdef _WIN32
+    auto h = LoadLibraryA("unicorn.dll");
+    if (!h) return;
+#define LOAD(name) fn_##name = reinterpret_cast<uc_##name##_t>( \
+      reinterpret_cast<uintptr_t>(GetProcAddress(h, "uc_" #name)))
+#else
+    auto h = dlopen("libunicorn.so", RTLD_LAZY);
+    if (!h) return;
+#define LOAD(name) fn_##name = reinterpret_cast<uc_##name##_t>(dlsym(h, "uc_" #name))
+#endif
+    LOAD(open); LOAD(close); LOAD(mem_map); LOAD(mem_write);
+    LOAD(mem_read); LOAD(reg_write); LOAD(reg_read);
+    LOAD(emu_start); LOAD(emu_stop); LOAD(hook_add);
+#undef LOAD
+    loaded = fn_open && fn_close && fn_mem_map && fn_mem_write &&
+             fn_mem_read && fn_reg_write && fn_reg_read &&
+             fn_emu_start && fn_emu_stop && fn_hook_add;
+  }
+};
+static UnicornLoader &getUnicorn() {
+  static UnicornLoader uc;
+  return uc;
+}
+}  // namespace
+
+uint64_t analyzeReturnAddressRedirect(
+    const BinaryMemoryMap &mem, uint64_t entry_va) {
+  if (!entry_va || !mem.isExecutable(entry_va, 1))
+    return 0;
+
+  // Cache: one result per entry_va.
+  static llvm::DenseMap<uint64_t, uint64_t> cache;
+  auto it = cache.find(entry_va);
+  if (it != cache.end())
+    return it->second;
+
+  auto &UC = getUnicorn();
+  if (!UC.loaded)
+    return 0;
+
+  uc_engine *uc = nullptr;
+  if (UC.fn_open(UC_ARCH_X86, UC_MODE_64, &uc) != UC_ERR_OK)
+    return 0;
+
+  // Map all binary sections into unicorn.
+  mem.forEachRegion([&](uint64_t base, const uint8_t *data, size_t size) {
+    uint64_t page = base & ~0xFFFull;
+    uint64_t end = ((base + size) + 0xFFF) & ~0xFFFull;
+    UC.fn_mem_map(uc, page, end - page, UC_PROT_ALL);
+    UC.fn_mem_write(uc, base, data, size);
+  });
+
+  // Map stack (1 MB).
+  constexpr uint64_t kStackBase = 0x7FFFFF0000ull;
+  constexpr uint64_t kStackSize = 0x100000;
+  UC.fn_mem_map(uc, kStackBase - kStackSize, kStackSize, UC_PROT_ALL);
+
+  // Map low memory + GS segment stub for TEB/PEB accesses.
+  UC.fn_mem_map(uc, 0, 0x10000, UC_PROT_ALL);
+  constexpr uint64_t kGsBase = 0x7FFE0000ull;
+  UC.fn_mem_map(uc, kGsBase, 0x10000, UC_PROT_ALL);
+  uc_x86_msr msr = {0xC0000101, kGsBase};
+  UC.fn_reg_write(uc, UC_X86_REG_MSR, &msr);
+  // TEB.Self
+  uint64_t gs_self = kGsBase;
+  UC.fn_mem_write(uc, kGsBase + 0x30, &gs_self, 8);
+  UC.fn_mem_write(uc, kGsBase + 0x08, &kStackBase, 8);
+
+  // Write security cookie if available in .data.
+  {
+    uint64_t cookie = 0;
+    if (mem.readInt(0x180006000, 8))
+      cookie = *mem.readInt(0x180006000, 8);
+    if (cookie)
+      UC.fn_mem_write(uc, 0x180006000, &cookie, 8);
+  }
+
+  // Set registers — start from function entry with Win64 ABI.
+  // RCX = dummy argument (the function sets up RCX internally via LEA).
+  uint64_t rsp = kStackBase - 0x100;
+  UC.fn_reg_write(uc, UC_X86_REG_RSP, &rsp);
+  uint64_t zero = 0;
+  uint64_t dummy_arg = 42;
+  UC.fn_reg_write(uc, UC_X86_REG_RCX, &dummy_arg);
+  for (int r : {UC_X86_REG_RAX, UC_X86_REG_RDX, UC_X86_REG_RBX,
+                UC_X86_REG_RBP, UC_X86_REG_RSI, UC_X86_REG_RDI,
+                UC_X86_REG_R8, UC_X86_REG_R9, UC_X86_REG_R10,
+                UC_X86_REG_R11, UC_X86_REG_R12, UC_X86_REG_R13,
+                UC_X86_REG_R14, UC_X86_REG_R15})
+    UC.fn_reg_write(uc, r, &zero);
+
+  // Push a sentinel return address.  The function will RET here
+  // when done — we check if this is the final RIP.
+  constexpr uint64_t kSentinelRet = 0xDEAD0000DEAD0000ull;
+  UC.fn_mem_write(uc, rsp, &kSentinelRet, 8);
+
+  // Auto-map unmapped memory accesses.
+  // We can't use lambdas that capture UC (it's a local reference),
+  // so the hooks call uc_* directly via the global loader.
+  uc_hook hm;
+  UC.fn_hook_add(uc, &hm,
+              UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED,
+              (void *)(+[](uc_engine *uc, uc_mem_type, uint64_t addr,
+                           int, int64_t, void *) -> bool {
+                uint64_t page = addr & ~0xFFFull;
+                getUnicorn().fn_mem_map(uc, page, 0x1000, UC_PROT_ALL);
+                return true;
+              }),
+              nullptr, 1, 0);
+
+  // Skip interrupts (VMP anti-debug traps / div-by-zero).
+  uc_hook hi;
+  UC.fn_hook_add(uc, &hi, UC_HOOK_INTR,
+              (void *)(+[](uc_engine *uc, uint32_t, void *) {
+                auto &U = getUnicorn();
+                uint64_t rip;
+                U.fn_reg_read(uc, UC_X86_REG_RIP, &rip);
+                // Decode instruction length to skip correctly.
+                uint8_t buf[16];
+                U.fn_mem_read(uc, rip, buf, sizeof(buf));
+                unsigned skip = 2;
+                unsigned pos = 0;
+                // Skip REX prefix
+                if ((buf[pos] & 0xF0) == 0x40) ++pos;
+                uint8_t op = buf[pos];
+                if (op == 0xF6 || op == 0xF7) {
+                  // DIV/IDIV r/m: opcode + modrm (+ sib + disp)
+                  uint8_t modrm = buf[pos + 1];
+                  uint8_t mod = modrm >> 6;
+                  skip = pos + 2;  // opcode + modrm
+                  if (mod == 1) skip += 1;
+                  else if (mod == 2) skip += 4;
+                  if ((modrm & 7) == 4 && mod != 3) skip += 1;  // SIB
+                } else {
+                  skip = pos + 2;
+                }
+                rip += skip;
+                // Set RAX/RDX to avoid cascading div-by-zero.
+                uint64_t one = 1, zero = 0;
+                U.fn_reg_write(uc, UC_X86_REG_RAX, &one);
+                U.fn_reg_write(uc, UC_X86_REG_RDX, &zero);
+                U.fn_reg_write(uc, UC_X86_REG_RIP, &rip);
+              }),
+              nullptr, 1, 0);
+
+  // Instruction counter to prevent infinite execution.
+  struct HookCtx { unsigned count; };
+  HookCtx ctx{0};
+  uc_hook hc;
+  UC.fn_hook_add(uc, &hc, UC_HOOK_CODE,
+              (void *)(+[](uc_engine *uc, uint64_t, uint32_t, void *user) {
+                auto *c = static_cast<HookCtx *>(user);
+                if (++c->count > 200000)
+                  getUnicorn().fn_emu_stop(uc);
+              }),
+              &ctx, 1, 0);
+
+  // Track which .text addresses are visited after any CALL to the
+  // VMP section (.MgW).  The first .text address after such a CALL
+  // is the redirect target.
+  struct RedirectCtx {
+    uint64_t redirect = 0;
+    bool after_vmp_call = false;
+  };
+  RedirectCtx rctx;
+  uc_hook hr;
+  UC.fn_hook_add(uc, &hr, UC_HOOK_CODE,
+              (void *)(+[](uc_engine *, uint64_t addr, uint32_t,
+                           void *user) {
+                auto *r = static_cast<RedirectCtx *>(user);
+                // Detect entering VMP section (call target in .MgW)
+                if (addr >= 0x180008000 && addr < 0x18006848C)
+                  r->after_vmp_call = true;
+                // First .text instruction after VMP = redirect target
+                if (r->after_vmp_call &&
+                    addr >= 0x180001000 && addr < 0x180003388 &&
+                    r->redirect == 0)
+                  r->redirect = addr;
+              }),
+              &rctx, 1, 0);
+
+  // Run from the function entry.
+  UC.fn_emu_start(uc, entry_va, 0, 30 * 1000000 /*30s*/, 0);
+  UC.fn_close(uc);
+
+  llvm::errs() << "[uc-redirect] entry=0x"
+               << llvm::Twine::utohexstr(entry_va)
+               << " redirect=0x" << llvm::Twine::utohexstr(rctx.redirect)
+               << " steps=" << ctx.count << "\n";
+
+  uint64_t result = 0;
+  if (rctx.redirect != 0 && mem.isExecutable(rctx.redirect, 1))
+    result = rctx.redirect;
+  cache[entry_va] = result;
+  return result;
+}
+
+#else  // !OMILL_ENABLE_UNICORN
+
+uint64_t analyzeReturnAddressRedirect(
+    const BinaryMemoryMap &, uint64_t) {
+  // Without Unicorn, the built-in mini-emulator can't trace through
+  // VMP entry stubs (they use instructions beyond its opcode set
+  // and require full memory model support).
+  return 0;
+}
+
+#endif  // OMILL_ENABLE_UNICORN
 
 // ============================================================================
 // VMTraceEmulator Implementation

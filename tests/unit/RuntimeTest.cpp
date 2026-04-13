@@ -1,6 +1,7 @@
 #include "omill/Devirtualization/ExecutableTargetFact.h"
 #include "omill/Devirtualization/Orchestrator.h"
 #include "omill/Devirtualization/Runtime.h"
+#include "omill/BC/RemillProjectionLifter.h"
 #include "omill/Utils/LiftedNames.h"
 
 #include <gtest/gtest.h>
@@ -13,6 +14,7 @@
 #include <cstring>
 #include <string>
 #include <algorithm>
+#include <sstream>
 #include <vector>
 
 namespace {
@@ -51,6 +53,32 @@ class RuntimeTest : public ::testing::Test {
         linkage, name, M);
     llvm::BasicBlock::Create(M.getContext(), "entry", Fn);
     return Fn;
+  }
+
+  static llvm::Function *materializeBlockFunction(llvm::Module &M,
+                                                  uint64_t pc) {
+    std::stringstream ss;
+    ss << "blk_" << std::hex << pc;
+    const auto name = ss.str();
+    if (auto *Fn = M.getFunction(name)) {
+      if (Fn->isDeclaration()) {
+        auto *Entry = llvm::BasicBlock::Create(M.getContext(), "entry", Fn);
+        llvm::IRBuilder<> B(Entry);
+        B.CreateRet(Fn->getArg(2));
+      }
+      return Fn;
+    }
+    return addLiftedFunction(M, name);
+  }
+
+  static omill::RemillProjectionLifter makeProjectionLifter(llvm::Module &M) {
+    return omill::RemillProjectionLifter(
+        [&](uint64_t pc,
+            llvm::SmallVectorImpl<uint64_t> &discovered_targets)
+            -> llvm::Function * {
+          discovered_targets.clear();
+          return materializeBlockFunction(M, pc);
+        });
   }
 };
 
@@ -130,9 +158,7 @@ TEST_F(RuntimeTest,
       };
   callbacks.run_final_output_cleanup = [&]() { ++cleanup_calls; };
 
-  auto summary = runtime.runOutputRecovery(M, nullptr, nullptr,
-                                           &frontier_callbacks, options,
-                                           callbacks);
+  auto summary = runtime.runOutputRecovery(M, nullptr, &frontier_callbacks, options, callbacks);
 
   EXPECT_TRUE(summary.changed);
   EXPECT_EQ(summary.noabi_imported_children, 1u);
@@ -149,7 +175,7 @@ TEST_F(RuntimeTest,
                omill::RuntimeArtifactStage::kOutputRecoveryImportRound;
       });
   ASSERT_NE(bundle_it, summary.artifact_bundles.end());
-  EXPECT_EQ(bundle_it->label, "noabi_executable_children");
+  EXPECT_EQ(bundle_it->label, "noabi_children");
   EXPECT_NE(std::find(bundle_it->imported_targets.begin(),
                       bundle_it->imported_targets.end(), 0x401230u),
             bundle_it->imported_targets.end());
@@ -168,6 +194,302 @@ TEST_F(RuntimeTest,
                       std::string("sub_401000")),
             bundle_it->output_root_names.end());
 }
+
+TEST_F(RuntimeTest, RunOutputRecoveryImportsNoAbiVmEnterChildrenThroughRuntime) {
+  llvm::Module M("runtime_noabi_vm_enter_recovery", Ctx);
+  auto *Root = addLiftedFunction(M, "sub_401000");
+  Root->addFnAttr("omill.output_root");
+  auto *Placeholder = llvm::Function::Create(
+      liftedFnTy(Ctx), llvm::Function::ExternalLinkage,
+      "omill_vm_enter_target_401530", M);
+  omill::BoundaryFact fact;
+  fact.boundary_pc = 0x401530u;
+  fact.continuation_pc = 0x401530u;
+  fact.is_vm_enter = true;
+  fact.exit_disposition = omill::BoundaryDisposition::kVmEnter;
+  fact.kind = omill::BoundaryKind::kVmEnterBoundary;
+  omill::writeBoundaryFact(*Placeholder, fact);
+
+  auto &Entry = Root->getEntryBlock();
+  Entry.getTerminator()->eraseFromParent();
+  llvm::IRBuilder<> B(&Entry);
+  B.CreateCall(Placeholder,
+               {Root->getArg(0), B.getInt64(0x401530), Root->getArg(2)});
+  B.CreateRet(Root->getArg(2));
+
+  omill::DevirtualizationOrchestrator orchestrator;
+  auto &edge =
+      orchestrator.session().graph.edge_facts_by_identity["closure:vm-enter-edge"];
+  edge.identity = "closure:vm-enter-edge";
+  edge.owner_function = "sub_401000";
+  edge.site_index = 0;
+  edge.site_pc = 0x401000u;
+  edge.target_pc = 0x401530u;
+  edge.boundary = fact;
+  edge.continuation_proof = omill::ContinuationProof{};
+  edge.continuation_proof->edge_identity = edge.identity;
+  edge.continuation_proof->raw_target_pc = 0x401530u;
+  edge.continuation_proof->source_handler_name = "sub_401000";
+  edge.continuation_proof->confidence =
+      omill::ContinuationConfidence::kTrusted;
+  edge.continuation_proof->liveness = omill::ContinuationLiveness::kLive;
+  edge.continuation_proof->scheduling_class =
+      omill::FrontierSchedulingClass::kNativeOrVmEnterBoundary;
+  edge.continuation_proof->resolution_kind =
+      omill::ContinuationResolutionKind::kBoundaryModeled;
+  edge.continuation_proof->import_disposition =
+      omill::ContinuationImportDisposition::kImportable;
+  omill::DevirtualizationRuntime runtime(orchestrator);
+
+  omill::FrontierCallbacks frontier_callbacks;
+  frontier_callbacks.is_code_address = [](uint64_t) { return true; };
+  frontier_callbacks.has_defined_target = [](uint64_t) { return false; };
+  frontier_callbacks.normalize_target_pc = [](uint64_t pc) { return pc; };
+
+  omill::OutputRecoveryOptions options;
+  options.raw_binary = false;
+  options.no_abi = true;
+  options.use_block_lifting = true;
+  options.allow_noabi_postmain_rounds = true;
+  options.max_noabi_executable_child_import_rounds = 1;
+
+  unsigned lift_calls = 0;
+  unsigned patch_calls = 0;
+  unsigned cleanup_calls = 0;
+  bool import_vm_enter_called = false;
+
+  omill::OutputRecoveryCallbacks callbacks;
+  callbacks.lift_child_target =
+      [&](uint64_t target_pc, bool, bool, bool,
+          bool) -> std::optional<omill::ChildLiftArtifact> {
+        ++lift_calls;
+        omill::ChildLiftArtifact artifact;
+        artifact.target_pc = target_pc;
+        artifact.ir_text =
+            "declare ptr @omill_native_target_401540(ptr, i64, ptr)\n"
+            "define ptr @blk_401530(ptr %0, i64 %1, ptr %2) {\n"
+            "entry:\n"
+            "  %call = call ptr @omill_native_target_401540(ptr %0, i64 %1, ptr %2)\n"
+            "  ret ptr %call\n"
+            "}\n";
+        artifact.model_text =
+            "root-slice root=0x401530 closed=true handler=blk_401530";
+        return artifact;
+      };
+  callbacks.import_vm_enter_child =
+      [&](uint64_t target_pc, const omill::ChildLiftArtifact &artifact,
+          const omill::ChildImportPlan &, llvm::Function &placeholder) {
+        import_vm_enter_called = true;
+        EXPECT_EQ(target_pc, 0x401530u);
+        EXPECT_EQ(placeholder.getName(), "omill_vm_enter_target_401530");
+        omill::ChildImportPlan plan;
+        plan.target_pc = target_pc;
+        plan.selected_root_pc = artifact.selected_root_pc;
+        plan.eligibility = omill::ImportEligibility::kImportable;
+        plan.rejection_reason = omill::RecoveryRejectionReason::kNone;
+        plan.imported_root = addLiftedFunction(M, "blk_401530");
+        return plan;
+      };
+  callbacks.collect_executable_placeholder_declaration_targets = [] {
+    return std::vector<uint64_t>{};
+  };
+  callbacks.patch_declared_lifted_or_block_calls_to_defined_targets =
+      [&](const std::vector<uint64_t> &targets, llvm::StringRef,
+          llvm::StringRef) -> unsigned {
+        ++patch_calls;
+        EXPECT_EQ(targets.size(), 1u);
+        EXPECT_EQ(targets.front(), 0x401530u);
+        auto *placeholder = M.getFunction("omill_vm_enter_target_401530");
+        auto *imported = M.getFunction("blk_401530");
+        EXPECT_NE(placeholder, nullptr);
+        EXPECT_NE(imported, nullptr);
+        if (!placeholder || !imported)
+          return 0u;
+        placeholder->replaceAllUsesWith(imported);
+        if (placeholder->use_empty())
+          placeholder->eraseFromParent();
+        return 1u;
+      };
+  callbacks.run_final_output_cleanup = [&]() { ++cleanup_calls; };
+
+  auto summary = runtime.runOutputRecovery(M, nullptr, &frontier_callbacks, options, callbacks);
+
+  EXPECT_FALSE(summary.changed);
+  EXPECT_FALSE(import_vm_enter_called);
+  EXPECT_EQ(summary.noabi_imported_children, 0u);
+  EXPECT_EQ(lift_calls, 0u);
+  EXPECT_EQ(patch_calls, 0u);
+  EXPECT_EQ(cleanup_calls, 0u);
+  EXPECT_NE(M.getFunction("omill_vm_enter_target_401530"), nullptr);
+
+  bool saw_imported_call = false;
+  for (auto &BB : *Root) {
+    for (auto &I : BB) {
+      auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+      if (!CB || !CB->getCalledFunction())
+        continue;
+      if (CB->getCalledFunction()->getName() == "blk_401530")
+        saw_imported_call = true;
+    }
+  }
+  EXPECT_FALSE(saw_imported_call);
+
+  auto bundle_it = std::find_if(
+      summary.artifact_bundles.begin(), summary.artifact_bundles.end(),
+      [](const omill::RoundArtifactBundle &bundle) {
+        return bundle.stage ==
+               omill::RuntimeArtifactStage::kOutputRecoveryImportRound;
+      });
+  ASSERT_NE(bundle_it, summary.artifact_bundles.end());
+  EXPECT_EQ(bundle_it->label, "noabi_children");
+  EXPECT_TRUE(bundle_it->imported_targets.empty());
+}
+
+
+TEST_F(RuntimeTest,
+       RunOutputRecoveryImportsNoAbiVmEnterChildWithModeledFrontierHandlers) {
+  llvm::Module M("runtime_noabi_vm_enter_frontier_modeled", Ctx);
+  auto *Root = addLiftedFunction(M, "sub_401000");
+  Root->addFnAttr("omill.output_root");
+  auto *Placeholder = llvm::Function::Create(
+      liftedFnTy(Ctx), llvm::Function::ExternalLinkage,
+      "omill_vm_enter_target_401530", M);
+  omill::BoundaryFact fact;
+  fact.boundary_pc = 0x401530u;
+  fact.continuation_pc = 0x401530u;
+  fact.is_vm_enter = true;
+  fact.exit_disposition = omill::BoundaryDisposition::kVmEnter;
+  fact.kind = omill::BoundaryKind::kVmEnterBoundary;
+  omill::writeBoundaryFact(*Placeholder, fact);
+
+  auto &Entry = Root->getEntryBlock();
+  Entry.getTerminator()->eraseFromParent();
+  llvm::IRBuilder<> B(&Entry);
+  B.CreateCall(Placeholder,
+               {Root->getArg(0), B.getInt64(0x401530), Root->getArg(2)});
+  B.CreateRet(Root->getArg(2));
+
+  omill::DevirtualizationOrchestrator orchestrator;
+  auto &edge = orchestrator
+                   .session()
+                   .graph.edge_facts_by_identity["closure:vm-enter-frontier"];
+  edge.identity = "closure:vm-enter-frontier";
+  edge.owner_function = "sub_401000";
+  edge.site_index = 0;
+  edge.site_pc = 0x401000u;
+  edge.target_pc = 0x401530u;
+  edge.boundary = fact;
+  edge.continuation_proof = omill::ContinuationProof{};
+  edge.continuation_proof->edge_identity = edge.identity;
+  edge.continuation_proof->raw_target_pc = 0x401530u;
+  edge.continuation_proof->source_handler_name = "sub_401000";
+  edge.continuation_proof->confidence =
+      omill::ContinuationConfidence::kTrusted;
+  edge.continuation_proof->liveness = omill::ContinuationLiveness::kLive;
+  edge.continuation_proof->scheduling_class =
+      omill::FrontierSchedulingClass::kNativeOrVmEnterBoundary;
+  edge.continuation_proof->resolution_kind =
+      omill::ContinuationResolutionKind::kBoundaryModeled;
+  edge.continuation_proof->import_disposition =
+      omill::ContinuationImportDisposition::kImportable;
+
+  omill::DevirtualizationRuntime runtime(orchestrator);
+
+  omill::FrontierCallbacks frontier_callbacks;
+  frontier_callbacks.is_code_address = [](uint64_t) { return true; };
+  frontier_callbacks.has_defined_target = [](uint64_t) { return false; };
+  frontier_callbacks.normalize_target_pc = [](uint64_t pc) { return pc; };
+
+  omill::OutputRecoveryOptions options;
+  options.raw_binary = false;
+  options.no_abi = true;
+  options.use_block_lifting = true;
+  options.allow_noabi_postmain_rounds = true;
+  options.max_noabi_executable_child_import_rounds = 1;
+
+  bool import_vm_enter_called = false;
+  omill::OutputRecoveryCallbacks callbacks;
+  callbacks.lift_child_target =
+      [&](uint64_t target_pc, bool, bool, bool,
+          bool) -> std::optional<omill::ChildLiftArtifact> {
+        EXPECT_EQ(target_pc, 0x401530u);
+        omill::ChildLiftArtifact artifact;
+        artifact.target_pc = target_pc;
+        artifact.ir_text =
+            "declare ptr @__remill_function_call(ptr, i64, ptr)\n"
+            "declare ptr @omill_executable_target_499999(ptr, i64, ptr)\n"
+            "define ptr @sub_401530(ptr %0, i64 %1, ptr %2) {\n"
+            "entry:\n"
+            "  %call = call ptr @blk_401540(ptr %0, i64 %1, ptr %2)\n"
+            "  ret ptr %call\n"
+            "}\n"
+            "define ptr @blk_401540(ptr %0, i64 %1, ptr %2) {\n"
+            "entry:\n"
+            "  %call = call ptr @__remill_function_call(ptr %0, i64 4200704, ptr %2)\n"
+            "  %ret = call ptr @blk_401541(ptr %0, i64 %1, ptr %call)\n"
+            "  ret ptr %ret\n"
+            "}\n"
+            "define ptr @blk_401541(ptr %0, i64 %1, ptr %2) {\n"
+            "entry:\n"
+            "  ret ptr %2\n"
+            "}\n"
+            "define ptr @blk_499990(ptr %0, i64 %1, ptr %2) {\n"
+            "entry:\n"
+            "  %call = call ptr @omill_executable_target_499999(ptr %0, i64 4823449, ptr %2)\n"
+            "  ret ptr %call\n"
+            "}\n";
+        artifact.model_text =
+            "root-slice root=0x401530 reachable=3 frontier=1 closed=false\n"
+            "slice-handler sub_401530\n"
+            "slice-handler blk_401540\n"
+            "slice-handler blk_401541\n"
+            "frontier blk_401540 kind=call target=0x401900 exit=vm_exit_native_call_reenter\n";
+        return artifact;
+      };
+  callbacks.import_vm_enter_child =
+      [&](uint64_t target_pc, const omill::ChildLiftArtifact &artifact,
+          const omill::ChildImportPlan &preimport_plan, llvm::Function &) {
+        import_vm_enter_called = true;
+        EXPECT_EQ(target_pc, 0x401530u);
+        EXPECT_EQ(preimport_plan.eligibility,
+                  omill::ImportEligibility::kImportable);
+        EXPECT_EQ(preimport_plan.import_class,
+                  std::optional<omill::ChildImportClass>(
+                      omill::ChildImportClass::kBoundaryModeledChild));
+        EXPECT_EQ(artifact.selected_root_pc, std::optional<uint64_t>(0x401541u));
+        omill::ChildImportPlan plan = preimport_plan;
+        plan.imported_root = addLiftedFunction(M, "sub_401530");
+        return plan;
+      };
+  callbacks.collect_executable_placeholder_declaration_targets = [] {
+    return std::vector<uint64_t>{};
+  };
+  callbacks.patch_declared_lifted_or_block_calls_to_defined_targets =
+      [&](const std::vector<uint64_t> &targets, llvm::StringRef,
+          llvm::StringRef) -> unsigned {
+        EXPECT_EQ(targets, std::vector<uint64_t>({0x401530u}));
+        auto *placeholder = M.getFunction("omill_vm_enter_target_401530");
+        auto *imported = M.getFunction("sub_401530");
+        if (!placeholder || !imported)
+          return 0u;
+        placeholder->replaceAllUsesWith(imported);
+        if (placeholder->use_empty())
+          placeholder->eraseFromParent();
+        return 1u;
+      };
+  callbacks.run_final_output_cleanup = [] {};
+
+  auto summary = runtime.runOutputRecovery(M, nullptr, &frontier_callbacks, options, callbacks);
+
+  const std::string joined_notes =
+      summary.notes.empty() ? std::string() : summary.notes.front();
+  EXPECT_FALSE(summary.changed) << joined_notes;
+  EXPECT_FALSE(import_vm_enter_called) << joined_notes;
+  EXPECT_EQ(summary.noabi_imported_children, 0u) << joined_notes;
+  EXPECT_NE(M.getFunction("omill_vm_enter_target_401530"), nullptr)
+      << joined_notes;
+}
+
 
 TEST_F(RuntimeTest,
        RunOutputRecoveryImportsTrustedTerminalChildFromContinuationProof) {
@@ -270,9 +592,7 @@ TEST_F(RuntimeTest,
           llvm::StringRef) -> unsigned { return 1; };
   callbacks.run_final_output_cleanup = [] {};
 
-  auto summary = runtime.runOutputRecovery(M, nullptr, nullptr,
-                                           &frontier_callbacks, options,
-                                           callbacks);
+  auto summary = runtime.runOutputRecovery(M, nullptr, &frontier_callbacks, options, callbacks);
 
   EXPECT_TRUE(summary.changed);
   EXPECT_EQ(summary.noabi_imported_children, 1u);
@@ -280,7 +600,104 @@ TEST_F(RuntimeTest,
 }
 
 TEST_F(RuntimeTest,
-       RunOutputRecoveryImportsTrustedSelfLoopChildFromResolverEvidence) {
+       RunOutputRecoveryImportsBoundedSnapshotSliceBeforeChildLift) {
+  llvm::Module M("runtime_bounded_snapshot_slice", Ctx);
+  auto *Root = addLiftedFunction(M, "sub_401000");
+  Root->addFnAttr("omill.output_root");
+  auto *Placeholder = llvm::Function::Create(
+      liftedFnTy(Ctx), llvm::Function::ExternalLinkage,
+      "omill_executable_target_401230", M);
+  omill::ExecutableTargetFact fact;
+  fact.raw_target_pc = 0x401230u;
+  fact.kind = omill::ExecutableTargetKind::kExecutablePlaceholder;
+  fact.trust = omill::ExecutableTargetTrust::kUntrustedExecutable;
+  omill::writeExecutableTargetFact(*Placeholder, fact);
+
+  auto &Entry = Root->getEntryBlock();
+  Entry.getTerminator()->eraseFromParent();
+  llvm::IRBuilder<> B(&Entry);
+  B.CreateCall(Placeholder,
+               {Root->getArg(0), B.getInt64(0x401230), Root->getArg(2)});
+  B.CreateRet(Root->getArg(2));
+
+  omill::DevirtualizationOrchestrator orchestrator;
+  auto &edge =
+      orchestrator.session().graph.edge_facts_by_identity["closure:snapshot-edge"];
+  edge.identity = "closure:snapshot-edge";
+  edge.owner_function = "sub_401000";
+  edge.site_index = 0;
+  edge.site_pc = 0x401000u;
+  edge.target_pc = 0x401230u;
+  edge.executable_target = fact;
+  edge.continuation_proof = omill::ContinuationProof{};
+  edge.continuation_proof->edge_identity = edge.identity;
+  edge.continuation_proof->raw_target_pc = 0x401230u;
+  edge.continuation_proof->source_handler_name = "sub_401000";
+  edge.continuation_proof->confidence =
+      omill::ContinuationConfidence::kTrusted;
+  edge.continuation_proof->liveness = omill::ContinuationLiveness::kLive;
+  edge.continuation_proof->scheduling_class =
+      omill::FrontierSchedulingClass::kTrustedLive;
+  edge.continuation_proof->resolution_kind =
+      omill::ContinuationResolutionKind::kTrustedEntry;
+  edge.continuation_proof->import_disposition =
+      omill::ContinuationImportDisposition::kRetryable;
+
+  omill::DevirtualizationRuntime runtime(orchestrator);
+
+  omill::FrontierCallbacks frontier_callbacks;
+  frontier_callbacks.is_code_address = [](uint64_t) { return true; };
+  frontier_callbacks.has_defined_target = [](uint64_t) { return false; };
+  frontier_callbacks.normalize_target_pc = [](uint64_t pc) { return pc; };
+  frontier_callbacks.is_executable_target = [](uint64_t) { return true; };
+  frontier_callbacks.read_target_bytes = [](uint64_t pc, uint8_t *out, size_t size) {
+    if (!size || pc != 0x401230u)
+      return false;
+    std::memset(out, 0, size);
+    out[0] = 0xFF;
+    return true;
+  };
+
+  omill::OutputRecoveryOptions options;
+  options.raw_binary = false;
+  options.no_abi = true;
+  options.use_block_lifting = true;
+  options.allow_noabi_postmain_rounds = true;
+  options.max_noabi_executable_child_import_rounds = 1;
+
+  unsigned snapshot_import_calls = 0;
+  omill::OutputRecoveryCallbacks callbacks;
+  callbacks.import_executable_snapshot_slice =
+      [&](uint64_t target_pc, const omill::BinaryRegionSnapshot &snapshot,
+          const omill::ChildImportPlan &preimport_plan) {
+        ++snapshot_import_calls;
+        EXPECT_EQ(target_pc, 0x401230u);
+        EXPECT_EQ(snapshot.entry_pc, 0x401230u);
+        EXPECT_EQ(snapshot.closure_kind, omill::BinaryRegionClosureKind::kOpen);
+        EXPECT_EQ(snapshot.blocks_by_pc.size(), 1u);
+        omill::ChildImportPlan plan = preimport_plan;
+        plan.imported_root = reinterpret_cast<llvm::Function *>(0x1);
+        return plan;
+      };
+  callbacks.collect_executable_placeholder_declaration_targets = [] {
+    return std::vector<uint64_t>{0x401230u};
+  };
+  callbacks.patch_declared_lifted_or_block_calls_to_defined_targets =
+      [](const std::vector<uint64_t> &, llvm::StringRef,
+         llvm::StringRef) -> unsigned { return 1; };
+  callbacks.run_final_output_cleanup = [] {};
+
+  auto summary =
+      runtime.runOutputRecovery(M, nullptr, &frontier_callbacks, options, callbacks);
+
+  EXPECT_TRUE(summary.changed);
+  EXPECT_EQ(summary.noabi_imported_children, 1u);
+  EXPECT_EQ(snapshot_import_calls, 1u);
+}
+
+
+TEST_F(RuntimeTest,
+       RunOutputRecoveryRejectsTrustedSelfLoopChildFromResolverEvidence) {
   llvm::Module M("runtime_resolver_promotes_exact_fallthrough", Ctx);
   auto *Root = addLiftedFunction(M, "sub_401000");
   Root->addFnAttr("omill.output_root");
@@ -349,6 +766,7 @@ TEST_F(RuntimeTest,
   options.max_noabi_executable_child_import_rounds = 1;
 
   unsigned lift_calls = 0;
+  unsigned import_calls = 0;
   omill::OutputRecoveryCallbacks callbacks;
   callbacks.lift_child_target =
       [&](uint64_t target_pc, bool, bool, bool,
@@ -366,8 +784,9 @@ TEST_F(RuntimeTest,
         return artifact;
       };
   callbacks.import_executable_child =
-      [](uint64_t target_pc, const omill::ChildLiftArtifact &artifact,
-         const omill::ChildImportPlan &, llvm::StringRef) {
+      [&](uint64_t target_pc, const omill::ChildLiftArtifact &artifact,
+          const omill::ChildImportPlan &, llvm::StringRef) {
+        ++import_calls;
         omill::ChildImportPlan plan;
         plan.target_pc = target_pc;
         plan.selected_root_pc = artifact.selected_root_pc;
@@ -384,13 +803,12 @@ TEST_F(RuntimeTest,
          llvm::StringRef) -> unsigned { return 1; };
   callbacks.run_final_output_cleanup = [] {};
 
-  auto summary = runtime.runOutputRecovery(M, nullptr, nullptr,
-                                           &frontier_callbacks, options,
-                                           callbacks);
+  auto summary = runtime.runOutputRecovery(M, nullptr, &frontier_callbacks, options, callbacks);
 
-  EXPECT_TRUE(summary.changed);
-  EXPECT_EQ(summary.noabi_imported_children, 1u);
+  EXPECT_FALSE(summary.changed);
+  EXPECT_EQ(summary.noabi_imported_children, 0u);
   EXPECT_EQ(lift_calls, 1u);
+  EXPECT_EQ(import_calls, 0u);
   auto bundle_it = std::find_if(
       summary.artifact_bundles.begin(), summary.artifact_bundles.end(),
       [](const omill::RoundArtifactBundle &bundle) {
@@ -398,10 +816,6 @@ TEST_F(RuntimeTest,
                omill::RuntimeArtifactStage::kOutputRecoveryImportRound;
       });
   ASSERT_NE(bundle_it, summary.artifact_bundles.end());
-  EXPECT_NE(std::find(bundle_it->recovery_quality.terminal_modeled_children.begin(),
-                      bundle_it->recovery_quality.terminal_modeled_children.end(),
-                      0x401230u),
-            bundle_it->recovery_quality.terminal_modeled_children.end());
   EXPECT_FALSE(bundle_it->recovery_quality.functionally_recovered);
 }
 
@@ -490,9 +904,7 @@ TEST_F(RuntimeTest,
          llvm::StringRef) -> unsigned { return 0; };
   callbacks.run_final_output_cleanup = [] {};
 
-  auto summary = runtime.runOutputRecovery(M, nullptr, nullptr,
-                                           &frontier_callbacks, options,
-                                           callbacks);
+  auto summary = runtime.runOutputRecovery(M, nullptr, &frontier_callbacks, options, callbacks);
 
   EXPECT_FALSE(summary.changed);
   EXPECT_EQ(decode_summary_calls, 0u);
@@ -597,14 +1009,219 @@ TEST_F(RuntimeTest,
          llvm::StringRef) -> unsigned { return 1; };
   callbacks.run_final_output_cleanup = [] {};
 
-  auto summary = runtime.runOutputRecovery(M, nullptr, nullptr,
-                                           &frontier_callbacks, options,
-                                           callbacks);
+  auto summary = runtime.runOutputRecovery(M, nullptr, &frontier_callbacks, options, callbacks);
 
   EXPECT_TRUE(summary.changed);
   EXPECT_EQ(summary.noabi_imported_children, 1u);
   EXPECT_EQ(lift_calls, 1u);
 }
+
+TEST_F(RuntimeTest, RunOutputRecoveryRetargetsExecutableWrapperRootToEffectiveTarget) {
+  llvm::Module M("runtime_exec_wrapper_redirect", Ctx);
+  auto *Root = addLiftedFunction(M, "sub_401000");
+  Root->addFnAttr("omill.output_root");
+  auto *Placeholder = llvm::Function::Create(
+      liftedFnTy(Ctx), llvm::Function::ExternalLinkage,
+      "omill_executable_target_401230", M);
+  omill::ExecutableTargetFact fact;
+  fact.raw_target_pc = 0x401230u;
+  fact.kind = omill::ExecutableTargetKind::kExecutablePlaceholder;
+  fact.trust = omill::ExecutableTargetTrust::kUntrustedExecutable;
+  omill::writeExecutableTargetFact(*Placeholder, fact);
+
+  auto &Entry = Root->getEntryBlock();
+  Entry.getTerminator()->eraseFromParent();
+  llvm::IRBuilder<> B(&Entry);
+  B.CreateCall(Placeholder,
+               {Root->getArg(0), B.getInt64(0x401230), Root->getArg(2)});
+  B.CreateRet(Root->getArg(2));
+
+  omill::DevirtualizationOrchestrator orchestrator;
+  omill::DevirtualizationRuntime runtime(orchestrator);
+
+  omill::FrontierCallbacks frontier_callbacks;
+  frontier_callbacks.is_code_address = [](uint64_t) { return true; };
+  frontier_callbacks.has_defined_target = [](uint64_t) { return false; };
+  frontier_callbacks.normalize_target_pc = [](uint64_t pc) { return pc; };
+
+  omill::OutputRecoveryOptions options;
+  options.raw_binary = false;
+  options.no_abi = true;
+  options.use_block_lifting = true;
+  options.allow_noabi_postmain_rounds = true;
+  options.max_noabi_executable_child_import_rounds = 1;
+
+  std::optional<uint64_t> observed_selected_root;
+  omill::OutputRecoveryCallbacks callbacks;
+  callbacks.lift_child_target =
+      [&](uint64_t target_pc, bool, bool, bool,
+          bool) -> std::optional<omill::ChildLiftArtifact> {
+        if (target_pc != 0x401230u)
+          return std::nullopt;
+        omill::ChildLiftArtifact artifact;
+        artifact.target_pc = target_pc;
+        artifact.ir_text =
+            "define ptr @sub_401230(ptr %0, i64 %1, ptr %2) {\n"
+            "entry:\n"
+            "  %call = call ptr @omill_executable_target_40123a(ptr %0, i64 %1, ptr %2)\n"
+            "  ret ptr %call\n"
+            "}\n"
+            "define ptr @blk_401260(ptr %0, i64 %1, ptr %2) {\n"
+            "entry:\n"
+            "  ret ptr %2\n"
+            "}\n"
+            "declare ptr @omill_executable_target_40123a(ptr, i64, ptr) #0\n"
+            "attributes #0 = { \"omill.executable_target_pc\"=\"40123a\" \"omill.effective_target_pc\"=\"401260\" \"omill.executable_target_kind\"=\"invalidated_executable_entry\" \"omill.executable_target_trust\"=\"invalidated_entry\" }\n";
+        artifact.model_text =
+            "root-slice root=0x401230 closed=true handler=sub_401230";
+        return artifact;
+      };
+  callbacks.import_executable_child =
+      [&](uint64_t target_pc, const omill::ChildLiftArtifact &artifact,
+          const omill::ChildImportPlan &, llvm::StringRef) {
+        omill::ChildImportPlan plan;
+        plan.target_pc = target_pc;
+        observed_selected_root = artifact.selected_root_pc;
+        plan.selected_root_pc = artifact.selected_root_pc;
+        plan.eligibility = omill::ImportEligibility::kImportable;
+        plan.rejection_reason = omill::RecoveryRejectionReason::kNone;
+        plan.imported_root = reinterpret_cast<llvm::Function *>(0x1);
+        return plan;
+      };
+  callbacks.collect_executable_placeholder_declaration_targets = [] {
+    return std::vector<uint64_t>{0x401230u};
+  };
+  callbacks.patch_declared_lifted_or_block_calls_to_defined_targets =
+      [](const std::vector<uint64_t> &, llvm::StringRef,
+         llvm::StringRef) -> unsigned { return 1u; };
+  callbacks.run_final_output_cleanup = [] {};
+
+  auto summary = runtime.runOutputRecovery(M, nullptr, &frontier_callbacks, options, callbacks);
+
+  EXPECT_TRUE(summary.changed);
+  ASSERT_TRUE(observed_selected_root.has_value());
+  EXPECT_EQ(*observed_selected_root, 0x401260u);
+}
+
+TEST_F(RuntimeTest, SelectExecutableChildImportArtifactRetargetsMissingExactRoot) {
+  omill::ChildLiftArtifact artifact;
+  artifact.target_pc = 0x401230u;
+  artifact.ir_text =
+      "define ptr @blk_401260(ptr %0, i64 %1, ptr %2) {\n"
+      "entry:\n"
+      "  ret ptr %2\n"
+      "}\n"
+      "declare ptr @omill_executable_target_401230(ptr, i64, ptr) #0\n"
+      "attributes #0 = { \"omill.executable_target_pc\"=\"401230\" \"omill.effective_target_pc\"=\"401260\" \"omill.executable_target_kind\"=\"invalidated_executable_entry\" \"omill.executable_target_trust\"=\"invalidated_entry\" }\n";
+  artifact.model_text =
+      "root-slice root=0x401230 closed=true handler=blk_401260";
+
+  auto selection = omill::selectExecutableChildImportArtifactForPlanning(
+      Ctx, artifact, /*no_abi_mode=*/true);
+
+  EXPECT_EQ(selection.plan.eligibility, omill::ImportEligibility::kImportable);
+  ASSERT_TRUE(selection.artifact.selected_root_pc.has_value());
+  EXPECT_EQ(*selection.artifact.selected_root_pc, 0x401260u);
+  EXPECT_EQ(selection.artifact.selected_root_name, "blk_401260");
+  EXPECT_TRUE(selection.artifact.selected_root_was_retargeted);
+}
+
+
+TEST_F(RuntimeTest, RunOutputRecoveryPrefersRedirectedExecutableRootOverLocalizedContinuation) {
+  llvm::Module M("runtime_exec_redirect_preferred", Ctx);
+  auto *Root = addLiftedFunction(M, "sub_401000");
+  Root->addFnAttr("omill.output_root");
+  auto *Placeholder = llvm::Function::Create(
+      liftedFnTy(Ctx), llvm::Function::ExternalLinkage,
+      "omill_executable_target_401230", M);
+  omill::ExecutableTargetFact fact;
+  fact.raw_target_pc = 0x401230u;
+  fact.kind = omill::ExecutableTargetKind::kExecutablePlaceholder;
+  fact.trust = omill::ExecutableTargetTrust::kUntrustedExecutable;
+  omill::writeExecutableTargetFact(*Placeholder, fact);
+
+  auto &Entry = Root->getEntryBlock();
+  Entry.getTerminator()->eraseFromParent();
+  llvm::IRBuilder<> B(&Entry);
+  B.CreateCall(Placeholder,
+               {Root->getArg(0), B.getInt64(0x401230), Root->getArg(2)});
+  B.CreateRet(Root->getArg(2));
+
+  omill::DevirtualizationOrchestrator orchestrator;
+  omill::DevirtualizationRuntime runtime(orchestrator);
+
+  omill::FrontierCallbacks frontier_callbacks;
+  frontier_callbacks.is_code_address = [](uint64_t) { return true; };
+  frontier_callbacks.has_defined_target = [](uint64_t) { return false; };
+  frontier_callbacks.normalize_target_pc = [](uint64_t pc) { return pc; };
+
+  omill::OutputRecoveryOptions options;
+  options.raw_binary = false;
+  options.no_abi = true;
+  options.use_block_lifting = true;
+  options.allow_noabi_postmain_rounds = true;
+  options.max_noabi_executable_child_import_rounds = 1;
+
+  std::optional<uint64_t> observed_selected_root;
+  omill::OutputRecoveryCallbacks callbacks;
+  callbacks.lift_child_target =
+      [&](uint64_t target_pc, bool, bool, bool,
+          bool) -> std::optional<omill::ChildLiftArtifact> {
+        if (target_pc != 0x401230u)
+          return std::nullopt;
+        omill::ChildLiftArtifact artifact;
+        artifact.target_pc = target_pc;
+        artifact.ir_text =
+            "define ptr @sub_401230(ptr %0, i64 %1, ptr %2) {\n"
+            "entry:\n"
+            "  %call = call ptr @omill_executable_target_40123a(ptr %0, i64 %1, ptr %2)\n"
+            "  ret ptr %call\n"
+            "}\n"
+            "define ptr @blk_401260(ptr %0, i64 %1, ptr %2) {\n"
+            "entry:\n"
+            "  ret ptr %2\n"
+            "}\n"
+            "define ptr @blk_401723(ptr %0, i64 %1, ptr %2) {\n"
+            "entry:\n"
+            "  ret ptr %2\n"
+            "}\n"
+            "declare ptr @omill_executable_target_40123a(ptr, i64, ptr) #0\n"
+            "attributes #0 = { \"omill.executable_target_pc\"=\"40123a\" \"omill.effective_target_pc\"=\"401260\" \"omill.executable_target_kind\"=\"invalidated_executable_entry\" \"omill.executable_target_trust\"=\"invalidated_entry\" }\n";
+        artifact.model_text =
+            "root-slice root=0x401230 closed=true handler=sub_401230\n"
+            "diag localized-continuation-call-edge caller=sub_401230 callee=blk_401723";
+        return artifact;
+      };
+  callbacks.import_executable_child =
+      [&](uint64_t target_pc, const omill::ChildLiftArtifact &artifact,
+          const omill::ChildImportPlan &, llvm::StringRef) {
+        omill::ChildImportPlan plan;
+        plan.target_pc = target_pc;
+        observed_selected_root = artifact.selected_root_pc;
+        plan.selected_root_pc = artifact.selected_root_pc;
+        plan.eligibility = omill::ImportEligibility::kImportable;
+        plan.rejection_reason = omill::RecoveryRejectionReason::kNone;
+        plan.imported_root = reinterpret_cast<llvm::Function *>(0x1);
+        return plan;
+      };
+  callbacks.collect_executable_placeholder_declaration_targets = [] {
+    return std::vector<uint64_t>{0x401230u};
+  };
+  callbacks.patch_declared_lifted_or_block_calls_to_defined_targets =
+      [](const std::vector<uint64_t> &, llvm::StringRef,
+         llvm::StringRef) -> unsigned { return 1u; };
+  callbacks.run_final_output_cleanup = [] {};
+
+  auto summary = runtime.runOutputRecovery(M, nullptr, &frontier_callbacks, options, callbacks);
+
+  EXPECT_TRUE(summary.changed);
+  ASSERT_TRUE(observed_selected_root.has_value());
+  EXPECT_EQ(*observed_selected_root, 0x401260u);
+}
+
+
+
+
 
 TEST_F(RuntimeTest, RunOutputRecoveryCachesChildArtifactsAcrossDecisionSites) {
   llvm::Module M("runtime_child_cache", Ctx);
@@ -675,9 +1292,7 @@ TEST_F(RuntimeTest, RunOutputRecoveryCachesChildArtifactsAcrossDecisionSites) {
          llvm::StringRef) -> unsigned { return 0; };
   callbacks.run_final_output_cleanup = [] {};
 
-  auto summary = runtime.runOutputRecovery(M, nullptr, nullptr,
-                                           &frontier_callbacks, options,
-                                           callbacks);
+  auto summary = runtime.runOutputRecovery(M, nullptr, &frontier_callbacks, options, callbacks);
 
   EXPECT_FALSE(summary.changed);
   EXPECT_EQ(lift_calls, 1u);
@@ -771,9 +1386,7 @@ TEST_F(RuntimeTest,
       };
   callbacks.run_final_output_cleanup = [] {};
 
-  auto summary = runtime.runOutputRecovery(M, nullptr, nullptr,
-                                           &frontier_callbacks, options,
-                                           callbacks);
+  auto summary = runtime.runOutputRecovery(M, nullptr, &frontier_callbacks, options, callbacks);
 
   EXPECT_TRUE(summary.changed);
   EXPECT_EQ(summary.noabi_imported_children, 1u);
@@ -860,9 +1473,7 @@ TEST_F(RuntimeTest,
          llvm::StringRef) -> unsigned { return 0; };
   callbacks.run_final_output_cleanup = [] {};
 
-  auto summary = runtime.runOutputRecovery(M, nullptr, nullptr,
-                                           &frontier_callbacks, options,
-                                           callbacks);
+  auto summary = runtime.runOutputRecovery(M, nullptr, &frontier_callbacks, options, callbacks);
 
   EXPECT_FALSE(summary.changed);
   EXPECT_FALSE(import_attempted);
@@ -987,9 +1598,7 @@ TEST_F(RuntimeTest,
          llvm::StringRef) -> unsigned { return 1; };
   callbacks.run_final_output_cleanup = [] {};
 
-  auto summary = runtime.runOutputRecovery(M, nullptr, nullptr,
-                                           &frontier_callbacks, options,
-                                           callbacks);
+  auto summary = runtime.runOutputRecovery(M, nullptr, &frontier_callbacks, options, callbacks);
 
   EXPECT_TRUE(summary.changed);
   EXPECT_FALSE(saw_feclearexcept_allowed);
@@ -1016,8 +1625,7 @@ TEST_F(RuntimeTest, RunOutputRecoveryEmitsPreciseLogsWhenEnabled) {
   };
   callbacks.run_final_output_cleanup = [] {};
 
-  (void)runtime.runOutputRecovery(M, nullptr, nullptr, nullptr, options,
-                                  callbacks);
+  (void)runtime.runOutputRecovery(M, nullptr, nullptr, options, callbacks);
 
   EXPECT_NE(std::find(log_trace.begin(), log_trace.end(),
                       "output-recovery:abi-step-begin:"
@@ -1126,7 +1734,7 @@ TEST_F(RuntimeTest, RunOutputRecoveryOwnsAbiCleanupSequencing) {
   };
 
   auto summary =
-      runtime.runOutputRecovery(M, nullptr, nullptr, nullptr, options, callbacks);
+      runtime.runOutputRecovery(M, nullptr, nullptr, options, callbacks);
 
   EXPECT_FALSE(summary.changed);
   EXPECT_EQ(trace,
@@ -1359,8 +1967,7 @@ TEST_F(RuntimeTest,
          llvm::StringRef) -> unsigned { return 0; };
   callbacks.run_final_output_cleanup = [] {};
 
-  (void)runtime.runOutputRecovery(M, nullptr, nullptr, nullptr, options,
-                                  callbacks);
+  (void)runtime.runOutputRecovery(M, nullptr, nullptr, options, callbacks);
   (void)runtime.finalizeOutput(M, true);
 
   omill::FinalStateRecoveryRequest request;
@@ -1459,8 +2066,7 @@ TEST_F(RuntimeTest, FinalStateRecoveryPlannerHardRejectsRuntimeLeakChild) {
          llvm::StringRef) -> unsigned { return 0; };
   callbacks.run_final_output_cleanup = [] {};
 
-  (void)runtime.runOutputRecovery(M, nullptr, nullptr, nullptr, options,
-                                  callbacks);
+  (void)runtime.runOutputRecovery(M, nullptr, nullptr, options, callbacks);
   (void)runtime.finalizeOutput(M, true);
 
   omill::FinalStateRecoveryRequest request;
@@ -1531,6 +2137,101 @@ TEST_F(RuntimeTest, FinalStateRecoveryPlannerModelsBoundaryReentryTarget) {
 }
 
 TEST_F(RuntimeTest,
+       BoundaryTailRecoveryPrefersTrackedExecutableContinuationOverJunkFallthrough) {
+  llvm::Module M("runtime_boundary_prefers_tracked_continuation", Ctx);
+  auto *Root = addLiftedFunction(M, "sub_401000");
+  Root->addFnAttr("omill.output_root");
+  auto *Boundary = llvm::Function::Create(
+      liftedFnTy(Ctx), llvm::Function::ExternalLinkage,
+      "omill_native_boundary_401400", M);
+  auto *Executable = llvm::Function::Create(
+      liftedFnTy(Ctx), llvm::Function::ExternalLinkage,
+      "omill_executable_target_401500", M);
+
+  omill::BoundaryFact boundary_fact;
+  boundary_fact.boundary_pc = 0x401400u;
+  boundary_fact.native_target_pc = 0x401400u;
+  boundary_fact.continuation_pc = 0x40140cu;
+  boundary_fact.continuation_vip_pc = 0x40140cu;
+  boundary_fact.reenters_vm = true;
+  boundary_fact.is_partial_exit = true;
+  boundary_fact.exit_disposition =
+      omill::BoundaryDisposition::kVmExitNativeCallReenter;
+  boundary_fact.kind = omill::BoundaryKind::kNativeBoundary;
+  omill::writeBoundaryFact(*Boundary, boundary_fact);
+
+  omill::ExecutableTargetFact executable_fact;
+  executable_fact.raw_target_pc = 0x401500u;
+  executable_fact.kind = omill::ExecutableTargetKind::kExecutablePlaceholder;
+  executable_fact.trust = omill::ExecutableTargetTrust::kUntrustedExecutable;
+  omill::writeExecutableTargetFact(*Executable, executable_fact);
+
+  Root->getEntryBlock().getTerminator()->eraseFromParent();
+  {
+    llvm::IRBuilder<> B(&Root->getEntryBlock());
+    auto *seed =
+        B.CreateCall(Executable, {Root->getArg(0), B.getInt64(0x401500),
+                                  Root->getArg(2)});
+    auto *tail =
+        B.CreateCall(Boundary, {Root->getArg(0), B.getInt64(0x401400), seed});
+    B.CreateRet(tail);
+  }
+
+  omill::DevirtualizationOrchestrator orchestrator(
+      {}, std::make_shared<omill::IterativeLiftingSession>());
+  orchestrator.session().graph.boundary_facts_by_target[0x401400u].target_pc =
+      0x401400u;
+  orchestrator.session().graph.boundary_facts_by_target[0x401400u].boundary =
+      boundary_fact;
+
+  omill::DevirtualizationRuntime runtime(orchestrator);
+  (void)runtime.finalizeOutput(M, true);
+
+  omill::FinalStateRecoveryRequest request;
+  request.no_abi = true;
+  request.enabled = true;
+
+  unsigned frontier_advances = 0;
+  omill::OutputRecoveryCallbacks callbacks;
+  callbacks.advance_session_owned_frontier_work =
+      [&](omill::FrontierDiscoveryPhase, llvm::StringRef) {
+        ++frontier_advances;
+        if (Executable->isDeclaration()) {
+          auto *entry = llvm::BasicBlock::Create(Ctx, "entry", Executable);
+          llvm::IRBuilder<> ir(entry);
+          ir.CreateRet(Executable->getArg(2));
+        }
+        return true;
+      };
+
+  auto bundle = runtime.runBoundaryTailRecovery(M, request, callbacks);
+  ASSERT_TRUE(bundle.has_value());
+  auto result_it = std::find_if(
+      bundle->boundary_recovery_results.begin(),
+      bundle->boundary_recovery_results.end(),
+      [](const omill::BoundaryTailRecoveryActionResult &result) {
+        return result.target_pc == 0x401400u;
+      });
+  ASSERT_NE(result_it, bundle->boundary_recovery_results.end());
+  EXPECT_EQ(result_it->disposition,
+            omill::BoundaryTailRecoveryDisposition::kContinuationLifted);
+  EXPECT_EQ(result_it->detail, "boundary_continuation_materialized");
+  EXPECT_EQ(result_it->continuation_pc, std::optional<uint64_t>(0x401500u));
+  EXPECT_GT(frontier_advances, 0u);
+  EXPECT_NE(std::find(bundle->recovery_quality.lifted_boundary_continuations.begin(),
+                      bundle->recovery_quality.lifted_boundary_continuations.end(),
+                      0x401500u),
+            bundle->recovery_quality.lifted_boundary_continuations.end());
+  ASSERT_FALSE(Boundary->isDeclaration());
+  auto *boundary_call = llvm::dyn_cast<llvm::CallInst>(
+      Boundary->getEntryBlock().getFirstNonPHIOrDbgOrAlloca());
+  ASSERT_NE(boundary_call, nullptr);
+  ASSERT_NE(boundary_call->getCalledFunction(), nullptr);
+  EXPECT_EQ(boundary_call->getCalledFunction(), Executable);
+}
+
+
+TEST_F(RuntimeTest,
        BoundaryTailRecoveryLiftsControlledReturnContinuationAndReportsIt) {
   llvm::Module M("runtime_boundary_controlled_return", Ctx);
   auto *Root = addLiftedFunction(M, "sub_401000");
@@ -1595,11 +2296,8 @@ TEST_F(RuntimeTest,
           return true;
         };
         frontier_callbacks.can_decode_target = [](uint64_t) { return true; };
-        auto *fake_lifter =
-            reinterpret_cast<omill::BlockLifter *>(static_cast<uintptr_t>(0x1));
-        auto summary = orchestrator.advanceFrontierWork(
-            M, *fake_lifter, *orchestrator.session().iterative_session,
-            frontier_callbacks);
+        auto projection_lifter = makeProjectionLifter(M);
+        auto summary = orchestrator.advanceFrontierWork(M, projection_lifter, frontier_callbacks);
         return summary.changed;
       };
 
@@ -1827,11 +2525,8 @@ TEST_F(RuntimeTest,
           return true;
         };
         frontier_callbacks.can_decode_target = [](uint64_t) { return true; };
-        auto *fake_lifter =
-            reinterpret_cast<omill::BlockLifter *>(static_cast<uintptr_t>(0x1));
-        auto summary = orchestrator.advanceFrontierWork(
-            M, *fake_lifter, *orchestrator.session().iterative_session,
-            frontier_callbacks);
+        auto projection_lifter = makeProjectionLifter(M);
+        auto summary = orchestrator.advanceFrontierWork(M, projection_lifter, frontier_callbacks);
         return summary.changed;
       };
 
@@ -1933,11 +2628,8 @@ TEST_F(RuntimeTest,
           return true;
         };
         frontier_callbacks.can_decode_target = [](uint64_t) { return true; };
-        auto *fake_lifter =
-            reinterpret_cast<omill::BlockLifter *>(static_cast<uintptr_t>(0x1));
-        auto summary = orchestrator.advanceFrontierWork(
-            M, *fake_lifter, *orchestrator.session().iterative_session,
-            frontier_callbacks);
+        auto projection_lifter = makeProjectionLifter(M);
+        auto summary = orchestrator.advanceFrontierWork(M, projection_lifter, frontier_callbacks);
         return summary.changed;
       };
 
@@ -2114,11 +2806,8 @@ TEST_F(RuntimeTest,
           return true;
         };
         frontier_callbacks.can_decode_target = [](uint64_t) { return true; };
-        auto *fake_lifter =
-            reinterpret_cast<omill::BlockLifter *>(static_cast<uintptr_t>(0x1));
-        auto summary = orchestrator.advanceFrontierWork(
-            M, *fake_lifter, *orchestrator.session().iterative_session,
-            frontier_callbacks);
+        auto projection_lifter = makeProjectionLifter(M);
+        auto summary = orchestrator.advanceFrontierWork(M, projection_lifter, frontier_callbacks);
         return summary.changed;
       };
 
@@ -2201,11 +2890,8 @@ TEST_F(RuntimeTest,
           return true;
         };
         frontier_callbacks.can_decode_target = [](uint64_t) { return true; };
-        auto *fake_lifter =
-            reinterpret_cast<omill::BlockLifter *>(static_cast<uintptr_t>(0x1));
-        auto summary = orchestrator.advanceFrontierWork(
-            M, *fake_lifter, *orchestrator.session().iterative_session,
-            frontier_callbacks);
+        auto projection_lifter = makeProjectionLifter(M);
+        auto summary = orchestrator.advanceFrontierWork(M, projection_lifter, frontier_callbacks);
         return summary.changed;
       };
 
@@ -2286,11 +2972,8 @@ TEST_F(RuntimeTest,
           return true;
         };
         frontier_callbacks.can_decode_target = [](uint64_t) { return true; };
-        auto *fake_lifter =
-            reinterpret_cast<omill::BlockLifter *>(static_cast<uintptr_t>(0x1));
-        auto summary = orchestrator.advanceFrontierWork(
-            M, *fake_lifter, *orchestrator.session().iterative_session,
-            frontier_callbacks);
+        auto projection_lifter = makeProjectionLifter(M);
+        auto summary = orchestrator.advanceFrontierWork(M, projection_lifter, frontier_callbacks);
         return summary.changed;
       };
 
@@ -2430,11 +3113,8 @@ TEST_F(RuntimeTest,
             out[i] = 0x90;
           return true;
         };
-        auto *fake_lifter =
-            reinterpret_cast<omill::BlockLifter *>(static_cast<uintptr_t>(0x1));
-        auto summary = orchestrator.advanceFrontierWork(
-            M, *fake_lifter, *orchestrator.session().iterative_session,
-            frontier_callbacks);
+        auto projection_lifter = makeProjectionLifter(M);
+        auto summary = orchestrator.advanceFrontierWork(M, projection_lifter, frontier_callbacks);
         return summary.changed;
       };
 
@@ -2448,9 +3128,9 @@ TEST_F(RuntimeTest,
       });
   ASSERT_NE(result_it, bundle->boundary_recovery_results.end());
   EXPECT_EQ(result_it->disposition,
-            omill::BoundaryTailRecoveryDisposition::kKeptModeledBoundary);
+            omill::BoundaryTailRecoveryDisposition::kContinuationLifted);
   EXPECT_EQ(result_it->continuation_pc, std::optional<uint64_t>(0x401613u));
-  EXPECT_FALSE(llvm::is_contained(
+  EXPECT_TRUE(llvm::is_contained(
       bundle->recovery_quality.lifted_boundary_continuations, 0x401613u));
   auto *BoundaryStub = M.getFunction("omill_native_target_401600");
   ASSERT_NE(BoundaryStub, nullptr);
@@ -2461,7 +3141,8 @@ TEST_F(RuntimeTest,
       auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
       if (!CB || !CB->getCalledFunction())
         continue;
-      if (CB->getCalledFunction()->getName() == VmEnterPlaceholder->getName())
+      if (CB->getCalledFunction()->getName() == VmEnterPlaceholder->getName() ||
+          CB->getCalledFunction()->getName() == "blk_401610")
         saw_continuation = true;
     }
   }
@@ -3557,11 +4238,8 @@ TEST_F(RuntimeTest,
           return true;
         };
         frontier_callbacks.can_decode_target = [](uint64_t) { return true; };
-        auto *fake_lifter =
-            reinterpret_cast<omill::BlockLifter *>(static_cast<uintptr_t>(0x1));
-        auto summary = orchestrator.advanceFrontierWork(
-            M, *fake_lifter, *orchestrator.session().iterative_session,
-            frontier_callbacks);
+        auto projection_lifter = makeProjectionLifter(M);
+        auto summary = orchestrator.advanceFrontierWork(M, projection_lifter, frontier_callbacks);
         return summary.changed;
       };
 
@@ -3582,3 +4260,6 @@ TEST_F(RuntimeTest,
 }
 
 }  // namespace
+
+
+

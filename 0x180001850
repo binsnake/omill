@@ -1,0 +1,471 @@
+module D:/binsnake/omill/build-remill/third_party/remill/lib/Arch/X86/Runtime\amd64_avx.bc
+binary_memory_empty false
+handlers 11
+slots 29
+stack_cells 57
+regions 1
+root_slices 1
+materialized 2
+root-slice root=0x180001850 reachable=12 frontier=2 closed=false specializations=0
+  slice-handler blk_180001893
+  slice-handler blk_1800018a6
+  slice-handler blk_180001cd1
+  slice-handler blk_180001cd6
+  slice-handler blk_180002450
+  slice-handler blk_18000adf9
+  slice-handler blk_18000ae1b
+  slice-handler blk_1800314d3
+  slice-handler blk_180033a8a
+  slice-handler blk_18003673b
+  slice-handler blk_1800464b0
+  slice-handler sub_180001850
+  frontier blk_1800018a6 kind=dispatch dispatch=0 reason=dynamic_target exit=unknown
+  frontier blk_180001cd6 kind=call callsite=0 reason=call_target_unlifted target=0x180002450 vip=0x180001D25 exit=vm_exit_native_call_reenter
+region 0 handlers=11 boundaries=0 entries=1
+  region-handler blk_180001893
+  region-handler blk_1800018a6
+  region-handler blk_180001cd1
+  region-handler blk_180001cd6
+  region-handler blk_18000adf9
+  region-handler blk_18000ae1b
+  region-handler blk_1800314d3
+  region-handler blk_180033a8a
+  region-handler blk_18003673b
+  region-handler blk_1800464b0
+  region-handler sub_180001850
+  region-in slot[1] = unknown
+  region-in slot[2] = unknown
+  region-in slot[4] = unknown
+  region-in slot[5] = unknown
+  region-in slot[8] = unknown
+  region-in slot[17] = unknown
+  region-in slot[19] = unknown
+  region-in slot[20] = unknown
+  region-in slot[26] = unknown
+  region-in slot[27] = unknown
+  region-in slot[28] = unknown
+  region-out slot[0] = phi(unknown, sub(phi(unknown, sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8), sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e, sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8)), 0x8)), 0x8))
+  region-out slot[1] = phi(unknown, sub(phi(unknown, sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8), sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e, sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8)), 0x8)), 0x8))
+  region-out slot[5] = slot(arg0+0x988)
+  region-out slot[6] = mem(add(slot(arg0+0x988), 0x18f4afd6))
+  region-out slot[8] = phi(slot(arg0+0x8a8), zext(xor(trunc(zext(xor(trunc(slot(arg0+0x8a8)), 0x95858c2e))), 0x95858c2e)))
+  region-out slot[9] = 0x0
+  region-out slot[10] = xor(and(unknown, 0x1), unknown)
+  region-out slot[11] = phi(zext(eq(unknown, 0x1800017ae)), zext(unknown))
+  region-out slot[12] = phi(trunc(lshr(xor(0x1800017ae, unknown), 0x3f)), zext(unknown))
+  region-out slot[13] = 0x0
+  region-out slot[14] = phi(0x0, unknown)
+  region-out slot[15] = phi(slot(RETURN_PC+0x0), 0x1800464b7, 0x180036740, 0x180033aa3)
+  region-out slot[17] = slot(arg0+0x978)
+  region-out slot[19] = slot(arg0+0x918)
+  region-out slot[20] = slot(arg0+0x8c8)
+  region-out slot[22] = trunc(slot(arg0+0x8a8))
+  region-out slot[24] = unknown
+  region-out slot[28] = slot(arg0+0x998)
+  region-stack-in cell[2] = unknown
+  region-stack-in cell[8] = unknown
+  region-stack-in cell[9] = unknown
+  region-stack-in cell[19] = unknown
+  region-stack-in cell[21] = unknown
+  region-stack-in cell[49] = unknown
+  region-stack-in cell[50] = unknown
+  region-stack-in cell[51] = unknown
+  region-stack-in cell[52] = unknown
+  region-stack-in cell[53] = unknown
+  region-stack-in cell[54] = unknown
+  region-stack-in cell[55] = unknown
+  region-stack-in cell[56] = unknown
+  region-stack-out cell[2] = phi(0x1800018a6, 0x18000ae1b)
+  region-stack-out cell[3] = 0x38e85660
+  region-stack-out cell[10] = mem(add(slot(arg0+0x988), 0x18f4afd6))
+  region-stack-out cell[13] = slot(arg0+0x8e8)
+slot 0 base=arg0 offset=0x9A8 width=8 from_argument=true from_alloca=false
+slot 1 base=arg0 offset=0x908 width=8 from_argument=true from_alloca=false
+slot 2 base=arg1 offset=0x0 width=8 from_argument=true from_alloca=false
+slot 3 base=arg2 offset=0x0 width=8 from_argument=true from_alloca=false
+slot 4 base=arg0 offset=0x0 width=8 from_argument=true from_alloca=false
+slot 5 base=arg0 offset=0x988 width=8 from_argument=true from_alloca=false
+slot 6 base=arg0 offset=0x958 width=8 from_argument=true from_alloca=false
+slot 7 base=arg0 offset=0x8E8 width=8 from_argument=true from_alloca=false
+slot 8 base=arg0 offset=0x8A8 width=8 from_argument=true from_alloca=false
+slot 9 base=arg0 offset=0x811 width=1 from_argument=true from_alloca=false
+slot 10 base=arg0 offset=0x813 width=1 from_argument=true from_alloca=false
+slot 11 base=arg0 offset=0x817 width=1 from_argument=true from_alloca=false
+slot 12 base=arg0 offset=0x819 width=1 from_argument=true from_alloca=false
+slot 13 base=arg0 offset=0x81D width=1 from_argument=true from_alloca=false
+slot 14 base=arg0 offset=0x815 width=1 from_argument=true from_alloca=false
+slot 15 base=NEXT_PC offset=0x0 width=8 from_argument=false from_alloca=true
+slot 16 base=RETURN_PC offset=0x0 width=8 from_argument=false from_alloca=true
+slot 17 base=arg0 offset=0x978 width=8 from_argument=true from_alloca=false
+slot 18 base=arg0 offset=0x8F8 width=8 from_argument=true from_alloca=false
+slot 19 base=arg0 offset=0x918 width=8 from_argument=true from_alloca=false
+slot 20 base=arg0 offset=0x8C8 width=8 from_argument=true from_alloca=false
+slot 21 base=arg0 offset=0x8A9 width=1 from_argument=true from_alloca=false
+slot 22 base=arg0 offset=0x8A8 width=1 from_argument=true from_alloca=false
+slot 23 base=arg0 offset=0x8B8 width=4 from_argument=true from_alloca=false
+slot 24 base=arg0 offset=0x908 width=4 from_argument=true from_alloca=false
+slot 25 base=arg0 offset=0x8B8 width=8 from_argument=true from_alloca=false
+slot 26 base=arg0 offset=0x928 width=8 from_argument=true from_alloca=false
+slot 27 base=arg0 offset=0x8D8 width=4 from_argument=true from_alloca=false
+slot 28 base=arg0 offset=0x998 width=8 from_argument=true from_alloca=false
+stack-cell 0 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x0 width=8
+stack-cell 1 base_slot=3 base=arg2 base_offset=0x0 cell_offset=0x0 width=8
+stack-cell 2 base_slot=1 base=arg0 base_offset=0x908 cell_offset=0x0 width=8
+stack-cell 3 base_slot=1 base=arg0 base_offset=0x908 cell_offset=0x8 width=8
+stack-cell 4 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x9 width=8
+stack-cell 5 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0xE width=8
+stack-cell 6 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x13 width=8
+stack-cell 7 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x34EA8 width=8
+stack-cell 8 base_slot=4 base=arg0 base_offset=0x0 cell_offset=0x0 width=8
+stack-cell 9 base_slot=5 base=arg0 base_offset=0x988 cell_offset=0x0 width=8
+stack-cell 10 base_slot=5 base=arg0 base_offset=0x988 cell_offset=0x18F4AFD6 width=8
+stack-cell 11 base_slot=6 base=arg0 base_offset=0x958 cell_offset=0x0 width=8
+stack-cell 12 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x7 width=8
+stack-cell 13 base_slot=1 base=arg0 base_offset=0x908 cell_offset=0xFFFFFFFFFFFFFFF8 width=8
+stack-cell 14 base_slot=7 base=arg0 base_offset=0x8E8 cell_offset=0x0 width=8
+stack-cell 15 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x8 width=8
+stack-cell 16 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x5 width=8
+stack-cell 17 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x9128 width=8
+stack-cell 18 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x3 width=8
+stack-cell 19 base_slot=17 base=arg0 base_offset=0x978 cell_offset=0x0 width=8
+stack-cell 20 base_slot=18 base=arg0 base_offset=0x8F8 cell_offset=0x0 width=8
+stack-cell 21 base_slot=19 base=arg0 base_offset=0x918 cell_offset=0x0 width=8
+stack-cell 22 base_slot=19 base=arg0 base_offset=0x918 cell_offset=0xFFFFFFFFFFFFFF9F width=8
+stack-cell 23 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0xB width=8
+stack-cell 24 base_slot=19 base=arg0 base_offset=0x918 cell_offset=0xFFFFFFFFFFFFFF97 width=8
+stack-cell 25 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0xF width=8
+stack-cell 26 base_slot=19 base=arg0 base_offset=0x918 cell_offset=0xFFFFFFFFFFFFFF8F width=8
+stack-cell 27 base_slot=19 base=arg0 base_offset=0x918 cell_offset=0xFFFFFFFFFFFFFF87 width=8
+stack-cell 28 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x16 width=8
+stack-cell 29 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x1A width=8
+stack-cell 30 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x1 width=8
+stack-cell 31 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0xA width=8
+stack-cell 32 base_slot=1 base=arg0 base_offset=0x908 cell_offset=0x10 width=8
+stack-cell 33 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x17 width=8
+stack-cell 34 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x18 width=8
+stack-cell 35 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x1D width=8
+stack-cell 36 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x22 width=8
+stack-cell 37 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x3B6B7 width=8
+stack-cell 38 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0xFFFFFFFFEC8F6293 width=8
+stack-cell 39 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x6 width=8
+stack-cell 40 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x11 width=8
+stack-cell 41 base_slot=25 base=arg0 base_offset=0x8B8 cell_offset=0x0 width=8
+stack-cell 42 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x14 width=8
+stack-cell 43 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x3121D width=8
+stack-cell 44 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x19 width=8
+stack-cell 45 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x2DEBD width=8
+stack-cell 46 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0xFFFFFFFFFFFFD34F width=8
+stack-cell 47 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x2 width=8
+stack-cell 48 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0xFFFFFFFFFFFEB023 width=8
+stack-cell 49 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x481 width=8
+stack-cell 50 base_slot=26 base=arg0 base_offset=0x928 cell_offset=0x0 width=8
+stack-cell 51 base_slot=1 base=arg0 base_offset=0x908 cell_offset=0xFFFFFFFFFFFFFF00 width=8
+stack-cell 52 base_slot=20 base=arg0 base_offset=0x8C8 cell_offset=0x0 width=8
+stack-cell 53 base_slot=2 base=arg1 base_offset=0x0 cell_offset=0x2970 width=8
+stack-cell 54 base_slot=1 base=arg0 base_offset=0x908 cell_offset=0xFFFFFFFFFFFFFFA1 width=8
+stack-cell 55 base_slot=8 base=arg0 base_offset=0x8A8 cell_offset=0x0 width=8
+stack-cell 56 base_slot=28 base=arg0 base_offset=0x998 cell_offset=0x0 width=8
+handler blk_180001893 entry=0x180001893 candidate=false output_root=false specialized=false direct_callees=2 dispatches=0 callsites=0
+  callee blk_1800018a6
+  callee blk_18003673b
+  in-phi slot[0] merged=phi(0x180001d20, 0x18000ae32) ; slot[0] from blk_180001893:prelude:0x180001cd1 (entry_prelude, handler=blk_180001893, site=0) = phi(0x180001d20, 0x18000ae32)
+  in-phi slot[1] merged=0x1800018a6 ; slot[1] from sub_180001850:callsite:2:blk_180001893 (direct_callsite, handler=sub_180001850, site=2) = 0x1800018a6
+  in slot[0] = phi(0x180001d20, 0x18000ae32)
+  in slot[1] = phi(unknown, sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8), sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e, sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8)), 0x8), 0x1800018a6)
+  in arg[0] = arg0
+  in arg[1] = 0x180001893
+  out slot[0] = 0x18003673b
+  out slot[1] = phi(unknown, sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8), sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e, sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8)), 0x8), 0x1800018a6)
+  out slot[6] = mem(add(slot(arg0+0x988), 0x18f4afd6))
+  stack-in-phi cell[2] merged=phi(0x18000ae1b, 0x1800018a6) ; cell[2] from blk_180001893:prelude:0x180001cd1 (entry_prelude, handler=blk_180001893, site=0) = 0x18000ae1b ; cell[2] from sub_180001850:callsite:2:blk_180001893 (direct_callsite, handler=sub_180001850, site=2) = 0x1800018a6
+  stack-in-phi cell[3] merged=0x38e85660 ; cell[3] from blk_180001893:prelude:0x180001cd1 (entry_prelude, handler=blk_180001893, site=0) = 0x38e85660 ; cell[3] from sub_180001850:callsite:2:blk_180001893 (direct_callsite, handler=sub_180001850, site=2) = 0x38e85660
+  stack-in cell[2] = phi(0x1800018a6, 0x18000ae1b, 0x180001cd6)
+  stack-in cell[3] = 0x38e85660
+  stack-out cell[2] = 0x1800018a6
+  stack-out cell[3] = 0x38e85660
+  stack-out cell[10] = mem(add(slot(arg0+0x988), 0x18f4afd6))
+  stack-out cell[13] = slot(arg0+0x8e8)
+handler blk_1800018a6 entry=0x1800018A6 candidate=true output_root=false specialized=false direct_callees=0 dispatches=1 callsites=0
+  in-phi slot[0] merged=0x180033a9e ; slot[0] from blk_1800018a6:prelude:0x18003673b (entry_prelude, handler=blk_1800018a6, site=0) = 0x180033a9e
+  in-phi slot[1] merged=sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e, sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8)), 0x8) ; slot[1] from blk_180001893:callsite:3:blk_1800018a6 (direct_callsite, handler=blk_180001893, site=3) = sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e, sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8)), 0x8)
+  in-phi slot[6] merged=mem(add(slot(arg0+0x988), 0x18f4afd6)) ; slot[6] from blk_180001893:callsite:3:blk_1800018a6 (direct_callsite, handler=blk_180001893, site=3) = mem(add(slot(arg0+0x988), 0x18f4afd6))
+  in-phi slot[15] merged=0x180036740 ; slot[15] from blk_1800018a6:prelude:0x18003673b (entry_prelude, handler=blk_1800018a6, site=0) = 0x180036740
+  in slot[0] = 0x180033a9e
+  in slot[1] = phi(unknown, sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8), sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e, sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8)), 0x8))
+  in slot[6] = mem(add(slot(arg0+0x988), 0x18f4afd6))
+  in slot[15] = 0x180036740
+  in arg[0] = arg0
+  in arg[1] = 0x1800018a6
+  out slot[0] = sub(phi(unknown, sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8), sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e, sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8)), 0x8)), 0x8)
+  out slot[1] = sub(phi(unknown, sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8), sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e, sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8)), 0x8)), 0x8)
+  out slot[6] = mem(add(slot(arg0+0x988), 0x18f4afd6))
+  out slot[8] = zext(xor(trunc(zext(xor(trunc(slot(arg0+0x8a8)), 0x95858c2e))), 0x95858c2e))
+  out slot[9] = 0x0
+  out slot[10] = xor(and(unknown, 0x1), unknown)
+  out slot[11] = zext(unknown)
+  out slot[12] = zext(unknown)
+  out slot[13] = 0x0
+  out slot[14] = unknown
+  out slot[15] = 0x180036740
+  stack-in-phi cell[2] merged=0x1800018a6 ; cell[2] from blk_1800018a6:prelude:0x18003673b (entry_prelude, handler=blk_1800018a6, site=0) = 0x1800018a6
+  stack-in-phi cell[10] merged=mem(add(slot(arg0+0x988), 0x18f4afd6)) ; cell[10] from blk_180001893:callsite:3:blk_1800018a6 (direct_callsite, handler=blk_180001893, site=3) = mem(add(slot(arg0+0x988), 0x18f4afd6))
+  stack-in-phi cell[13] merged=slot(arg0+0x8e8) ; cell[13] from blk_180001893:callsite:3:blk_1800018a6 (direct_callsite, handler=blk_180001893, site=3) = slot(arg0+0x8e8)
+  stack-in cell[2] = 0x1800018a6
+  stack-in cell[10] = mem(add(slot(arg0+0x988), 0x18f4afd6))
+  stack-in cell[13] = slot(arg0+0x8e8)
+  stack-out cell[2] = 0x1800018a6
+  stack-out cell[10] = mem(add(slot(arg0+0x988), 0x18f4afd6))
+  stack-out cell[13] = slot(arg0+0x8e8)
+  dispatch jump target=add(slot(arg0+0x908), 0xfffffffffffffff8)
+    specialized_target source=incoming_phi_facts expr=sub(slot(arg0+0x908), 0x8)
+    unresolved dynamic_target
+    exit=unknown
+handler blk_180001cd1 entry=0x180001CD1 candidate=true output_root=false specialized=false direct_callees=3 dispatches=0 callsites=1
+  callee _ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_
+  callee blk_180001cd6
+  callee blk_18000adf9
+  in-phi slot[0] merged=0x180033a9e ; slot[0] from blk_180001cd1:prelude:0x180001893 (entry_prelude, handler=blk_180001cd1, site=0) = 0x180033a9e
+  in-phi slot[1] merged=sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e, sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8)), 0x8) ; slot[1] from blk_180001cd1:prelude:0x180001893 (entry_prelude, handler=blk_180001cd1, site=0) = sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e, sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8)), 0x8)
+  in slot[0] = phi(unknown, 0x180033a9e)
+  in slot[1] = unknown
+  in arg[0] = arg0
+  in arg[1] = 0x180001cd1
+  out slot[0] = 0x180001cd1
+  out slot[1] = unknown
+  out slot[15] = slot(RETURN_PC+0x0)
+  stack-in-phi cell[2] merged=phi(0x1800018a6, 0x180001893) ; cell[2] from blk_180001cd1:prelude:0x180001893 (entry_prelude, handler=blk_180001cd1, site=0) = 0x1800018a6 ; cell[2] from sub_180001850:callsite:1:blk_180001cd1 (direct_callsite, handler=sub_180001850, site=1) = 0x180001893
+  stack-in-phi cell[3] merged=0x38e85660 ; cell[3] from blk_180001cd1:prelude:0x180001893 (entry_prelude, handler=blk_180001cd1, site=0) = 0x38e85660
+  stack-in cell[2] = phi(0x180001893, 0x1800018a6)
+  stack-in cell[3] = 0x38e85660
+  stack-out cell[2] = 0x18000ae1b
+  stack-out cell[3] = 0x38e85660
+  callsite target=add(arg1, 0x9128)
+    specialized_target source=helper_argument_specialization expr=0x18000adf9
+    resolved_target=0x18000ADF9
+    continuation_pc=0x180001CD6
+    vip=0x180001CD6
+    exit=stay_in_vm
+    executable_in_image=true
+    decodable_entry=true
+    target_fn=blk_18000adf9
+    return slot[15] = slot(RETURN_PC+0x0)
+    return slot[0] = phi(0x18000ae32, 0x1800314d3)
+    return slot[15] = 0x1800464b7
+    return cell[2] = 0x18000ae1b
+    return cell[3] = 0x38e85660
+handler blk_180001cd6 entry=0x180001CD6 candidate=true output_root=false specialized=false direct_callees=9 dispatches=0 callsites=1
+  callee _ZN12_GLOBAL__N_13MOVI3RnWImE2InImEEEP6MemoryS6_R5StateT_T0_
+  callee _ZN12_GLOBAL__N_13MOVI3RnWImE2MnImEEEP6MemoryS6_R5StateT_T0_
+  callee _ZN12_GLOBAL__N_13MOVI3RnWImE2RnImLb1EEEEP6MemoryS6_R5StateT_T0_
+  callee _ZN12_GLOBAL__N_13SHRI3RnWImE2RnImLb1EE2InImEEEP6MemoryS8_R5StateT_T0_T1_
+  callee _ZN12_GLOBAL__N_13XORI3RnWImE2RnImLb1EE2MnImEEEP6MemoryS8_R5StateT_T0_T1_
+  callee _ZN12_GLOBAL__N_13XORI3RnWImE2RnImLb1EES4_EEP6MemoryS6_R5StateT_T0_T1_
+  callee _ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_
+  callee _ZN12_GLOBAL__N_14IMULI3RnWImE2RnImLb1EES4_EEP6MemoryS6_R5StateT_T0_T1_
+  callee blk_180002450
+  in-phi slot[0] merged=phi(0x18000ae32, 0x1800314d3) ; slot[0] from blk_180001cd6:prelude:0x18000adf9 (entry_prelude, handler=blk_180001cd6, site=0) = phi(0x18000ae32, 0x1800314d3)
+  in-phi slot[1] merged=phi(slot(arg0+0x8e8), 0x18000189e, sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8), sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8)) ; slot[1] from blk_180001cd1:callsite:2:blk_180001cd6 (direct_callsite, handler=blk_180001cd1, site=2) = phi(slot(arg0+0x8e8), 0x18000189e, sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8), sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8))
+  in-phi slot[15] merged=0x1800464b7 ; slot[15] from blk_180001cd6:prelude:0x18000adf9 (entry_prelude, handler=blk_180001cd6, site=0) = 0x1800464b7
+  in slot[0] = phi(0x18000ae32, 0x1800314d3)
+  in slot[1] = phi(slot(arg0+0x8e8), 0x18000189e, sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8), sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8))
+  in slot[15] = 0x1800464b7
+  in arg[0] = arg0
+  in arg[1] = 0x180001cd6
+  out slot[0] = 0x180001d20
+  out slot[1] = phi(slot(arg0+0x8e8), 0x18000189e, sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8), sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8))
+  out slot[15] = slot(RETURN_PC+0x0)
+  stack-in-phi cell[2] merged=0x18000ae1b ; cell[2] from blk_180001cd6:prelude:0x18000adf9 (entry_prelude, handler=blk_180001cd6, site=0) = 0x18000ae1b
+  stack-in cell[2] = 0x18000ae1b
+  stack-out cell[2] = 0x18000ae1b
+  callsite target=add(arg1, 0x77a)
+    specialized_target source=helper_argument_specialization expr=0x180002450
+    resolved_target=0x180002450
+    continuation_pc=0x180001D25
+    vip=0x180001D25
+    exit=vm_exit_native_call_reenter
+    executable_in_image=true
+    decodable_entry=true
+    target_fn=blk_180002450
+    return slot[15] = slot(RETURN_PC+0x0)
+    return cell[2] = 0x180001d25
+handler blk_18000adf9 entry=0x18000ADF9 candidate=true output_root=false specialized=false direct_callees=9 dispatches=0 callsites=1
+  callee _ZN12_GLOBAL__N_13ADDI3MnWImE2MnImE2InImEEEP6MemoryS8_R5StateT_T0_T1_
+  callee _ZN12_GLOBAL__N_13LEAI3RnWImE2MnIhEmEEP6MemoryS6_R5StateT_T0_
+  callee _ZN12_GLOBAL__N_13MOVI3MnWImE2InImEEEP6MemoryS6_R5StateT_T0_
+  callee _ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_
+  callee _ZN12_GLOBAL__N_14PUSHI2MnImEEEP6MemoryS4_R5StateT_
+  callee _ZN12_GLOBAL__N_17DoPOPFQEP6MemoryR5State
+  callee _ZN12_GLOBAL__N_18DoPUSHFQEP6MemoryR5State
+  callee blk_18000ae1b
+  callee blk_1800464b0
+  in-phi slot[1] merged=phi(slot(arg0+0x8e8), 0x18000189e, sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8), sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8)) ; slot[1] from blk_180001cd1:callsite:1:blk_18000adf9 (direct_callsite, handler=blk_180001cd1, site=1) = phi(slot(arg0+0x8e8), 0x18000189e, sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8), sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8))
+  in slot[1] = phi(slot(arg0+0x8e8), 0x18000189e, sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8), sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8))
+  in arg[0] = arg0
+  in arg[1] = 0x18000adf9
+  in arg[2] = arg2
+  out slot[0] = 0x18000ae16
+  out slot[1] = phi(slot(arg0+0x8e8), 0x18000189e, sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8), sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8))
+  out slot[15] = slot(RETURN_PC+0x0)
+  out slot[24] = phi(trunc(slot(arg0+0x8e8)), 0x8000189e, trunc(sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8)), trunc(sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8)))
+  stack-in-phi cell[2] merged=0x180001cd6 ; cell[2] from blk_180001cd1:callsite:1:blk_18000adf9 (direct_callsite, handler=blk_180001cd1, site=1) = 0x180001cd6
+  stack-in-phi cell[3] merged=0x38e85660 ; cell[3] from blk_180001cd1:callsite:1:blk_18000adf9 (direct_callsite, handler=blk_180001cd1, site=1) = 0x38e85660
+  stack-in cell[2] = phi(0x18000ae1b, 0x180001cd6)
+  stack-in cell[3] = 0x38e85660
+  stack-out cell[2] = 0x18000ae1b
+  stack-out cell[3] = 0x38e85660
+  callsite target=add(arg1, 0x3b6b7)
+    specialized_target source=helper_argument_specialization expr=0x1800464b0
+    resolved_target=0x1800464B0
+    continuation_pc=0x18000AE1B
+    vip=0x18000AE1B
+    exit=stay_in_vm
+    executable_in_image=true
+    decodable_entry=true
+    target_fn=blk_1800464b0
+    return slot[15] = slot(RETURN_PC+0x0)
+    return slot[0] = 0x1800314d3
+    return slot[15] = 0x1800464b7
+    return cell[2] = 0x18000ae1b
+handler blk_18000ae1b entry=0x18000AE1B candidate=false output_root=false specialized=false direct_callees=6 dispatches=0 callsites=0
+  callee _ZN12_GLOBAL__N_117HandleUnsupportedEP6MemoryR5State
+  callee _ZN12_GLOBAL__N_13ADDI3RnWImE2RnIjLb1EE2MnIjEEEP6MemoryS8_R5StateT_T0_T1_
+  callee _ZN12_GLOBAL__N_13CMPI2RnIjLb1EES2_EEP6MemoryS4_R5StateT_T0_
+  callee _ZN12_GLOBAL__N_13ROLI3MnWIjE2MnIjE2InIjEEEP6MemoryS8_R5StateT_T0_T1_
+  callee _ZN12_GLOBAL__N_13SUBI3MnWIhE2MnIhE2InIhEEEP6MemoryS8_R5StateT_T0_T1_
+  callee _ZN12_GLOBAL__N_14XCHGI3RnWIhE2RnIhLb1EES2_S4_EEP6MemoryS6_R5StateT_T0_T1_T2_
+  in-phi slot[0] merged=0x1800314d3 ; slot[0] from blk_18000ae1b:prelude:0x1800464b0 (entry_prelude, handler=blk_18000ae1b, site=0) = 0x1800314d3
+  in-phi slot[1] merged=phi(slot(arg0+0x8e8), 0x18000189e, sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8), sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8)) ; slot[1] from blk_18000adf9:callsite:8:blk_18000ae1b (direct_callsite, handler=blk_18000adf9, site=8) = phi(slot(arg0+0x8e8), 0x18000189e, sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8), sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8))
+  in-phi slot[15] merged=0x1800464b7 ; slot[15] from blk_18000ae1b:prelude:0x1800464b0 (entry_prelude, handler=blk_18000ae1b, site=0) = 0x1800464b7
+  in-phi slot[24] merged=phi(trunc(slot(arg0+0x8e8)), 0x8000189e, trunc(sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8)), trunc(sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8))) ; slot[24] from blk_18000adf9:callsite:8:blk_18000ae1b (direct_callsite, handler=blk_18000adf9, site=8) = phi(trunc(slot(arg0+0x8e8)), 0x8000189e, trunc(sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8)), trunc(sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8)))
+  in slot[0] = 0x1800314d3
+  in slot[1] = phi(slot(arg0+0x8e8), 0x18000189e, sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8), sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8))
+  in slot[15] = 0x1800464b7
+  in slot[24] = phi(trunc(slot(arg0+0x8e8)), 0x8000189e, trunc(sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8)), trunc(sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8)))
+  in arg[0] = arg0
+  in arg[1] = 0x18000ae1b
+  out slot[0] = 0x18000ae32
+  out slot[1] = phi(slot(arg0+0x8e8), 0x18000189e, sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8), sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8))
+  out slot[15] = 0x1800464b7
+  out slot[24] = phi(trunc(slot(arg0+0x8e8)), 0x8000189e, trunc(sub(phi(0x1800018a6, slot(arg0+0x8e8)), 0x8)), trunc(sub(phi(0x1800018a6, slot(arg0+0x8e8), 0x18000189e), 0x8)))
+  stack-in-phi cell[2] merged=0x18000ae1b ; cell[2] from blk_18000adf9:callsite:8:blk_18000ae1b (direct_callsite, handler=blk_18000adf9, site=8) = 0x18000ae1b ; cell[2] from blk_18000ae1b:prelude:0x1800464b0 (entry_prelude, handler=blk_18000ae1b, site=0) = 0x18000ae1b
+  stack-in cell[2] = 0x18000ae1b
+  stack-out cell[2] = 0x18000ae1b
+handler blk_1800314d3 entry=0x1800314D3 candidate=true output_root=false specialized=false direct_callees=2 dispatches=0 callsites=1
+  callee _ZN12_GLOBAL__N_14CALLI2InImEEEP6MemoryS4_R5StateT_3RnWImES2_S9_
+  callee blk_1800626f0
+  in arg[0] = arg0
+  in arg[1] = 0x1800314d3
+  in arg[2] = arg2
+  out slot[0] = 0x1800314d3
+  out slot[15] = slot(RETURN_PC+0x0)
+  callsite target=add(arg1, 0x3121d)
+    specialized_target source=helper_argument_specialization expr=0x1800626f0
+    resolved_target=0x1800626F0
+    continuation_pc=0x1800314D8
+    vip=0x1800314D8
+    exit=vm_exit_native_call_reenter
+    executable_in_image=true
+    decodable_entry=true
+    target_fn=blk_1800626f0
+    return slot[15] = slot(RETURN_PC+0x0)
+    return cell[2] = 0x1800314d8
+handler blk_180033a8a entry=0x180033A8A candidate=false output_root=false specialized=false direct_callees=3 dispatches=0 callsites=0
+  callee _ZN12_GLOBAL__N_13JMPI2InImEEEP6MemoryS4_R5StateT_3RnWImE
+  callee _ZN12_GLOBAL__N_13MOVI3MnWImE2RnImLb1EEEEP6MemoryS6_R5StateT_T0_
+  callee _ZN12_GLOBAL__N_14PUSHI2InImEEEP6MemoryS4_R5StateT_
+  in arg[0] = arg0
+  in arg[1] = 0x180033a8a
+  in arg[2] = arg2
+  out slot[0] = 0x180033a9e
+  out slot[15] = 0x180033aa3
+  stack-in-phi cell[2] merged=0x1800018a6 ; cell[2] from blk_18003673b:callsite:1:blk_180033a8a (direct_callsite, handler=blk_18003673b, site=1) = 0x1800018a6
+  stack-in cell[2] = 0x1800018a6
+  stack-out cell[2] = 0x1800018a6
+handler blk_18003673b entry=0x18003673B candidate=false output_root=false specialized=false direct_callees=2 dispatches=0 callsites=0
+  callee _ZN12_GLOBAL__N_13JMPI2InImEEEP6MemoryS4_R5StateT_3RnWImE
+  callee blk_180033a8a
+  in arg[0] = arg0
+  in arg[1] = 0x18003673b
+  in arg[2] = arg2
+  out slot[0] = 0x18003673b
+  out slot[15] = 0x180036740
+  stack-in-phi cell[2] merged=0x1800018a6 ; cell[2] from blk_180001893:callsite:2:blk_18003673b (direct_callsite, handler=blk_180001893, site=2) = 0x1800018a6
+  stack-in cell[2] = 0x1800018a6
+  stack-out cell[2] = 0x1800018a6
+handler blk_1800464b0 entry=0x1800464B0 candidate=false output_root=false specialized=false direct_callees=3 dispatches=0 callsites=0
+  callee _ZN12_GLOBAL__N_13JMPI2InImEEEP6MemoryS4_R5StateT_3RnWImE
+  callee _ZN12_GLOBAL__N_14PUSHI2InImEEEP6MemoryS4_R5StateT_
+  callee blk_1800314d3
+  in arg[0] = arg0
+  in arg[1] = 0x1800464b0
+  in arg[2] = arg2
+  out slot[0] = 0x1800464b2
+  out slot[15] = 0x1800464b7
+  stack-in-phi cell[2] merged=0x18000ae1b ; cell[2] from blk_18000adf9:callsite:7:blk_1800464b0 (direct_callsite, handler=blk_18000adf9, site=7) = 0x18000ae1b
+  stack-in cell[2] = 0x18000ae1b
+  stack-out cell[2] = 0x18000ae1b
+handler sub_180001850 entry=0x180001850 candidate=false output_root=true specialized=false direct_callees=2 dispatches=0 callsites=0
+  callee blk_180001893
+  callee blk_180001cd1
+  in arg[1] = 0x180001850
+  out slot[0] = 0x180001cd1
+  out slot[1] = 0x1800018a6
+  out slot[5] = slot(arg0+0x988)
+  out slot[8] = slot(arg0+0x8a8)
+  out slot[9] = 0x0
+  out slot[10] = xor(and(unknown, 0x1), unknown)
+  out slot[11] = zext(eq(unknown, 0x1800017ae))
+  out slot[12] = trunc(lshr(xor(0x1800017ae, unknown), 0x3f))
+  out slot[13] = 0x0
+  out slot[14] = 0x0
+  out slot[17] = slot(arg0+0x978)
+  out slot[19] = slot(arg0+0x918)
+  out slot[20] = slot(arg0+0x8c8)
+  out slot[22] = trunc(slot(arg0+0x8a8))
+  out slot[24] = 0x800018a6
+  out slot[28] = slot(arg0+0x998)
+  stack-out cell[2] = 0x1800018a6
+  stack-out cell[3] = 0x38e85660
+  stack-out cell[10] = mem(add(slot(arg0+0x988), 0x18f4afd6))
+  stack-out cell[13] = slot(arg0+0x8e8)
+diag lifted target=0x180002450 -> blk_180002450
+diag dispatch-const-lift caller=blk_180001cd6 target=0x180002450
+diag lifted target=0x1800626F0 -> blk_1800626f0
+diag dispatch-const-lift caller=blk_1800314d3 target=0x1800626F0
+diag terminal-next-pc blk_18003673b state=out/out target=0x180036740
+diag nearby-lifted target=0x180036740 -> blk_18003673b recovered_pc=0x18003673B
+diag terminal-next-pc blk_180033a8a state=out/out target=0x180033AA3
+diag nearby-lifted target=0x180033AA3 -> blk_180033a8a recovered_pc=0x180033A8A
+diag terminal-next-pc blk_1800464b0 state=out/out target=0x1800464B7
+diag nearby-lifted target=0x1800464B7 -> blk_1800464b0 recovered_pc=0x1800464B0
+diag lifted target=0x180001D25 -> blk_180001d25
+diag lifted target=0x180002450 -> blk_180002450
+diag terminal-next-pc blk_18003673b state=out/out target=0x180036740
+diag nearby-lifted target=0x180036740 -> blk_18003673b recovered_pc=0x18003673B
+diag lifted target=0x180061947 -> blk_180061947
+diag terminal-next-pc blk_180033a8a state=out/out target=0x180033AA3
+diag nearby-lifted target=0x180033AA3 -> blk_180033a8a recovered_pc=0x180033A8A
+diag terminal-next-pc blk_1800464b0 state=out/out target=0x1800464B7
+diag nearby-lifted target=0x1800464B7 -> blk_1800464b0 recovered_pc=0x1800464B0
+diag lifted target=0x1800314D8 -> blk_1800314d8
+diag lifted target=0x1800626F0 -> blk_1800626f0
+diag lifted target=0x180002469 -> blk_180002469
+diag lifted target=0x180002459 -> blk_180002459
+diag lifted target=0x1800399E7 -> blk_1800399e7
+diag terminal-next-pc blk_18003673b state=out/out target=0x180036740
+diag nearby-lifted target=0x180036740 -> blk_18003673b recovered_pc=0x18003673B
+diag terminal-next-pc blk_180033a8a state=out/out target=0x180033AA3
+diag nearby-lifted target=0x180033AA3 -> blk_180033a8a recovered_pc=0x180033A8A
+diag terminal-next-pc blk_1800464b0 state=out/out target=0x1800464B7
+diag nearby-lifted target=0x1800464B7 -> blk_1800464b0 recovered_pc=0x1800464B0
+diag lifted target=0x180001D25 -> blk_180001d25
+diag terminal-next-pc blk_18003673b state=out/out target=0x180036740
+diag nearby-lifted target=0x180036740 -> blk_18003673b recovered_pc=0x18003673B
+diag lifted target=0x180061947 -> blk_180061947
+diag terminal-next-pc blk_180033a8a state=out/out target=0x180033AA3
+diag nearby-lifted target=0x180033AA3 -> blk_180033a8a recovered_pc=0x180033A8A
+diag terminal-next-pc blk_1800464b0 state=out/out target=0x1800464B7
+diag nearby-lifted target=0x1800464B7 -> blk_1800464b0 recovered_pc=0x1800464B0
+diag lifted target=0x1800314D8 -> blk_1800314d8
+diag lifted target=0x180002469 -> blk_180002469
+diag lifted target=0x180002459 -> blk_180002459

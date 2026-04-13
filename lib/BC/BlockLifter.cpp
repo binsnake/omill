@@ -827,6 +827,82 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
         // thunk (VMProtect-style return-address manipulation and
         // similar), we replay the stack writes inline at the call site
         // so no `omill_native_boundary_<thunk_pc>` placeholder ever
+        // Check if the call target modifies the return address (VMP
+        // entry stubs redirect to a different continuation).  This
+        // must run BEFORE the bridge check — a trivial JMP bridge
+        // would incorrectly inline as a no-op and fall through to
+        // the original (dead) dispatch loop.
+        // Only run the (expensive) return-address redirect analysis
+        // when the bridge check would return a trivial JMP bridge —
+        // those are the VMP entry stubs that redirect the return.
+        if (const auto *memory_map = manager.GetBinaryMemoryMap()) {
+          auto probe = LookupBridgeEffect(current_pc, call_target);
+          if (probe && probe->terminator ==
+                           CallTargetBridgeEffect::Terminator::kJmpConst &&
+              probe->stack_writes.empty() &&
+              probe->register_writes.empty()) {
+            // Trivial JMP bridge — likely a VMP entry stub.
+            // Emulate from the FUNCTION ENTRY (not the call target)
+            // so the full call chain runs with correct stack layout.
+            uint64_t entry_va = 0;
+            for (auto &F : *module) {
+              if (F.hasFnAttribute("omill.output_root")) {
+                entry_va = extractEntryVA(F.getName());
+                if (entry_va == 0)
+                  entry_va = extractBlockPC(F.getName());
+                break;
+              }
+            }
+            uint64_t redirect =
+                entry_va ? analyzeReturnAddressRedirect(
+                               *memory_map, entry_va)
+                         : 0;
+            if (redirect != 0 && redirect != fallthrough) {
+              // VMP entry stub redirects the return address.  The
+              // callee is an opaque VM executor — don't lift its
+              // blocks (they're a huge obfuscated graph).  Emit a
+              // dispatch_call as the opaque call boundary, but fall
+              // through to the REDIRECT target, not the original.
+              {
+                fallthrough = redirect;
+                fallthrough_target = manager.ResolveLiftTarget(
+                    current_pc, fallthrough,
+                    LiftTargetEdgeKind::kCallFallthrough);
+
+                auto *pc_val =
+                    llvm::ConstantInt::get(word_type, call_target);
+                auto *lifted_fn_ty = func->getFunctionType();
+                auto dispatch = module->getOrInsertFunction(
+                    canonicalDispatchIntrinsicName(
+                        DispatchIntrinsicKind::kCall, *module),
+                    lifted_fn_ty);
+                auto *sp = remill::NthArgument(
+                    func, remill::kStatePointerArgNum);
+
+                llvm::IRBuilder<> ir(current_block);
+                auto *mp =
+                    LoadCurrentMemoryToken(ir, func, *intrinsics);
+                auto *call_result =
+                    ir.CreateCall(dispatch, {sp, pc_val, mp});
+
+                // Don't add call_target to discovered_targets —
+                // the VMP init is an opaque boundary.
+
+                auto *next_pc_ref =
+                    remill::LoadNextProgramCounterRef(current_block);
+                ir.CreateStore(
+                    llvm::ConstantInt::get(word_type, fallthrough),
+                    next_pc_ref);
+
+                EmitDecisionEdgeWithMemory(
+                    current_block, fallthrough, fallthrough_target,
+                    call_result, discovered_targets);
+              }
+              goto done;
+            }
+          }
+        }
+
         // needs to exist.  Any written constants stay on the simulated
         // stack and will be consumed by a later lifted `ret`; the
         // caller then resumes at its own fallthrough as if the call had
@@ -916,6 +992,7 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
 
         // Emit: dispatch_call(state, call_target_pc, mem)
         // Then: musttail call @blk_<fallthrough>(state, fallthrough_pc, result)
+        emit_dispatch_call:
         {
           const uint64_t call_pc =
               call_target_decision.effective_target_pc
@@ -944,10 +1021,10 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
           auto *mp = LoadCurrentMemoryToken(ir, func, *intrinsics);
           auto *call_result = ir.CreateCall(dispatch, {sp, pc_val, mp});
 
-          // Store RETURN_PC into NEXT_PC for the fall-through.
-          auto *ret_pc_ref = remill::LoadReturnProgramCounterRef(current_block);
+          // Store the effective fall-through PC into NEXT_PC.
           auto *next_pc_ref = remill::LoadNextProgramCounterRef(current_block);
-          ir.CreateStore(ir.CreateLoad(word_type, ret_pc_ref), next_pc_ref);
+          ir.CreateStore(
+              llvm::ConstantInt::get(word_type, fallthrough), next_pc_ref);
 
           // Musttail to fall-through block.
           EmitDecisionEdgeWithMemory(current_block, fallthrough,

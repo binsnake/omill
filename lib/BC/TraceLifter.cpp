@@ -13,7 +13,9 @@
 ///     avoid confusing omill passes that use extractBlockPC / collectBlockPCMap.
 
 #include "omill/BC/TraceLifter.h"
+#include "omill/BC/DecodeInstruction.h"
 
+#include "omill/BC/LiftDatabaseProjection.h"
 #include "omill/Devirtualization/ExecutableTargetFact.h"
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Constants.h>
@@ -34,6 +36,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <utility>
 
 namespace omill {
 
@@ -107,6 +110,11 @@ class TraceLifter::Impl {
   bool Lift(uint64_t addr,
             std::function<void(uint64_t, llvm::Function *)> callback);
 
+  void SetLiftDatabase(const LiftDatabase *db_) { lift_db = db_; }
+  void SetLiftOverlayKey(std::optional<std::string> overlay_key) {
+    projection_overlay_key = std::move(overlay_key);
+  }
+
   bool ReadInstructionBytes(uint64_t addr);
 
   llvm::Function *GetLiftedTraceDeclaration(uint64_t addr);
@@ -115,11 +123,23 @@ class TraceLifter::Impl {
   llvm::BasicBlock *GetOrCreateBlock(uint64_t block_pc) {
     auto &block = blocks[block_pc];
     if (!block) {
-      // Only name blocks that came from devirtualized targets (jump table
-      // analysis).  Naming ALL blocks block_<hex> would confuse omill passes
-      // that use extractBlockPC / collectBlockPCMap throughout the pipeline.
+      // Name blocks that come from explicit control-flow targets so later
+      // passes can recover their PCs. Leave the root entry block unnamed to
+      // avoid treating the whole trace head like a devirtualized target.
       std::string name;
-      if (devirt_targets.count(block_pc)) {
+      const bool should_name =
+          (devirt_targets.count(block_pc) || projected_blocks.count(block_pc)) &&
+          (!active_trace_addr || block_pc != *active_trace_addr);
+      const bool projected = projected_blocks.count(block_pc);
+      const bool devirt = devirt_targets.count(block_pc);
+      if (std::getenv("OMILL_DEBUG_TRACE_BLOCK_NAMING") != nullptr &&
+          (projected || devirt)) {
+        llvm::errs() << "[trace-block] pc=0x" << llvm::Twine::utohexstr(block_pc)
+                     << " projected=" << (projected ? "yes" : "no")
+                     << " devirt=" << (devirt ? "yes" : "no")
+                     << " name=" << (should_name ? "yes" : "no") << "\n";
+      }
+      if (should_name) {
         std::stringstream ss;
         ss << "block_" << std::hex << block_pc;
         name = ss.str();
@@ -154,8 +174,117 @@ class TraceLifter::Impl {
     return GetOrCreateMissingBlock(decision.raw_target_pc, &decision);
   }
 
+  std::optional<LiftDbProjection> ActiveProjectionForTrace(
+      uint64_t trace_addr) const {
+    if (!lift_db) {
+      return std::nullopt;
+    }
+
+    LiftDatabaseProjector projector(*lift_db);
+    if (projection_overlay_key) {
+      if (const auto *overlay = lift_db->traceOverlay(*projection_overlay_key);
+          overlay && overlay->function_entry_va == trace_addr) {
+        if (auto projection = projector.projectOverlay(*projection_overlay_key)) {
+          return projection;
+        }
+      }
+    }
+    return projector.projectFunction(trace_addr);
+  }
+
+  std::optional<uint64_t> ProjectedTargetBlock(uint64_t source_pc,
+                                               uint64_t fallback_pc,
+                                               LiftTargetEdgeKind edge_kind) const {
+    if (!lift_db || !active_trace_addr) {
+      return std::nullopt;
+    }
+
+    auto projection = ActiveProjectionForTrace(*active_trace_addr);
+    if (!projection) {
+      return std::nullopt;
+    }
+
+    const auto *projected_block =
+        FindProjectionBlockContaining(*projection, source_pc);
+    if (!projected_block) {
+      return std::nullopt;
+    }
+    auto matches_edge = [&](const LiftDbEdgeRecord &edge) {
+      switch (edge_kind) {
+        case LiftTargetEdgeKind::kDirectJump:
+        case LiftTargetEdgeKind::kConditionalTaken:
+          return edge.kind == LiftDbEdgeKind::kBranchTaken ||
+                 edge.kind == LiftDbEdgeKind::kOverlay;
+        case LiftTargetEdgeKind::kConditionalNotTaken:
+        case LiftTargetEdgeKind::kTraceNext:
+          return edge.kind == LiftDbEdgeKind::kFallthrough ||
+                 edge.kind == LiftDbEdgeKind::kOverlay;
+        default:
+          return false;
+      }
+    };
+
+    for (const auto &edge : projected_block->successors) {
+      if (edge.target_block_va == fallback_pc && matches_edge(edge)) {
+        return edge.target_block_va;
+      }
+    }
+    for (const auto &edge : projected_block->successors) {
+      if (matches_edge(edge) && edge.target_block_va) {
+        return edge.target_block_va;
+      }
+    }
+    return std::nullopt;
+  }
+
+  llvm::SmallVector<uint64_t, 8> ProjectedDevirtualizedTargets(
+      uint64_t source_pc) const {
+    llvm::SmallVector<uint64_t, 8> targets;
+    if (!lift_db || !active_trace_addr) {
+      return targets;
+    }
+
+    auto projection = ActiveProjectionForTrace(*active_trace_addr);
+    if (!projection) {
+      return targets;
+    }
+
+    const auto *projected_block =
+        FindProjectionBlockContaining(*projection, source_pc);
+    if (!projected_block) {
+      return targets;
+    }
+
+    for (const auto &edge : projected_block->successors) {
+      if (!edge.target_block_va) {
+        continue;
+      }
+      switch (edge.kind) {
+        case LiftDbEdgeKind::kBranchTaken:
+        case LiftDbEdgeKind::kOverlay:
+          if (std::find(targets.begin(), targets.end(), edge.target_block_va) ==
+              targets.end()) {
+            targets.push_back(edge.target_block_va);
+          }
+          break;
+        default:
+          break;
+      }
+    }
+
+    return targets;
+  }
+
+
+
+
+
   llvm::BasicBlock *GetOrCreateResolvedTargetBlock(
       uint64_t source_pc, uint64_t block_pc, LiftTargetEdgeKind edge_kind) {
+    if (auto projected_pc =
+            ProjectedTargetBlock(source_pc, block_pc, edge_kind)) {
+      block_pc = *projected_pc;
+    }
     return GetOrCreateTargetBlock(
         manager.ResolveLiftTarget(source_pc, block_pc, edge_kind));
   }
@@ -191,6 +320,45 @@ class TraceLifter::Impl {
     return inst_addr;
   }
 
+  void SeedProjectedTraceWork(uint64_t trace_addr) {
+    auto projection = ActiveProjectionForTrace(trace_addr);
+    if (std::getenv("OMILL_DEBUG_PROJECTED_TRACE_WORK") != nullptr) {
+      llvm::errs() << "[trace-projection] root=0x"
+                   << llvm::Twine::utohexstr(trace_addr)
+                   << " has_projection=" << (projection ? "yes" : "no");
+      if (projection) {
+        llvm::errs() << " blocks=" << projection->block_order.size();
+      }
+      llvm::errs() << "\n";
+    }
+    if (!projection) {
+      inst_work_list.insert(trace_addr);
+      return;
+    }
+    if (projection->empty()) {
+      inst_work_list.insert(trace_addr);
+      return;
+    }
+
+    for (auto block_entry_va : projection->block_order) {
+      projected_blocks.insert(block_entry_va);
+      inst_work_list.insert(block_entry_va);
+      (void) GetOrCreateBlock(block_entry_va);
+    }
+
+    for (auto block_entry_va : projection->block_order) {
+      auto block_it = projection->blocks.find(block_entry_va);
+      if (block_it == projection->blocks.end()) {
+        continue;
+      }
+      for (const auto &edge : block_it->second.successors) {
+        if (edge.kind == LiftDbEdgeKind::kCall && edge.target_block_va) {
+          trace_work_list.insert(edge.target_block_va);
+        }
+      }
+    }
+  }
+
   const remill::Arch *const arch;
   const remill::IntrinsicTable *intrinsics;
   llvm::Type *word_type;
@@ -209,7 +377,11 @@ class TraceLifter::Impl {
   DecoderWorkList trace_work_list;
   DecoderWorkList inst_work_list;
   DecoderWorkList devirt_targets;  // PCs from ForEachDevirtualizedTarget.
+  DecoderWorkList projected_blocks;  // PCs seeded from LiftDatabase blocks.
   std::map<uint64_t, llvm::BasicBlock *> blocks;
+  const LiftDatabase *lift_db = nullptr;
+  std::optional<uint64_t> active_trace_addr;
+  std::optional<std::string> projection_overlay_key;
 };
 
 TraceLifter::Impl::Impl(const remill::Arch *arch_, TraceManager *manager_)
@@ -282,6 +454,14 @@ bool TraceLifter::Lift(
   return impl->Lift(addr, callback);
 }
 
+void TraceLifter::SetLiftDatabase(const LiftDatabase *db) {
+  impl->SetLiftDatabase(db);
+}
+
+void TraceLifter::SetLiftOverlayKey(std::optional<std::string> overlay_key) {
+  impl->SetLiftOverlayKey(std::move(overlay_key));
+}
+
 // ---------------------------------------------------------------------------
 // ReadInstructionBytes
 // ---------------------------------------------------------------------------
@@ -314,6 +494,7 @@ bool TraceLifter::Impl::Lift(
   trace_work_list.clear();
   inst_work_list.clear();
   devirt_targets.clear();
+  projected_blocks.clear();
   blocks.clear();
   inst_bytes.clear();
   func = nullptr;
@@ -321,6 +502,7 @@ bool TraceLifter::Impl::Lift(
   block = nullptr;
   inst.Reset();
   delayed_inst.Reset();
+  active_trace_addr.reset();
 
   // Get a trace head that the manager knows about, or that we will
   // eventually tell the trace manager about.
@@ -338,6 +520,7 @@ bool TraceLifter::Impl::Lift(
   trace_work_list.insert(addr);
   while (!trace_work_list.empty()) {
     const auto trace_addr = PopTraceAddress();
+    active_trace_addr = trace_addr;
 
     // Already lifted.
     func = GetLiftedTraceDefinition(trace_addr);
@@ -388,7 +571,7 @@ bool TraceLifter::Impl::Lift(
     }
 
     assert(inst_work_list.empty());
-    inst_work_list.insert(trace_addr);
+    SeedProjectedTraceWork(trace_addr);
 
     // Decode instructions.
     while (!inst_work_list.empty()) {
@@ -420,8 +603,7 @@ bool TraceLifter::Impl::Lift(
 
       inst.Reset();
 
-      auto decode_ok = arch->DecodeInstruction(
-          inst_addr, inst_bytes, inst, this->arch->CreateInitialContext());
+      auto decode_ok = omill::DecodeInstruction(*arch, inst_addr, inst_bytes, inst);
       if (!decode_ok && inst_addr == trace_addr) {
         // Entry-point decode failure — the handler VA itself is invalid.
         llvm::errs() << "omill: TraceLifter: decode failed at entry 0x"
@@ -524,14 +706,22 @@ bool TraceLifter::Impl::Lift(
           try_add_delay_slot(true, block);
           remill::AddTerminatingTailCall(block, intrinsics->jump, *intrinsics);
 
-          // Ask the trace manager for devirtualized targets (e.g. from
-          // binary-level jump table analysis).
-          manager.ForEachDevirtualizedTarget(
-              inst,
-              [this](uint64_t target, DevirtualizedTargetKind) {
-                inst_work_list.insert(target);
-                devirt_targets.insert(target);
-              });
+          auto projected_targets = ProjectedDevirtualizedTargets(inst_addr);
+          if (!projected_targets.empty()) {
+            for (uint64_t target : projected_targets) {
+              inst_work_list.insert(target);
+              devirt_targets.insert(target);
+            }
+          } else {
+            // Ask the trace manager for devirtualized targets (e.g. from
+            // binary-level jump table analysis).
+            manager.ForEachDevirtualizedTarget(
+                inst,
+                [this](uint64_t target, DevirtualizedTargetKind) {
+                  inst_work_list.insert(target);
+                  devirt_targets.insert(target);
+                });
+          }
           break;
         }
 
@@ -767,6 +957,8 @@ bool TraceLifter::Impl::Lift(
     callback(trace_addr, func);
     manager.SetLiftedTraceDefinition(trace_addr, func);
   }
+
+  active_trace_addr.reset();
 
   return true;
 }

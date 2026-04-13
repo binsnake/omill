@@ -148,8 +148,10 @@ std::optional<FrontierCallbacks::DecodedTargetSummary> decodeWithFallback(
     return std::nullopt;
 
   if (callbacks.decode_target_summary &&
-      (!callbacks.can_decode_target || callbacks.can_decode_target(pc)))
-    return callbacks.decode_target_summary(pc);
+      (!callbacks.can_decode_target || callbacks.can_decode_target(pc))) {
+    if (auto decoded = callbacks.decode_target_summary(pc))
+      return decoded;
+  }
 
   if (!callbacks.read_target_bytes)
     return std::nullopt;

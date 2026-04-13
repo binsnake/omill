@@ -1,5 +1,6 @@
 #pragma once
 
+#include <llvm/ADT/StringRef.h>
 #include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Intrinsics.h>
@@ -9,7 +10,7 @@
 #include <llvm/IR/Value.h>
 
 #include <cstdint>
-
+#include <string>
 namespace ollvm {
 
 namespace detail {
@@ -199,6 +200,64 @@ inline uint32_t softwareCRC32C(uint32_t crc, uint32_t data) {
   return crc;
 }
 
+namespace detail {
+
+inline void ensureCRC32TargetFeatures(llvm::Function &F) {
+  static constexpr const char *kRequiredFeatures[] = {
+      "+sse3", "+ssse3", "+sse4.1", "+sse4.2", "+crc32"};
+
+  llvm::StringRef existingFeatures;
+  if (F.hasFnAttribute("target-features"))
+    existingFeatures = F.getFnAttribute("target-features").getValueAsString();
+
+  auto isRequiredFeature = [](llvm::StringRef feature) {
+    if (feature.starts_with("+") || feature.starts_with("-"))
+      feature = feature.drop_front();
+    for (const char *required : kRequiredFeatures) {
+      llvm::StringRef requiredFeature(required);
+      if (feature == requiredFeature.drop_front())
+        return true;
+    }
+    return false;
+  };
+
+  std::string updatedFeatures;
+  auto appendFeature = [&](llvm::StringRef feature) {
+    if (feature.empty())
+      return;
+    if (!updatedFeatures.empty())
+      updatedFeatures += ',';
+    updatedFeatures.append(feature.data(), feature.size());
+  };
+
+  for (llvm::StringRef remaining = existingFeatures; !remaining.empty();) {
+    auto separator = remaining.find(',');
+    llvm::StringRef feature = separator == llvm::StringRef::npos
+                                ? remaining
+                                : remaining.take_front(separator);
+    feature = feature.trim();
+    if (!feature.empty() && !isRequiredFeature(feature))
+      appendFeature(feature);
+    remaining = separator == llvm::StringRef::npos
+                    ? llvm::StringRef()
+                    : remaining.drop_front(separator + 1);
+  }
+
+  // Rebuild the required chain in canonical order so it overrides any stale
+  // +/- entries already present on the function and remains stable on repeats.
+  for (const char *required : kRequiredFeatures)
+    appendFeature(required);
+
+  if (llvm::StringRef(updatedFeatures) == existingFeatures)
+    return;
+
+  F.removeFnAttr("target-features");
+  F.addFnAttr(llvm::Attribute::get(F.getContext(), "target-features",
+                                   updatedFeatures));
+}
+}  // namespace detail
+
+
 /// Build an always-true predicate using the CRC32 hardware intrinsic.
 ///
 /// Creates a volatile load from a module-level global initialized to a known
@@ -225,25 +284,10 @@ inline llvm::Value *buildCRC32Predicate(llvm::IRBuilder<> &builder,
   // Volatile load to prevent constant folding.
   auto *loaded = builder.CreateLoad(i32Ty, gv, /*isVolatile=*/true, "");
 
-  // Ensure the function has the CRC32 target feature so the backend can
-  // select the intrinsic.  LLVM 21+ splits CRC32 into its own feature flag
-  // separate from SSE4.2.  We add the full prerequisite chain plus +crc32.
-  {
-    llvm::StringRef features;
-    if (F.hasFnAttribute("target-features"))
-      features = F.getFnAttribute("target-features").getValueAsString();
-    if (!features.contains("+crc32")) {
-      std::string updated(features);
-      for (const char *feat : {"+sse3", "+ssse3", "+sse4.1", "+sse4.2", "+crc32"}) {
-        if (!llvm::StringRef(updated).contains(feat)) {
-          if (!updated.empty())
-            updated += ',';
-          updated += feat;
-        }
-      }
-      F.addFnAttr("target-features", updated);
-    }
-  }
+  // Ensure the function has the full x86 CRC32 prerequisite chain. LLVM 21
+  // models +crc32 independently, so we must repair incomplete or conflicting
+  // target-features instead of only appending when +crc32 is absent.
+  detail::ensureCRC32TargetFeatures(F);
 
   // Call llvm.x86.sse42.crc32.32.32(i32 S, i32 loaded_V).
   auto *seedConst = llvm::ConstantInt::get(i32Ty, sVal);

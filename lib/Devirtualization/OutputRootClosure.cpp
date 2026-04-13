@@ -15,8 +15,9 @@
 #include <map>
 #include <set>
 
+#include "omill/Analysis/RemillStateVariableSolver.h"
 #include "omill/Analysis/IterativeLiftingSession.h"
-#include "omill/BC/BlockLifter.h"
+#include "omill/BC/RemillProjectionLifter.h"
 #include "omill/Devirtualization/BoundaryFact.h"
 #include "omill/Devirtualization/ExecutableTargetFact.h"
 #include "omill/Utils/LiftedNames.h"
@@ -85,6 +86,44 @@ std::optional<uint64_t> extractFunctionSitePc(const llvm::Function &F) {
     return entry;
   if (auto block_pc = extractBlockPC(F.getName()))
     return block_pc;
+  return std::nullopt;
+}
+
+std::optional<uint64_t> resolveRelativeCalliTargetPc(const llvm::Function &F,
+                                                   llvm::Value *target_value) {
+  if (!target_value)
+    return std::nullopt;
+  target_value = target_value->stripPointerCasts();
+  if (auto *ci = llvm::dyn_cast<llvm::ConstantInt>(target_value))
+    return ci->getZExtValue();
+
+  auto base_pc = extractFunctionSitePc(F);
+  if (!base_pc || F.arg_size() < 2)
+    return std::nullopt;
+
+  auto *pc_arg = F.getArg(1);
+  auto decodeAddSub = [&](llvm::BinaryOperator *binop) -> std::optional<uint64_t> {
+    if (!binop)
+      return std::nullopt;
+    auto *lhs = binop->getOperand(0)->stripPointerCasts();
+    auto *rhs = binop->getOperand(1)->stripPointerCasts();
+    auto *lhs_ci = llvm::dyn_cast<llvm::ConstantInt>(lhs);
+    auto *rhs_ci = llvm::dyn_cast<llvm::ConstantInt>(rhs);
+
+    if (binop->getOpcode() == llvm::Instruction::Add) {
+      if (lhs == pc_arg && rhs_ci)
+        return *base_pc + rhs_ci->getZExtValue();
+      if (rhs == pc_arg && lhs_ci)
+        return *base_pc + lhs_ci->getZExtValue();
+    } else if (binop->getOpcode() == llvm::Instruction::Sub) {
+      if (lhs == pc_arg && rhs_ci)
+        return *base_pc - rhs_ci->getZExtValue();
+    }
+    return std::nullopt;
+  };
+
+  if (auto *binop = llvm::dyn_cast<llvm::BinaryOperator>(target_value))
+    return decodeAddSub(binop);
   return std::nullopt;
 }
 
@@ -196,6 +235,26 @@ OutputRootClosureTargetSummary collectOutputRootClosureTargets(
           if ((callee->getName() == "__remill_function_call" ||
                callee->getName() == "__remill_jump") &&
               call->arg_size() >= 3) {
+            if (auto executable_fact = readExecutableTargetFact(*call)) {
+              uint64_t target = normalize_target_pc(
+                  executable_fact->effective_target_pc
+                      ? *executable_fact->effective_target_pc
+                      : executable_fact->raw_target_pc);
+              if (is_code_address(target) &&
+                  (include_defined_targets || !has_defined_target(target))) {
+                constant_code_targets.insert(target);
+              }
+            }
+            if (auto solved_targets = readSolvedTargetSet(*call)) {
+              for (uint64_t solved_target : *solved_targets) {
+                uint64_t target = normalize_target_pc(solved_target);
+                if (!is_code_address(target))
+                  continue;
+                if (!include_defined_targets && has_defined_target(target))
+                  continue;
+                constant_code_targets.insert(target);
+              }
+            }
             if (auto *ci =
                     llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1))) {
               uint64_t target = normalize_target_pc(ci->getZExtValue());
@@ -211,6 +270,26 @@ OutputRootClosureTargetSummary collectOutputRootClosureTargets(
               callee->getName() != "__remill_jump" &&
               callee->getName() != "__remill_function_call" &&
               omill::isDispatchIntrinsicName(callee->getName())) {
+            if (auto executable_fact = readExecutableTargetFact(*call)) {
+              uint64_t target = normalize_target_pc(
+                  executable_fact->effective_target_pc
+                      ? *executable_fact->effective_target_pc
+                      : executable_fact->raw_target_pc);
+              if (is_code_address(target) &&
+                  (include_defined_targets || !has_defined_target(target))) {
+                constant_dispatch_targets.insert(target);
+              }
+            }
+            if (auto solved_targets = readSolvedTargetSet(*call)) {
+              for (uint64_t solved_target : *solved_targets) {
+                uint64_t target = normalize_target_pc(solved_target);
+                if (!is_code_address(target))
+                  continue;
+                if (!include_defined_targets && has_defined_target(target))
+                  continue;
+                constant_dispatch_targets.insert(target);
+              }
+            }
             if (auto *ci =
                     llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1))) {
               uint64_t target = normalize_target_pc(ci->getZExtValue());
@@ -251,34 +330,29 @@ OutputRootClosureTargetSummary collectOutputRootClosureTargets(
             }
           }
           uint64_t target = omill::extractStructuralCodeTargetPC(*callee);
-          if (target == 0 || !is_code_address(target))
-            continue;
-          if (!include_defined_targets && has_defined_target(target))
-            continue;
-          auto *FT = callee->getFunctionType();
-          if (FT->getNumParams() != 3 ||
-              FT->getReturnType() != llvm::PointerType::getUnqual(M.getContext()) ||
-              FT->getParamType(0) != llvm::PointerType::getUnqual(M.getContext()) ||
-              FT->getParamType(1) != llvm::Type::getInt64Ty(M.getContext()) ||
-              FT->getParamType(2) != llvm::PointerType::getUnqual(M.getContext())) {
-            continue;
+          if (target != 0 && is_code_address(target) &&
+              (include_defined_targets || !has_defined_target(target))) {
+            auto *FT = callee->getFunctionType();
+            if (FT->getNumParams() == 3 &&
+                FT->getReturnType() == llvm::PointerType::getUnqual(M.getContext()) &&
+                FT->getParamType(0) == llvm::PointerType::getUnqual(M.getContext()) &&
+                FT->getParamType(1) == llvm::Type::getInt64Ty(M.getContext()) &&
+                FT->getParamType(2) == llvm::PointerType::getUnqual(M.getContext())) {
+              constant_code_targets.insert(target);
+              continue;
+            }
           }
-          constant_code_targets.insert(target);
-          continue;
         }
 
         auto *callee_op = call->getCalledOperand()->stripPointerCasts();
         if (auto *callee_fn = llvm::dyn_cast<llvm::Function>(callee_op)) {
           if (callee_fn->getName().contains("CALLI") && call->arg_size() >= 3) {
-            if (auto *ci =
-                    llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(2))) {
-              const uint64_t target = ci->getZExtValue();
-              if (!is_code_address(target))
-                continue;
-              if (!include_defined_targets && has_defined_target(target))
-                continue;
-              constant_calli_targets.insert(target);
-            }
+            auto target = resolveRelativeCalliTargetPc(F, call->getArgOperand(2));
+            if (!target || !is_code_address(*target))
+              continue;
+            if (!include_defined_targets && has_defined_target(*target))
+              continue;
+            constant_calli_targets.insert(*target);
           }
         }
 
@@ -381,7 +455,34 @@ std::vector<OutputRootClosureWorkItem> collectOutputRootClosureWorkItems(
     item.identity = buildClosureWorkIdentity(item);
     if (!seen_identities.insert(item.identity).second)
       return;
+    const auto boundary_for_followup = item.boundary;
     work_items.push_back(std::move(item));
+    if (boundary_for_followup &&
+        boundary_for_followup->suppresses_normal_fallthrough) {
+      std::optional<uint64_t> continuation_target;
+      if (boundary_for_followup->continuation_entry_transform &&
+          boundary_for_followup->continuation_entry_transform->jump_target_pc) {
+        continuation_target =
+            boundary_for_followup->continuation_entry_transform->jump_target_pc;
+      } else if (boundary_for_followup->continuation_pc) {
+        continuation_target = boundary_for_followup->continuation_pc;
+      }
+      if (continuation_target && *continuation_target != target_pc &&
+          is_code_address(*continuation_target)) {
+        OutputRootClosureWorkItem continuation_item;
+        continuation_item.owner_function = F.getName().str();
+        continuation_item.site_index = site_index;
+        continuation_item.site_pc = extractFunctionSitePc(F);
+        continuation_item.target_pc = normalize_target_pc(*continuation_target);
+        continuation_item.vip_symbolic = vip_symbolic;
+        continuation_item.source_kind =
+            OutputRootClosureSourceKind::kVmUnresolvedContinuationTarget;
+        continuation_item.identity =
+            buildClosureWorkIdentity(continuation_item);
+        if (seen_identities.insert(continuation_item.identity).second)
+          work_items.push_back(std::move(continuation_item));
+      }
+    }
   };
 
   forEachFunctionInOutputRootClosure(M, [&](const llvm::Function &F) {
@@ -420,6 +521,21 @@ std::vector<OutputRootClosureWorkItem> collectOutputRootClosureWorkItems(
           if ((callee->getName() == "__remill_function_call" ||
                callee->getName() == "__remill_jump") &&
               call->arg_size() >= 3) {
+            if (auto executable_fact = readExecutableTargetFact(*call)) {
+              add_item(F, site_index,
+                       executable_fact->effective_target_pc
+                           ? *executable_fact->effective_target_pc
+                           : executable_fact->raw_target_pc,
+                       OutputRootClosureSourceKind::kConstantCodeTarget, call,
+                       callee);
+            }
+            if (auto solved_targets = readSolvedTargetSet(*call)) {
+              for (uint64_t target : *solved_targets) {
+                add_item(F, site_index, target,
+                         OutputRootClosureSourceKind::kConstantCodeTarget, call,
+                         callee);
+              }
+            }
             if (auto *ci =
                     llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1))) {
               add_item(F, site_index, ci->getZExtValue(),
@@ -430,6 +546,21 @@ std::vector<OutputRootClosureWorkItem> collectOutputRootClosureWorkItems(
 
           if (call->arg_size() >= 2 &&
               omill::isDispatchIntrinsicName(callee->getName())) {
+            if (auto executable_fact = readExecutableTargetFact(*call)) {
+              add_item(F, site_index,
+                       executable_fact->effective_target_pc
+                           ? *executable_fact->effective_target_pc
+                           : executable_fact->raw_target_pc,
+                       OutputRootClosureSourceKind::kConstantDispatchTarget,
+                       call, callee);
+            }
+            if (auto solved_targets = readSolvedTargetSet(*call)) {
+              for (uint64_t target : *solved_targets) {
+                add_item(F, site_index, target,
+                         OutputRootClosureSourceKind::kConstantDispatchTarget,
+                         call, callee);
+              }
+            }
             if (auto *ci =
                     llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1))) {
               add_item(
@@ -446,19 +577,37 @@ std::vector<OutputRootClosureWorkItem> collectOutputRootClosureWorkItems(
                 omill::isDispatchIntrinsicName(callee->getName())) {
               continue;
             }
-            if (auto boundary_fact = readBoundaryFact(*callee);
-                boundary_fact && boundary_fact->native_target_pc) {
-              add_item(F, site_index, *boundary_fact->native_target_pc,
-                       OutputRootClosureSourceKind::kConstantCodeTarget, call,
-                       callee);
-              continue;
-            }
-            if (auto boundary_fact = readBoundaryFact(*callee);
-                boundary_fact && boundary_fact->boundary_pc) {
-              add_item(F, site_index, *boundary_fact->boundary_pc,
-                       OutputRootClosureSourceKind::kConstantCodeTarget, call,
-                       callee);
-              continue;
+            if (auto boundary_fact = readBoundaryFact(*callee)) {
+              std::optional<uint64_t> continuation_target;
+              if (boundary_fact->continuation_entry_transform &&
+                  boundary_fact->continuation_entry_transform->jump_target_pc) {
+                continuation_target =
+                    boundary_fact->continuation_entry_transform->jump_target_pc;
+              } else if (boundary_fact->continuation_pc) {
+                continuation_target = boundary_fact->continuation_pc;
+              }
+              if (boundary_fact->native_target_pc) {
+                add_item(F, site_index, *boundary_fact->native_target_pc,
+                         OutputRootClosureSourceKind::kConstantCodeTarget, call,
+                         callee);
+                if (continuation_target) {
+                  add_item(F, site_index, *continuation_target,
+                           OutputRootClosureSourceKind::kVmUnresolvedContinuationTarget,
+                           call, callee);
+                }
+                continue;
+              }
+              if (boundary_fact->boundary_pc) {
+                add_item(F, site_index, *boundary_fact->boundary_pc,
+                         OutputRootClosureSourceKind::kConstantCodeTarget, call,
+                         callee);
+                if (continuation_target) {
+                  add_item(F, site_index, *continuation_target,
+                           OutputRootClosureSourceKind::kVmUnresolvedContinuationTarget,
+                           call, callee);
+                }
+                continue;
+              }
             }
             if (auto executable_fact = readExecutableTargetFact(*callee)) {
               add_item(F, site_index, executable_fact->raw_target_pc,
@@ -559,17 +708,39 @@ std::vector<OutputRootClosureWorkItem> collectVmUnresolvedContinuationWorkItems(
   for (const auto &F : M) {
     if (F.isDeclaration() || !F.hasFnAttribute("omill.output_root"))
       continue;
-    auto attr = F.getFnAttribute("omill.vm_unresolved_continuation_targets");
-    if (!attr.isValid() || !attr.isStringAttribute())
+    auto targets_attr = F.getFnAttribute("omill.vm_unresolved_continuation_targets");
+    auto summary_attr = F.getFnAttribute("omill.vm_unresolved_continuation_summary");
+    if (!targets_attr.isValid() || !targets_attr.isStringAttribute() ||
+        !summary_attr.isValid() || !summary_attr.isStringAttribute()) {
       continue;
-    llvm::SmallVector<llvm::StringRef, 8> parts;
-    attr.getValueAsString().split(parts, ',', -1, /*KeepEmpty=*/false);
-    for (llvm::StringRef part : parts) {
-      uint64_t target = 0;
-      if (part.empty() || part.getAsInteger(16, target))
+    }
+    llvm::SmallVector<llvm::StringRef, 8> target_parts;
+    llvm::SmallVector<llvm::StringRef, 8> summary_parts;
+    targets_attr.getValueAsString().split(target_parts, ',', -1,
+                                          /*KeepEmpty=*/false);
+    summary_attr.getValueAsString().split(summary_parts, ',', -1,
+                                          /*KeepEmpty=*/false);
+    llvm::SmallDenseSet<uint64_t, 8> controlled_return_targets;
+    for (llvm::StringRef part : summary_parts) {
+      auto pieces = part.split('@');
+      if (pieces.first != "boundary_controlled_return")
         continue;
+      uint64_t target = 0;
+      llvm::StringRef target_text = pieces.second;
+      if (target_text.consume_front("0x")) {
+      }
+      if (target_text.empty() || target_text.getAsInteger(16, target))
+        continue;
+      controlled_return_targets.insert(target);
+    }
+    for (llvm::StringRef part : target_parts) {
+      uint64_t target = 0;
+      if (part.empty() || part.getAsInteger(16, target) ||
+          !controlled_return_targets.contains(target)) {
+        continue;
+      }
       target = normalize_target_pc(target);
-      if (!is_code_address(target) || has_defined_target(target))
+      if (!is_code_address(target))
         continue;
       OutputRootClosureWorkItem item;
       item.owner_function = F.getName().str();
@@ -618,7 +789,7 @@ std::vector<uint64_t> collectLateLiftableOutputRootClosureTargets(
 }
 
 unsigned lateLiftTargets(llvm::ArrayRef<uint64_t> targets,
-                         BlockLifter &block_lifter,
+                         RemillProjectionLifter &projection_lifter,
                          IterativeLiftingSession &session,
                          llvm::function_ref<bool(uint64_t)> has_defined_target,
                          llvm::function_ref<bool(uint64_t)> is_executable_target,
@@ -631,7 +802,7 @@ unsigned lateLiftTargets(llvm::ArrayRef<uint64_t> targets,
       continue;
     }
     scratch_targets.clear();
-    if (auto *lifted_fn = block_lifter.LiftBlock(pc, scratch_targets)) {
+    if (auto *lifted_fn = projection_lifter.LiftBlock(pc, scratch_targets)) {
       (void) lifted_fn;
       session.noteLiftedTarget(pc);
       ++lifted_count;

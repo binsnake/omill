@@ -11,6 +11,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/Transforms/Utils/Cloning.h>
+#include <set>
 
 #include "omill/Analysis/VirtualModel/Types.h"
 #include "omill/Utils/LiftedNames.h"
@@ -81,6 +82,60 @@ bool shouldLowerJumpEarly(const llvm::CallBase &call) {
   return true;
 }
 
+
+bool isLargeNoAbiLiftModule(const llvm::Module &M) {
+  auto *flag = M.getModuleFlag("omill.no_abi_mode");
+  auto *value = llvm::mdconst::dyn_extract_or_null<llvm::ConstantInt>(flag);
+  if (!value || value->getZExtValue() == 0)
+    return false;
+
+  unsigned lifted_count = 0;
+  for (auto &F : M) {
+    if (isLiftedFunction(F) && ++lifted_count >= 512)
+      return true;
+  }
+  return false;
+}
+
+bool isJumpInlineScopeSeed(const llvm::Function &F) {
+  return !F.isDeclaration() &&
+         (F.hasFnAttribute("omill.output_root") ||
+          F.hasFnAttribute("omill.internal_output_root") ||
+          F.hasFnAttribute("omill.closed_root_slice_root"));
+}
+
+std::set<llvm::Function *> collectReachableLiftedJumpInlineScope(
+    llvm::Module &M) {
+  std::set<llvm::Function *> reachable;
+  llvm::SmallVector<llvm::Function *, 32> worklist;
+
+  for (auto &F : M) {
+    if (!isJumpInlineScopeSeed(F))
+      continue;
+    if (reachable.insert(&F).second)
+      worklist.push_back(&F);
+  }
+
+  for (size_t i = 0; i < worklist.size(); ++i) {
+    auto *F = worklist[i];
+    for (auto &BB : *F) {
+      for (auto &I : BB) {
+        auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+        if (!CI)
+          continue;
+        auto *callee = CI->getCalledFunction();
+        if (!callee || callee->isDeclaration() || !isLiftedFunction(*callee))
+          continue;
+        if (reachable.insert(callee).second)
+          worklist.push_back(callee);
+      }
+    }
+  }
+
+  return reachable;
+}
+
+
 /// Connect disconnected jump table target blocks to the function's CFG by
 /// replacing non-constant __remill_jump calls with switches over the known
 /// target PCs.  Only creates switch cases for disconnected blocks (lifted from
@@ -113,20 +168,34 @@ unsigned lowerJumpsEarly(llvm::Function &F) {
       jt_targets.push_back({pc, BB});
   }
 
+  if (std::getenv("OMILL_DEBUG_INLINE_JUMP_TARGETS") != nullptr) {
+    llvm::errs() << "[inline-jump] function=" << F.getName()
+                 << " reachable=" << reachable.size()
+                 << " named_targets=" << named_pcs.size()
+                 << " disconnected=" << jt_targets.size() << "\n";
+  }
+
+
   if (jt_targets.empty())
     return 0;
 
-  // Collect __remill_jump calls with non-constant targets.
+  // Collect unresolved jump dispatcher calls with non-constant targets.
   // Constant-target jumps are left for Phase 3 LowerJump.
   llvm::SmallVector<llvm::CallInst *, 8> jump_calls;
   for (auto &BB : F)
     for (auto &I : BB)
       if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
         if (auto *callee = CI->getCalledFunction())
-          if (callee->getName() == "__remill_jump" &&
+          if (isDispatchJumpName(callee->getName()) &&
               !llvm::isa<llvm::ConstantInt>(CI->getArgOperand(1)) &&
               shouldLowerJumpEarly(*CI))
             jump_calls.push_back(CI);
+
+  if (std::getenv("OMILL_DEBUG_INLINE_JUMP_TARGETS") != nullptr) {
+    llvm::errs() << "[inline-jump] function=" << F.getName()
+                 << " jump_calls=" << jump_calls.size() << "\n";
+  }
+
 
   if (jump_calls.empty())
     return 0;
@@ -139,6 +208,8 @@ unsigned lowerJumpsEarly(llvm::Function &F) {
   auto *lifted_fn_ty = llvm::FunctionType::get(
       mem_ptr_ty, {state_ptr_ty, i64_ty, mem_ptr_ty}, false);
   auto &M = *F.getParent();
+
+  const bool exhaustive_disconnected_targets = (jump_calls.size() == 1);
 
   unsigned lowered = 0;
   for (auto *CI : jump_calls) {
@@ -153,7 +224,9 @@ unsigned lowerJumpsEarly(llvm::Function &F) {
 
     auto *fallback_bb = llvm::BasicBlock::Create(
         Ctx, "jump_dispatch_fallback", &F);
-    {
+    if (exhaustive_disconnected_targets) {
+      new llvm::UnreachableInst(Ctx, fallback_bb);
+    } else {
       llvm::IRBuilder<> FBBuilder(fallback_bb);
       auto dispatcher = M.getOrInsertFunction(
           canonicalDispatchIntrinsicName(DispatchIntrinsicKind::kJump, M),
@@ -188,6 +261,11 @@ unsigned lowerJumpsEarly(llvm::Function &F) {
         old_succ->removePredecessor(BB);
 
     ++lowered;
+  }
+
+  if (std::getenv("OMILL_DEBUG_INLINE_JUMP_TARGETS") != nullptr) {
+    llvm::errs() << "[inline-jump] lowered function=" << F.getName()
+                 << " lowered=" << lowered << "\n";
   }
 
   return lowered;
@@ -249,6 +327,17 @@ InlineJumpTargetsPass::run(llvm::Module &M,
   if (va_to_def.empty())
     return llvm::PreservedAnalyses::all();
 
+
+  const bool scope_large_noabi = isLargeNoAbiLiftModule(M);
+  std::set<llvm::Function *> scoped_lifted_fns;
+  if (scope_large_noabi)
+    scoped_lifted_fns = collectReachableLiftedJumpInlineScope(M);
+  auto isScopedLiftedFunction = [&](llvm::Function &F) {
+    if (!isLiftedFunction(F))
+      return false;
+    return !scope_large_noabi || scoped_lifted_fns.count(&F) != 0;
+  };
+
   // Step 2: Resolve declared stubs to their implementations.
   // e.g. declare @sub_1800600b0 → define @sub_1800600b0.2
   llvm::SmallVector<llvm::Function *, 4> stubs_to_erase;
@@ -286,7 +375,7 @@ InlineJumpTargetsPass::run(llvm::Module &M,
   // Must run BEFORE inlining so the switches are present in the inlined copies.
   llvm::SmallPtrSet<llvm::Function *, 4> jump_lowered_fns;
   for (auto &F : M) {
-    if (!isLiftedFunction(F))
+    if (!isScopedLiftedFunction(F))
       continue;
     if (lowerJumpsEarly(F)) {
       jump_lowered_fns.insert(&F);
@@ -307,9 +396,8 @@ InlineJumpTargetsPass::run(llvm::Module &M,
   while (did_inline) {
     did_inline = false;
     for (auto &F : M) {
-      if (!isLiftedFunction(F))
+      if (!isScopedLiftedFunction(F))
         continue;
-
       bool inlined_this_function = false;
       llvm::SmallVector<llvm::CallInst *, 8> calls_to_inline;
       for (auto &BB : F) {
@@ -347,7 +435,7 @@ InlineJumpTargetsPass::run(llvm::Module &M,
   // target lifting.  These disconnected blocks confuse later passes (SROA,
   // PromoteStateToSSA) and can cause SEH crashes.
   for (auto &F : M) {
-    if (!isLiftedFunction(F))
+    if (!isScopedLiftedFunction(F))
       continue;
     if (llvm::EliminateUnreachableBlocks(F))
       changed = true;

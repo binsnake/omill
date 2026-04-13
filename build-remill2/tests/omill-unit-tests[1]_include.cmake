@@ -1,0 +1,5 @@
+if(EXISTS "D:/binsnake/omill/build-remill2/tests/omill-unit-tests[1]_tests.cmake")
+  include("D:/binsnake/omill/build-remill2/tests/omill-unit-tests[1]_tests.cmake")
+else()
+  add_test(omill-unit-tests_NOT_BUILT omill-unit-tests_NOT_BUILT)
+endif()

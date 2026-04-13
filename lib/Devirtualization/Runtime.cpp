@@ -7,6 +7,7 @@
 #include <llvm/ADT/StringSet.h>
 #include <llvm/AsmParser/Parser.h>
 #include <llvm/IR/Function.h>
+#include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
@@ -16,6 +17,7 @@
 #include <llvm/Support/SourceMgr.h>
 #include <llvm/Support/raw_ostream.h>
 
+#include <functional>
 #include <algorithm>
 #include <cstring>
 #include <map>
@@ -412,29 +414,65 @@ llvm::SmallVector<uint64_t, 16> parseLocalizedContinuationCalleePcs(
   return callee_pcs;
 }
 
-llvm::SmallVector<uint64_t, 16> parseRootSliceFrontierTargetPcs(
+
+struct ParsedRootSliceFrontierEdge {
+  std::string source_handler_name;
+  std::optional<uint64_t> target_pc;
+  VirtualExitDisposition exit_disposition = VirtualExitDisposition::kUnknown;
+};
+
+std::optional<uint64_t> parseFrontierPcValue(llvm::StringRef value) {
+  if (value.empty())
+    return std::nullopt;
+  llvm::StringRef hex = value.trim();
+  if (hex.consume_front("0x"))
+    ;
+  uint64_t pc = 0;
+  if (hex.getAsInteger(16, pc))
+    return std::nullopt;
+  return pc;
+}
+
+VirtualExitDisposition parseFrontierExitDisposition(llvm::StringRef value) {
+  auto text = value.trim();
+  if (text == "vm_exit_terminal")
+    return VirtualExitDisposition::kVmExitTerminal;
+  if (text == "vm_exit_native_call_reenter")
+    return VirtualExitDisposition::kVmExitNativeCallReenter;
+  if (text == "vm_exit_native_exec_unknown_return")
+    return VirtualExitDisposition::kVmExitNativeExecUnknownReturn;
+  if (text == "vm_enter")
+    return VirtualExitDisposition::kVmEnter;
+  if (text == "nested_vm_enter")
+    return VirtualExitDisposition::kNestedVmEnter;
+  if (text == "stay_in_vm")
+    return VirtualExitDisposition::kStayInVm;
+  return VirtualExitDisposition::kUnknown;
+}
+
+bool frontierExitDispositionModelsBoundary(VirtualExitDisposition disposition) {
+  switch (disposition) {
+    case VirtualExitDisposition::kVmExitNativeCallReenter:
+    case VirtualExitDisposition::kVmExitNativeExecUnknownReturn:
+    case VirtualExitDisposition::kVmEnter:
+    case VirtualExitDisposition::kNestedVmEnter:
+      return true;
+    case VirtualExitDisposition::kUnknown:
+    case VirtualExitDisposition::kStayInVm:
+    case VirtualExitDisposition::kVmExitTerminal:
+      return false;
+  }
+  return false;
+}
+
+llvm::SmallVector<ParsedRootSliceFrontierEdge, 16> parseRootSliceFrontierEdges(
     llvm::StringRef model_text, uint64_t root_pc) {
-  llvm::SmallVector<uint64_t, 16> target_pcs;
-  llvm::DenseSet<uint64_t> seen_pcs;
+  llvm::SmallVector<ParsedRootSliceFrontierEdge, 16> edges;
+  llvm::StringSet<> seen_keys;
   llvm::SmallVector<llvm::StringRef, 128> lines;
   model_text.split(lines, '\n');
 
   bool in_root_block = false;
-  auto add_pc = [&](llvm::StringRef value) {
-    if (value.empty())
-      return;
-    llvm::StringRef hex = value;
-    if (hex.consume_front("0x"))
-      ;
-    uint64_t pc = 0;
-    if (hex.getAsInteger(16, pc))
-      return;
-    if (pc == root_pc)
-      return;
-    if (seen_pcs.insert(pc).second)
-      target_pcs.push_back(pc);
-  };
-
   const std::string prefix =
       (llvm::Twine("root-slice root=0x") + llvm::utohexstr(root_pc)).str();
   for (auto line : lines) {
@@ -445,29 +483,61 @@ llvm::SmallVector<uint64_t, 16> parseRootSliceFrontierTargetPcs(
     }
     if (!in_root_block)
       continue;
-    if (trimmed.starts_with("frontier ")) {
-      if (auto target = parseQuotedAttrValueFromLine(trimmed, "target")) {
-        add_pc(*target);
-        continue;
-      }
-      constexpr llvm::StringLiteral pattern = "target=";
-      size_t pos = trimmed.find(pattern);
-      if (pos != llvm::StringRef::npos) {
-        pos += pattern.size();
-        size_t end = pos;
-        while (end < trimmed.size() && !llvm::isSpace(trimmed[end]))
-          ++end;
-        add_pc(trimmed.slice(pos, end));
-      }
-      continue;
-    }
     if (trimmed.starts_with("region ") || trimmed.starts_with("root-slice ") ||
         trimmed.starts_with("slot ") || trimmed.starts_with("handler ") ||
         trimmed.empty()) {
       in_root_block = false;
+      continue;
     }
+    if (!trimmed.starts_with("frontier "))
+      continue;
+
+    auto remainder = trimmed.drop_front(strlen("frontier ")).trim();
+    size_t handler_end = 0;
+    while (handler_end < remainder.size() && !llvm::isSpace(remainder[handler_end]))
+      ++handler_end;
+    auto handler_name = remainder.take_front(handler_end).trim();
+    if (handler_name.empty())
+      continue;
+
+    ParsedRootSliceFrontierEdge edge;
+    edge.source_handler_name = handler_name.str();
+    if (auto target = parseQuotedAttrValueFromLine(trimmed, "target"))
+      edge.target_pc = parseFrontierPcValue(*target);
+    if (!edge.target_pc) {
+      constexpr llvm::StringLiteral target_pattern = "target=";
+      size_t pos = trimmed.find(target_pattern);
+      if (pos != llvm::StringRef::npos) {
+        pos += target_pattern.size();
+        size_t end = pos;
+        while (end < trimmed.size() && !llvm::isSpace(trimmed[end]))
+          ++end;
+        edge.target_pc = parseFrontierPcValue(trimmed.slice(pos, end));
+      }
+    }
+    if (auto exit = parseQuotedAttrValueFromLine(trimmed, "exit"))
+      edge.exit_disposition = parseFrontierExitDisposition(*exit);
+    if (edge.exit_disposition == VirtualExitDisposition::kUnknown) {
+      constexpr llvm::StringLiteral exit_pattern = "exit=";
+      size_t pos = trimmed.find(exit_pattern);
+      if (pos != llvm::StringRef::npos) {
+        pos += exit_pattern.size();
+        size_t end = pos;
+        while (end < trimmed.size() && !llvm::isSpace(trimmed[end]))
+          ++end;
+        edge.exit_disposition =
+            parseFrontierExitDisposition(trimmed.slice(pos, end));
+      }
+    }
+
+    std::string key = edge.source_handler_name + ":";
+    key += edge.target_pc ? llvm::utohexstr(*edge.target_pc) : "none";
+    key += ":" + std::to_string(static_cast<int>(edge.exit_disposition));
+    if (!seen_keys.insert(key).second)
+      continue;
+    edges.push_back(std::move(edge));
   }
-  return target_pcs;
+  return edges;
 }
 
 llvm::Function *findImportedRootByPc(llvm::Module &M, uint64_t pc) {
@@ -477,7 +547,76 @@ llvm::Function *findImportedRootByPc(llvm::Module &M, uint64_t pc) {
   }
   if (auto *fn = findLiftedOrBlockFunctionByPC(M, pc); fn && !fn->isDeclaration())
     return fn;
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    if (auto fact = readExecutableTargetFact(F);
+        fact && fact->raw_target_pc == pc) {
+      return &F;
+    }
+  }
   return nullptr;
+}
+
+std::optional<uint64_t> preferredExecutableRedirectPc(
+    const ExecutableTargetFact &fact) {
+  if (fact.effective_target_pc && *fact.effective_target_pc != fact.raw_target_pc)
+    return fact.effective_target_pc;
+  if (fact.canonical_owner_pc && *fact.canonical_owner_pc != fact.raw_target_pc)
+    return fact.canonical_owner_pc;
+  return std::nullopt;
+}
+
+std::optional<uint64_t> findExecutablePlaceholderRedirectPc(
+    llvm::Function &root) {
+  if (root.isDeclaration())
+    return std::nullopt;
+
+  llvm::CallBase *returned_call = nullptr;
+  for (auto &BB : root) {
+    for (auto &I : BB) {
+      if (I.isDebugOrPseudoInst())
+        continue;
+      if (auto *CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
+        if (returned_call)
+          return std::nullopt;
+        returned_call = CB;
+        continue;
+      }
+      if (auto *RI = llvm::dyn_cast<llvm::ReturnInst>(&I)) {
+        if (!returned_call || RI->getReturnValue() != returned_call)
+          return std::nullopt;
+        auto *callee = returned_call->getCalledFunction();
+        if (!callee)
+          return std::nullopt;
+        if (auto fact = readExecutableTargetFact(*callee))
+          return preferredExecutableRedirectPc(*fact);
+        return std::nullopt;
+      }
+      return std::nullopt;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<uint64_t> findImportedExecutableRedirectPc(llvm::Module &M,
+                                                          uint64_t requested_pc) {
+  for (auto &F : M) {
+    auto fact = readExecutableTargetFact(F);
+    if (!fact)
+      continue;
+    if (fact->raw_target_pc != requested_pc &&
+        (!fact->invalidated_entry_source_pc ||
+         *fact->invalidated_entry_source_pc != requested_pc)) {
+      continue;
+    }
+    auto redirect_pc = preferredExecutableRedirectPc(*fact);
+    if (!redirect_pc)
+      continue;
+    if (findImportedRootByPc(M, *redirect_pc))
+      return redirect_pc;
+  }
+  return std::nullopt;
 }
 
 bool isTrustedExecutableFact(const ExecutableTargetFact &fact) {
@@ -766,9 +905,57 @@ ChildLiftArtifact analyzeChildLiftArtifact(llvm::LLVMContext &llvm_context,
     return artifact;
   }
 
-  const uint64_t selected_root_pc =
+  uint64_t selected_root_pc =
       artifact.selected_root_pc.value_or(artifact.target_pc);
   auto *selected_root = findImportedRootByPc(*imported_module, selected_root_pc);
+  if (!selected_root) {
+    if (auto redirected_pc =
+            findImportedExecutableRedirectPc(*imported_module, selected_root_pc)) {
+      selected_root_pc = *redirected_pc;
+      selected_root = findImportedRootByPc(*imported_module, selected_root_pc);
+      artifact.selected_root_was_retargeted = true;
+      artifact.selected_root_selection_detail =
+          (llvm::Twine("redirected_invalidated_entry_to=0x") +
+           llvm::utohexstr(selected_root_pc))
+              .str();
+    }
+  }
+  if (selected_root) {
+    if (auto redirected_pc = findExecutablePlaceholderRedirectPc(*selected_root)) {
+      if (auto *redirected_root =
+              findImportedRootByPc(*imported_module, *redirected_pc);
+          redirected_root) {
+        selected_root_pc = *redirected_pc;
+        selected_root = redirected_root;
+        artifact.selected_root_was_retargeted = true;
+        artifact.selected_root_selection_detail =
+            (llvm::Twine("redirected_placeholder_wrapper_to=0x") +
+             llvm::utohexstr(selected_root_pc))
+                .str();
+      }
+    }
+  }
+  if (auto *target_root = findImportedRootByPc(*imported_module, artifact.target_pc)) {
+    if (auto redirected_pc = findExecutablePlaceholderRedirectPc(*target_root)) {
+      appendUniquePc(artifact.localized_continuation_targets, *redirected_pc);
+      if (auto *redirected_root =
+              findImportedRootByPc(*imported_module, *redirected_pc);
+          redirected_root && selected_root_pc != *redirected_pc) {
+        selected_root_pc = *redirected_pc;
+        selected_root = redirected_root;
+        artifact.selected_root_was_retargeted = true;
+        artifact.selected_root_is_trusted_entry = true;
+        artifact.import_safety = ChildImportClass::kTrustedTerminalEntry;
+        artifact.rejection_reason = RecoveryRejectionReason::kNone;
+        artifact.rejection_detail.clear();
+        artifact.selected_root_selection_detail =
+            (llvm::Twine("preferred_target_wrapper_redirect_to=0x") +
+             llvm::utohexstr(selected_root_pc))
+                .str();
+      }
+    }
+  }
+
   if (!selected_root) {
     artifact.rejection_reason = RecoveryRejectionReason::kMissingRoot;
     artifact.rejection_detail = "selected_root_missing";
@@ -786,14 +973,27 @@ ChildLiftArtifact analyzeChildLiftArtifact(llvm::LLVMContext &llvm_context,
   for (const auto &name :
        parseClosedRootSliceHandlerNames(artifact.model_text, selected_root_pc)) {
     artifact.closed_slice_function_names.push_back(name);
+  if (!artifact.selected_root_name.empty()) {
+    const bool selected_root_recorded = llvm::is_contained(
+        artifact.closed_slice_function_names, artifact.selected_root_name);
+    if (!selected_root_recorded)
+      artifact.closed_slice_function_names.push_back(artifact.selected_root_name);
+  }
   }
   for (uint64_t pc :
        parseLocalizedContinuationCalleePcs(artifact.model_text, selected_root_pc)) {
     appendUniquePc(artifact.localized_continuation_targets, pc);
   }
-  for (uint64_t pc :
-       parseRootSliceFrontierTargetPcs(artifact.model_text, selected_root_pc)) {
-    appendUniquePc(artifact.frontier_target_pcs, pc);
+  auto frontier_edges = parseRootSliceFrontierEdges(artifact.model_text,
+                                                    selected_root_pc);
+  llvm::StringSet<> frontier_source_handlers;
+  for (const auto &edge : frontier_edges) {
+    frontier_source_handlers.insert(edge.source_handler_name);
+    if (edge.target_pc) {
+      appendUniquePc(artifact.frontier_target_pcs, *edge.target_pc);
+      if (frontierExitDispositionModelsBoundary(edge.exit_disposition))
+        appendUniquePc(artifact.modeled_boundary_targets, *edge.target_pc);
+    }
   }
   if (auto fact = readExecutableTargetFact(*selected_root))
     artifact.selected_root_is_trusted_entry = isTrustedExecutableFact(*fact);
@@ -824,30 +1024,38 @@ ChildLiftArtifact analyzeChildLiftArtifact(llvm::LLVMContext &llvm_context,
           callee->getName().starts_with("__remill_")) {
         artifact.has_runtime_leak = true;
       }
-      if (!callee->isIntrinsic() && !callee->getName().starts_with("__remill_"))
-        saw_non_intrinsic_call = true;
+      if (!callee->isIntrinsic() && !callee->getName().starts_with("__remill_")) {
+        if (!(readExecutableTargetFact(*callee) && !callee->isDeclaration()))
+          saw_non_intrinsic_call = true;
+      }
     }
   }
 
-  auto isStructuralImportedFunction = [&](llvm::StringRef name) {
-    return name.starts_with("sub_") || name.starts_with("blk_") ||
-           name.starts_with("block_") || name.starts_with("__lifted_");
-  };
   llvm::StringSet<> allowed_slice_names;
   for (const auto &name : artifact.closed_slice_function_names)
     allowed_slice_names.insert(name);
 
   llvm::SmallVector<llvm::Function *, 16> closure_worklist;
   llvm::SmallPtrSet<llvm::Function *, 16> closure_visited;
+  llvm::SmallPtrSet<llvm::Function *, 16> frontier_derived_functions;
   llvm::StringSet<> seen_decl_callees;
   closure_worklist.push_back(selected_root);
   while (!closure_worklist.empty()) {
     auto *F = closure_worklist.pop_back_val();
     if (!F || F->isDeclaration() || !closure_visited.insert(F).second)
       continue;
+    const bool frontier_modeled_path =
+        frontier_source_handlers.contains(F->getName()) ||
+        frontier_derived_functions.contains(F);
+    const bool same_selected_pc_clone =
+        extractEntryVA(F->getName()) == selected_root_pc ||
+        extractBlockPC(F->getName()) == selected_root_pc;
     if (!allowed_slice_names.empty() &&
-        isStructuralImportedFunction(F->getName()) &&
-        !allowed_slice_names.count(F->getName())) {
+        (F->getName().starts_with("sub_") || F->getName().starts_with("blk_") ||
+         F->getName().starts_with("block_") ||
+         F->getName().starts_with("__lifted_")) &&
+        !allowed_slice_names.count(F->getName()) && !same_selected_pc_clone &&
+        !frontier_modeled_path) {
       artifact.rejection_reason = RecoveryRejectionReason::kDisallowedFunction;
       artifact.rejection_detail = "disallowed_slice_function";
       artifact.import_safety = ChildImportClass::kUnsupported;
@@ -860,6 +1068,24 @@ ChildLiftArtifact analyzeChildLiftArtifact(llvm::LLVMContext &llvm_context,
         if (!callee)
           continue;
         if (callee->isDeclaration()) {
+          const uint64_t target_pc = extractStructuralCodeTargetPC(*callee);
+          if (callee->getName().starts_with("omill_executable_target_")) {
+            if (target_pc) {
+              if (frontier_modeled_path)
+                appendUniquePc(artifact.frontier_target_pcs, target_pc);
+              else
+                appendUniquePc(artifact.modeled_executable_targets, target_pc);
+            }
+            continue;
+          }
+          if (callee->getName().starts_with("omill_native_target_") ||
+              callee->getName().starts_with("omill_native_boundary_") ||
+              callee->getName().starts_with("omill_vm_enter_target_") ||
+              callee->getName().starts_with("omill_vm_enter_boundary_")) {
+            if (target_pc)
+              appendUniquePc(artifact.modeled_boundary_targets, target_pc);
+            continue;
+          }
           if (!callee->isIntrinsic() &&
               !callee->getName().starts_with("llvm.")) {
             if (isLoweringHelperCalleeName(callee->getName())) {
@@ -870,6 +1096,11 @@ ChildLiftArtifact analyzeChildLiftArtifact(llvm::LLVMContext &llvm_context,
               artifact.reachable_declaration_callees.push_back(
                   callee->getName().str());
             }
+          }
+          if (frontier_modeled_path &&
+              (callee->getName() == "__remill_jump" ||
+               callee->getName() == "__remill_function_call")) {
+            continue;
           }
           if (callee->getName() == "__remill_jump")
             artifact.has_remill_jump = true;
@@ -885,28 +1116,20 @@ ChildLiftArtifact analyzeChildLiftArtifact(llvm::LLVMContext &llvm_context,
           }
           continue;
         }
+        if (auto fact = readExecutableTargetFact(*callee);
+            fact && fact->raw_target_pc) {
+          if (frontier_modeled_path)
+            appendUniquePc(artifact.frontier_target_pcs, fact->raw_target_pc);
+          else
+            appendUniquePc(artifact.modeled_executable_targets, fact->raw_target_pc);
+        }
+        if (frontier_modeled_path)
+          frontier_derived_functions.insert(callee);
         closure_worklist.push_back(callee);
       }
     }
   }
 
-  for (auto &F : *imported_module) {
-    if (!F.isDeclaration())
-      continue;
-    const uint64_t target_pc = extractStructuralCodeTargetPC(F);
-    if (!target_pc)
-      continue;
-    if (F.getName().starts_with("omill_executable_target_")) {
-      appendUniquePc(artifact.modeled_executable_targets, target_pc);
-      continue;
-    }
-    if (F.getName().starts_with("omill_native_target_") ||
-        F.getName().starts_with("omill_native_boundary_") ||
-        F.getName().starts_with("omill_vm_enter_target_") ||
-        F.getName().starts_with("omill_vm_enter_boundary_")) {
-      appendUniquePc(artifact.modeled_boundary_targets, target_pc);
-    }
-  }
 
   artifact.selected_root_is_terminal_only =
       saw_return && !saw_non_intrinsic_call &&
@@ -942,7 +1165,7 @@ ChildLiftArtifact analyzeChildLiftArtifact(llvm::LLVMContext &llvm_context,
     artifact.import_safety = ChildImportClass::kTrustedTerminalEntry;
     artifact.rejection_reason = RecoveryRejectionReason::kNone;
     artifact.rejection_detail.clear();
-  } else if (closed_slice_root_pc) {
+  } else if (closed_slice_root_pc && !artifact.selected_root_is_self_loop_only) {
     artifact.import_safety = ChildImportClass::kClosedSliceRoot;
     artifact.rejection_reason = RecoveryRejectionReason::kNone;
     artifact.rejection_detail.clear();
@@ -1035,7 +1258,8 @@ ChildImportPlan buildVmEnterChildImportPlan(const ChildLiftArtifact &artifact) {
   if (artifact.import_safety == ChildImportClass::kTrustedTerminalEntry ||
       artifact.import_safety == ChildImportClass::kBoundaryModeledChild ||
       (artifact.import_safety == ChildImportClass::kClosedSliceRoot &&
-       artifact.selected_root_is_terminal_modeled)) {
+       artifact.selected_root_is_terminal_modeled &&
+       !artifact.selected_root_is_self_loop_only)) {
     plan.eligibility = ImportEligibility::kImportable;
     plan.rejection_reason = RecoveryRejectionReason::kNone;
     return plan;
@@ -1059,13 +1283,206 @@ ChildImportPlan buildVmEnterChildImportPlan(const ChildLiftArtifact &artifact) {
   return plan;
 }
 
-std::optional<ContinuationProof> findContinuationProofForTarget(
+
+std::optional<ContinuationProof> synthesizeContinuationProofFromBoundary(
     const DevirtualizationOrchestrator &orchestrator, uint64_t target_pc) {
+  auto singletonSolvedTarget = [](const SessionEdgeFact &edge)
+      -> std::optional<uint64_t> {
+    if (!edge.solver_metadata ||
+        edge.solver_metadata->possible_target_pcs.size() != 1) {
+      return std::nullopt;
+    }
+    return edge.solver_metadata->possible_target_pcs.front();
+  };
+
+  for (const auto &[identity, edge] : orchestrator.session().graph.edge_facts_by_identity) {
+    (void)identity;
+    if (!edge.boundary)
+      continue;
+    const auto &boundary = *edge.boundary;
+    std::optional<uint64_t> continuation_target;
+    if (boundary.continuation_entry_transform &&
+        boundary.continuation_entry_transform->jump_target_pc) {
+      continuation_target = boundary.continuation_entry_transform->jump_target_pc;
+    } else if (boundary.continuation_pc) {
+      continuation_target = boundary.continuation_pc;
+    }
+    const auto solved_target = singletonSolvedTarget(edge);
+    const bool matches_raw_target =
+        continuation_target && *continuation_target == target_pc;
+    const bool matches_solved_target =
+        solved_target && *solved_target == target_pc;
+    if ((!matches_raw_target && !matches_solved_target) ||
+        !boundary.suppresses_normal_fallthrough) {
+      continue;
+    }
+    ContinuationProof proof;
+    proof.edge_identity = edge.identity;
+    proof.raw_target_pc = continuation_target.value_or(target_pc);
+    proof.effective_target_pc = solved_target.value_or(target_pc);
+    proof.source_handler_name = edge.owner_function;
+    proof.provenance = ContinuationProvenance::kReturnAddressControlled;
+    proof.confidence = solved_target ? ContinuationConfidence::kTrusted
+                                     : edge.continuation_proof
+                                           ? edge.continuation_proof->confidence
+                                           : ContinuationConfidence::kWeak;
+    proof.liveness = solved_target ? ContinuationLiveness::kLive
+                                   : edge.continuation_proof
+                                         ? edge.continuation_proof->liveness
+                                         : ContinuationLiveness::kLive;
+    proof.scheduling_class = solved_target
+                                 ? FrontierSchedulingClass::kTrustedLive
+                                 : edge.continuation_proof
+                                       ? edge.continuation_proof->scheduling_class
+                                       : FrontierSchedulingClass::kNativeOrVmEnterBoundary;
+    proof.resolution_kind = ContinuationResolutionKind::kBoundaryModeled;
+    proof.import_disposition = ContinuationImportDisposition::kRetryable;
+    proof.selected_root_import_class = ChildImportClass::kBoundedContinuationSlice;
+    proof.return_address_control_kind = boundary.return_address_control_kind;
+    proof.controlled_return_pc = boundary.controlled_return_pc;
+    proof.suppresses_normal_fallthrough = boundary.suppresses_normal_fallthrough;
+    proof.rationale = solved_target
+                          ? "synthesized_from_boundary_solver_singleton"
+                          : "synthesized_from_boundary_fact";
+    return proof;
+  }
+  return std::nullopt;
+}
+
+
+struct ContinuationProofCacheBucket {
+  uint64_t revision = 0;
+  std::map<uint64_t, std::optional<ContinuationProof>> proofs;
+};
+
+ContinuationProofCacheBucket &continuationProofCacheBucket(
+    const SessionGraphState &graph) {
+  static std::map<const SessionGraphState *, ContinuationProofCacheBucket>
+      buckets;
+  auto &bucket = buckets[&graph];
+  if (bucket.revision != graph.edge_fact_revision) {
+    bucket.revision = graph.edge_fact_revision;
+    bucket.proofs.clear();
+  }
+  return bucket;
+}
+
+std::optional<ContinuationProof> computeContinuationProofForTarget(
+    const DevirtualizationOrchestrator &orchestrator, uint64_t target_pc) {
+  auto proofMatchesTarget = [&](const ContinuationProof &proof) {
+    if (proof.raw_target_pc == target_pc)
+      return true;
+    if (proof.effective_target_pc && *proof.effective_target_pc == target_pc)
+      return true;
+    if (proof.selected_root_pc && *proof.selected_root_pc == target_pc)
+      return true;
+    return false;
+  };
+  auto singletonSolvedTarget = [](const SessionEdgeFact &edge)
+      -> std::optional<uint64_t> {
+    if (!edge.solver_metadata ||
+        edge.solver_metadata->possible_target_pcs.size() != 1) {
+      return std::nullopt;
+    }
+    return edge.solver_metadata->possible_target_pcs.front();
+  };
+  auto edgeMatchesTarget = [&](const SessionEdgeFact &edge) -> bool {
+    if (edge.target_pc && *edge.target_pc == target_pc)
+      return true;
+    if (edge.executable_target && edge.executable_target->effective_target_pc &&
+        *edge.executable_target->effective_target_pc == target_pc) {
+      return true;
+    }
+    if (edge.continuation_proof) {
+      if (edge.continuation_proof->raw_target_pc == target_pc)
+        return true;
+      if (edge.continuation_proof->effective_target_pc &&
+          *edge.continuation_proof->effective_target_pc == target_pc) {
+        return true;
+      }
+    }
+    if (auto solved_target = singletonSolvedTarget(edge);
+        solved_target && *solved_target == target_pc) {
+      return true;
+    }
+    return false;
+  };
+  auto synthesizeFromSolverSingleton =
+      [&](const SessionEdgeFact &edge) -> std::optional<ContinuationProof> {
+    const auto solved_target = singletonSolvedTarget(edge);
+    if (!solved_target)
+      return std::nullopt;
+    if (!edgeMatchesTarget(edge))
+      return std::nullopt;
+
+    ContinuationProof proof;
+    proof.edge_identity = edge.identity;
+    proof.raw_target_pc = edge.target_pc.value_or(target_pc);
+    proof.effective_target_pc = *solved_target;
+    proof.source_handler_name = edge.owner_function;
+    proof.confidence = ContinuationConfidence::kTrusted;
+    proof.liveness = ContinuationLiveness::kLive;
+    proof.scheduling_class = FrontierSchedulingClass::kTrustedLive;
+    proof.import_disposition = ContinuationImportDisposition::kRetryable;
+
+    if (edge.executable_target &&
+        edge.executable_target->canonical_owner_pc) {
+      proof.canonical_owner_pc = edge.executable_target->canonical_owner_pc;
+    }
+
+    if (edge.boundary) {
+      proof.provenance =
+          edge.boundary->suppresses_normal_fallthrough &&
+                  edge.boundary->return_address_control_kind !=
+                      VirtualReturnAddressControlKind::kUnknown
+              ? ContinuationProvenance::kReturnAddressControlled
+              : (edge.boundary->is_vm_enter || edge.boundary->is_nested_vm_enter ||
+                         edge.boundary->kind == BoundaryKind::kVmEnterBoundary ||
+                         edge.boundary->kind ==
+                             BoundaryKind::kNestedVmEnterBoundary
+                     ? ContinuationProvenance::kVmEnterBoundary
+                     : ContinuationProvenance::kNativeBoundary);
+      proof.resolution_kind = ContinuationResolutionKind::kBoundaryModeled;
+      proof.selected_root_import_class =
+          ChildImportClass::kBoundedContinuationSlice;
+      proof.return_address_control_kind =
+          edge.boundary->return_address_control_kind;
+      proof.controlled_return_pc = edge.boundary->controlled_return_pc;
+      proof.suppresses_normal_fallthrough =
+          edge.boundary->suppresses_normal_fallthrough;
+    } else if (edge.executable_target &&
+               edge.executable_target->invalidated_executable_entry) {
+      proof.provenance =
+          ContinuationProvenance::kInvalidatedExecutableEntry;
+      proof.resolution_kind =
+          ContinuationResolutionKind::kInvalidatedExecutableEntry;
+      proof.selected_root_import_class = ChildImportClass::kClosedSliceRoot;
+      proof.is_invalidated_entry = true;
+    } else if (edge.executable_target &&
+               edge.executable_target->exact_fallthrough_target) {
+      proof.provenance = ContinuationProvenance::kExactFallthrough;
+      proof.resolution_kind = ContinuationResolutionKind::kExactFallthrough;
+      proof.import_disposition = ContinuationImportDisposition::kImportable;
+      proof.selected_root_import_class = ChildImportClass::kTrustedTerminalEntry;
+      proof.is_trusted_entry = true;
+      proof.is_exact_fallthrough = true;
+    } else {
+      proof.provenance = ContinuationProvenance::kExecutablePlaceholder;
+      proof.resolution_kind = ContinuationResolutionKind::kTrustedEntry;
+      proof.selected_root_import_class = ChildImportClass::kClosedSliceRoot;
+      proof.is_trusted_entry = true;
+    }
+
+    proof.rationale = "synthesized_from_solver_singleton";
+    return proof;
+  };
+
   const auto &session = orchestrator.session();
   const SessionEdgeFact *best_edge = nullptr;
+  std::optional<ContinuationProof> best_solver_proof;
   for (const auto &[identity, edge] : session.graph.edge_facts_by_identity) {
     (void)identity;
-    if (!edge.target_pc || *edge.target_pc != target_pc)
+    if (!edgeMatchesTarget(edge))
       continue;
     if (!best_edge ||
         edge.scheduling_class < best_edge->scheduling_class ||
@@ -1073,14 +1490,36 @@ std::optional<ContinuationProof> findContinuationProofForTarget(
       best_edge = &edge;
     }
     if (edge.continuation_proof &&
+        proofMatchesTarget(*edge.continuation_proof) &&
         edge.continuation_proof->import_disposition ==
             ContinuationImportDisposition::kImportable) {
       return edge.continuation_proof;
     }
+    if (!best_solver_proof) {
+      best_solver_proof = synthesizeFromSolverSingleton(edge);
+    }
   }
-  if (best_edge && best_edge->continuation_proof)
+  if (best_solver_proof &&
+      (!best_edge || !best_edge->continuation_proof ||
+       best_edge->continuation_proof->confidence !=
+           ContinuationConfidence::kTrusted)) {
+    return best_solver_proof;
+  }
+  if (best_edge && best_edge->continuation_proof &&
+      proofMatchesTarget(*best_edge->continuation_proof)) {
     return best_edge->continuation_proof;
-  return std::nullopt;
+  }
+  return synthesizeContinuationProofFromBoundary(orchestrator, target_pc);
+}
+
+std::optional<ContinuationProof> findContinuationProofForTarget(
+    const DevirtualizationOrchestrator &orchestrator, uint64_t target_pc) {
+  auto &bucket = continuationProofCacheBucket(orchestrator.session().graph);
+  if (auto it = bucket.proofs.find(target_pc); it != bucket.proofs.end())
+    return it->second;
+  auto proof = computeContinuationProofForTarget(orchestrator, target_pc);
+  bucket.proofs.emplace(target_pc, proof);
+  return proof;
 }
 
 std::map<uint64_t, std::vector<LearnedOutgoingEdge>> collectLearnedOutgoingEdges(
@@ -1114,10 +1553,25 @@ std::map<uint64_t, std::vector<LearnedOutgoingEdge>> collectLearnedOutgoingEdges
 void mergeResolvedProofIntoSession(DevirtualizationOrchestrator &orchestrator,
                                    uint64_t target_pc,
                                    const ContinuationProof &proof) {
+  bool revised = false;
+  auto matches_target = [&](const SessionEdgeFact &edge) {
+    if (edge.target_pc && *edge.target_pc == target_pc)
+      return true;
+    if (edge.executable_target && edge.executable_target->effective_target_pc &&
+        *edge.executable_target->effective_target_pc == target_pc) {
+      return true;
+    }
+    if (edge.solver_metadata &&
+        edge.solver_metadata->possible_target_pcs.size() == 1 &&
+        edge.solver_metadata->possible_target_pcs.front() == target_pc) {
+      return true;
+    }
+    return false;
+  };
   for (auto &[identity, edge] :
        orchestrator.session().graph.edge_facts_by_identity) {
     (void)identity;
-    if (!edge.target_pc || *edge.target_pc != target_pc)
+    if (!matches_target(edge))
       continue;
     edge.continuation_proof = proof;
     edge.continuation_confidence = proof.confidence;
@@ -1125,8 +1579,81 @@ void mergeResolvedProofIntoSession(DevirtualizationOrchestrator &orchestrator,
     edge.scheduling_class = proof.scheduling_class;
     if (!proof.rationale.empty())
       edge.continuation_rationale = proof.rationale;
+    revised = true;
   }
+  if (revised)
+    ++orchestrator.session().graph.edge_fact_revision;
 }
+
+void emitPreciseLog(const OutputRecoveryOptions &options,
+                    const OutputRecoveryCallbacks &callbacks,
+                    llvm::StringRef component, llvm::StringRef stage,
+                    llvm::StringRef message,
+                    std::optional<uint64_t> target_pc,
+                    std::optional<unsigned> round,
+                    std::optional<std::string> detail);
+
+
+bool shouldAttemptBoundedSnapshotImport(
+    const OutputRecoveryOptions &options,
+    const OutputRecoveryCallbacks &callbacks,
+    const std::optional<ContinuationResolutionResult> &resolution) {
+  if (!options.no_abi || !options.use_block_lifting ||
+      !callbacks.import_executable_snapshot_slice || !resolution) {
+    return false;
+  }
+  if (resolution->disposition !=
+          ContinuationResolutionDisposition::kRetryableOpenRegion ||
+      resolution->region_snapshot.blocks_by_pc.empty()) {
+    return false;
+  }
+  return resolution->region_snapshot.entry_pc != 0;
+}
+
+std::optional<ChildImportPlan> tryImportBoundedSnapshotContinuation(
+    uint64_t target_pc, const OutputRecoveryOptions &options,
+    const OutputRecoveryCallbacks &callbacks,
+    const std::optional<ContinuationProof> &proof,
+    const std::optional<ContinuationResolutionResult> &resolution,
+    llvm::StringRef precise_stage, llvm::StringRef precise_message) {
+  if (!shouldAttemptBoundedSnapshotImport(options, callbacks, resolution))
+    return std::nullopt;
+
+  ChildImportPlan snapshot_plan;
+  snapshot_plan.target_pc = target_pc;
+  snapshot_plan.eligibility = ImportEligibility::kImportable;
+  snapshot_plan.rejection_reason = RecoveryRejectionReason::kNone;
+  snapshot_plan.selected_root_pc =
+      resolution->updated_proof.selected_root_pc.value_or(
+          resolution->region_snapshot.entry_pc);
+  snapshot_plan.import_class = ChildImportClass::kBoundedContinuationSlice;
+  snapshot_plan.proof = proof;
+
+  emitPreciseLog(
+      options, callbacks, "output-recovery", precise_stage, precise_message,
+      target_pc, std::nullopt,
+      (llvm::Twine("region=") +
+       llvm::Twine(toString(resolution->region_snapshot.closure_kind)) +
+       ",blocks=" +
+       llvm::Twine(resolution->region_snapshot.blocks_by_pc.size()))
+          .str());
+
+  auto plan = callbacks.import_executable_snapshot_slice(
+      target_pc, resolution->region_snapshot, snapshot_plan);
+  plan.target_pc = target_pc;
+  if (!plan.selected_root_pc)
+    plan.selected_root_pc = snapshot_plan.selected_root_pc;
+  if (!plan.import_class)
+    plan.import_class = snapshot_plan.import_class;
+  if (!plan.proof)
+    plan.proof = proof;
+  if (plan.eligibility == ImportEligibility::kImportable &&
+      plan.imported_root && !plan.selected_root_pc) {
+    plan.selected_root_pc = resolution->region_snapshot.entry_pc;
+  }
+  return plan;
+}
+
 
 ChildImportPlan planExecutableChildImport(
     uint64_t target_pc, const ChildLiftArtifact &artifact,
@@ -1164,12 +1691,13 @@ ChildImportPlan planExecutableChildImport(
   }
 
   if (resolution &&
-      (resolution->disposition ==
-           ContinuationResolutionDisposition::kImportableTrustedEntry ||
-       resolution->disposition ==
-           ContinuationResolutionDisposition::kImportableClosedSliceRoot ||
-       resolution->disposition ==
-           ContinuationResolutionDisposition::kBoundaryModeledChild)) {
+      ((resolution->disposition ==
+            ContinuationResolutionDisposition::kImportableClosedSliceRoot ||
+        resolution->disposition ==
+            ContinuationResolutionDisposition::kBoundaryModeledChild ||
+        resolution->disposition ==
+            ContinuationResolutionDisposition::kImportableTrustedEntry) &&
+       !artifact.selected_root_is_self_loop_only)) {
     plan.eligibility = ImportEligibility::kImportable;
     plan.rejection_reason = RecoveryRejectionReason::kNone;
     if (resolution->updated_proof.selected_root_import_class)
@@ -1180,8 +1708,9 @@ ChildImportPlan planExecutableChildImport(
   }
 
   if (artifact.import_safety == ChildImportClass::kTrustedTerminalEntry ||
-      artifact.import_safety == ChildImportClass::kClosedSliceRoot ||
-      artifact.import_safety == ChildImportClass::kBoundaryModeledChild) {
+      artifact.import_safety == ChildImportClass::kBoundaryModeledChild ||
+      (artifact.import_safety == ChildImportClass::kClosedSliceRoot &&
+       !artifact.selected_root_is_self_loop_only)) {
     plan.eligibility = ImportEligibility::kImportable;
     plan.rejection_reason = RecoveryRejectionReason::kNone;
     plan.allowed_declaration_callees = artifact.reachable_declaration_callees;
@@ -1216,6 +1745,7 @@ enum class ChildRootSelectionMode {
 struct ChildRootCandidate {
   uint64_t pc = 0;
   const char *source = "";
+  unsigned preference = 100;
 };
 
 struct ChildRootSelectionResult {
@@ -1279,27 +1809,53 @@ ChildImportPlan buildChildImportPlanForMode(
   return buildVmEnterChildImportPlan(artifact);
 }
 
+std::optional<uint64_t> preferredChildRootPcFromProof(
+    const std::optional<ContinuationProof> &proof) {
+  if (!proof)
+    return std::nullopt;
+  if (proof->selected_root_pc)
+    return proof->selected_root_pc;
+  if (proof->effective_target_pc)
+    return proof->effective_target_pc;
+  if (proof->canonical_owner_pc)
+    return proof->canonical_owner_pc;
+  return std::nullopt;
+}
+
 llvm::SmallVector<ChildRootCandidate, 8> collectPreparedChildRootCandidates(
-    const ChildLiftArtifact &artifact) {
+    const ChildLiftArtifact &artifact,
+    const std::optional<ContinuationProof> &proof = std::nullopt) {
   llvm::SmallVector<ChildRootCandidate, 8> candidates;
   llvm::SmallDenseSet<uint64_t, 8> seen;
-  auto add_candidate = [&](uint64_t pc, const char *source) {
+  auto add_candidate = [&](uint64_t pc, const char *source,
+                           unsigned preference) {
     if (!pc || pc == artifact.target_pc)
       return;
     if (artifact.selected_root_pc && *artifact.selected_root_pc == pc)
       return;
     if (!seen.insert(pc).second)
       return;
-    candidates.push_back({pc, source});
+    candidates.push_back({pc, source, preference});
   };
 
+  if (proof) {
+    if (proof->selected_root_pc)
+      add_candidate(*proof->selected_root_pc, "proof_selected_root", 0);
+    if (proof->effective_target_pc)
+      add_candidate(*proof->effective_target_pc, "proof_effective_target", 1);
+    if (proof->canonical_owner_pc)
+      add_candidate(*proof->canonical_owner_pc, "proof_canonical_owner", 2);
+  }
+
   for (uint64_t pc : artifact.localized_continuation_targets)
-    add_candidate(pc, "localized_continuation");
+    add_candidate(pc, "localized_continuation", 10);
+  for (uint64_t pc : artifact.modeled_executable_targets)
+    add_candidate(pc, "modeled_executable", 20);
   for (uint64_t pc : artifact.frontier_target_pcs)
-    add_candidate(pc, "frontier_target");
+    add_candidate(pc, "frontier_target", 30);
   for (const auto &name : artifact.closed_slice_function_names) {
     if (auto pc = parseSyntheticBlockLikePcFromName(name))
-      add_candidate(*pc, "closed_slice_handler");
+      add_candidate(*pc, "closed_slice_handler", 40);
   }
   return candidates;
 }
@@ -1314,8 +1870,22 @@ ChildRootSelectionResult selectPreparedChildImportRoot(
   best.artifact = artifact;
   best.plan = buildChildImportPlanForMode(mode, artifact.target_pc, artifact,
                                           proof, resolution);
+  const auto preferred_proof_root_pc = preferredChildRootPcFromProof(proof);
 
-  const auto candidates = collectPreparedChildRootCandidates(artifact);
+  if (mode == ChildRootSelectionMode::kExecutable &&
+      artifact.selected_root_was_retargeted &&
+      best.plan.eligibility == ImportEligibility::kImportable &&
+      (!preferred_proof_root_pc || !artifact.selected_root_pc ||
+       *artifact.selected_root_pc == *preferred_proof_root_pc)) {
+    if (best.artifact.selected_root_selection_detail.empty())
+      best.artifact.selected_root_selection_detail =
+          "selected_root_kept_redirected_executable_root";
+    return best;
+  }
+
+  const auto candidates = collectPreparedChildRootCandidates(artifact, proof);
+  unsigned best_candidate_preference =
+      best.artifact.selected_root_was_retargeted ? 50u : 1000u;
   for (const auto &candidate : candidates) {
     ChildLiftArtifact candidate_artifact = artifact;
     const auto original_root_pc = artifact.selected_root_pc;
@@ -1335,31 +1905,40 @@ ChildRootSelectionResult selectPreparedChildImportRoot(
 
     const auto candidate_rank = childImportPlanPreferenceRank(candidate_plan);
     const auto best_rank = childImportPlanPreferenceRank(best.plan);
+    const bool preserve_redirected_best =
+        candidate_rank == best_rank &&
+        candidate_plan.eligibility == ImportEligibility::kImportable &&
+        best.plan.eligibility == ImportEligibility::kImportable &&
+        best.artifact.selected_root_was_retargeted &&
+        candidate.preference >= best_candidate_preference;
     const bool better =
-        candidate_rank < best_rank ||
-        (candidate_rank == best_rank &&
-         candidate_plan.eligibility == ImportEligibility::kImportable &&
-         candidate_artifact.selected_root_is_terminal_modeled !=
-             best.artifact.selected_root_is_terminal_modeled &&
-         candidate_artifact.selected_root_is_terminal_modeled) ||
-        (candidate_rank == best_rank &&
-         candidate_plan.eligibility == ImportEligibility::kImportable &&
-         candidate_artifact.selected_root_pc &&
-         best.artifact.selected_root_pc &&
-         *candidate_artifact.selected_root_pc < *best.artifact.selected_root_pc);
+        !preserve_redirected_best &&
+        (candidate_rank < best_rank ||
+         (candidate_rank == best_rank &&
+          candidate.preference < best_candidate_preference) ||
+         (candidate_rank == best_rank &&
+          candidate.preference == best_candidate_preference &&
+          candidate_plan.eligibility == ImportEligibility::kImportable &&
+          candidate_artifact.selected_root_is_terminal_modeled !=
+              best.artifact.selected_root_is_terminal_modeled &&
+          candidate_artifact.selected_root_is_terminal_modeled) ||
+         (candidate_rank == best_rank &&
+          candidate.preference == best_candidate_preference &&
+          candidate_plan.eligibility == ImportEligibility::kImportable &&
+          candidate_artifact.selected_root_pc &&
+          best.artifact.selected_root_pc &&
+          *candidate_artifact.selected_root_pc < *best.artifact.selected_root_pc));
     if (!better)
       continue;
 
     best.artifact = std::move(candidate_artifact);
     best.plan = std::move(candidate_plan);
     best.changed = true;
+    best_candidate_preference = candidate.preference;
   }
 
-  if (!best.changed) {
-    best.artifact.selected_root_was_retargeted = false;
-    if (best.artifact.selected_root_selection_detail.empty())
-      best.artifact.selected_root_selection_detail = "selected_root_unchanged";
-  }
+  if (!best.changed && best.artifact.selected_root_selection_detail.empty())
+    best.artifact.selected_root_selection_detail = "selected_root_unchanged";
   return best;
 }
 
@@ -1377,6 +1956,13 @@ ChildVariantSelectionResult selectBestChildImportArtifact(
   const auto raw_rank = childImportPlanPreferenceRank(raw_selection.plan);
   const auto prepared_rank =
       childImportPlanPreferenceRank(prepared_selection.plan);
+  const auto preferred_proof_root_pc = preferredChildRootPcFromProof(proof);
+  const bool raw_matches_preferred_proof_root =
+      preferred_proof_root_pc && raw_selection.artifact.selected_root_pc &&
+      *raw_selection.artifact.selected_root_pc == *preferred_proof_root_pc;
+  const bool prepared_matches_preferred_proof_root =
+      preferred_proof_root_pc && prepared_selection.artifact.selected_root_pc &&
+      *prepared_selection.artifact.selected_root_pc == *preferred_proof_root_pc;
 
   ChildVariantSelectionResult best;
   const bool prepared_only_collapsed_same_root =
@@ -1393,6 +1979,10 @@ ChildVariantSelectionResult selectBestChildImportArtifact(
       prepared_selection.artifact.selected_root_is_terminal_modeled;
   const bool raw_better =
       raw_rank < prepared_rank || prepared_only_collapsed_same_root ||
+      (raw_rank == prepared_rank &&
+       raw_matches_preferred_proof_root !=
+           prepared_matches_preferred_proof_root &&
+       raw_matches_preferred_proof_root) ||
       (raw_rank == prepared_rank &&
        raw_selection.plan.eligibility == ImportEligibility::kImportable &&
        raw_selection.artifact.selected_root_is_terminal_modeled !=
@@ -1437,6 +2027,26 @@ ChildVariantSelectionResult selectBestChildImportArtifact(
   return best;
 }
 
+SelectedChildImportArtifact selectExecutableChildImportArtifactForPlanningImpl(
+    llvm::LLVMContext &llvm_context, const ChildLiftArtifact &raw_artifact,
+    bool no_abi_mode) {
+  auto analyzed_raw =
+      analyzeChildLiftArtifactForPlanning(llvm_context, raw_artifact);
+  auto prepared_artifact =
+      prepareChildLiftArtifact(llvm_context, analyzed_raw, no_abi_mode);
+  auto analyzed_prepared = analyzeChildLiftArtifactForPlanning(
+      llvm_context, prepared_artifact.artifact);
+  auto selected = selectBestChildImportArtifact(
+      llvm_context, analyzed_raw, analyzed_prepared,
+      ChildRootSelectionMode::kExecutable);
+
+  SelectedChildImportArtifact result;
+  result.artifact = std::move(selected.artifact);
+  result.plan = std::move(selected.plan);
+  result.used_prepared_variant = selected.used_prepared_variant;
+  return result;
+}
+
 ChildVariantSelectionResult selectCachedChildImportArtifact(
     llvm::LLVMContext &llvm_context, const ChildArtifactCacheEntry &entry,
     ChildRootSelectionMode mode,
@@ -1468,10 +2078,18 @@ ChildVariantSelectionResult selectCachedChildImportArtifact(
 std::string summarizeProof(const std::optional<ContinuationProof> &proof) {
   if (!proof)
     return "proof=none";
-  return "proof=" + std::string(toString(proof->resolution_kind)) +
-         ",import=" + std::string(toString(proof->import_disposition)) +
-         ",confidence=" + std::string(toString(proof->confidence)) +
-         ",liveness=" + std::string(toString(proof->liveness));
+  std::string summary =
+      "proof=" + std::string(toString(proof->resolution_kind)) +
+      ",import=" + std::string(toString(proof->import_disposition)) +
+      ",confidence=" + std::string(toString(proof->confidence)) +
+      ",liveness=" + std::string(toString(proof->liveness));
+  if (proof->effective_target_pc &&
+      *proof->effective_target_pc != proof->raw_target_pc) {
+    summary += ",effective=0x" + llvm::utohexstr(*proof->effective_target_pc);
+  }
+  if (!proof->rationale.empty())
+    summary += ",rationale=" + proof->rationale;
+  return summary;
 }
 
 bool hasMeaningfulProof(const std::optional<ContinuationProof> &proof) {
@@ -2173,8 +2791,55 @@ std::optional<FinalTailNodeKind> parseFinalTailNodeKind(llvm::StringRef text) {
   return std::nullopt;
 }
 
-void populateRoundArtifactBundleFromModule(const llvm::Module &M,
-                                           RoundArtifactBundle &bundle) {
+void populateSolverArtifactsFromSession(
+    const DevirtualizationOrchestrator &orchestrator,
+    RoundArtifactBundle &bundle) {
+  bundle.solver_edges.clear();
+
+  for (const auto &[identity, edge] :
+       orchestrator.session().graph.edge_facts_by_identity) {
+    if (!edge.solver_metadata)
+      continue;
+
+    const auto &solver = *edge.solver_metadata;
+    if (solver.possible_target_pcs.empty() && !solver.branch_taken &&
+        solver.state_values.empty() && !solver.handler_va &&
+        !solver.incoming_hash && !solver.overlay_key) {
+      continue;
+    }
+
+    RoundArtifactBundle::SolverEdgeArtifact artifact;
+    artifact.identity = identity;
+    artifact.owner_function = edge.owner_function;
+    artifact.site_index = edge.site_index;
+    artifact.site_pc = edge.site_pc;
+    artifact.target_pc = edge.target_pc;
+    artifact.kind = toString(edge.kind);
+    artifact.status = toString(edge.status);
+    artifact.possible_target_pcs.assign(solver.possible_target_pcs.begin(),
+                                        solver.possible_target_pcs.end());
+    artifact.branch_taken = solver.branch_taken;
+    artifact.state_values = solver.state_values;
+    artifact.handler_va = solver.handler_va;
+    artifact.incoming_hash = solver.incoming_hash;
+    artifact.overlay_key = solver.overlay_key;
+    bundle.solver_edges.push_back(std::move(artifact));
+  }
+
+  llvm::sort(bundle.solver_edges,
+             [](const RoundArtifactBundle::SolverEdgeArtifact &lhs,
+                const RoundArtifactBundle::SolverEdgeArtifact &rhs) {
+               if (lhs.owner_function != rhs.owner_function)
+                 return lhs.owner_function < rhs.owner_function;
+               if (lhs.site_index != rhs.site_index)
+                 return lhs.site_index < rhs.site_index;
+               return lhs.identity < rhs.identity;
+             });
+}
+
+void populateRoundArtifactBundleFromModule(
+    const llvm::Module &M, RoundArtifactBundle &bundle,
+    const DevirtualizationOrchestrator *orchestrator = nullptr) {
   bundle.module_fingerprint = llvm::StructuralHash(M);
   auto output_roots = collectArtifactOutputRoots(M);
   for (const auto *root : output_roots)
@@ -2220,6 +2885,9 @@ void populateRoundArtifactBundleFromModule(const llvm::Module &M,
       }
     }
   }
+
+  if (orchestrator)
+    populateSolverArtifactsFromSession(*orchestrator, bundle);
 }
 
 BoundaryFact mergeRuntimeBoundaryFacts(const BoundaryFact &primary,
@@ -2408,6 +3076,14 @@ std::optional<BoundaryFact> findBoundaryFactForTarget(
 std::optional<FrontierWorkStatus> findBoundaryContinuationStatus(
     const DevirtualizationOrchestrator &orchestrator, uint64_t boundary_pc,
     uint64_t continuation_pc) {
+  auto singletonSolvedTarget = [](const SessionEdgeFact &edge)
+      -> std::optional<uint64_t> {
+    if (!edge.solver_metadata ||
+        edge.solver_metadata->possible_target_pcs.size() != 1) {
+      return std::nullopt;
+    }
+    return edge.solver_metadata->possible_target_pcs.front();
+  };
   std::optional<FrontierWorkStatus> fallback_status;
   for (const auto &[identity, edge] :
        orchestrator.session().graph.edge_facts_by_identity) {
@@ -2422,6 +3098,15 @@ std::optional<FrontierWorkStatus> findBoundaryContinuationStatus(
         *edge.executable_target->effective_target_pc == continuation_pc) {
       return edge.status;
     }
+    if (edge.continuation_proof &&
+        edge.continuation_proof->effective_target_pc &&
+        *edge.continuation_proof->effective_target_pc == continuation_pc) {
+      return edge.status;
+    }
+    if (auto solved_target = singletonSolvedTarget(edge);
+        solved_target && *solved_target == continuation_pc) {
+      return edge.status;
+    }
     if (!fallback_status)
       fallback_status = edge.status;
   }
@@ -2430,11 +3115,28 @@ std::optional<FrontierWorkStatus> findBoundaryContinuationStatus(
 
 std::optional<std::string> findVmEnterChildImportFailureReasonForTarget(
     const DevirtualizationOrchestrator &orchestrator, uint64_t target_pc) {
+  auto singletonSolvedTarget = [](const SessionEdgeFact &edge)
+      -> std::optional<uint64_t> {
+    if (!edge.solver_metadata ||
+        edge.solver_metadata->possible_target_pcs.size() != 1) {
+      return std::nullopt;
+    }
+    return edge.solver_metadata->possible_target_pcs.front();
+  };
   std::optional<std::string> fallback_reason;
   for (const auto &[identity, edge] :
        orchestrator.session().graph.edge_facts_by_identity) {
     (void)identity;
-    if (!edge.target_pc || *edge.target_pc != target_pc)
+    const auto solved_target = singletonSolvedTarget(edge);
+    const bool matches_target =
+        (edge.target_pc && *edge.target_pc == target_pc) ||
+        (edge.executable_target && edge.executable_target->effective_target_pc &&
+         *edge.executable_target->effective_target_pc == target_pc) ||
+        (edge.continuation_proof &&
+         edge.continuation_proof->effective_target_pc &&
+         *edge.continuation_proof->effective_target_pc == target_pc) ||
+        (solved_target && *solved_target == target_pc);
+    if (!matches_target)
       continue;
     const bool is_vm_enter_candidate =
         edge.kind == FrontierWorkKind::kVmEnterBoundary ||
@@ -2590,6 +3292,47 @@ bool isUsableBoundaryContinuationFunction(
   return true;
 }
 
+llvm::Function *materializeBoundaryContinuationBridge(
+    llvm::Function &boundary_fn, llvm::Function &continuation_fn,
+    uint64_t continuation_pc) {
+  if (!boundary_fn.isDeclaration())
+    return &boundary_fn;
+  auto *continuation_ty = continuation_fn.getFunctionType();
+  auto *boundary_ty = boundary_fn.getFunctionType();
+  llvm::SmallVector<llvm::Value *, 3> args;
+  auto boundary_arg_it = boundary_fn.arg_begin();
+  if (continuation_ty->getNumParams() < 2 || boundary_ty->getNumParams() < 2)
+    return nullptr;
+  if (continuation_ty->getParamType(0) != boundary_ty->getParamType(0) ||
+      continuation_ty->getParamType(1) != boundary_ty->getParamType(1)) {
+    return nullptr;
+  }
+  args.push_back(&*boundary_arg_it++);
+  args.push_back(llvm::ConstantInt::get(
+      llvm::cast<llvm::IntegerType>(boundary_ty->getParamType(1)),
+      continuation_pc));
+  if (continuation_ty->getNumParams() == 3) {
+    if (boundary_ty->getNumParams() < 3 ||
+        continuation_ty->getParamType(2) != boundary_ty->getParamType(2)) {
+      return nullptr;
+    }
+    ++boundary_arg_it;
+    args.push_back(&*boundary_arg_it);
+  } else if (continuation_ty->getNumParams() != 2) {
+    return nullptr;
+  }
+  if (continuation_ty->getReturnType() != boundary_ty->getReturnType())
+    return nullptr;
+
+  auto *entry = llvm::BasicBlock::Create(
+      boundary_fn.getContext(), "entry", &boundary_fn);
+  llvm::IRBuilder<> ir(entry);
+  auto *call = ir.CreateCall(&continuation_fn, args);
+  ir.CreateRet(call);
+  return &boundary_fn;
+}
+
+
 bool isQuarantinedProof(const std::optional<ContinuationProof> &proof) {
   if (!proof)
     return false;
@@ -2628,17 +3371,784 @@ unsigned finalStateRecoveryPriority(FinalStateRecoveryActionKind kind) {
 
 }  // namespace
 
-FrontierRoundSummary DevirtualizationRuntime::runFrontierRound(
-    llvm::Module &M, BlockLifter &block_lifter,
-    IterativeLiftingSession &iterative_session,
-    const FrontierCallbacks &callbacks, FrontierDiscoveryPhase phase) const {
-  return orchestrator_.runFrontierRound(M, block_lifter, iterative_session,
-                                        callbacks, phase);
+
+static ChildArtifactCacheKey makeChildArtifactCacheKey(
+    uint64_t target_pc, bool no_abi, bool enable_gsd,
+    bool enable_recovery_mode, bool dump_virtual_model) {
+  ChildArtifactCacheKey key;
+  key.target_pc = target_pc;
+  key.no_abi = no_abi;
+  key.enable_gsd = enable_gsd;
+  key.enable_recovery_mode = enable_recovery_mode;
+  key.dump_virtual_model = dump_virtual_model;
+  return key;
 }
 
+struct ChildArtifactRepository {
+  explicit ChildArtifactRepository(
+      std::map<ChildArtifactCacheKey, ChildArtifactCacheEntry> &cache_)
+      : cache(cache_) {}
+
+  ChildArtifactCacheEntry *find(uint64_t target_pc, bool no_abi, bool enable_gsd,
+                                bool enable_recovery_mode,
+                                bool dump_virtual_model) {
+    auto it = cache.find(makeChildArtifactCacheKey(
+        target_pc, no_abi, enable_gsd, enable_recovery_mode,
+        dump_virtual_model));
+    return it == cache.end() ? nullptr : &it->second;
+  }
+
+  ChildArtifactCacheEntry &getOrCreate(const ChildArtifactCacheKey &key) {
+    return cache[key];
+  }
+
+  void rememberPlan(uint64_t target_pc, bool no_abi, bool enable_gsd,
+                    bool enable_recovery_mode, bool dump_virtual_model,
+                    const ChildImportPlan &plan, bool imported) {
+    if (auto *entry = find(target_pc, no_abi, enable_gsd, enable_recovery_mode,
+                           dump_virtual_model)) {
+      entry->last_plan = plan;
+      entry->imported = imported;
+    }
+  }
+
+  std::map<ChildArtifactCacheKey, ChildArtifactCacheEntry> &cache;
+};
+
+struct OutputRecoveryArtifactRecorder {
+  const DevirtualizationRuntime &runtime;
+  llvm::Module &module;
+  OutputRecoverySummary &summary;
+  std::vector<ImportDecisionArtifact> &pending_import_decisions;
+  std::vector<CleanupActionArtifact> &pending_cleanup_actions;
+  std::map<ChildArtifactCacheKey, ChildArtifactCacheEntry> &child_artifact_cache;
+  std::vector<RoundArtifactBundle> &round_artifact_bundles;
+
+  void record(RoundArtifactBundle bundle) {
+    populateRoundArtifactBundleFromModule(module, bundle,
+                                         &runtime.orchestrator());
+    bundle.import_decisions = std::move(pending_import_decisions);
+    bundle.cleanup_actions = std::move(pending_cleanup_actions);
+    populateRecoveryQualitySummary(bundle, child_artifact_cache,
+                                  round_artifact_bundles);
+    bundle.final_tail_graph = runtime.buildFinalTailGraph(module);
+    augmentRecoveryQualityFromTailGraph(bundle, *bundle.final_tail_graph);
+    refineRecoveryQualityFromModuleShape(module, bundle);
+    summary.artifact_bundles.push_back(bundle);
+    round_artifact_bundles.push_back(bundle);
+  }
+
+};
+
+void finalizeNoAbiImportRound(
+    OutputRecoveryArtifactRecorder &artifact_recorder,
+    OutputRecoverySummary &summary,
+    const OutputRecoveryCallbacks &callbacks,
+    const std::function<void(llvm::StringRef, bool, llvm::StringRef)>
+        &remember_cleanup_action,
+    unsigned import_round, const std::vector<uint64_t> &imported_child_targets,
+    std::vector<RejectedImportArtifact> rejected_imports) {
+  RoundArtifactBundle import_bundle;
+  import_bundle.stage = RuntimeArtifactStage::kOutputRecoveryImportRound;
+  import_bundle.label = "noabi_children";
+  import_bundle.round = import_round;
+  import_bundle.changed = !imported_child_targets.empty();
+  import_bundle.imported_targets.assign(imported_child_targets.begin(),
+                                        imported_child_targets.end());
+  import_bundle.rejected_imports = std::move(rejected_imports);
+  if (imported_child_targets.empty()) {
+    artifact_recorder.record(std::move(import_bundle));
+    return;
+  }
+
+  auto patched_targets =
+      callbacks.patch_declared_lifted_or_block_calls_to_defined_targets(
+          imported_child_targets, "noabi_imported_child_patch",
+          "patched output-root placeholders to imported child roots");
+  summary.patched_declared_targets += patched_targets;
+  remember_cleanup_action(
+      "noabi_imported_child_patch", patched_targets != 0,
+      (llvm::Twine("patched_targets=") + llvm::Twine(patched_targets)).str());
+  callbacks.run_final_output_cleanup();
+  remember_cleanup_action("noabi_post_import_final_output_cleanup", true,
+                          "executed");
+  summary.changed = true;
+  artifact_recorder.record(std::move(import_bundle));
+}
+
+void runInitialAbiPostMainCleanup(
+    const OutputRecoveryCallbacks &callbacks,
+    const std::function<void(llvm::StringRef, const std::function<void()> &)>
+        &note_abi_step,
+    OutputRecoverySummary &summary) {
+  if (callbacks.sanitize_remaining_poison_native_helper_args) {
+    note_abi_step("sanitize_remaining_poison_native_helper_args", [&] {
+      callbacks.sanitize_remaining_poison_native_helper_args();
+    });
+  }
+  if (callbacks.erase_noop_self_recursive_native_calls) {
+    note_abi_step("erase_noop_self_recursive_native_calls", [&] {
+      callbacks.erase_noop_self_recursive_native_calls();
+    });
+  }
+  if (callbacks.run_final_output_cleanup) {
+    note_abi_step("initial_final_output_cleanup",
+                  [&] { callbacks.run_final_output_cleanup(); });
+  }
+  if (callbacks.prune_to_defined_output_root_closure) {
+    note_abi_step("initial_prune_defined_output_root_closure", [&] {
+      callbacks.prune_to_defined_output_root_closure();
+    });
+  }
+  if (callbacks.run_final_output_cleanup) {
+    note_abi_step("post_prune_final_output_cleanup",
+                  [&] { callbacks.run_final_output_cleanup(); });
+  }
+  if (callbacks.rerun_late_output_root_target_pipeline) {
+    note_abi_step("initial_rerun_late_output_root_target_pipeline", [&] {
+      callbacks.rerun_late_output_root_target_pipeline();
+    });
+  }
+  if (callbacks.advance_session_owned_frontier_work &&
+      callbacks.advance_session_owned_frontier_work(
+          FrontierDiscoveryPhase::kVmUnresolvedContinuations,
+          "abi_late_vm_continuations")) {
+    if (callbacks.run_final_output_cleanup) {
+      note_abi_step("vm_continuations_final_output_cleanup",
+                    [&] { callbacks.run_final_output_cleanup(); });
+    }
+    if (callbacks.prune_to_defined_output_root_closure) {
+      note_abi_step("vm_continuations_prune_defined_output_root_closure", [&] {
+        callbacks.prune_to_defined_output_root_closure();
+      });
+    }
+    if (callbacks.run_final_output_cleanup) {
+      note_abi_step("vm_continuations_post_prune_final_output_cleanup",
+                    [&] { callbacks.run_final_output_cleanup(); });
+    }
+    if (callbacks.rerun_late_output_root_target_pipeline) {
+      note_abi_step("vm_continuations_rerun_late_output_root_target_pipeline",
+                    [&] { callbacks.rerun_late_output_root_target_pipeline(); });
+    }
+    summary.changed = true;
+  }
+
+}
+
+void processNoAbiDeclarationChildCandidate(
+    llvm::LLVMContext &context, uint64_t target_pc,
+    const OutputRecoveryOptions &options,
+    const OutputRecoveryCallbacks &callbacks,
+    DevirtualizationOrchestrator &orchestrator,
+    OutputRecoverySummary &summary, llvm::DenseSet<uint64_t> &seen_import_targets,
+    llvm::DenseSet<uint64_t> &exhausted_import_targets,
+    std::vector<uint64_t> &imported_child_targets,
+    std::vector<RejectedImportArtifact> &rejected_imports,
+    const std::function<std::optional<ContinuationResolutionResult>(
+        uint64_t, const std::optional<ContinuationProof> &)>
+        &resolve_executable_continuation,
+    const std::function<std::optional<ChildLiftArtifact>(uint64_t, bool, bool,
+                                                         bool, bool)>
+        &lookup_cached_child_artifact,
+    const std::function<ChildArtifactCacheEntry *(uint64_t, bool, bool, bool,
+                                                  bool)>
+        &find_cached_child_artifact_entry,
+    const std::function<void(
+        llvm::StringRef, const ChildImportPlan &,
+        const std::optional<ContinuationProof> &,
+        const std::optional<ContinuationResolutionResult> &)>
+        &append_import_plan_note,
+    const std::function<void(uint64_t, bool, bool, bool, bool,
+                             const ChildImportPlan &, bool)>
+        &remember_child_plan) {
+  auto proof = findContinuationProofForTarget(orchestrator, target_pc);
+  emitPreciseLog(options, callbacks, "output-recovery", "noabi-decl-proof",
+                 "evaluating declaration proof", target_pc, std::nullopt,
+                 summarizeProof(proof));
+  auto resolution = resolve_executable_continuation(target_pc, proof);
+  emitPreciseLog(options, callbacks, "output-recovery", "noabi-decl-resolution",
+                 "resolved declaration-backed continuation", target_pc,
+                 std::nullopt, summarizeResolution(resolution));
+  if (resolution &&
+      resolution->disposition ==
+          ContinuationResolutionDisposition::kDeferredQuarantinedSelectorArm) {
+    ChildImportPlan deferred_plan;
+    deferred_plan.target_pc = target_pc;
+    deferred_plan.eligibility = ImportEligibility::kRetryable;
+    deferred_plan.rejection_reason = RecoveryRejectionReason::kUnsupported;
+    deferred_plan.rejection_detail = "quarantined_selector_arm";
+    deferred_plan.proof = proof;
+    append_import_plan_note("noabi_decl_plan", deferred_plan, proof, resolution);
+    rejected_imports.push_back(
+        {target_pc, deferred_plan.rejection_reason,
+         deferred_plan.rejection_detail});
+    remember_child_plan(target_pc, /*no_abi=*/true, /*enable_gsd=*/false,
+                        /*enable_recovery_mode=*/false,
+                        /*dump_virtual_model=*/true, deferred_plan, false);
+    return;
+  }
+  if (auto snapshot_plan = tryImportBoundedSnapshotContinuation(
+          target_pc, options, callbacks, proof, resolution,
+          "noabi-decl-snapshot-attempt",
+          "attempting bounded continuation snapshot import")) {
+    append_import_plan_note("noabi_decl_snapshot", *snapshot_plan, proof,
+                            resolution);
+    if (snapshot_plan->eligibility != ImportEligibility::kImportable ||
+        !snapshot_plan->imported_root) {
+      rejected_imports.push_back(
+          {target_pc, snapshot_plan->rejection_reason,
+           snapshot_plan->rejection_detail});
+      remember_child_plan(target_pc, /*no_abi=*/true, /*enable_gsd=*/false,
+                          /*enable_recovery_mode=*/false,
+                          /*dump_virtual_model=*/true, *snapshot_plan, false);
+      if (snapshot_plan->eligibility == ImportEligibility::kRejected)
+        exhausted_import_targets.insert(target_pc);
+      return;
+    }
+    remember_child_plan(target_pc, /*no_abi=*/true, /*enable_gsd=*/false,
+                        /*enable_recovery_mode=*/false,
+                        /*dump_virtual_model=*/true, *snapshot_plan, true);
+    emitPreciseLog(options, callbacks, "output-recovery",
+                   "noabi-decl-snapshot-import",
+                   "imported bounded continuation snapshot", target_pc);
+    seen_import_targets.insert(target_pc);
+    imported_child_targets.push_back(target_pc);
+    ++summary.noabi_imported_children;
+    return;
+  }
+
+  emitPreciseLog(options, callbacks, "output-recovery",
+                 "noabi-declaration-lift",
+                 "lifting declaration-backed executable child", target_pc);
+  auto child = lookup_cached_child_artifact(
+      target_pc, /*no_abi=*/true, /*enable_gsd=*/false,
+      /*enable_recovery_mode=*/false, /*dump_virtual_model=*/true);
+  if (!child) {
+    ChildImportPlan failed_plan;
+    failed_plan.target_pc = target_pc;
+    failed_plan.rejection_reason = RecoveryRejectionReason::kChildLiftFailed;
+    append_import_plan_note("noabi_decl_import", failed_plan, proof, resolution);
+    rejected_imports.push_back(
+        {target_pc, failed_plan.rejection_reason, failed_plan.rejection_detail});
+    exhausted_import_targets.insert(target_pc);
+    return;
+  }
+  auto *cache_entry = find_cached_child_artifact_entry(
+      target_pc, /*no_abi=*/true, /*enable_gsd=*/false,
+      /*enable_recovery_mode=*/false, /*dump_virtual_model=*/true);
+  ChildVariantSelectionResult selected_child;
+  if (cache_entry) {
+    selected_child = selectCachedChildImportArtifact(
+        context, *cache_entry, ChildRootSelectionMode::kExecutable, proof,
+        resolution);
+  } else {
+    auto prepared_selection = selectPreparedChildImportRoot(
+        context, *child, ChildRootSelectionMode::kExecutable, proof, resolution);
+    selected_child.artifact = std::move(prepared_selection.artifact);
+    selected_child.plan = std::move(prepared_selection.plan);
+    selected_child.used_prepared_variant = true;
+  }
+  if (selected_child.artifact.selected_root_was_retargeted ||
+      !selected_child.used_prepared_variant) {
+    emitPreciseLog(options, callbacks, "output-recovery",
+                   "noabi-decl-root-select",
+                   "selected declaration child import root", target_pc,
+                   std::nullopt,
+                   selected_child.artifact.selected_root_selection_detail);
+  }
+  *child = selected_child.artifact;
+  auto preimport_plan = selected_child.plan;
+  emitPreciseLog(
+      options, callbacks, "output-recovery", "noabi-decl-plan",
+      "classified declaration-backed child", target_pc, std::nullopt,
+      "class=" + std::string(toString(*preimport_plan.import_class)) +
+          ",eligibility=" + std::string(toString(preimport_plan.eligibility)));
+  append_import_plan_note("noabi_decl_plan", preimport_plan, proof, resolution);
+  if (preimport_plan.eligibility != ImportEligibility::kImportable) {
+    rejected_imports.push_back(
+        {target_pc, preimport_plan.rejection_reason,
+         preimport_plan.rejection_detail});
+  }
+  remember_child_plan(target_pc, /*no_abi=*/true, /*enable_gsd=*/false,
+                      /*enable_recovery_mode=*/false,
+                      /*dump_virtual_model=*/true, preimport_plan, false);
+  if (preimport_plan.eligibility != ImportEligibility::kImportable) {
+    if (preimport_plan.eligibility == ImportEligibility::kRejected)
+      exhausted_import_targets.insert(target_pc);
+    return;
+  }
+  auto plan = callbacks.import_executable_child(target_pc, *child, preimport_plan,
+                                                "execchild_");
+  plan.import_class = preimport_plan.import_class;
+  plan.proof = proof;
+  if (!plan.selected_root_pc)
+    plan.selected_root_pc = preimport_plan.selected_root_pc;
+  append_import_plan_note("noabi_decl_import", plan, proof, resolution);
+  if (plan.eligibility != ImportEligibility::kImportable || !plan.imported_root) {
+    rejected_imports.push_back(
+        {target_pc, plan.rejection_reason, plan.rejection_detail});
+  }
+  remember_child_plan(target_pc, /*no_abi=*/true, /*enable_gsd=*/false,
+                      /*enable_recovery_mode=*/false,
+                      /*dump_virtual_model=*/true, plan,
+                      plan.eligibility == ImportEligibility::kImportable &&
+                          plan.imported_root != nullptr);
+  if (plan.eligibility != ImportEligibility::kImportable || !plan.imported_root) {
+    exhausted_import_targets.insert(target_pc);
+    return;
+  }
+  emitPreciseLog(options, callbacks, "output-recovery",
+                 "noabi-declaration-import",
+                 "imported declaration-backed executable child", target_pc);
+  seen_import_targets.insert(target_pc);
+  imported_child_targets.push_back(target_pc);
+  ++summary.noabi_imported_children;
+}
+
+bool isVmEnterBoundaryFact(const std::optional<BoundaryFact> &boundary) {
+  return boundary &&
+         (boundary->is_vm_enter || boundary->is_nested_vm_enter ||
+          boundary->kind == BoundaryKind::kVmEnterBoundary ||
+          boundary->kind == BoundaryKind::kNestedVmEnterBoundary);
+}
+
+void processNoAbiClosureChildCandidate(
+    llvm::Module &module, uint64_t target_pc, bool executable_target,
+    const std::optional<BoundaryFact> &boundary,
+    const OutputRecoveryOptions &options,
+    const OutputRecoveryCallbacks &callbacks,
+    DevirtualizationOrchestrator &orchestrator,
+    OutputRecoverySummary &summary, llvm::DenseSet<uint64_t> &seen_import_targets,
+    llvm::DenseSet<uint64_t> &exhausted_import_targets,
+    std::vector<uint64_t> &imported_child_targets,
+    std::vector<RejectedImportArtifact> &rejected_imports,
+    const std::function<std::optional<ContinuationResolutionResult>(
+        uint64_t, const std::optional<ContinuationProof> &)>
+        &resolve_executable_continuation,
+    const std::function<std::optional<ChildLiftArtifact>(uint64_t, bool, bool,
+                                                         bool, bool)>
+        &lookup_cached_child_artifact,
+    const std::function<ChildArtifactCacheEntry *(uint64_t, bool, bool, bool,
+                                                  bool)>
+        &find_cached_child_artifact_entry,
+    const std::function<void(
+        llvm::StringRef, const ChildImportPlan &,
+        const std::optional<ContinuationProof> &,
+        const std::optional<ContinuationResolutionResult> &)>
+        &append_import_plan_note,
+    const std::function<void(uint64_t, bool, bool, bool, bool,
+                             const ChildImportPlan &, bool)>
+        &remember_child_plan) {
+  const bool boundary_points_at_continuation =
+      boundary &&
+      ((boundary->continuation_entry_transform &&
+        boundary->continuation_entry_transform->jump_target_pc == target_pc) ||
+       boundary->continuation_pc == target_pc);
+  const bool import_as_vm_enter =
+      !boundary_points_at_continuation && isVmEnterBoundaryFact(boundary) &&
+      callbacks.import_vm_enter_child != nullptr;
+  const bool can_import_executable =
+      callbacks.import_executable_snapshot_slice != nullptr ||
+      callbacks.import_executable_child != nullptr;
+  if ((!executable_target && !import_as_vm_enter) ||
+      (!import_as_vm_enter && !can_import_executable) ||
+      seen_import_targets.contains(target_pc) ||
+      exhausted_import_targets.contains(target_pc)) {
+    return;
+  }
+
+  llvm::Function *vm_enter_placeholder = nullptr;
+  if (import_as_vm_enter) {
+    vm_enter_placeholder = findBoundaryContinuationFunction(module, target_pc);
+    if (!vm_enter_placeholder || !vm_enter_placeholder->isDeclaration())
+      return;
+  }
+
+  auto synthesize_proof_from_boundary = [&]() -> std::optional<ContinuationProof> {
+    if (!boundary_points_at_continuation || !boundary ||
+        !boundary->suppresses_normal_fallthrough) {
+      return std::nullopt;
+    }
+    ContinuationProof proof;
+    proof.raw_target_pc = target_pc;
+    proof.effective_target_pc = target_pc;
+    proof.provenance = ContinuationProvenance::kReturnAddressControlled;
+    proof.confidence = ContinuationConfidence::kWeak;
+    proof.liveness = ContinuationLiveness::kLive;
+    proof.scheduling_class = FrontierSchedulingClass::kNativeOrVmEnterBoundary;
+    proof.resolution_kind = ContinuationResolutionKind::kBoundaryModeled;
+    proof.import_disposition = ContinuationImportDisposition::kRetryable;
+    proof.selected_root_import_class = ChildImportClass::kBoundedContinuationSlice;
+    proof.return_address_control_kind = boundary->return_address_control_kind;
+    proof.controlled_return_pc = boundary->controlled_return_pc;
+    proof.suppresses_normal_fallthrough = boundary->suppresses_normal_fallthrough;
+    proof.rationale = "synthesized_from_closure_boundary";
+    return proof;
+  };
+  auto proof = findContinuationProofForTarget(orchestrator, target_pc);
+  if (auto boundary_proof = synthesize_proof_from_boundary()) {
+    const bool prefer_boundary_proof =
+        !proof || proof->resolution_kind == ContinuationResolutionKind::kUnknown ||
+        proof->import_disposition == ContinuationImportDisposition::kUnknown ||
+        !proof->suppresses_normal_fallthrough ||
+        proof->return_address_control_kind ==
+            VirtualReturnAddressControlKind::kUnknown;
+    if (prefer_boundary_proof)
+      proof = std::move(boundary_proof);
+  }
+  emitPreciseLog(options, callbacks, "output-recovery", "noabi-child-proof",
+                 "evaluating child proof", target_pc, std::nullopt,
+                 summarizeProof(proof));
+  std::optional<ContinuationResolutionResult> resolution;
+  if (!import_as_vm_enter) {
+    resolution = resolve_executable_continuation(target_pc, proof);
+    emitPreciseLog(options, callbacks, "output-recovery", "noabi-child-resolution",
+                   "resolved executable continuation", target_pc, std::nullopt,
+                   summarizeResolution(resolution));
+  } else {
+    emitPreciseLog(options, callbacks, "output-recovery", "noabi-vm-enter-proof",
+                   "using vm-enter continuation proof", target_pc, std::nullopt,
+                   summarizeProof(proof));
+  }
+
+  const bool deferred_selector_arm =
+      resolution &&
+      resolution->disposition ==
+          ContinuationResolutionDisposition::kDeferredQuarantinedSelectorArm;
+  const bool weak_vm_enter_proof =
+      import_as_vm_enter &&
+      (!hasMeaningfulProof(proof) ||
+       proof->import_disposition == ContinuationImportDisposition::kDeferred ||
+       proof->import_disposition == ContinuationImportDisposition::kRejected ||
+       proof->confidence == ContinuationConfidence::kDeadArmSuspect ||
+       proof->liveness == ContinuationLiveness::kQuarantined);
+  if (deferred_selector_arm || weak_vm_enter_proof) {
+    ChildImportPlan deferred_plan;
+    deferred_plan.target_pc = target_pc;
+    deferred_plan.eligibility = ImportEligibility::kRetryable;
+    deferred_plan.rejection_reason = RecoveryRejectionReason::kUnsupported;
+    deferred_plan.rejection_detail =
+        weak_vm_enter_proof ? "vm_enter_boundary_unproven"
+                            : "quarantined_selector_arm";
+    deferred_plan.proof = proof;
+    append_import_plan_note("noabi_child_plan", deferred_plan, proof, resolution);
+    rejected_imports.push_back(
+        {target_pc, deferred_plan.rejection_reason,
+         deferred_plan.rejection_detail});
+    remember_child_plan(target_pc, /*no_abi=*/true,
+                        /*enable_gsd=*/import_as_vm_enter,
+                        /*enable_recovery_mode=*/import_as_vm_enter,
+                        /*dump_virtual_model=*/true, deferred_plan, false);
+    return;
+  }
+
+  if (!import_as_vm_enter) {
+    if (auto snapshot_plan = tryImportBoundedSnapshotContinuation(
+            target_pc, options, callbacks, proof, resolution,
+            "noabi-child-snapshot-attempt",
+            "attempting bounded continuation snapshot import")) {
+      append_import_plan_note("noabi_child_snapshot", *snapshot_plan, proof,
+                              resolution);
+      if (snapshot_plan->eligibility != ImportEligibility::kImportable ||
+          !snapshot_plan->imported_root) {
+        rejected_imports.push_back(
+            {target_pc, snapshot_plan->rejection_reason,
+             snapshot_plan->rejection_detail});
+        remember_child_plan(target_pc, /*no_abi=*/true,
+                            /*enable_gsd=*/false,
+                            /*enable_recovery_mode=*/false,
+                            /*dump_virtual_model=*/true, *snapshot_plan, false);
+        if (snapshot_plan->eligibility == ImportEligibility::kRejected)
+          exhausted_import_targets.insert(target_pc);
+        return;
+      }
+      remember_child_plan(target_pc, /*no_abi=*/true,
+                          /*enable_gsd=*/false,
+                          /*enable_recovery_mode=*/false,
+                          /*dump_virtual_model=*/true, *snapshot_plan, true);
+      emitPreciseLog(options, callbacks, "output-recovery",
+                     "noabi-child-snapshot-import",
+                     "imported bounded continuation snapshot", target_pc);
+      seen_import_targets.insert(target_pc);
+      imported_child_targets.push_back(target_pc);
+      ++summary.noabi_imported_children;
+      return;
+    }
+  }
+
+
+  emitPreciseLog(options, callbacks, "output-recovery",
+                 import_as_vm_enter ? "noabi-vm-enter-lift"
+                                    : "noabi-child-lift",
+                 import_as_vm_enter ? "lifting vm-enter child"
+                                    : "lifting executable child",
+                 target_pc);
+  auto child = lookup_cached_child_artifact(
+      target_pc, /*no_abi=*/true, /*enable_gsd=*/import_as_vm_enter,
+      /*enable_recovery_mode=*/import_as_vm_enter,
+      /*dump_virtual_model=*/true);
+  if (!child) {
+    ChildImportPlan failed_plan;
+    failed_plan.target_pc = target_pc;
+    failed_plan.rejection_reason = RecoveryRejectionReason::kChildLiftFailed;
+    append_import_plan_note("noabi_child_import", failed_plan, proof, resolution);
+    rejected_imports.push_back(
+        {target_pc, failed_plan.rejection_reason, failed_plan.rejection_detail});
+    exhausted_import_targets.insert(target_pc);
+    return;
+  }
+
+  auto *cache_entry = find_cached_child_artifact_entry(
+      target_pc, /*no_abi=*/true, /*enable_gsd=*/import_as_vm_enter,
+      /*enable_recovery_mode=*/import_as_vm_enter,
+      /*dump_virtual_model=*/true);
+  const auto selection_mode = import_as_vm_enter
+                                  ? ChildRootSelectionMode::kVmEnter
+                                  : ChildRootSelectionMode::kExecutable;
+  ChildVariantSelectionResult selected_child;
+  if (cache_entry) {
+    selected_child = selectCachedChildImportArtifact(
+        module.getContext(), *cache_entry, selection_mode, proof, resolution);
+  } else {
+    auto prepared_selection = selectPreparedChildImportRoot(
+        module.getContext(), *child, selection_mode, proof, resolution);
+    selected_child.artifact = std::move(prepared_selection.artifact);
+    selected_child.plan = std::move(prepared_selection.plan);
+    selected_child.used_prepared_variant = true;
+  }
+  if (selected_child.artifact.selected_root_was_retargeted ||
+      !selected_child.used_prepared_variant) {
+    emitPreciseLog(options, callbacks, "output-recovery",
+                   import_as_vm_enter ? "noabi-vm-enter-root-select"
+                                      : "noabi-child-root-select",
+                   import_as_vm_enter ? "selected vm-enter child import root"
+                                      : "selected executable child import root",
+                   target_pc, std::nullopt,
+                   selected_child.artifact.selected_root_selection_detail);
+  }
+  *child = selected_child.artifact;
+  auto preimport_plan = selected_child.plan;
+  emitPreciseLog(options, callbacks, "output-recovery",
+                 import_as_vm_enter ? "noabi-vm-enter-plan"
+                                    : "noabi-child-plan",
+                 import_as_vm_enter ? "classified vm-enter child"
+                                    : "classified executable child",
+                 target_pc, std::nullopt,
+                 "class=" + std::string(toString(*preimport_plan.import_class)) +
+                     ",eligibility=" +
+                     std::string(toString(preimport_plan.eligibility)));
+  append_import_plan_note("noabi_child_plan", preimport_plan, proof, resolution);
+  if (preimport_plan.eligibility != ImportEligibility::kImportable) {
+    rejected_imports.push_back(
+        {target_pc, preimport_plan.rejection_reason,
+         preimport_plan.rejection_detail});
+  }
+  remember_child_plan(target_pc, /*no_abi=*/true,
+                      /*enable_gsd=*/import_as_vm_enter,
+                      /*enable_recovery_mode=*/import_as_vm_enter,
+                      /*dump_virtual_model=*/true, preimport_plan, false);
+  if (preimport_plan.eligibility != ImportEligibility::kImportable) {
+    if (preimport_plan.eligibility == ImportEligibility::kRejected)
+      exhausted_import_targets.insert(target_pc);
+    return;
+  }
+
+  auto plan = import_as_vm_enter
+                  ? callbacks.import_vm_enter_child(target_pc, *child,
+                                                    preimport_plan,
+                                                    *vm_enter_placeholder)
+                  : callbacks.import_executable_child(target_pc, *child,
+                                                      preimport_plan,
+                                                      "execchild_");
+  plan.import_class = preimport_plan.import_class;
+  plan.proof = proof;
+  if (!plan.selected_root_pc)
+    plan.selected_root_pc = preimport_plan.selected_root_pc;
+  append_import_plan_note("noabi_child_import", plan, proof, resolution);
+  if (plan.eligibility != ImportEligibility::kImportable || !plan.imported_root) {
+    rejected_imports.push_back(
+        {target_pc, plan.rejection_reason, plan.rejection_detail});
+  }
+  remember_child_plan(target_pc, /*no_abi=*/true, /*enable_gsd=*/false,
+                      /*enable_recovery_mode=*/false,
+                      /*dump_virtual_model=*/true, plan,
+                      plan.eligibility == ImportEligibility::kImportable &&
+                          plan.imported_root != nullptr);
+  if (plan.eligibility != ImportEligibility::kImportable || !plan.imported_root) {
+    exhausted_import_targets.insert(target_pc);
+    return;
+  }
+  emitPreciseLog(options, callbacks, "output-recovery",
+                 import_as_vm_enter ? "noabi-vm-enter-import"
+                                    : "noabi-child-import",
+                 import_as_vm_enter ? "imported vm-enter child"
+                                    : "imported executable child",
+                 target_pc);
+  seen_import_targets.insert(target_pc);
+  imported_child_targets.push_back(target_pc);
+  ++summary.noabi_imported_children;
+}
+
+
+std::optional<VmEnterChildImportCallbacks> buildAbiVmEnterImportCallbacks(
+    llvm::Module &module, const OutputRecoveryOptions &options,
+    const OutputRecoveryCallbacks &callbacks,
+    const std::function<void(llvm::StringRef, const ChildImportPlan &)>
+        &append_import_plan_note) {
+  if (!options.enable_nested_vm_enter_child_import ||
+      !callbacks.lift_child_target || !callbacks.import_vm_enter_child) {
+    return std::nullopt;
+  }
+
+  VmEnterChildImportCallbacks import_callbacks;
+  import_callbacks.enabled = true;
+  import_callbacks.max_imports = options.max_vm_enter_child_imports;
+  import_callbacks.try_import_target =
+      [&](uint64_t target_pc, llvm::Function &placeholder,
+          std::string &failure_reason, llvm::Function *&imported_root) -> bool {
+        auto child = callbacks.lift_child_target(
+            target_pc, /*no_abi=*/true, /*enable_gsd=*/true,
+            /*enable_recovery_mode=*/true, /*dump_virtual_model=*/true);
+        if (!child) {
+          emitPreciseLog(options, callbacks, "output-recovery",
+                         "abi-vm-enter-lift-failed",
+                         "failed to lift vm-enter child", target_pc);
+          failure_reason = "child_lift_failed";
+          return false;
+        }
+        auto analyzed_raw_child = analyzeChildLiftArtifactForPlanning(
+            module.getContext(), std::move(*child));
+        auto prepared_child = prepareChildLiftArtifact(
+            module.getContext(), analyzed_raw_child, /*no_abi_mode=*/true);
+        auto analyzed_child = analyzeChildLiftArtifactForPlanning(
+            module.getContext(), prepared_child.artifact);
+        auto selected_child = selectBestChildImportArtifact(
+            module.getContext(), analyzed_raw_child, analyzed_child,
+            ChildRootSelectionMode::kVmEnter);
+        analyzed_child = selected_child.artifact;
+        auto preimport_plan = selected_child.plan;
+        auto plan = callbacks.import_vm_enter_child(
+            target_pc, analyzed_child, preimport_plan, placeholder);
+        append_import_plan_note("abi_vm_enter_import", plan);
+        if (plan.eligibility != ImportEligibility::kImportable ||
+            !plan.imported_root) {
+          emitPreciseLog(options, callbacks, "output-recovery",
+                         "abi-vm-enter-import-rejected",
+                         "vm-enter child import rejected", target_pc,
+                         std::nullopt,
+                         plan.rejection_detail.empty()
+                             ? std::optional<std::string>(toString(
+                                   plan.rejection_reason))
+                             : std::optional<std::string>(
+                                   plan.rejection_detail));
+          failure_reason = plan.rejection_detail.empty()
+                               ? toString(plan.rejection_reason)
+                               : plan.rejection_detail;
+          return false;
+        }
+        emitPreciseLog(options, callbacks, "output-recovery",
+                       "abi-vm-enter-import",
+                       "imported vm-enter child", target_pc);
+        imported_root = plan.imported_root;
+        return true;
+      };
+  import_callbacks.on_imported_target = [&](uint64_t target_pc) {
+    if (callbacks.note_imported_target)
+      callbacks.note_imported_target(target_pc);
+  };
+  return import_callbacks;
+}
+bool handleAbiLateFrontierRound(
+    OutputRecoverySummary &summary, const OutputRecoveryCallbacks &callbacks,
+    const FrontierRoundSummary &round_summary,
+    const VmEnterChildImportSummary &import_summary,
+    const std::function<void(llvm::StringRef, const std::function<void()> &)>
+        &note_abi_step) {
+  for (const auto &note : import_summary.notes)
+    summary.notes.push_back("abi_late_output_root_closure:" + note);
+  summary.abi_imported_vm_enter_children += import_summary.imported;
+  const bool imported_vm_enter_children = import_summary.changed;
+  if (imported_vm_enter_children)
+    summary.changed = true;
+
+  auto final_code_targets =
+      callbacks.collect_output_root_constant_code_call_targets
+          ? callbacks.collect_output_root_constant_code_call_targets()
+          : std::vector<uint64_t>{};
+  auto final_calli_targets = callbacks.collect_output_root_constant_calli_targets
+                                ? callbacks.collect_output_root_constant_calli_targets()
+                                : std::vector<uint64_t>{};
+  auto final_dispatch_targets =
+      callbacks.collect_output_root_constant_dispatch_targets
+          ? callbacks.collect_output_root_constant_dispatch_targets()
+          : std::vector<uint64_t>{};
+
+  if (callbacks.patch_constant_inttoptr_calls_to_native)
+    callbacks.patch_constant_inttoptr_calls_to_native(
+        final_code_targets, "abi_post_final_constant_code_patch",
+        "patched final constant code callsites");
+  if (callbacks.patch_declared_lifted_or_block_calls_to_defined_targets) {
+    summary.patched_declared_targets +=
+        callbacks.patch_declared_lifted_or_block_calls_to_defined_targets(
+            final_code_targets, "abi_post_final_declared_code_patch",
+            "patched final declared lifted/block callsites");
+  }
+  if (callbacks.patch_constant_calli_targets_to_direct_calls) {
+    summary.patched_calli_targets +=
+        callbacks.patch_constant_calli_targets_to_direct_calls(
+            final_calli_targets, "abi_post_final_calli_patch",
+            "patched final constant CALLI callsites");
+  }
+  if (callbacks.patch_constant_dispatch_targets_to_direct_calls) {
+    summary.patched_dispatch_targets +=
+        callbacks.patch_constant_dispatch_targets_to_direct_calls(
+            final_dispatch_targets, "abi_post_final_dispatch_patch",
+            "patched final constant dispatch callsites");
+  }
+  if (!final_code_targets.empty())
+    summary.patched_code_targets +=
+        static_cast<unsigned>(final_code_targets.size());
+
+  const bool callback_changed =
+      imported_vm_enter_children || summary.patched_declared_targets != 0 ||
+      summary.patched_calli_targets != 0 ||
+      summary.patched_dispatch_targets != 0 || !final_code_targets.empty();
+  if (!round_summary.changed && !callback_changed)
+    return false;
+
+  if (callbacks.run_final_output_cleanup) {
+    note_abi_step("late_output_root_final_output_cleanup",
+                  [&] { callbacks.run_final_output_cleanup(); });
+  }
+  if (callbacks.prune_to_defined_output_root_closure) {
+    note_abi_step("late_output_root_prune_defined_output_root_closure", [&] {
+      callbacks.prune_to_defined_output_root_closure();
+    });
+  }
+  if (callbacks.run_final_output_cleanup) {
+    note_abi_step("late_output_root_post_prune_final_output_cleanup",
+                  [&] { callbacks.run_final_output_cleanup(); });
+  }
+  if (callbacks.run_late_closure_canonicalization) {
+    note_abi_step("late_output_root_canonicalization", [&] {
+      callbacks.run_late_closure_canonicalization(
+          "abi_late_output_root_closure");
+    });
+  }
+  if (callbacks.run_post_patch_cleanup) {
+    note_abi_step("late_output_root_post_patch_cleanup", [&] {
+      callbacks.run_post_patch_cleanup("abi_late_output_root_closure");
+    });
+  }
+  if (callbacks.annotate_vm_unresolved_continuations)
+    callbacks.annotate_vm_unresolved_continuations();
+  summary.changed = true;
+  return true;
+}
+
+
 FrontierIterationSummary DevirtualizationRuntime::runFrontierIterations(
-    llvm::Module &M, BlockLifter &block_lifter,
-    IterativeLiftingSession &iterative_session,
+    llvm::Module &M, RemillProjectionLifter &projection_lifter,
     const FrontierCallbacks &frontier_callbacks, FrontierDiscoveryPhase phase,
     unsigned max_rounds, const FrontierIterationCallbacks &iteration_callbacks,
     const VmEnterChildImportCallbacks *vm_enter_import_callbacks) const {
@@ -2662,7 +4172,7 @@ FrontierIterationSummary DevirtualizationRuntime::runFrontierIterations(
                             round_summary.advance.notes.end());
         bundle.notes.insert(bundle.notes.end(), import_summary.notes.begin(),
                             import_summary.notes.end());
-        populateRoundArtifactBundleFromModule(M, bundle);
+        populateRoundArtifactBundleFromModule(M, bundle, &orchestrator_);
         populateRecoveryQualitySummary(bundle, child_artifact_cache_,
                                       round_artifact_bundles_);
         bundle.final_tail_graph = buildFinalTailGraph(M);
@@ -2672,40 +4182,41 @@ FrontierIterationSummary DevirtualizationRuntime::runFrontierIterations(
         return should_continue;
       };
 
-  return orchestrator_.runFrontierIterations(
-      M, block_lifter, iterative_session, frontier_callbacks, phase,
-      max_rounds, wrapped_callbacks, vm_enter_import_callbacks);
+  try {
+    return orchestrator_.runFrontierIterations(
+        M, projection_lifter, frontier_callbacks, phase, max_rounds,
+        wrapped_callbacks, vm_enter_import_callbacks);
+  } catch (...) {
+    FrontierIterationSummary summary;
+    summary.crashed = true;
+    return summary;
+  }
 }
 
-FrontierIterationSummary DevirtualizationRuntime::runPrimaryDevirtualization(
-    llvm::Module &M, BlockLifter &block_lifter,
-    IterativeLiftingSession &iterative_session,
-    const FrontierCallbacks &frontier_callbacks, FrontierDiscoveryPhase phase,
-    unsigned max_rounds, const FrontierIterationCallbacks &iteration_callbacks,
-    const VmEnterChildImportCallbacks *vm_enter_import_callbacks) const {
-  return runFrontierIterations(M, block_lifter, iterative_session,
-                               frontier_callbacks, phase, max_rounds,
-                               iteration_callbacks,
-                               vm_enter_import_callbacks);
-}
 
 OutputRecoverySummary DevirtualizationRuntime::runOutputRecovery(
-    llvm::Module &M, BlockLifter *block_lifter,
-    IterativeLiftingSession *iterative_session,
+    llvm::Module &M, RemillProjectionLifter *projection_lifter,
     const FrontierCallbacks *frontier_callbacks,
     const OutputRecoveryOptions &options,
     const OutputRecoveryCallbacks &callbacks) const {
+  auto *iterative_session = orchestrator_.session().iterative_session.get();
   OutputRecoverySummary summary;
-  const llvm::stable_hash module_fingerprint = llvm::StructuralHash(M);
-  if (!child_cache_module_fingerprint_ ||
-      *child_cache_module_fingerprint_ != module_fingerprint) {
-    child_artifact_cache_.clear();
-    boundary_resolution_cache_.clear();
-    child_cache_module_fingerprint_ = module_fingerprint;
-  }
+  child_artifact_cache_.clear();
+  boundary_resolution_cache_.clear();
+  child_cache_module_fingerprint_.reset();
 
   std::vector<ImportDecisionArtifact> pending_import_decisions;
   std::vector<CleanupActionArtifact> pending_cleanup_actions;
+  ChildArtifactRepository child_artifacts(child_artifact_cache_);
+  OutputRecoveryArtifactRecorder artifact_recorder{
+      *this,
+      M,
+      summary,
+      pending_import_decisions,
+      pending_cleanup_actions,
+      child_artifact_cache_,
+      round_artifact_bundles_,
+  };
   auto rememberCleanupAction = [&](llvm::StringRef label, bool changed,
                                    llvm::StringRef detail = {}) {
     pending_cleanup_actions.push_back(
@@ -2723,18 +4234,25 @@ OutputRecoverySummary DevirtualizationRuntime::runOutputRecovery(
     emitPreciseLog(options, callbacks, "output-recovery", "abi-step-end",
                    label);
   };
-  auto recordArtifactBundle = [&](RoundArtifactBundle bundle) {
-    populateRoundArtifactBundleFromModule(M, bundle);
-    bundle.import_decisions = std::move(pending_import_decisions);
-    bundle.cleanup_actions = std::move(pending_cleanup_actions);
-    populateRecoveryQualitySummary(bundle, child_artifact_cache_,
-                                  round_artifact_bundles_);
-    bundle.final_tail_graph = buildFinalTailGraph(M);
-    augmentRecoveryQualityFromTailGraph(bundle, *bundle.final_tail_graph);
-    refineRecoveryQualityFromModuleShape(M, bundle);
-    summary.artifact_bundles.push_back(bundle);
-    round_artifact_bundles_.push_back(bundle);
-  };
+  auto runAndRecordLateFrontier =
+      [&](llvm::StringRef label, FrontierDiscoveryPhase phase,
+          unsigned max_rounds,
+          const FrontierIterationCallbacks &iteration_callbacks,
+          const VmEnterChildImportCallbacks *vm_enter_import_callbacks,
+          auto &&populate_notes) {
+        auto late_summary = runFrontierIterations(
+            M, *projection_lifter, *frontier_callbacks, phase, max_rounds,
+            iteration_callbacks, vm_enter_import_callbacks);
+        summary.changed |= late_summary.changed;
+        RoundArtifactBundle bundle;
+        bundle.stage = RuntimeArtifactStage::kOutputRecoveryRound;
+        bundle.label = label.str();
+        bundle.changed = late_summary.changed;
+        populate_notes(late_summary, bundle);
+        artifact_recorder.record(std::move(bundle));
+        return late_summary;
+      };
+
   auto rememberImportDecision =
       [&](llvm::StringRef label, const ChildImportPlan &plan,
           const std::optional<ContinuationProof> &proof,
@@ -2774,27 +4292,25 @@ OutputRecoverySummary DevirtualizationRuntime::runOutputRecovery(
       [&](uint64_t target_pc, bool no_abi, bool enable_gsd,
           bool enable_recovery_mode,
           bool dump_virtual_model) -> std::optional<ChildLiftArtifact> {
-    ChildArtifactCacheKey key;
-    key.target_pc = target_pc;
-    key.no_abi = no_abi;
-    key.enable_gsd = enable_gsd;
-    key.enable_recovery_mode = enable_recovery_mode;
-    key.dump_virtual_model = dump_virtual_model;
-
-    auto cache_it = child_artifact_cache_.find(key);
-    if (cache_it != child_artifact_cache_.end()) {
-      if (cache_it->second.skipped_child_lift) {
+    auto key = makeChildArtifactCacheKey(
+        target_pc, no_abi, enable_gsd, enable_recovery_mode,
+        dump_virtual_model);
+    auto *cache_entry = child_artifacts.find(
+        target_pc, no_abi, enable_gsd, enable_recovery_mode,
+        dump_virtual_model);
+    if (cache_entry) {
+      if (cache_entry->skipped_child_lift) {
         emitPreciseLog(options, callbacks, "output-recovery",
                        "child-cache-negative-hit",
                        "reusing cached failed child lift", target_pc,
-                       std::nullopt, cache_it->second.diagnostics);
+                       std::nullopt, cache_entry->diagnostics);
         return std::nullopt;
       }
-      if (!cache_it->second.artifact.ir_text.empty()) {
+      if (!cache_entry->artifact.ir_text.empty()) {
         emitPreciseLog(options, callbacks, "output-recovery",
                        "child-cache-hit", "reusing cached child artifact",
-                       target_pc, std::nullopt, cache_it->second.diagnostics);
-        return cache_it->second.artifact;
+                       target_pc, std::nullopt, cache_entry->diagnostics);
+        return cache_entry->artifact;
       }
     }
 
@@ -2805,7 +4321,7 @@ OutputRecoverySummary DevirtualizationRuntime::runOutputRecovery(
     auto raw_child = callbacks.lift_child_target(
         target_pc, no_abi, enable_gsd, enable_recovery_mode, dump_virtual_model);
     if (!raw_child) {
-      auto &entry = child_artifact_cache_[key];
+      auto &entry = child_artifacts.getOrCreate(key);
       entry.raw_artifact = ChildLiftArtifact{};
       entry.raw_artifact.target_pc = target_pc;
       entry.raw_artifact.rejection_reason =
@@ -2827,7 +4343,7 @@ OutputRecoverySummary DevirtualizationRuntime::runOutputRecovery(
                                                    analyzed_raw_child, no_abi);
     auto analyzed_child = analyzeChildLiftArtifact(
         M.getContext(), prepared_child.artifact);
-    auto &entry = child_artifact_cache_[key];
+    auto &entry = child_artifacts.getOrCreate(key);
     entry.raw_artifact = std::move(analyzed_raw_child);
     entry.prepared_artifact = std::move(prepared_child);
     entry.artifact = analyzed_child;
@@ -2850,32 +4366,17 @@ OutputRecoverySummary DevirtualizationRuntime::runOutputRecovery(
       [&](uint64_t target_pc, bool no_abi, bool enable_gsd,
           bool enable_recovery_mode,
           bool dump_virtual_model) -> ChildArtifactCacheEntry * {
-    ChildArtifactCacheKey key;
-    key.target_pc = target_pc;
-    key.no_abi = no_abi;
-    key.enable_gsd = enable_gsd;
-    key.enable_recovery_mode = enable_recovery_mode;
-    key.dump_virtual_model = dump_virtual_model;
-    auto it = child_artifact_cache_.find(key);
-    if (it == child_artifact_cache_.end())
-      return nullptr;
-    return &it->second;
-  };
+        return child_artifacts.find(target_pc, no_abi, enable_gsd,
+                                    enable_recovery_mode,
+                                    dump_virtual_model);
+      };
   auto rememberChildPlan = [&](uint64_t target_pc, bool no_abi, bool enable_gsd,
                                bool enable_recovery_mode,
                                bool dump_virtual_model,
                                const ChildImportPlan &plan, bool imported) {
-    ChildArtifactCacheKey key;
-    key.target_pc = target_pc;
-    key.no_abi = no_abi;
-    key.enable_gsd = enable_gsd;
-    key.enable_recovery_mode = enable_recovery_mode;
-    key.dump_virtual_model = dump_virtual_model;
-    auto it = child_artifact_cache_.find(key);
-    if (it == child_artifact_cache_.end())
-      return;
-    it->second.last_plan = plan;
-    it->second.imported = imported;
+    child_artifacts.rememberPlan(target_pc, no_abi, enable_gsd,
+                                  enable_recovery_mode, dump_virtual_model,
+                                  plan, imported);
   };
   auto resolveExecutableContinuation =
       [&](uint64_t target_pc,
@@ -2884,12 +4385,9 @@ OutputRecoverySummary DevirtualizationRuntime::runOutputRecovery(
     if (!frontier_callbacks)
       return std::nullopt;
 
-    ChildArtifactCacheKey key;
-    key.target_pc = target_pc;
-    key.no_abi = true;
-    key.enable_gsd = false;
-    key.enable_recovery_mode = false;
-    key.dump_virtual_model = true;
+    auto key = makeChildArtifactCacheKey(
+        target_pc, /*no_abi=*/true, /*enable_gsd=*/false,
+        /*enable_recovery_mode=*/false, /*dump_virtual_model=*/true);
 
     const bool has_meaningful_proof = hasMeaningfulProof(proof);
     const std::string proof_summary =
@@ -2910,12 +4408,10 @@ OutputRecoverySummary DevirtualizationRuntime::runOutputRecovery(
       emitPreciseLog(options, callbacks, "output-recovery", "resolver-skip",
                      "skipping binary reconstruction because continuation proof is missing",
                      target_pc, std::nullopt, proof_summary);
-      auto [entry_it, inserted] =
-          child_artifact_cache_.try_emplace(key, ChildArtifactCacheEntry{});
-      (void)inserted;
-      entry_it->second.resolver_result = result;
-      entry_it->second.proof_summary = proof_summary;
-      entry_it->second.diagnostics =
+      auto &entry = child_artifacts.getOrCreate(key);
+      entry.resolver_result = result;
+      entry.proof_summary = proof_summary;
+      entry.diagnostics =
           "proof=" + proof_summary + ",resolver=missing_proof";
       return result;
     }
@@ -2942,13 +4438,18 @@ OutputRecoverySummary DevirtualizationRuntime::runOutputRecovery(
                                            : "proof_skips_reconstruction",
         target_pc, std::nullopt, proof_summary);
 
+    const bool controlled_return_region =
+        proof->resolution_kind == ContinuationResolutionKind::kBoundaryModeled &&
+        proof->suppresses_normal_fallthrough &&
+        proof->return_address_control_kind !=
+            VirtualReturnAddressControlKind::kUnknown;
     const bool exact_fallthrough_target =
         frontier_callbacks->is_exact_call_fallthrough_target &&
         frontier_callbacks->is_exact_call_fallthrough_target(target_pc);
     if (!proof_allows_binary_reconstruction ||
         (frontier_callbacks->can_decode_target &&
          !frontier_callbacks->can_decode_target(target_pc) &&
-         !exact_fallthrough_target)) {
+         !exact_fallthrough_target && !controlled_return_region)) {
       ContinuationResolutionResult result;
       result.kind = ContinuationResolverKind::kExecutable;
       result.updated_proof = proof.value_or(ContinuationProof{});
@@ -2983,20 +4484,15 @@ OutputRecoverySummary DevirtualizationRuntime::runOutputRecovery(
       emitPreciseLog(options, callbacks, "output-recovery", "resolver-skip",
                      "skipping binary reconstruction for non-importable proof target",
                      target_pc, std::nullopt, proof_summary);
-      auto [entry_it, inserted] =
-          child_artifact_cache_.try_emplace(key, ChildArtifactCacheEntry{});
-      (void)inserted;
-      entry_it->second.resolver_result = result;
-      entry_it->second.proof_summary = proof_summary;
-      entry_it->second.diagnostics =
+      auto &entry = child_artifacts.getOrCreate(key);
+      entry.resolver_result = result;
+      entry.proof_summary = proof_summary;
+      entry.diagnostics =
           "proof=" + proof_summary + ",resolver=skipped_nondecodable";
       return result;
     }
 
-    auto [entry_it, inserted] =
-        child_artifact_cache_.try_emplace(key, ChildArtifactCacheEntry{});
-    (void)inserted;
-    auto &entry = entry_it->second;
+    auto &entry = child_artifacts.getOrCreate(key);
     if (entry.resolver_result && entry.proof_summary == proof_summary) {
       emitPreciseLog(options, callbacks, "output-recovery",
                      "resolver-cache-hit",
@@ -3015,10 +4511,16 @@ OutputRecoverySummary DevirtualizationRuntime::runOutputRecovery(
     request.learned_edges_by_source =
         collectLearnedOutgoingEdges(iterative_session, target_pc, proof);
 
+    FrontierCallbacks callbacks_for_resolution = *frontier_callbacks;
+    if (controlled_return_region) {
+      callbacks_for_resolution.can_decode_target =
+          [](uint64_t) { return true; };
+    }
+
     ExecutableContinuationResolver resolver;
     emitPreciseLog(options, callbacks, "output-recovery", "resolver-run",
                    "running executable continuation resolver", target_pc);
-    auto result = resolver.resolve(request, *frontier_callbacks);
+    auto result = resolver.resolve(request, callbacks_for_resolution);
     emitPreciseLog(options, callbacks, "output-recovery",
                    "resolver-after-run", "resolver produced region snapshot",
                    target_pc, std::nullopt,
@@ -3046,9 +4548,12 @@ OutputRecoverySummary DevirtualizationRuntime::runOutputRecovery(
     return result;
   };
 
+
+
   if (!options.raw_binary && options.no_abi &&
       options.allow_noabi_postmain_rounds && options.use_block_lifting &&
-      block_lifter && iterative_session && frontier_callbacks) {
+      projection_lifter && iterative_session && frontier_callbacks &&
+      !options.enable_devirtualization) {
     FrontierIterationCallbacks iteration_callbacks;
     iteration_callbacks.before_frontier_round = [&](unsigned round) {
       emitPreciseLog(options, callbacks, "output-recovery",
@@ -3075,568 +4580,144 @@ OutputRecoverySummary DevirtualizationRuntime::runOutputRecovery(
             callbacks.annotate_vm_unresolved_continuations();
           return round_summary.changed;
         };
-    auto late_summary = runPrimaryDevirtualization(
-        M, *block_lifter, *iterative_session, *frontier_callbacks,
-        FrontierDiscoveryPhase::kCombined, options.late_noabi_closure_rounds,
-        iteration_callbacks);
-    summary.changed |= late_summary.changed;
-    RoundArtifactBundle bundle;
-    bundle.stage = RuntimeArtifactStage::kOutputRecoveryRound;
-    bundle.label = "noabi_late_frontier";
-    bundle.changed = late_summary.changed;
-    for (const auto &round_summary : late_summary.round_summaries) {
-      bundle.notes.push_back(
-          "discover_changed=" + std::to_string(round_summary.discover.changed));
-      bundle.notes.push_back(
-          "advance_changed=" + std::to_string(round_summary.advance.changed));
-    }
-    recordArtifactBundle(std::move(bundle));
+    (void)runAndRecordLateFrontier(
+        "noabi_late_frontier", FrontierDiscoveryPhase::kCombined,
+        options.late_noabi_closure_rounds, iteration_callbacks, nullptr,
+        [&](const FrontierIterationSummary &late_summary,
+            RoundArtifactBundle &bundle) {
+          for (const auto &round_summary : late_summary.round_summaries) {
+            bundle.notes.push_back(
+                "discover_changed=" +
+                std::to_string(round_summary.discover.changed));
+            bundle.notes.push_back(
+                "advance_changed=" +
+                std::to_string(round_summary.advance.changed));
+          }
+        });
   }
 
+
+
+  const bool has_executable_child_recovery =
+      callbacks.import_executable_snapshot_slice ||
+      (callbacks.lift_child_target && callbacks.import_executable_child);
+  const bool has_vm_enter_child_recovery =
+      callbacks.lift_child_target && callbacks.import_vm_enter_child;
   if (!options.raw_binary && options.no_abi &&
       options.allow_noabi_postmain_rounds && options.use_block_lifting &&
-      callbacks.lift_child_target && callbacks.import_executable_child &&
+      (has_executable_child_recovery || has_vm_enter_child_recovery) &&
       callbacks.collect_executable_placeholder_declaration_targets &&
       callbacks.patch_declared_lifted_or_block_calls_to_defined_targets &&
       callbacks.run_final_output_cleanup) {
+    emitPreciseLog(options, callbacks, "output-recovery",
+                   "noabi-preimport-annotate-begin",
+                   "annotating vm unresolved continuations before import rounds");
+    if (callbacks.annotate_vm_unresolved_continuations)
+      callbacks.annotate_vm_unresolved_continuations();
+    emitPreciseLog(options, callbacks, "output-recovery",
+                   "noabi-preimport-annotate-end",
+                   "annotated vm unresolved continuations before import rounds");
     llvm::DenseSet<uint64_t> seen_import_targets;
     llvm::DenseSet<uint64_t> exhausted_import_targets;
     for (unsigned import_round = 0;
          import_round < options.max_noabi_executable_child_import_rounds;
          ++import_round) {
-      std::vector<uint64_t> imported_executable_children;
+      std::vector<uint64_t> imported_child_targets;
       std::vector<RejectedImportArtifact> rejected_imports;
       if (frontier_callbacks) {
         for (const auto &item : collectOutputRootClosureWorkItems(
                  M, frontier_callbacks->is_code_address,
                  frontier_callbacks->has_defined_target,
                  frontier_callbacks->normalize_target_pc)) {
-          if (!item.executable_target || !item.target_pc ||
-              seen_import_targets.contains(item.target_pc) ||
-              exhausted_import_targets.contains(item.target_pc))
+          if (!item.target_pc)
             continue;
-          auto proof = findContinuationProofForTarget(orchestrator_,
-                                                      item.target_pc);
-          emitPreciseLog(options, callbacks, "output-recovery",
-                         "noabi-child-proof", "evaluating child proof",
-                         item.target_pc, std::nullopt, summarizeProof(proof));
-          auto resolution =
-              resolveExecutableContinuation(item.target_pc, proof);
-          emitPreciseLog(options, callbacks, "output-recovery",
-                         "noabi-child-resolution",
-                         "resolved executable continuation", item.target_pc,
-                         std::nullopt, summarizeResolution(resolution));
-          if (resolution &&
-              resolution->disposition ==
-                  ContinuationResolutionDisposition::
-                      kDeferredQuarantinedSelectorArm) {
-            ChildImportPlan deferred_plan;
-            deferred_plan.target_pc = item.target_pc;
-            deferred_plan.eligibility = ImportEligibility::kRetryable;
-            deferred_plan.rejection_reason = RecoveryRejectionReason::kUnsupported;
-            deferred_plan.rejection_detail = "quarantined_selector_arm";
-            deferred_plan.proof = proof;
-            appendImportPlanNote("noabi_child_plan", deferred_plan, proof,
-                                 resolution);
-            rejected_imports.push_back(
-                {item.target_pc, deferred_plan.rejection_reason,
-                 deferred_plan.rejection_detail});
-            rememberChildPlan(item.target_pc, /*no_abi=*/true,
-                              /*enable_gsd=*/false,
-                              /*enable_recovery_mode=*/false,
-                              /*dump_virtual_model=*/true, deferred_plan,
-                              false);
-            continue;
-          }
-          emitPreciseLog(options, callbacks, "output-recovery",
-                         "noabi-child-lift", "lifting executable child",
-                         item.target_pc);
-          auto child = lookupCachedChildArtifact(
-              item.target_pc, /*no_abi=*/true, /*enable_gsd=*/false,
-              /*enable_recovery_mode=*/false, /*dump_virtual_model=*/true);
-          if (!child) {
-            ChildImportPlan failed_plan;
-            failed_plan.target_pc = item.target_pc;
-            failed_plan.rejection_reason =
-                RecoveryRejectionReason::kChildLiftFailed;
-            appendImportPlanNote("noabi_child_import", failed_plan, proof,
-                                 resolution);
-            rejected_imports.push_back(
-                {item.target_pc, failed_plan.rejection_reason,
-                 failed_plan.rejection_detail});
-            exhausted_import_targets.insert(item.target_pc);
-            continue;
-          }
-          auto *cache_entry = findCachedChildArtifactEntry(
-              item.target_pc, /*no_abi=*/true, /*enable_gsd=*/false,
-              /*enable_recovery_mode=*/false, /*dump_virtual_model=*/true);
-          ChildVariantSelectionResult selected_child;
-          if (cache_entry) {
-            selected_child = selectCachedChildImportArtifact(
-                M.getContext(), *cache_entry, ChildRootSelectionMode::kExecutable,
-                proof, resolution);
-          } else {
-            auto prepared_selection = selectPreparedChildImportRoot(
-                M.getContext(), *child, ChildRootSelectionMode::kExecutable,
-                proof, resolution);
-            selected_child.artifact = std::move(prepared_selection.artifact);
-            selected_child.plan = std::move(prepared_selection.plan);
-            selected_child.used_prepared_variant = true;
-          }
-          if (selected_child.artifact.selected_root_was_retargeted ||
-              !selected_child.used_prepared_variant) {
-            emitPreciseLog(options, callbacks, "output-recovery",
-                           "noabi-child-root-select",
-                           "selected executable child import root", item.target_pc,
-                           std::nullopt,
-                           selected_child.artifact.selected_root_selection_detail);
-          }
-          *child = selected_child.artifact;
-          auto preimport_plan = selected_child.plan;
-          emitPreciseLog(
-              options, callbacks, "output-recovery", "noabi-child-plan",
-              "classified executable child", item.target_pc, std::nullopt,
-              "class=" + std::string(toString(*preimport_plan.import_class)) +
-                  ",eligibility=" +
-                  std::string(toString(preimport_plan.eligibility)));
-          appendImportPlanNote("noabi_child_plan", preimport_plan, proof,
-                               resolution);
-          if (preimport_plan.eligibility != ImportEligibility::kImportable) {
-            rejected_imports.push_back(
-                {item.target_pc, preimport_plan.rejection_reason,
-                 preimport_plan.rejection_detail});
-          }
-          rememberChildPlan(item.target_pc, /*no_abi=*/true,
-                            /*enable_gsd=*/false,
-                            /*enable_recovery_mode=*/false,
-                            /*dump_virtual_model=*/true, preimport_plan,
-                            false);
-          if (preimport_plan.eligibility != ImportEligibility::kImportable) {
-            if (preimport_plan.eligibility == ImportEligibility::kRejected)
-              exhausted_import_targets.insert(item.target_pc);
-            continue;
-          }
-          auto plan = callbacks.import_executable_child(
-              item.target_pc, *child, preimport_plan, "execchild_");
-          plan.import_class = preimport_plan.import_class;
-          plan.proof = proof;
-          if (!plan.selected_root_pc)
-            plan.selected_root_pc = preimport_plan.selected_root_pc;
-          appendImportPlanNote("noabi_child_import", plan, proof, resolution);
-          if (plan.eligibility != ImportEligibility::kImportable ||
-              !plan.imported_root) {
-            rejected_imports.push_back(
-                {item.target_pc, plan.rejection_reason,
-                 plan.rejection_detail});
-          }
-          rememberChildPlan(item.target_pc, /*no_abi=*/true,
-                            /*enable_gsd=*/false,
-                            /*enable_recovery_mode=*/false,
-                            /*dump_virtual_model=*/true, plan,
-                            plan.eligibility == ImportEligibility::kImportable &&
-                                plan.imported_root != nullptr);
-          if (plan.eligibility != ImportEligibility::kImportable ||
-              !plan.imported_root) {
-            exhausted_import_targets.insert(item.target_pc);
-            continue;
-          }
-          emitPreciseLog(options, callbacks, "output-recovery",
-                         "noabi-child-import", "imported executable child",
-                         item.target_pc);
-          seen_import_targets.insert(item.target_pc);
-          imported_executable_children.push_back(item.target_pc);
-          ++summary.noabi_imported_children;
+          const bool executable_candidate =
+              static_cast<bool>(item.executable_target) ||
+              item.source_kind ==
+                  OutputRootClosureSourceKind::kVmUnresolvedContinuationTarget;
+          processNoAbiClosureChildCandidate(
+              M, item.target_pc, executable_candidate, item.boundary, options,
+              callbacks, orchestrator_, summary,
+              seen_import_targets, exhausted_import_targets,
+              imported_child_targets, rejected_imports,
+              resolveExecutableContinuation, lookupCachedChildArtifact,
+              findCachedChildArtifactEntry, appendImportPlanNote,
+              rememberChildPlan);
         }
       }
-
-      for (uint64_t target_pc :
-           callbacks.collect_executable_placeholder_declaration_targets()) {
+      for (uint64_t target_pc : collectVmUnresolvedContinuationTargets(
+               M, frontier_callbacks->is_code_address,
+               frontier_callbacks->has_defined_target,
+               frontier_callbacks->normalize_target_pc)) {
         if (seen_import_targets.contains(target_pc) ||
-            exhausted_import_targets.contains(target_pc))
-          continue;
-        auto proof = findContinuationProofForTarget(orchestrator_, target_pc);
-        emitPreciseLog(options, callbacks, "output-recovery",
-                       "noabi-decl-proof", "evaluating declaration proof",
-                       target_pc, std::nullopt, summarizeProof(proof));
-        auto resolution = resolveExecutableContinuation(target_pc, proof);
-        emitPreciseLog(options, callbacks, "output-recovery",
-                       "noabi-decl-resolution",
-                       "resolved declaration-backed continuation", target_pc,
-                       std::nullopt, summarizeResolution(resolution));
-        if (resolution &&
-            resolution->disposition ==
-                ContinuationResolutionDisposition::
-                    kDeferredQuarantinedSelectorArm) {
-          ChildImportPlan deferred_plan;
-          deferred_plan.target_pc = target_pc;
-          deferred_plan.eligibility = ImportEligibility::kRetryable;
-          deferred_plan.rejection_reason = RecoveryRejectionReason::kUnsupported;
-          deferred_plan.rejection_detail = "quarantined_selector_arm";
-          deferred_plan.proof = proof;
-          appendImportPlanNote("noabi_decl_plan", deferred_plan, proof,
-                               resolution);
-          rejected_imports.push_back(
-              {target_pc, deferred_plan.rejection_reason,
-               deferred_plan.rejection_detail});
-          rememberChildPlan(target_pc, /*no_abi=*/true, /*enable_gsd=*/false,
-                            /*enable_recovery_mode=*/false,
-                            /*dump_virtual_model=*/true, deferred_plan, false);
+            exhausted_import_targets.contains(target_pc)) {
           continue;
         }
-        emitPreciseLog(options, callbacks, "output-recovery",
-                       "noabi-declaration-lift",
-                       "lifting declaration-backed executable child",
-                       target_pc);
-        auto child = lookupCachedChildArtifact(
-            target_pc, /*no_abi=*/true, /*enable_gsd=*/false,
-            /*enable_recovery_mode=*/false, /*dump_virtual_model=*/true);
-        if (!child) {
-          ChildImportPlan failed_plan;
-          failed_plan.target_pc = target_pc;
-          failed_plan.rejection_reason =
-              RecoveryRejectionReason::kChildLiftFailed;
-          appendImportPlanNote("noabi_decl_import", failed_plan, proof,
-                               resolution);
-          rejected_imports.push_back(
-              {target_pc, failed_plan.rejection_reason,
-               failed_plan.rejection_detail});
-          exhausted_import_targets.insert(target_pc);
-          continue;
-        }
-        auto *cache_entry = findCachedChildArtifactEntry(
-            target_pc, /*no_abi=*/true, /*enable_gsd=*/false,
-            /*enable_recovery_mode=*/false, /*dump_virtual_model=*/true);
-        ChildVariantSelectionResult selected_child;
-        if (cache_entry) {
-          selected_child = selectCachedChildImportArtifact(
-              M.getContext(), *cache_entry, ChildRootSelectionMode::kExecutable,
-              proof, resolution);
-        } else {
-          auto prepared_selection = selectPreparedChildImportRoot(
-              M.getContext(), *child, ChildRootSelectionMode::kExecutable, proof,
-              resolution);
-          selected_child.artifact = std::move(prepared_selection.artifact);
-          selected_child.plan = std::move(prepared_selection.plan);
-          selected_child.used_prepared_variant = true;
-        }
-        if (selected_child.artifact.selected_root_was_retargeted ||
-            !selected_child.used_prepared_variant) {
-          emitPreciseLog(options, callbacks, "output-recovery",
-                         "noabi-decl-root-select",
-                         "selected declaration child import root",
-                         target_pc, std::nullopt,
-                         selected_child.artifact.selected_root_selection_detail);
-        }
-        *child = selected_child.artifact;
-        auto preimport_plan = selected_child.plan;
-        emitPreciseLog(
-            options, callbacks, "output-recovery", "noabi-decl-plan",
-            "classified declaration-backed child", target_pc, std::nullopt,
-            "class=" + std::string(toString(*preimport_plan.import_class)) +
-                ",eligibility=" +
-                std::string(toString(preimport_plan.eligibility)));
-        appendImportPlanNote("noabi_decl_plan", preimport_plan, proof,
-                             resolution);
-        if (preimport_plan.eligibility != ImportEligibility::kImportable) {
-          rejected_imports.push_back(
-              {target_pc, preimport_plan.rejection_reason,
-               preimport_plan.rejection_detail});
-        }
-        rememberChildPlan(target_pc, /*no_abi=*/true, /*enable_gsd=*/false,
-                          /*enable_recovery_mode=*/false,
-                          /*dump_virtual_model=*/true, preimport_plan, false);
-        if (preimport_plan.eligibility != ImportEligibility::kImportable) {
-          if (preimport_plan.eligibility == ImportEligibility::kRejected)
-            exhausted_import_targets.insert(target_pc);
-          continue;
-        }
-        auto plan =
-            callbacks.import_executable_child(target_pc, *child,
-                                              preimport_plan, "execchild_");
-        plan.import_class = preimport_plan.import_class;
-        plan.proof = proof;
-        if (!plan.selected_root_pc)
-          plan.selected_root_pc = preimport_plan.selected_root_pc;
-        appendImportPlanNote("noabi_decl_import", plan, proof, resolution);
-        if (plan.eligibility != ImportEligibility::kImportable ||
-            !plan.imported_root) {
-          rejected_imports.push_back(
-              {target_pc, plan.rejection_reason, plan.rejection_detail});
-        }
-        rememberChildPlan(target_pc, /*no_abi=*/true, /*enable_gsd=*/false,
-                          /*enable_recovery_mode=*/false,
-                          /*dump_virtual_model=*/true, plan,
-                          plan.eligibility == ImportEligibility::kImportable &&
-                              plan.imported_root != nullptr);
-        if (plan.eligibility != ImportEligibility::kImportable ||
-            !plan.imported_root) {
-          exhausted_import_targets.insert(target_pc);
-          continue;
-        }
-        emitPreciseLog(options, callbacks, "output-recovery",
-                       "noabi-declaration-import",
-                       "imported declaration-backed executable child",
-                       target_pc);
-        seen_import_targets.insert(target_pc);
-        imported_executable_children.push_back(target_pc);
-        ++summary.noabi_imported_children;
+        processNoAbiClosureChildCandidate(
+            M, target_pc, /*executable_target=*/true, std::nullopt, options,
+            callbacks, orchestrator_, summary, seen_import_targets,
+            exhausted_import_targets, imported_child_targets, rejected_imports,
+            resolveExecutableContinuation, lookupCachedChildArtifact,
+            findCachedChildArtifactEntry, appendImportPlanNote,
+            rememberChildPlan);
       }
 
-      RoundArtifactBundle import_bundle;
-      import_bundle.stage = RuntimeArtifactStage::kOutputRecoveryImportRound;
-      import_bundle.label = "noabi_executable_children";
-      import_bundle.round = import_round;
-      import_bundle.changed = !imported_executable_children.empty();
-      import_bundle.imported_targets.assign(imported_executable_children.begin(),
-                                            imported_executable_children.end());
-      import_bundle.rejected_imports = std::move(rejected_imports);
-      if (imported_executable_children.empty()) {
-        recordArtifactBundle(std::move(import_bundle));
-        break;
+
+      if (callbacks.import_executable_child) {
+        for (uint64_t target_pc :
+             callbacks.collect_executable_placeholder_declaration_targets()) {
+          if (seen_import_targets.contains(target_pc) ||
+              exhausted_import_targets.contains(target_pc))
+            continue;
+          processNoAbiDeclarationChildCandidate(
+              M.getContext(), target_pc, options, callbacks, orchestrator_,
+              summary, seen_import_targets, exhausted_import_targets,
+              imported_child_targets, rejected_imports,
+              resolveExecutableContinuation, lookupCachedChildArtifact,
+              findCachedChildArtifactEntry, appendImportPlanNote,
+              rememberChildPlan);
+        }
       }
-      auto patched_targets =
-          callbacks.patch_declared_lifted_or_block_calls_to_defined_targets(
-              imported_executable_children,
-              "noabi_imported_executable_child_patch",
-              "patched output-root executable placeholders to imported child roots");
-      summary.patched_declared_targets += patched_targets;
-      rememberCleanupAction(
-          "noabi_imported_executable_child_patch", patched_targets != 0,
-          (llvm::Twine("patched_targets=") + llvm::Twine(patched_targets))
-              .str());
-      callbacks.run_final_output_cleanup();
-      rememberCleanupAction("noabi_post_import_final_output_cleanup", true,
-                            "executed");
-      summary.changed = true;
-      recordArtifactBundle(std::move(import_bundle));
+
+      finalizeNoAbiImportRound(
+          artifact_recorder, summary, callbacks, rememberCleanupAction,
+          import_round, imported_child_targets, std::move(rejected_imports));
+      if (imported_child_targets.empty())
+        break;
     }
   }
 
   if (!options.raw_binary && !options.no_abi &&
       options.allow_abi_postmain_rounds) {
-    if (callbacks.sanitize_remaining_poison_native_helper_args) {
-      noteAbiStep("sanitize_remaining_poison_native_helper_args", [&] {
-        callbacks.sanitize_remaining_poison_native_helper_args();
-      });
-    }
-    if (callbacks.erase_noop_self_recursive_native_calls) {
-      noteAbiStep("erase_noop_self_recursive_native_calls", [&] {
-        callbacks.erase_noop_self_recursive_native_calls();
-      });
-    }
-    if (callbacks.run_final_output_cleanup) {
-      noteAbiStep("initial_final_output_cleanup",
-                  [&] { callbacks.run_final_output_cleanup(); });
-    }
-    if (callbacks.prune_to_defined_output_root_closure) {
-      noteAbiStep("initial_prune_defined_output_root_closure", [&] {
-        callbacks.prune_to_defined_output_root_closure();
-      });
-    }
-    if (callbacks.run_final_output_cleanup) {
-      noteAbiStep("post_prune_final_output_cleanup",
-                  [&] { callbacks.run_final_output_cleanup(); });
-    }
-    if (callbacks.rerun_late_output_root_target_pipeline) {
-      noteAbiStep("initial_rerun_late_output_root_target_pipeline", [&] {
-        callbacks.rerun_late_output_root_target_pipeline();
-      });
-    }
-    if (callbacks.advance_session_owned_frontier_work &&
-        callbacks.advance_session_owned_frontier_work(
-            FrontierDiscoveryPhase::kVmUnresolvedContinuations,
-            "abi_late_vm_continuations")) {
-      if (callbacks.run_final_output_cleanup) {
-        noteAbiStep("vm_continuations_final_output_cleanup",
-                    [&] { callbacks.run_final_output_cleanup(); });
-      }
-      if (callbacks.prune_to_defined_output_root_closure) {
-        noteAbiStep("vm_continuations_prune_defined_output_root_closure", [&] {
-          callbacks.prune_to_defined_output_root_closure();
-        });
-      }
-      if (callbacks.run_final_output_cleanup) {
-        noteAbiStep("vm_continuations_post_prune_final_output_cleanup",
-                    [&] { callbacks.run_final_output_cleanup(); });
-      }
-      if (callbacks.rerun_late_output_root_target_pipeline) {
-        noteAbiStep("vm_continuations_rerun_late_output_root_target_pipeline",
-                    [&] {
-                      callbacks.rerun_late_output_root_target_pipeline();
-                    });
-      }
-      summary.changed = true;
-    }
+    runInitialAbiPostMainCleanup(callbacks, noteAbiStep, summary);
 
-    if (block_lifter && iterative_session && frontier_callbacks) {
-      std::optional<VmEnterChildImportCallbacks> vm_enter_import_callbacks;
-      if (options.enable_nested_vm_enter_child_import &&
-          callbacks.lift_child_target && callbacks.import_vm_enter_child) {
-        VmEnterChildImportCallbacks import_callbacks;
-        import_callbacks.enabled = true;
-        import_callbacks.max_imports = options.max_vm_enter_child_imports;
-        import_callbacks.try_import_target =
-            [&](uint64_t target_pc, llvm::Function &placeholder,
-                std::string &failure_reason,
-                llvm::Function *&imported_root) -> bool {
-              auto child = callbacks.lift_child_target(
-                  target_pc, /*no_abi=*/true, /*enable_gsd=*/true,
-                  /*enable_recovery_mode=*/true, /*dump_virtual_model=*/true);
-              if (!child) {
-                emitPreciseLog(options, callbacks, "output-recovery",
-                               "abi-vm-enter-lift-failed",
-                               "failed to lift vm-enter child", target_pc);
-                failure_reason = "child_lift_failed";
-                return false;
-              }
-              auto analyzed_raw_child = analyzeChildLiftArtifactForPlanning(
-                  M.getContext(), std::move(*child));
-              auto prepared_child = prepareChildLiftArtifact(
-                  M.getContext(), analyzed_raw_child, /*no_abi_mode=*/true);
-              auto analyzed_child = analyzeChildLiftArtifactForPlanning(
-                  M.getContext(), prepared_child.artifact);
-              auto selected_child = selectBestChildImportArtifact(
-                  M.getContext(), analyzed_raw_child, analyzed_child,
-                  ChildRootSelectionMode::kVmEnter);
-              analyzed_child = selected_child.artifact;
-              auto preimport_plan = selected_child.plan;
-              auto plan = callbacks.import_vm_enter_child(
-                  target_pc, analyzed_child, preimport_plan, placeholder);
-              appendImportPlanNote("abi_vm_enter_import", plan);
-              if (plan.eligibility != ImportEligibility::kImportable ||
-                  !plan.imported_root) {
-                emitPreciseLog(options, callbacks, "output-recovery",
-                               "abi-vm-enter-import-rejected",
-                               "vm-enter child import rejected", target_pc,
-                               std::nullopt,
-                               plan.rejection_detail.empty()
-                                   ? std::optional<std::string>(toString(
-                                         plan.rejection_reason))
-                                   : std::optional<std::string>(
-                                         plan.rejection_detail));
-                failure_reason = plan.rejection_detail.empty()
-                                     ? toString(plan.rejection_reason)
-                                     : plan.rejection_detail;
-                return false;
-              }
-              emitPreciseLog(options, callbacks, "output-recovery",
-                             "abi-vm-enter-import",
-                             "imported vm-enter child", target_pc);
-              imported_root = plan.imported_root;
-              return true;
-            };
-        import_callbacks.on_imported_target = [&](uint64_t target_pc) {
-          if (callbacks.note_imported_target)
-            callbacks.note_imported_target(target_pc);
-        };
-        vm_enter_import_callbacks = std::move(import_callbacks);
-      }
+    if (projection_lifter && iterative_session && frontier_callbacks) {
+      auto vm_enter_import_callbacks = buildAbiVmEnterImportCallbacks(
+          M, options, callbacks,
+          [&](llvm::StringRef label, const ChildImportPlan &plan) {
+            appendImportPlanNote(label, plan);
+          });
 
       FrontierIterationCallbacks iteration_callbacks;
       iteration_callbacks.after_frontier_round =
           [&](unsigned, const FrontierRoundSummary &round_summary,
               const VmEnterChildImportSummary &import_summary) {
-            for (const auto &note : import_summary.notes)
-              summary.notes.push_back("abi_late_output_root_closure:" + note);
-            summary.abi_imported_vm_enter_children += import_summary.imported;
-            const bool imported_vm_enter_children = import_summary.changed;
-            if (imported_vm_enter_children)
-              summary.changed = true;
-
-            auto final_code_targets =
-                callbacks.collect_output_root_constant_code_call_targets
-                    ? callbacks.collect_output_root_constant_code_call_targets()
-                    : std::vector<uint64_t>{};
-            auto final_calli_targets =
-                callbacks.collect_output_root_constant_calli_targets
-                    ? callbacks.collect_output_root_constant_calli_targets()
-                    : std::vector<uint64_t>{};
-            auto final_dispatch_targets =
-                callbacks.collect_output_root_constant_dispatch_targets
-                    ? callbacks.collect_output_root_constant_dispatch_targets()
-                    : std::vector<uint64_t>{};
-
-            if (callbacks.patch_constant_inttoptr_calls_to_native)
-              callbacks.patch_constant_inttoptr_calls_to_native(
-                  final_code_targets, "abi_post_final_constant_code_patch",
-                  "patched final constant code callsites");
-            if (callbacks.patch_declared_lifted_or_block_calls_to_defined_targets) {
-              summary.patched_declared_targets +=
-                  callbacks.patch_declared_lifted_or_block_calls_to_defined_targets(
-                      final_code_targets, "abi_post_final_declared_code_patch",
-                      "patched final declared lifted/block callsites");
-            }
-            if (callbacks.patch_constant_calli_targets_to_direct_calls) {
-              summary.patched_calli_targets +=
-                  callbacks.patch_constant_calli_targets_to_direct_calls(
-                      final_calli_targets, "abi_post_final_calli_patch",
-                      "patched final constant CALLI callsites");
-            }
-            if (callbacks.patch_constant_dispatch_targets_to_direct_calls) {
-              summary.patched_dispatch_targets +=
-                  callbacks.patch_constant_dispatch_targets_to_direct_calls(
-                      final_dispatch_targets, "abi_post_final_dispatch_patch",
-                      "patched final constant dispatch callsites");
-            }
-            if (!final_code_targets.empty())
-              summary.patched_code_targets +=
-                  static_cast<unsigned>(final_code_targets.size());
-
-            const bool callback_changed =
-                imported_vm_enter_children ||
-                summary.patched_declared_targets != 0 ||
-                summary.patched_calli_targets != 0 ||
-                summary.patched_dispatch_targets != 0 ||
-                !final_code_targets.empty();
-            if (!round_summary.changed && !callback_changed)
-              return false;
-
-            if (callbacks.run_final_output_cleanup) {
-              noteAbiStep("late_output_root_final_output_cleanup",
-                          [&] { callbacks.run_final_output_cleanup(); });
-            }
-            if (callbacks.prune_to_defined_output_root_closure) {
-              noteAbiStep("late_output_root_prune_defined_output_root_closure",
-                          [&] {
-                            callbacks.prune_to_defined_output_root_closure();
-                          });
-            }
-            if (callbacks.run_final_output_cleanup) {
-              noteAbiStep("late_output_root_post_prune_final_output_cleanup",
-                          [&] { callbacks.run_final_output_cleanup(); });
-            }
-            if (callbacks.run_late_closure_canonicalization) {
-              noteAbiStep("late_output_root_canonicalization", [&] {
-                callbacks.run_late_closure_canonicalization(
-                    "abi_late_output_root_closure");
-              });
-            }
-            if (callbacks.run_post_patch_cleanup) {
-              noteAbiStep("late_output_root_post_patch_cleanup", [&] {
-                callbacks.run_post_patch_cleanup("abi_late_output_root_closure");
-              });
-            }
-            if (callbacks.annotate_vm_unresolved_continuations)
-              callbacks.annotate_vm_unresolved_continuations();
-            summary.changed = true;
-            return true;
+            return handleAbiLateFrontierRound(
+                summary, callbacks, round_summary, import_summary, noteAbiStep);
           };
 
-      auto late_summary = runPrimaryDevirtualization(
-          M, *block_lifter, *iterative_session, *frontier_callbacks,
-          FrontierDiscoveryPhase::kOutputRootClosure,
+      (void)runAndRecordLateFrontier(
+          "abi_late_frontier", FrontierDiscoveryPhase::kOutputRootClosure,
           options.late_abi_closure_rounds, iteration_callbacks,
-          vm_enter_import_callbacks ? &*vm_enter_import_callbacks : nullptr);
-      summary.changed |= late_summary.changed;
-      RoundArtifactBundle bundle;
-      bundle.stage = RuntimeArtifactStage::kOutputRecoveryRound;
-      bundle.label = "abi_late_frontier";
-      bundle.changed = late_summary.changed;
-      for (const auto &import_summary : late_summary.import_summaries) {
-        bundle.notes.insert(bundle.notes.end(), import_summary.notes.begin(),
-                            import_summary.notes.end());
-      }
-      recordArtifactBundle(std::move(bundle));
+          vm_enter_import_callbacks ? &*vm_enter_import_callbacks : nullptr,
+          [&](const FrontierIterationSummary &late_summary,
+              RoundArtifactBundle &bundle) {
+            for (const auto &import_summary : late_summary.import_summaries) {
+              bundle.notes.insert(bundle.notes.end(),
+                                  import_summary.notes.begin(),
+                                  import_summary.notes.end());
+            }
+          });
     }
   }
 
@@ -3670,7 +4751,7 @@ OutputRecoverySummary DevirtualizationRuntime::runOutputRecovery(
                                       : "output_recovery_abi_final";
   final_bundle.changed = summary.changed;
   final_bundle.notes = summary.notes;
-  recordArtifactBundle(std::move(final_bundle));
+  artifact_recorder.record(std::move(final_bundle));
 
   return summary;
 }
@@ -3753,7 +4834,7 @@ ProtectorValidationReport DevirtualizationRuntime::buildValidationReport(
 RecoveryQualitySummary DevirtualizationRuntime::classifyRecoveryQuality(
     const llvm::Module &M) const {
   RoundArtifactBundle bundle;
-  populateRoundArtifactBundleFromModule(M, bundle);
+  populateRoundArtifactBundleFromModule(M, bundle, &orchestrator_);
   populateRecoveryQualitySummary(bundle, child_artifact_cache_,
                                  round_artifact_bundles_);
   bundle.final_tail_graph = buildFinalTailGraph(M);
@@ -4377,7 +5458,7 @@ FinalizationSummary DevirtualizationRuntime::finalizeOutput(
       bundle.notes.push_back(issue.message);
     }
   }
-  populateRoundArtifactBundleFromModule(M, bundle);
+  populateRoundArtifactBundleFromModule(M, bundle, &orchestrator_);
   populateRecoveryQualitySummary(bundle, child_artifact_cache_,
                                 round_artifact_bundles_);
   bundle.final_tail_graph = buildFinalTailGraph(M);
@@ -4450,6 +5531,29 @@ DevirtualizationRuntime::planFinalStateRecovery(
     auto result = resolver.resolve(request);
     boundary_resolution_cache_[target_pc] = result;
     return result;
+  };
+  auto findBoundarySolverContinuationTarget =
+      [&](uint64_t boundary_target_pc) -> std::optional<uint64_t> {
+    std::optional<uint64_t> candidate;
+    for (const auto &[identity, edge] :
+         orchestrator_.session().graph.edge_facts_by_identity) {
+      (void)identity;
+      if (!edge.boundary || !edge.boundary->boundary_pc ||
+          *edge.boundary->boundary_pc != boundary_target_pc ||
+          !edge.solver_metadata ||
+          edge.solver_metadata->possible_target_pcs.size() != 1) {
+        continue;
+      }
+      const uint64_t solved_target =
+          edge.solver_metadata->possible_target_pcs.front();
+      if (!candidate) {
+        candidate = solved_target;
+        continue;
+      }
+      if (*candidate != solved_target)
+        return std::nullopt;
+    }
+    return candidate;
   };
 
   for (uint64_t target_pc : final_bundle.executable_placeholder_targets) {
@@ -4530,6 +5634,24 @@ DevirtualizationRuntime::planFinalStateRecovery(
       continue;
     }
 
+    const bool solver_singleton_retry =
+        proof &&
+        proof->rationale.find("solver_singleton") != std::string::npos &&
+        proof->import_disposition != ContinuationImportDisposition::kDeferred &&
+        proof->import_disposition != ContinuationImportDisposition::kRejected;
+    if (solver_singleton_retry) {
+      action.kind = FinalStateRecoveryActionKind::kRetryExecutableChildImport;
+      action.reason =
+          proof->effective_target_pc && *proof->effective_target_pc != target_pc
+              ? "solver_singleton_redirect"
+              : "solver_singleton_target";
+      action.retry_budget = 1;
+      action.expected_outcome =
+          "retry child import using solver-proven singleton continuation";
+      addAction(std::move(action));
+      continue;
+    }
+
     const bool terminal_retry =
         (cache_entry &&
          (cache_entry->artifact.import_safety ==
@@ -4582,6 +5704,8 @@ DevirtualizationRuntime::planFinalStateRecovery(
     action.final_state_class = "native_boundary";
     action.planned_resolver_path = "boundary_continuation_resolver";
     auto boundary_resolution = resolveBoundaryTarget(target_pc);
+    auto solver_boundary_continuation =
+        findBoundarySolverContinuationTarget(target_pc);
     if (boundary_resolution &&
         boundary_resolution->disposition ==
             BoundaryResolutionDisposition::kModeledReentryBoundary) {
@@ -4605,6 +5729,13 @@ DevirtualizationRuntime::planFinalStateRecovery(
       action.retry_budget = 1;
       action.expected_outcome =
           "recheck boundary eligibility and preserve explicit modeled boundary";
+    } else if (solver_boundary_continuation) {
+      action.kind =
+          FinalStateRecoveryActionKind::kRetryNativeBoundaryRecovery;
+      action.reason = "solver_singleton_boundary_continuation";
+      action.retry_budget = 1;
+      action.expected_outcome =
+          "materialize solver-proven singleton continuation for modeled boundary";
     } else if (boundary_resolution) {
       action.kind = FinalStateRecoveryActionKind::kHardReject;
       action.reason = boundary_resolution->rationale.empty()
@@ -4789,7 +5920,8 @@ std::optional<RoundArtifactBundle> DevirtualizationRuntime::runBoundaryTailRecov
     return true;
   };
   auto drainBoundaryContinuationFrontier =
-      [&](llvm::StringRef frontier_label, bool initial_changed) {
+      [&](llvm::StringRef frontier_label, FrontierDiscoveryPhase phase,
+          bool initial_changed) {
         if (!callbacks.advance_session_owned_frontier_work)
           return false;
         bool any_changed = false;
@@ -4806,8 +5938,7 @@ std::optional<RoundArtifactBundle> DevirtualizationRuntime::runBoundaryTailRecov
                llvm::Twine(round))
                   .str();
           const bool frontier_changed =
-              callbacks.advance_session_owned_frontier_work(
-                  FrontierDiscoveryPhase::kUnresolvedOnly, round_label);
+              callbacks.advance_session_owned_frontier_work(phase, round_label);
           if (frontier_changed) {
             noteBoundaryCleanup(
                 "boundary_continuation_followup_output_cleanup");
@@ -4818,7 +5949,8 @@ std::optional<RoundArtifactBundle> DevirtualizationRuntime::runBoundaryTailRecov
         return any_changed;
       };
   auto requeueBoundaryBridgeMaterialization =
-      [&](uint64_t target_pc, llvm::StringRef frontier_label) {
+      [&](uint64_t target_pc, llvm::StringRef frontier_label,
+          FrontierDiscoveryPhase phase) {
         if (!callbacks.advance_session_owned_frontier_work)
           return false;
         if (!orchestrator_.requeueBoundaryEdgesForTarget(
@@ -4828,14 +5960,45 @@ std::optional<RoundArtifactBundle> DevirtualizationRuntime::runBoundaryTailRecov
         const auto requeue_label =
             (llvm::Twine(frontier_label) + ".requeue").str();
         const bool frontier_changed =
-            callbacks.advance_session_owned_frontier_work(
-                FrontierDiscoveryPhase::kUnresolvedOnly, requeue_label);
+            callbacks.advance_session_owned_frontier_work(phase, requeue_label);
         if (frontier_changed)
           noteBoundaryCleanup("boundary_continuation_requeue_output_cleanup");
         const bool drained =
-            drainBoundaryContinuationFrontier(requeue_label, frontier_changed);
+            drainBoundaryContinuationFrontier(requeue_label, phase, frontier_changed);
         return frontier_changed || drained;
       };
+
+  auto selectFallbackExecutableContinuation =
+      [&](uint64_t boundary_pc, std::optional<uint64_t> current_continuation_pc)
+      -> std::optional<uint64_t> {
+    llvm::SmallDenseSet<uint64_t, 4> candidates;
+    for (auto it = round_artifact_bundles_.rbegin();
+         it != round_artifact_bundles_.rend(); ++it) {
+      const auto &bundle = *it;
+      const bool mentions_boundary =
+          llvm::is_contained(bundle.native_boundary_targets, boundary_pc) ||
+          llvm::is_contained(bundle.recovery_quality.modeled_reentry_boundaries,
+                             boundary_pc);
+      if (!mentions_boundary)
+        continue;
+      for (uint64_t target_pc : bundle.executable_placeholder_targets) {
+        if (!target_pc || target_pc == boundary_pc)
+          continue;
+        if (current_continuation_pc && *current_continuation_pc == target_pc)
+          continue;
+        if (llvm::is_contained(bundle.recovery_quality.hard_rejected_targets,
+                               target_pc)) {
+          continue;
+        }
+        candidates.insert(target_pc);
+      }
+      if (!candidates.empty())
+        break;
+    }
+    if (candidates.size() != 1)
+      return std::nullopt;
+    return *candidates.begin();
+  };
 
   for (const auto &node : graph.nodes) {
     switch (node.kind) {
@@ -4886,6 +6049,46 @@ std::optional<RoundArtifactBundle> DevirtualizationRuntime::runBoundaryTailRecov
               : VirtualReturnAddressControlKind::kRedirectedSymbolic;
       effective_boundary->controlled_return_pc = effective_continuation_pc;
       effective_boundary->kind = BoundaryKind::kNativeBoundary;
+    }
+
+    if (effective_boundary) {
+      auto &session_boundary =
+          orchestrator_.session().graph.boundary_facts_by_target[node.target_pc];
+      session_boundary.target_pc = node.target_pc;
+      session_boundary.boundary = *effective_boundary;
+      if (auto *boundary_fn = findStructuralCodeTargetFunctionByPC(M, node.target_pc))
+        writeBoundaryFact(*boundary_fn, *effective_boundary);
+    }
+
+    bool used_fallback_executable_continuation = false;
+    if (effective_boundary && effective_continuation_pc &&
+        !effective_boundary->suppresses_normal_fallthrough &&
+        !effective_boundary->covered_entry_pc &&
+        !effective_boundary->continuation_entry_transform) {
+      auto *current_continuation =
+          findBoundaryContinuationFunction(M, *effective_continuation_pc);
+      if (!isUsableBoundaryContinuationFunction(orchestrator_,
+                                                current_continuation,
+                                                effective_continuation_pc)) {
+        if (auto fallback_continuation_pc =
+                selectFallbackExecutableContinuation(node.target_pc,
+                                                     effective_continuation_pc)) {
+          effective_continuation_pc = fallback_continuation_pc;
+          effective_boundary->continuation_pc = fallback_continuation_pc;
+          if (!effective_boundary->continuation_vip_pc)
+            effective_boundary->continuation_vip_pc = fallback_continuation_pc;
+          used_fallback_executable_continuation = true;
+        }
+      }
+    }
+
+    if (effective_boundary) {
+      auto &session_boundary =
+          orchestrator_.session().graph.boundary_facts_by_target[node.target_pc];
+      session_boundary.target_pc = node.target_pc;
+      session_boundary.boundary = *effective_boundary;
+      if (auto *boundary_fn = findStructuralCodeTargetFunctionByPC(M, node.target_pc))
+        writeBoundaryFact(*boundary_fn, *effective_boundary);
     }
 
     if (effective_continuation_pc) {
@@ -4953,7 +6156,7 @@ std::optional<RoundArtifactBundle> DevirtualizationRuntime::runBoundaryTailRecov
         } else {
           result.detail = "tail_graph_continuation_materialized";
         }
-        lifted_boundary_targets.push_back(node.target_pc);
+        lifted_boundary_targets.push_back(*effective_continuation_pc);
       } else if (!effective_continuation_pc) {
         result.disposition =
             boundary_has_controlled_return
@@ -4974,17 +6177,22 @@ std::optional<RoundArtifactBundle> DevirtualizationRuntime::runBoundaryTailRecov
           result.disposition = BoundaryTailRecoveryDisposition::kSkipped;
           result.detail = "boundary_continuation_enqueue_failed";
         } else {
+          const auto frontier_phase =
+              used_fallback_executable_continuation
+                  ? FrontierDiscoveryPhase::kCombined
+                  : FrontierDiscoveryPhase::kUnresolvedOnly;
           const auto frontier_label =
               (llvm::Twine("boundary_continuation_") +
                llvm::utohexstr(node.target_pc))
                   .str();
           const bool frontier_changed =
-              callbacks.advance_session_owned_frontier_work(
-                  FrontierDiscoveryPhase::kUnresolvedOnly, frontier_label);
+              callbacks.advance_session_owned_frontier_work(frontier_phase,
+                                                           frontier_label);
           if (frontier_changed)
             noteBoundaryCleanup("boundary_continuation_final_output_cleanup");
           const bool drained_boundary_frontier =
-              drainBoundaryContinuationFrontier(frontier_label, frontier_changed);
+              drainBoundaryContinuationFrontier(frontier_label, frontier_phase,
+                                               frontier_changed);
           auto preferImportedVmEnterRoot =
               [&](llvm::Function *candidate) -> llvm::Function * {
             if (!effective_continuation_pc)
@@ -5003,6 +6211,45 @@ std::optional<RoundArtifactBundle> DevirtualizationRuntime::runBoundaryTailRecov
           };
           auto *continuation = preferImportedVmEnterRoot(
               findBoundaryContinuationFunction(M, *effective_continuation_pc));
+          llvm::Function *imported_executable_continuation = nullptr;
+          if ((!continuation || continuation->isDeclaration() ||
+               !isUsableBoundaryContinuationFunction(orchestrator_, continuation,
+                                                     effective_continuation_pc)) &&
+              callbacks.lift_child_target && callbacks.import_executable_child) {
+            if (auto raw_child = callbacks.lift_child_target(
+                    *effective_continuation_pc, /*no_abi=*/true, request.enable_gsd,
+                    /*enable_recovery_mode=*/true,
+                    /*dump_virtual_model=*/true)) {
+              auto analyzed_raw_child = analyzeChildLiftArtifactForPlanning(
+                  M.getContext(), std::move(*raw_child));
+              auto prepared_child = prepareChildLiftArtifact(
+                  M.getContext(), analyzed_raw_child, /*no_abi_mode=*/true);
+              auto analyzed_child = analyzeChildLiftArtifactForPlanning(
+                  M.getContext(), prepared_child.artifact);
+              auto proof = findContinuationProofForTarget(
+                  orchestrator_, *effective_continuation_pc);
+              auto selected_child = selectBestChildImportArtifact(
+                  M.getContext(), analyzed_raw_child, analyzed_child,
+                  ChildRootSelectionMode::kExecutable, proof, std::nullopt);
+              auto preimport_plan = selected_child.plan;
+              if (preimport_plan.eligibility == ImportEligibility::kImportable) {
+                auto plan_result = callbacks.import_executable_child(
+                    *effective_continuation_pc, selected_child.artifact,
+                    preimport_plan, "execchild_");
+                if (plan_result.eligibility == ImportEligibility::kImportable &&
+                    plan_result.imported_root) {
+                  imported_executable_continuation = plan_result.imported_root;
+                  bundle.changed = true;
+                  result.module_changed = true;
+                  if (callbacks.note_imported_target)
+                    callbacks.note_imported_target(*effective_continuation_pc);
+                }
+              }
+            }
+          }
+          if (imported_executable_continuation)
+            continuation = imported_executable_continuation;
+
           auto findMaterializedBoundaryBridge = [&]() -> llvm::Function * {
             auto find_by_pc = [&](std::optional<uint64_t> maybe_pc)
                 -> llvm::Function * {
@@ -5031,7 +6278,17 @@ std::optional<RoundArtifactBundle> DevirtualizationRuntime::runBoundaryTailRecov
             }
             return nullptr;
           };
+
           llvm::Function *boundary_fn = findMaterializedBoundaryBridge();
+          if (!boundary_fn && continuation && !continuation->isDeclaration()) {
+            if (auto *decl = findStructuralCodeTargetFunctionByPC(M, node.target_pc);
+                decl && decl->isDeclaration() &&
+                materializeBoundaryContinuationBridge(
+                    *decl, *continuation, *effective_continuation_pc)) {
+              boundary_fn = decl;
+            }
+          }
+
           const auto continuation_status = effective_boundary->boundary_pc
                                                ? findBoundaryContinuationStatus(
                                                      orchestrator_,
@@ -5063,8 +6320,10 @@ std::optional<RoundArtifactBundle> DevirtualizationRuntime::runBoundaryTailRecov
             }
             result.module_changed = true;
             bundle.changed = true;
-            lifted_boundary_targets.push_back(node.target_pc);
-          } else if ((!had_session_boundary_fact || boundary_has_controlled_return) &&
+            lifted_boundary_targets.push_back(*effective_continuation_pc);
+          } else if ((used_fallback_executable_continuation ||
+                      !had_session_boundary_fact ||
+                      boundary_has_controlled_return) &&
                      !boundary_bridge_materialized &&
                      usable_continuation_materialized &&
                      continuation_materialized) {
@@ -5077,13 +6336,24 @@ std::optional<RoundArtifactBundle> DevirtualizationRuntime::runBoundaryTailRecov
             } else {
               result.detail = "tail_graph_continuation_materialized";
             }
-            lifted_boundary_targets.push_back(node.target_pc);
+            lifted_boundary_targets.push_back(*effective_continuation_pc);
           } else if (continuation &&
                      requeueBoundaryBridgeMaterialization(node.target_pc,
-                                                          frontier_label)) {
+                                                         frontier_label,
+                                                         frontier_phase)) {
             continuation = preferImportedVmEnterRoot(
                 findBoundaryContinuationFunction(M, *effective_continuation_pc));
+
             boundary_fn = findMaterializedBoundaryBridge();
+            if (!boundary_fn && continuation && !continuation->isDeclaration()) {
+              if (auto *decl = findStructuralCodeTargetFunctionByPC(M, node.target_pc);
+                  decl && decl->isDeclaration() &&
+                  materializeBoundaryContinuationBridge(
+                      *decl, *continuation, *effective_continuation_pc)) {
+                boundary_fn = decl;
+              }
+            }
+
             const auto refreshed_status =
                 effective_boundary->boundary_pc
                     ? findBoundaryContinuationStatus(orchestrator_,
@@ -5115,8 +6385,10 @@ std::optional<RoundArtifactBundle> DevirtualizationRuntime::runBoundaryTailRecov
               }
               result.module_changed = true;
               bundle.changed = true;
-              lifted_boundary_targets.push_back(node.target_pc);
-            } else if ((!had_session_boundary_fact || boundary_has_controlled_return) &&
+              lifted_boundary_targets.push_back(*effective_continuation_pc);
+            } else if ((used_fallback_executable_continuation ||
+                        !had_session_boundary_fact ||
+                        boundary_has_controlled_return) &&
                        !refreshed_boundary_bridge_materialized &&
                        refreshed_usable_continuation_materialized &&
                        refreshed_continuation_materialized) {
@@ -5129,7 +6401,7 @@ std::optional<RoundArtifactBundle> DevirtualizationRuntime::runBoundaryTailRecov
               } else {
                 result.detail = "tail_graph_continuation_materialized";
               }
-              lifted_boundary_targets.push_back(node.target_pc);
+              lifted_boundary_targets.push_back(*effective_continuation_pc);
             } else {
               result.disposition =
                   BoundaryTailRecoveryDisposition::kKeptModeledBoundary;
@@ -5274,7 +6546,7 @@ std::optional<RoundArtifactBundle> DevirtualizationRuntime::runBoundaryTailRecov
   if (bundle.boundary_recovery_actions.empty() && !bundle.changed)
     return std::nullopt;
 
-  populateRoundArtifactBundleFromModule(M, bundle);
+  populateRoundArtifactBundleFromModule(M, bundle, &orchestrator_);
   populateRecoveryQualitySummary(bundle, child_artifact_cache_,
                                  round_artifact_bundles_);
   bundle.final_tail_graph = buildFinalTailGraph(M);
@@ -5530,7 +6802,7 @@ std::optional<RoundArtifactBundle> DevirtualizationRuntime::runFinalStateRecover
       break;
   }
 
-  populateRoundArtifactBundleFromModule(M, bundle);
+  populateRoundArtifactBundleFromModule(M, bundle, &orchestrator_);
   populateRecoveryQualitySummary(bundle, child_artifact_cache_,
                                 round_artifact_bundles_);
   bundle.final_tail_graph = buildFinalTailGraph(M);
@@ -5541,3 +6813,11 @@ std::optional<RoundArtifactBundle> DevirtualizationRuntime::runFinalStateRecover
 }
 
 }  // namespace omill
+
+omill::SelectedChildImportArtifact
+omill::selectExecutableChildImportArtifactForPlanning(
+    llvm::LLVMContext &llvm_context,
+    const omill::ChildLiftArtifact &raw_artifact, bool no_abi_mode) {
+  return selectExecutableChildImportArtifactForPlanningImpl(
+      llvm_context, raw_artifact, no_abi_mode);
+}

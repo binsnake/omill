@@ -88,6 +88,20 @@ std::optional<CallTargetBridgeEffect> analyzeCallTargetBridgeEffect(
     const BinaryMemoryMap &memory_map, uint64_t call_target_pc,
     bool deep = false);
 
+/// Check whether the call target modifies the return address and RETs
+/// to a different location.  Returns the redirected address, or 0 if
+/// the target returns normally (or analysis fails).
+///
+/// This is lighter than full bridge analysis — it tolerates tainted
+/// stack writes and only checks the final RET destination.  Used for
+/// VMP entry stubs that redirect to a different continuation without
+/// returning to the instruction after the CALL.
+/// Emulate from \p entry_va (function entry, not the call target)
+/// through the full call chain.  The function entry sets up RCX via
+/// LEA and the stack frame.  Returns the redirect target or 0.
+uint64_t analyzeReturnAddressRedirect(
+    const BinaryMemoryMap &memory_map, uint64_t entry_va);
+
 /// Concrete x86-64 emulator for the EasyAntiCheat hash-dispatch VM.
 ///
 /// The architecture is flat and trace-driven: a wrapper seeds [r12+0x190] with

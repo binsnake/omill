@@ -15,6 +15,8 @@ class Module;
 
 namespace omill {
 
+struct SessionGraphState;
+
 enum class CleanupProfile {
   kLightScalar,
   kLightScalarNoInstCombine,
@@ -109,6 +111,10 @@ struct PipelineOptions {
   /// functions with the TranslationValidator when Z3 is available.
   bool verify_generic_static_devirtualization = false;
 
+  /// Optional devirtualization session snapshot used by generic static
+  /// materialization and virtual-model reruns when the caller owns one.
+  const SessionGraphState *session_graph = nullptr;
+
   /// When set, per-function pass adaptors in Phases 1–3.5 run only on
   /// functions matching this predicate.  Module-wide passes are unaffected.
   /// Used by the VM discovery loop to avoid re-processing already-optimized
@@ -194,6 +200,18 @@ void buildCleanupPipeline(llvm::ModulePassManager &MPM,
 /// Internalize and remove now-dead Remill lifting infrastructure once no
 /// further iterative lifting rounds will run.
 void buildLiftInfrastructureCleanupPipeline(llvm::ModulePassManager &MPM);
+
+/// Rewrite every definition whose body is a single `unreachable`
+/// instruction into a no-op pass-through (`ret ptr %memory`) if its
+/// signature matches remill's lifted convention
+/// `ptr (ptr, i64, ptr) -> ptr`.  This eliminates orphan `ud2` stubs
+/// from the final output without touching call sites — callers keep
+/// threading the memory token through the call graph and simply
+/// observe a clean return from each now-trivial stub.  Intended to be
+/// called just before final output emission, after every pipeline
+/// stage that could leave orphan `body: unreachable` shells behind.
+/// Returns the number of functions rewritten.
+unsigned eliminateBodyUnreachableFunctions(llvm::Module &M);
 
 /// Build the post-patch cleanup pipeline used after call-target rewrites.
 /// Includes module inlining and core scalar cleanup passes.

@@ -3,6 +3,7 @@
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
@@ -412,6 +413,16 @@ TEST_F(MergeBlockFunctionsTest, OutputRootDrivesEntrySelectionInLoop) {
   ASSERT_NE(merged, nullptr);
   EXPECT_TRUE(merged->hasFnAttribute("omill.output_root"));
   EXPECT_EQ(M->getFunction("sub_2010"), nullptr);
+
+  auto &entry_bb = merged->getEntryBlock();
+  EXPECT_EQ(entry_bb.getName(), "block_2000");
+  auto *entry_ret = llvm::dyn_cast<llvm::ReturnInst>(entry_bb.getTerminator());
+  ASSERT_NE(entry_ret, nullptr);
+  auto *entry_call = llvm::dyn_cast<llvm::CallInst>(entry_ret->getReturnValue());
+  ASSERT_NE(entry_call, nullptr);
+  ASSERT_NE(entry_call->getCalledFunction(), nullptr);
+  EXPECT_EQ(entry_call->getCalledFunction()->getName(), "blk_2010");
+
   EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
 }
 

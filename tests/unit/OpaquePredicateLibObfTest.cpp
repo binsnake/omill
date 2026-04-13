@@ -41,9 +41,11 @@ protected:
   }
 
   /// Create a module + function() -> i1 suitable for CRC32 predicate tests.
-  /// Adds target-features "+sse4.2" so the intrinsic verifies.
+  /// targetFeatures lets tests seed incomplete feature sets that the helper must
+  /// repair before emitting the intrinsic.
   std::pair<std::unique_ptr<llvm::Module>, llvm::Function *>
-  createCRC32Function(const char *name = "crc_fn") {
+  createCRC32Function(const char *name = "crc_fn",
+                      const char *targetFeatures = "+sse4.2") {
     auto M = std::make_unique<llvm::Module>("test", Ctx);
     M->setDataLayout(kDataLayout);
     M->setTargetTriple(llvm::Triple("x86_64-pc-windows-msvc"));
@@ -52,7 +54,8 @@ protected:
     auto *fnTy = llvm::FunctionType::get(i1Ty, false);
     auto *F = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage,
                                      name, *M);
-    F->addFnAttr("target-features", "+sse4.2");
+    if (targetFeatures != nullptr && targetFeatures[0] != '\0')
+      F->addFnAttr("target-features", targetFeatures);
     llvm::BasicBlock::Create(Ctx, "entry", F);
     return {std::move(M), F};
   }
@@ -236,6 +239,25 @@ TEST_F(OpaquePredicateLibTest, CRC32PredicateHasVolatileLoad) {
   }
   EXPECT_TRUE(foundVolatile) << "Expected volatile load in CRC32 predicate";
 }
+
+TEST_F(OpaquePredicateLibTest, CRC32PredicateRepairsIncompleteFeatureSets) {
+  auto [M, F] = createCRC32Function("crc_partial", "+crc32");
+  llvm::IRBuilder<> builder(&F->getEntryBlock());
+  auto *result = ollvm::buildCRC32Predicate(builder, *F, 789);
+  builder.CreateRet(result);
+
+  auto attr = F->getFnAttribute("target-features");
+  ASSERT_TRUE(attr.isValid());
+
+  llvm::StringRef features = attr.getValueAsString();
+  EXPECT_TRUE(features.contains("+sse3"));
+  EXPECT_TRUE(features.contains("+ssse3"));
+  EXPECT_TRUE(features.contains("+sse4.1"));
+  EXPECT_TRUE(features.contains("+sse4.2"));
+  EXPECT_TRUE(features.contains("+crc32"));
+  EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()));
+}
+
 
 // ===== generateOpaqueTrue additional structural tests =====
 

@@ -79,6 +79,43 @@ else()
   message(STATUS "EqSat simplifier disabled (set -DOMILL_ENABLE_SIMPLIFIER=ON to enable)")
 endif()
 
+# Unicorn engine (optional, for VMP return-address redirect analysis)
+if(OMILL_ENABLE_UNICORN)
+  if(OMILL_UNICORN_DIR)
+    set(_uc_inc "${OMILL_UNICORN_DIR}/include")
+    set(_uc_lib "${OMILL_UNICORN_DIR}/lib/unicorn.lib")
+  else()
+    # Try the Python package location as a fallback.
+    execute_process(
+      COMMAND python3 -c "import unicorn, os; print(os.path.dirname(unicorn.__file__))"
+      OUTPUT_VARIABLE _uc_pydir OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(_uc_pydir)
+      set(_uc_inc "${_uc_pydir}/include")
+      set(_uc_lib "${_uc_pydir}/lib/unicorn.lib")
+    endif()
+  endif()
+  if(EXISTS "${_uc_inc}/unicorn/unicorn.h" AND EXISTS "${_uc_lib}")
+    # We use runtime loading (LoadLibrary/dlopen) to avoid CRT
+    # conflicts — unicorn is typically built with dynamic CRT while
+    # omill uses static CRT.  Only the headers are needed at compile time.
+    add_library(unicorn INTERFACE)
+    target_include_directories(unicorn INTERFACE "${_uc_inc}")
+    # Copy the DLL next to executables so they can find it at runtime.
+    get_filename_component(_uc_libdir "${_uc_lib}" DIRECTORY)
+    file(GLOB _uc_dlls "${_uc_libdir}/unicorn*.dll")
+    foreach(_dll ${_uc_dlls})
+      file(COPY "${_dll}" DESTINATION "${CMAKE_BINARY_DIR}/tools/omill-lift")
+      file(COPY "${_dll}" DESTINATION "${CMAKE_BINARY_DIR}/tests")
+    endforeach()
+    message(STATUS "Unicorn enabled (runtime-loaded): ${_uc_libdir}")
+  else()
+    message(FATAL_ERROR "OMILL_ENABLE_UNICORN=ON but unicorn not found. "
+      "Set OMILL_UNICORN_DIR or install the Python unicorn package.")
+  endif()
+else()
+  message(STATUS "Unicorn disabled (set -DOMILL_ENABLE_UNICORN=ON to enable)")
+endif()
+
 # omill library
 add_subdirectory(lib)
 

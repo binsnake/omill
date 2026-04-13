@@ -354,6 +354,15 @@ std::optional<uint64_t> evaluateToConstantImpl(
       if (llvm::isa<llvm::InvokeInst>(&*it))
         break;
     }
+    auto *pc_like_ptr = load_ptr->stripPointerCasts();
+    auto name = pc_like_ptr->getName();
+    if (load->getType()->isIntegerTy(64) &&
+        (name.starts_with("NEXT_PC") || name == "PC" ||
+         name.starts_with("PC."))) {
+      uint64_t block_pc = extractBlockPC(BB->getName());
+      if (block_pc != 0)
+        return block_pc;
+    }
 
     return std::nullopt;
   }
@@ -1645,6 +1654,7 @@ llvm::PreservedAnalyses IndirectCallResolverPass::run(
   MCStoreMap SSM;
   if (!skip_mc)
     SSM = buildMCStoreMap(F, DL);
+
 
   bool changed = false;
 

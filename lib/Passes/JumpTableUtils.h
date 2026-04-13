@@ -87,24 +87,101 @@ inline bool containsLoadLikeValue(llvm::Value *V, unsigned depth = 0) {
 }
 
 inline llvm::LoadInst *extractUnderlyingLoad(llvm::Value *V,
+                                             const llvm::Function *F = nullptr,
                                              unsigned depth = 0) {
   if (!V || depth > 8)
     return nullptr;
 
   V = stripSimpleValueCasts(V);
-  if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(V))
+  if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(V)) {
+    if (F && !F->arg_empty()) {
+      auto *ptr = LI->getPointerOperand();
+      auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(ptr);
+      if (gep && gep->getPointerOperand() == F->getArg(0) &&
+          gep->hasAllConstantIndices()) {
+        llvm::APInt load_offset(64, 0);
+        if (gep->accumulateConstantOffset(F->getDataLayout(), load_offset)) {
+          const uint64_t target_offset = load_offset.getZExtValue();
+          auto matchesOffset = [&](llvm::Value *store_ptr) {
+            if (store_ptr == ptr)
+              return true;
+            auto *sg = llvm::dyn_cast<llvm::GetElementPtrInst>(store_ptr);
+            if (!sg || sg->getPointerOperand() != F->getArg(0) ||
+                !sg->hasAllConstantIndices()) {
+              return false;
+            }
+            llvm::APInt store_offset(64, 0);
+            return sg->accumulateConstantOffset(F->getDataLayout(), store_offset) &&
+                   store_offset.getZExtValue() == target_offset;
+          };
+
+          auto findStoredValue = [&](llvm::BasicBlock *BB, llvm::Instruction *before)
+              -> llvm::Value * {
+            for (auto it = llvm::BasicBlock::reverse_iterator(before->getIterator());
+                 it != BB->rend(); ++it) {
+              if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&*it)) {
+                if (matchesOffset(SI->getPointerOperand()))
+                  return SI->getValueOperand();
+              }
+              if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&*it))
+                if (!CI->doesNotAccessMemory())
+                  break;
+            }
+            return nullptr;
+          };
+
+          if (auto *stored = findStoredValue(LI->getParent(), LI)) {
+            if (auto *forwarded = extractUnderlyingLoad(stored, F, depth + 1))
+              return forwarded;
+          }
+
+          llvm::SmallPtrSet<llvm::BasicBlock *, 8> visited;
+          auto *cur = LI->getParent();
+          visited.insert(cur);
+          for (unsigned chain = 0; chain < 8; ++chain) {
+            auto *pred = cur->getSinglePredecessor();
+            if (!pred || visited.count(pred))
+              break;
+            visited.insert(pred);
+            if (auto *term = pred->getTerminator()) {
+              if (auto *stored = findStoredValue(pred, term)) {
+                if (auto *forwarded = extractUnderlyingLoad(stored, F, depth + 1))
+                  return forwarded;
+                break;
+              }
+            }
+            cur = pred;
+          }
+        }
+      }
+    }
     return LI;
+  }
 
   auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(V);
   if (!BO)
     return nullptr;
 
-  llvm::LoadInst *lhs_load = extractUnderlyingLoad(BO->getOperand(0), depth + 1);
-  llvm::LoadInst *rhs_load = extractUnderlyingLoad(BO->getOperand(1), depth + 1);
+  llvm::LoadInst *lhs_load =
+      extractUnderlyingLoad(BO->getOperand(0), F, depth + 1);
+  llvm::LoadInst *rhs_load =
+      extractUnderlyingLoad(BO->getOperand(1), F, depth + 1);
   if (lhs_load && !rhs_load)
     return lhs_load;
   if (rhs_load && !lhs_load)
     return rhs_load;
+  if (lhs_load && rhs_load && F && !F->arg_empty()) {
+    auto isStateSlotLoad = [&](llvm::LoadInst *LI) {
+      auto *ptr = stripSimpleValueCasts(LI->getPointerOperand());
+      auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(ptr);
+      return gep && gep->getPointerOperand() == F->getArg(0) &&
+             gep->hasAllConstantIndices();
+    };
+    const bool lhs_state = isStateSlotLoad(lhs_load);
+    const bool rhs_state = isStateSlotLoad(rhs_load);
+    if (lhs_state != rhs_state)
+      return lhs_state ? rhs_load : lhs_load;
+  }
   return nullptr;
 }
 

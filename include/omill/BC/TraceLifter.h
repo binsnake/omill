@@ -33,6 +33,8 @@ class Instruction;
 
 namespace omill {
 
+class LiftDatabase;
+
 using TraceMap = std::unordered_map<uint64_t, llvm::Function *>;
 
 /// Target kinds returned by devirtualization callbacks.
@@ -107,6 +109,9 @@ class TraceLifter {
   TraceLifter(const remill::Arch *arch, TraceManager *manager);
 
   static void NullCallback(uint64_t, llvm::Function *);
+
+  void SetLiftDatabase(const LiftDatabase *db);
+  void SetLiftOverlayKey(std::optional<std::string> overlay_key);
 
   /// Lift one or more traces starting from \p addr.
   /// Calls \p callback with each lifted (address, function) pair.
