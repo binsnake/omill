@@ -160,7 +160,15 @@ llvm::DenseSet<uint64_t> collectNewTargetPCs(llvm::Module &M) {
         if (!callee)
           continue;
         auto name = callee->getName();
-        if (!isDispatchIntrinsicName(name))
+        // Discover targets from dispatch_call/dispatch_jump intrinsics.
+        bool is_dispatch = isDispatchIntrinsicName(name);
+        // Also discover targets from raw __remill_function_call and
+        // __remill_jump intrinsics in late-lifted blocks — these
+        // haven't been lowered to dispatch_call yet but still carry
+        // constant PC targets that should be lifted.
+        bool is_remill_call =
+            name == "__remill_function_call" || name == "__remill_jump";
+        if (!is_dispatch && !is_remill_call)
           continue;
         if (call->arg_size() < 2)
           continue;
