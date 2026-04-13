@@ -38,6 +38,56 @@ bool canDecodeX86InstructionAt(const BinaryMemoryMap &mem, uint64_t pc);
 std::optional<uint64_t> nextDecodableX86InstructionPC(
     const BinaryMemoryMap &mem, uint64_t pc);
 
+/// A single stack write observed while probing a call-target bridge.
+struct BridgeStackWrite {
+  int64_t rsp_offset = 0;    ///< Offset from the call-entry RSP at which
+                              ///< the thunk wrote.
+  uint32_t size_bytes = 0;   ///< Size in bytes (1/2/4/8).
+  uint64_t value = 0;        ///< Constant value written.
+};
+
+/// A register write observed during bridge emulation.
+struct BridgeRegisterWrite {
+  uint8_t reg_index = 0;     ///< Register index (x86 encoding order).
+  uint64_t value = 0;        ///< Constant value written.
+};
+
+/// Deterministic stack-effect descriptor for a VMProtect-style thunk.
+struct CallTargetBridgeEffect {
+  enum class Terminator : uint8_t {
+    kJmpConst = 0,
+    kRet = 1,
+    kUnsupported = 2,
+  };
+
+  llvm::SmallVector<BridgeStackWrite, 4> stack_writes;
+  llvm::SmallVector<BridgeRegisterWrite, 4> register_writes;
+  int64_t net_rsp_delta = 0;
+  uint64_t final_jump_target_pc = 0;
+  Terminator terminator = Terminator::kUnsupported;
+  unsigned instructions_modeled = 0;
+};
+
+/// Probe-decode the call target at \p call_target_pc and, if it turns out
+/// to be a deterministic stack-effect trampoline (VMProtect-style return
+/// address thunk or similar), return a descriptor of the observed stack
+/// writes, net RSP delta, and final jump destination.
+///
+/// Returns `nullopt` when the target is not a pure stack-effect thunk:
+///   * `stepInstruction` encounters an unsupported opcode,
+///   * the sequence performs a real call, indirect jump, or non-overwriting
+///     return,
+///   * a non-constant value (e.g. caller-supplied register) would be
+///     written to the stack or to RSP,
+///   * more than kMaxSteps instructions have been executed,
+///   * the derived final jump target is not executable.
+/// When \p deep is true, a two-tier analysis is used: 16 steps first,
+/// then 512 steps if the short budget is exhausted.  This handles VMP
+/// entry stubs that save registers and compute bytecode pointers.
+std::optional<CallTargetBridgeEffect> analyzeCallTargetBridgeEffect(
+    const BinaryMemoryMap &memory_map, uint64_t call_target_pc,
+    bool deep = false);
+
 /// Concrete x86-64 emulator for the EasyAntiCheat hash-dispatch VM.
 ///
 /// The architecture is flat and trace-driven: a wrapper seeds [r12+0x190] with

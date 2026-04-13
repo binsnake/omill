@@ -880,6 +880,26 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
               "rsp.bridge.new");
           ir.CreateStore(new_rsp, rsp_addr);
 
+          // Emit register writes from the bridge (deep mode only).
+          // VMP entry stubs set VM context registers (R14 = bytecode
+          // pointer, etc.) that must be replayed inline at the call site.
+          if (!bridge->register_writes.empty()) {
+            static constexpr const char *kRegNames[] = {
+                "RAX", "RCX", "RDX", "RBX", "RSP", "RBP", "RSI", "RDI",
+                "R8",  "R9",  "R10", "R11", "R12", "R13", "R14", "R15",
+            };
+            for (const auto &rw : bridge->register_writes) {
+              if (rw.reg_index >= 16 || rw.reg_index == 4 /*RSP*/)
+                continue;
+              auto [reg_addr, reg_type] =
+                  arch->DefaultLifter(*intrinsics)
+                      ->LoadRegAddress(current_block, state_ptr,
+                                       kRegNames[rw.reg_index]);
+              auto *val = llvm::ConstantInt::get(word_type, rw.value);
+              ir.CreateStore(val, reg_addr);
+            }
+          }
+
           // Mirror the normal direct-call semantics for the fallthrough:
           // move RETURN_PC into NEXT_PC so the caller resumes at the
           // instruction following the original CALL.

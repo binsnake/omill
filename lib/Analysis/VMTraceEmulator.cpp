@@ -1712,8 +1712,10 @@ static bool bridgeIsConditionalBranchAt(const BinaryMemoryMap &mem,
 
 }  // namespace
 
-std::optional<CallTargetBridgeEffect> analyzeCallTargetBridgeEffect(
-    const BinaryMemoryMap &mem, uint64_t call_target_pc) {
+static std::optional<CallTargetBridgeEffect> analyzeCallTargetBridgeEffectImpl(
+    const BinaryMemoryMap &mem, uint64_t call_target_pc,
+    unsigned max_steps, bool deep = false,
+    bool *budget_exhausted = nullptr) {
   if (!call_target_pc) {
     return std::nullopt;
   }
@@ -1752,9 +1754,11 @@ std::optional<CallTargetBridgeEffect> analyzeCallTargetBridgeEffect(
               sizeof(kBridgeRetaddrSentinel));
 
   CallTargetBridgeEffect effect;
-  constexpr unsigned kMaxSteps = 16;
+  const unsigned kMaxSteps = max_steps;
 
   std::array<uint8_t, EmuState::kStackSize> prev_mem{};
+  llvm::DenseSet<uint64_t> visited;
+  visited.insert(call_target_pc);
 
   for (unsigned step = 0; step < kMaxSteps; ++step) {
     if (!mem.isExecutable(state.rip, 1)) {
@@ -1834,29 +1838,47 @@ std::optional<CallTargetBridgeEffect> analyzeCallTargetBridgeEffect(
       }
     }
 
-    // Helper lambda: reject bridges that modify callee-saved registers
-    // (RBX, RBP, R12–R15 in Win64 ABI).  Bridge inlining only replays
-    // stack writes — callee-saved register side-effects (e.g. VMP init
-    // setting R14 to the bytecode base) would be silently lost, causing
-    // the caller to proceed with uninitialised register values.  Volatile
-    // registers (RAX, RCX, RDX, R8–R11, RSI, RDI) may be freely
-    // clobbered by bridge thunks, as VMP often inserts junk arithmetic
-    // on volatile registers as obfuscation noise.
-    auto hasCalleeSavedSideEffects = [&]() -> bool {
+    // Check callee-saved registers.  In the default (non-deep) mode,
+    // reject bridges that modify callee-saved registers — the short
+    // 16-step budget can't fully trace VMP entry stubs, so accepting
+    // partial register state would be wrong.  In deep mode, collect
+    // the register writes for replay.
+    auto collectRegisterWrites = [&]() -> bool {
       static constexpr unsigned kCalleeSaved[] = {RBX, RBP, R12, R13, R14, R15};
       for (unsigned reg : kCalleeSaved) {
-        if (state.regs[reg] != bridgeUninitSentinel(reg)) {
-          return true;
+        if (state.regs[reg] == bridgeUninitSentinel(reg))
+          continue;
+        if (!deep) {
+          // Non-deep: reject any callee-saved modification.
+          return false;
         }
+        // Deep: reject if the value still looks tainted.
+        if (bridgeHasTaintPattern(
+                reinterpret_cast<const uint8_t *>(&state.regs[reg]), 8))
+          return false;
+        BridgeRegisterWrite rw;
+        rw.reg_index = static_cast<uint8_t>(reg);
+        rw.value = state.regs[reg];
+        effect.register_writes.push_back(rw);
       }
-      return false;
+      return true;
     };
 
     if (r == ExecResult::Jump) {
       if (!mem.isExecutable(state.rip, 1)) {
         return std::nullopt;
       }
-      if (hasCalleeSavedSideEffects()) {
+      if (deep) {
+        // Deep mode: follow JMP chains — VMP entry stubs use JMP-based
+        // obfuscation before the actual bridge body.  Loop detection
+        // prevents infinite re-execution.
+        if (!visited.insert(state.rip).second) {
+          return std::nullopt;  // backward JMP loop
+        }
+        continue;
+      }
+      // Non-deep: JMP is the bridge terminator.
+      if (!collectRegisterWrites()) {
         return std::nullopt;
       }
       effect.terminator = CallTargetBridgeEffect::Terminator::kJmpConst;
@@ -1877,7 +1899,7 @@ std::optional<CallTargetBridgeEffect> analyzeCallTargetBridgeEffect(
       if (!mem.isExecutable(state.rip, 1)) {
         return std::nullopt;
       }
-      if (hasCalleeSavedSideEffects()) {
+      if (!collectRegisterWrites()) {
         return std::nullopt;
       }
       effect.terminator = CallTargetBridgeEffect::Terminator::kRet;
@@ -1891,7 +1913,38 @@ std::optional<CallTargetBridgeEffect> analyzeCallTargetBridgeEffect(
   }
 
   // Step budget exhausted without finding a clean terminator.
+  if (budget_exhausted)
+    *budget_exhausted = true;
   return std::nullopt;
+}
+
+std::optional<CallTargetBridgeEffect> analyzeCallTargetBridgeEffect(
+    const BinaryMemoryMap &mem, uint64_t call_target_pc,
+    bool deep) {
+  if (!deep) {
+    // Fast path: try with a small step budget for simple stack thunks.
+    return analyzeCallTargetBridgeEffectImpl(mem, call_target_pc, 16);
+  }
+
+  // Two-tier: try 16 steps first (non-deep, JMP terminates).  If
+  // the result is a non-trivial bridge (has stack/register writes),
+  // use it.  Otherwise, escalate to the deep 512-step analysis that
+  // follows JMP chains into VMP entry stubs.
+  bool exhausted = false;
+  auto result = analyzeCallTargetBridgeEffectImpl(mem, call_target_pc, 16,
+                                                   /*deep=*/false,
+                                                   &exhausted);
+  if (result && (!result->stack_writes.empty() ||
+                 !result->register_writes.empty())) {
+    // Non-trivial bridge found in 16 steps — use it.
+    return result;
+  }
+
+  // Either the short analysis failed, returned a trivial bridge
+  // (JMP-only with no side effects), or exhausted its budget.
+  // Try the deep analysis which follows JMP chains.
+  return analyzeCallTargetBridgeEffectImpl(mem, call_target_pc, 512,
+                                            /*deep=*/true);
 }
 
 // ============================================================================
