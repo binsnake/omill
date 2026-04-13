@@ -1834,8 +1834,29 @@ std::optional<CallTargetBridgeEffect> analyzeCallTargetBridgeEffect(
       }
     }
 
+    // Helper lambda: reject bridges that modify callee-saved registers
+    // (RBX, RBP, R12–R15 in Win64 ABI).  Bridge inlining only replays
+    // stack writes — callee-saved register side-effects (e.g. VMP init
+    // setting R14 to the bytecode base) would be silently lost, causing
+    // the caller to proceed with uninitialised register values.  Volatile
+    // registers (RAX, RCX, RDX, R8–R11, RSI, RDI) may be freely
+    // clobbered by bridge thunks, as VMP often inserts junk arithmetic
+    // on volatile registers as obfuscation noise.
+    auto hasCalleeSavedSideEffects = [&]() -> bool {
+      static constexpr unsigned kCalleeSaved[] = {RBX, RBP, R12, R13, R14, R15};
+      for (unsigned reg : kCalleeSaved) {
+        if (state.regs[reg] != bridgeUninitSentinel(reg)) {
+          return true;
+        }
+      }
+      return false;
+    };
+
     if (r == ExecResult::Jump) {
       if (!mem.isExecutable(state.rip, 1)) {
+        return std::nullopt;
+      }
+      if (hasCalleeSavedSideEffects()) {
         return std::nullopt;
       }
       effect.terminator = CallTargetBridgeEffect::Terminator::kJmpConst;
@@ -1854,6 +1875,9 @@ std::optional<CallTargetBridgeEffect> analyzeCallTargetBridgeEffect(
         return std::nullopt;
       }
       if (!mem.isExecutable(state.rip, 1)) {
+        return std::nullopt;
+      }
+      if (hasCalleeSavedSideEffects()) {
         return std::nullopt;
       }
       effect.terminator = CallTargetBridgeEffect::Terminator::kRet;
