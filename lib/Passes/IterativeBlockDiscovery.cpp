@@ -18,6 +18,7 @@
 #include "omill/Passes/ConstantMemoryFolding.h"
 #include "omill/Passes/CombinedFixedPointDevirt.h"
 #include "omill/Passes/FoldProgramCounter.h"
+#include "omill/Passes/LowerRemillIntrinsics.h"
 #include "omill/Passes/RecoverStackFrame.h"
 #include "omill/Passes/InterProceduralConstProp.h"
 #include "omill/BC/BlockLifterAnalysis.h"
@@ -464,6 +465,12 @@ llvm::PreservedAnalyses IterativeBlockDiscoveryPass::run(
     // Step 1: Run lightweight optimization on all block-functions.
     {
       llvm::FunctionPassManager FPM;
+      // Lower __remill_function_call / __remill_jump intrinsics that
+      // survived from late-lifted blocks into dispatch_call/dispatch_jump
+      // so their constant PC targets become visible for discovery.
+      FPM.addPass(LowerRemillIntrinsicsPass(
+          LowerCategories::Call | LowerCategories::Jump |
+          LowerCategories::Return));
       FPM.addPass(FoldProgramCounterPass());
       FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
       FPM.addPass(CombinedFixedPointDevirtPass());

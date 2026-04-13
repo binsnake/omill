@@ -7910,7 +7910,9 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
   {
     llvm::FunctionPassManager FPM;
     FPM.addPass(LowerRemillIntrinsicsPass(
-        LowerCategories::Phase1 | LowerCategories::ResolvedDispatch));
+        LowerCategories::Phase1 | LowerCategories::ResolvedDispatch |
+        LowerCategories::Call | LowerCategories::Jump |
+        LowerCategories::Return));
     FPM.addPass(CombinedFixedPointDevirtPass());
     FPM.addPass(MemoryPointerEliminationPass());
     FPM.addPass(RecoverStackFramePass());
@@ -7936,7 +7938,9 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
   {
     llvm::FunctionPassManager FPM;
     FPM.addPass(LowerRemillIntrinsicsPass(
-        LowerCategories::Phase1 | LowerCategories::ResolvedDispatch));
+        LowerCategories::Phase1 | LowerCategories::ResolvedDispatch |
+        LowerCategories::Call | LowerCategories::Jump |
+        LowerCategories::Return));
     FPM.addPass(CombinedFixedPointDevirtPass());
     buildCleanupPipeline(FPM, CleanupProfile::kPostInline);
     FPM.addPass(llvm::ADCEPass());
