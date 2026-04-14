@@ -866,38 +866,101 @@ void lowerAsyncHyperCall(llvm::CallInst *CI) {
   llvm::Value *mem = CI->getArgOperand(2);
 
   // Remill stores AsyncHyperCall::Name at State+0 (i32) and the interrupt
-  // vector at State+8 (i32) immediately before this call.  Walk backward to
-  // find the constant values so we can emit the right native instruction.
+  // vector at State+8 (i32/i64) immediately before this call.  Walk backward
+  // to find the constant values so we can emit the right native instruction.
+  //
+  // The scan uses offset-based resolution (not raw pointer equality) to
+  // handle GEP chains that SROA or InstCombine may introduce.  It also
+  // crosses single-predecessor block boundaries, since SimplifyCFG or
+  // inlining can move the store to a predecessor.
   uint32_t hyper_call_code = 0;  // AsyncHyperCall::Name enum
   uint32_t vector = 0;
 
-  // Scan preceding stores into %state for the enum and vector.
-  for (auto It = CI->getReverseIterator(); It != CI->getParent()->rend(); ++It) {
-    auto *SI = llvm::dyn_cast<llvm::StoreInst>(&*It);
-    if (!SI) continue;
+  auto &DL = CI->getModule()->getDataLayout();
 
-    // State+0: hyper_call enum (store i32 N, ptr %state)
-    if (SI->getPointerOperand() == state) {
-      if (auto *C = llvm::dyn_cast<llvm::ConstantInt>(SI->getValueOperand()))
-        hyper_call_code = C->getZExtValue();
-    }
-
-    // State+8: vector (store i32 N, ptr (gep state, 8))
-    if (auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(
-            SI->getPointerOperand())) {
-      if (GEP->getPointerOperand() == state) {
-        llvm::APInt Off(64, 0);
-        if (GEP->accumulateConstantOffset(
-                CI->getModule()->getDataLayout(), Off) &&
-            Off.getZExtValue() == 8) {
-          if (auto *C = llvm::dyn_cast<llvm::ConstantInt>(
-                  SI->getValueOperand()))
-            vector = C->getZExtValue();
+  // Resolve a pointer to its byte offset from the State argument.
+  auto resolveStateOff = [&](llvm::Value *ptr) -> int64_t {
+    int64_t total = 0;
+    llvm::Value *base = ptr;
+    while (true) {
+      if (auto *GEP = llvm::dyn_cast<llvm::GEPOperator>(base)) {
+        llvm::APInt ap(64, 0);
+        if (GEP->accumulateConstantOffset(DL, ap)) {
+          total += ap.getSExtValue();
+          base = GEP->getPointerOperand();
+          continue;
         }
+        return -1;
+      }
+      if (auto *BC = llvm::dyn_cast<llvm::BitCastOperator>(base)) {
+        base = BC->getOperand(0);
+        continue;
+      }
+      break;
+    }
+    return (base == state && total >= 0) ? total : -1;
+  };
+
+  auto *scan_bb = CI->getParent();
+  auto scan_end = CI->getIterator();
+  for (unsigned depth = 0; depth < 4; ++depth) {
+    for (auto It = scan_end; It != scan_bb->begin();) {
+      --It;
+      auto *SI = llvm::dyn_cast<llvm::StoreInst>(&*It);
+      if (!SI) continue;
+      int64_t off = resolveStateOff(SI->getPointerOperand());
+      if (off == 0 && !hyper_call_code) {
+        if (auto *C = llvm::dyn_cast<llvm::ConstantInt>(SI->getValueOperand()))
+          hyper_call_code = static_cast<uint32_t>(C->getZExtValue());
+      } else if (off == 8 && !vector) {
+        if (auto *C = llvm::dyn_cast<llvm::ConstantInt>(SI->getValueOperand()))
+          vector = static_cast<uint32_t>(C->getZExtValue());
+      }
+      if (hyper_call_code && vector) break;
+    }
+    if (hyper_call_code && vector) break;
+    auto *pred = scan_bb->getSinglePredecessor();
+    if (!pred || pred == scan_bb) break;
+    scan_bb = pred;
+    scan_end = scan_bb->end();
+  }
+
+  // Metadata fallback: if the backward scan didn't find a constant store
+  // (e.g., PromoteStateToSSA promoted State.hyper_call to an alloca that
+  // ADCE later removed), recover the hyper call code from the metadata
+  // that the block lifter attached.
+  if (!hyper_call_code) {
+    if (auto *md = CI->getMetadata("omill.hyper_call_fn")) {
+      if (auto *str = llvm::dyn_cast<llvm::MDString>(md->getOperand(0))) {
+        auto fn = str->getString();
+        // Map ISEL function names to AsyncHyperCall::Name values.
+        if (fn.starts_with("INT1"))
+          hyper_call_code = 1;  // kX86Int1
+        else if (fn.starts_with("INT3"))
+          hyper_call_code = 2;  // kX86Int3
+        else if (fn.starts_with("INTO"))
+          hyper_call_code = 3;  // kX86IntO
+        else if (fn.starts_with("INT_"))
+          hyper_call_code = 4;  // kX86IntN
+        else if (fn.starts_with("BOUND"))
+          hyper_call_code = 5;  // kX86Bound
+        else if (fn.starts_with("IRET"))
+          hyper_call_code = 6;  // kX86IRet
+        else if (fn.starts_with("SYSCALL"))
+          hyper_call_code = 7;  // kX86SysCall
+        else if (fn.starts_with("SYSRET"))
+          hyper_call_code = 8;  // kX86SysRet
+        else if (fn.starts_with("SYSENTER"))
+          hyper_call_code = 9;  // kX86SysEnter
+        else if (fn.starts_with("SYSEXIT"))
+          hyper_call_code = 10; // kX86SysExit
+        else if (fn.starts_with("JMP_FAR") || fn.starts_with("CALL_FAR"))
+          hyper_call_code = 11; // kX86JmpFar
+        if (std::getenv("OMILL_DEBUG_HYPER_CALL"))
+          llvm::errs() << "[hyper] recovered code=" << hyper_call_code
+                       << " from metadata fn=" << fn << "\n";
       }
     }
-
-    if (hyper_call_code && vector) break;
   }
 
   // Emit the appropriate native instruction via inline asm.
@@ -995,6 +1058,27 @@ void lowerAsyncHyperCall(llvm::CallInst *CI) {
     }
     default: {
       // Unknown async hyper call — emit ud2 (x86) or brk (AArch64).
+      if (std::getenv("OMILL_DEBUG_HYPER_CALL")) {
+        llvm::errs() << "[hyper] unresolved async hyper_call_code="
+                     << hyper_call_code << " in "
+                     << CI->getParent()->getParent()->getName()
+                     << " bb=" << CI->getParent()->getName() << "\n";
+        // Dump preceding stores for debugging.
+        auto *dbb = CI->getParent();
+        for (auto dit = CI->getReverseIterator();
+             dit != dbb->rend(); ++dit) {
+          if (auto *dsi = llvm::dyn_cast<llvm::StoreInst>(&*dit)) {
+            int64_t doff = resolveStateOff(dsi->getPointerOperand());
+            llvm::errs() << "[hyper]   store off=" << doff << " val=";
+            dsi->getValueOperand()->printAsOperand(llvm::errs(), false);
+            llvm::errs() << " ptr=";
+            dsi->getPointerOperand()->printAsOperand(llvm::errs(), false);
+            llvm::errs() << " (state=";
+            state->printAsOperand(llvm::errs(), false);
+            llvm::errs() << ")\n";
+          }
+        }
+      }
       auto *IA = llvm::InlineAsm::get(void_fn_ty, "ud2", "",
                                       /*hasSideEffects=*/true);
       Builder.CreateCall(IA);

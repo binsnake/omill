@@ -1294,6 +1294,15 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
         remill::AddTerminatingTailCall(current_block,
                                        intrinsics->async_hyper_call,
                                        *intrinsics);
+        // Tag the call with the semantic function name so the lowering
+        // pass can recover the hyper call code after optimization
+        // eliminates the State+0 store.
+        if (auto *term = current_block->getTerminator())
+          if (auto *prev = term->getPrevNode())
+            if (auto *ci = llvm::dyn_cast<llvm::CallInst>(prev))
+              ci->setMetadata("omill.hyper_call_fn",
+                  llvm::MDNode::get(context, llvm::MDString::get(
+                      context, inst.function)));
         goto done;
       }
 
@@ -1314,6 +1323,12 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
         remill::AddTerminatingTailCall(do_hyper,
                                        intrinsics->async_hyper_call,
                                        *intrinsics);
+        if (auto *hterm = do_hyper->getTerminator())
+          if (auto *prev = hterm->getPrevNode())
+            if (auto *ci = llvm::dyn_cast<llvm::CallInst>(prev))
+              ci->setMetadata("omill.hyper_call_fn",
+                  llvm::MDNode::get(context, llvm::MDString::get(
+                      context, inst.function)));
         EmitDecisionEdge(cont_bb, next_pc, next_target, discovered_targets);
         goto done;
       }
