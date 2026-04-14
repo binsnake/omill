@@ -214,6 +214,10 @@ llvm::SmallVector<llvm::Value *, 4> findStackBaseValues(llvm::Function &F) {
 
   if (F.arg_empty()) return result;
   llvm::Value *state_ptr = F.getArg(0);
+  if (debugStackFrame()) {
+    llvm::errs() << "[RSF] findStackBaseValues: " << F.getName()
+                 << " arg_count=" << F.arg_size() << "\n";
+  }
   auto &DL = F.getDataLayout();
 
   // Pass 1: find State field offsets with negative-offset inttoptr patterns.
@@ -231,11 +235,14 @@ llvm::SmallVector<llvm::Value *, 4> findStackBaseValues(llvm::Function &F) {
           LI->getPointerOperand(), state_ptr, DL);
       if (state_off < 0) continue;
 
+
       for (auto *user : LI->users()) {
         auto *binop = llvm::dyn_cast<llvm::BinaryOperator>(user);
         if (!binop) continue;
         int64_t offset = 0;
-        if (!traceToBase(binop, LI, offset) || offset >= 0) continue;
+        if (!traceToBase(binop, LI, offset) || offset == 0) continue;
+        // Native stack grows down (negative offsets).  VMP virtual stack
+        // grows up (positive offsets from RBP/R13).  Accept both.
 
         // Check direct inttoptr users of the add.
         bool found_direct = false;
@@ -288,11 +295,15 @@ llvm::SmallVector<llvm::Value *, 4> findStackBaseValues(llvm::Function &F) {
   }
 
   llvm::DenseSet<llvm::Value *> seen;
+  llvm::DenseSet<int64_t> field_seen;  // limit to one base per State field
   for (auto &[field_off, bases] : effective_bases) {
     bool has_phi = phi_fields.count(field_off);
     for (auto *base : bases) {
       // Skip load bases when a phi base covers the same State field.
       if (has_phi && !llvm::isa<llvm::PHINode>(base))
+        continue;
+      // For load bases without a phi, keep only the first per field.
+      if (!has_phi && !field_seen.insert(field_off).second)
         continue;
       if (seen.insert(base).second) {
         if (llvm::isa<llvm::PHINode>(base) || hasIntToPtrUser(base))

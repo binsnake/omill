@@ -10078,12 +10078,16 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
           };
           MPM.addPass(MergeBlockLifterSCCs{});
           MPM.addPass(llvm::VerifierPass());
-          // TODO: inline member functions into the wrapper.  Currently
-          // blocked by LLVM InlineFunction crashing on ValueMapper with
-          // complex noalias metadata from remill lifting.  The members
-          // stay as separate internal functions called from the wrapper —
-          // still a big improvement over cross-recursive musttail.
+          // After merging, members get inlined into the wrapper by the
+          // later AlwaysInlinerPass (SCC is broken).
+          MPM.addPass(llvm::AlwaysInlinerPass());
           MPM.addPass(llvm::GlobalDCEPass());
+          // TODO: Run RSF on scc_dispatch to promote VMP virtual stack
+          // (State+2328/RBP-based inttoptr) to allocas.  Currently blocked
+          // because RSF finds ALL State field loads (26K bases from 20
+          // inlined handlers) and tries to convert all of them, which is
+          // too slow.  Needs scoped RSF: only promote the VMP stack pointer
+          // (State+2328), not every State field that reaches inttoptr.
         }
 
         //
@@ -10204,6 +10208,19 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
               llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
         }
         MPM.addPass(llvm::GlobalDCEPass());
+
+        // Post-tail-recursion cleanup: SROA decomposes the stack allocas
+        // created by RSF above, GVN forwards stores→loads, SimplifyCFG
+        // cleans up dead branches.
+        {
+          llvm::FunctionPassManager FPM;
+          FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+          FPM.addPass(llvm::InstCombinePass());
+          FPM.addPass(llvm::GVNPass());
+          FPM.addPass(llvm::SimplifyCFGPass());
+          MPM.addPass(
+              llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+        }
       }
 
       addClosedSliceShapeProbe(MPM, "phase3.97");
