@@ -153,22 +153,47 @@ static StateConstants collectExitConstants(
   return result;
 }
 
-/// Collect constant State stores in the local block before a call site.
-/// Unlike the old collectAllPreCallStateConstants, this does NOT walk
-/// backward through musttail callers — the worklist handles that.
-static StateConstants collectLocalPreCallConstants(
+/// Collect ALL constant State stores before a call site, walking backward
+/// through the local block, single-predecessor chains, and musttail callers.
+static StateConstants collectPreCallStateConstants(
     llvm::CallInst *CI, const llvm::DataLayout &DL) {
   StateConstants result;
   llvm::DenseSet<unsigned> seen;
   auto *BB = CI->getParent();
   collectStateConstantsInBlock(BB, CI->getIterator(), DL, seen, result);
-  // Also walk single-predecessor chain within the same function.
+
+  // Walk single-predecessor chain within the same function.
   auto *pred = BB;
   for (unsigned pd = 0; pd < 16; ++pd) {
     auto *sp = pred->getSinglePredecessor();
     if (!sp || sp == pred || sp->getParent() != BB->getParent()) break;
     collectStateConstantsInBlock(sp, sp->end(), DL, seen, result);
     pred = sp;
+  }
+
+  // Walk backward through musttail caller chain.
+  auto *F = BB->getParent();
+  for (unsigned depth = 0; depth < 8; ++depth) {
+    llvm::CallInst *caller_ci = nullptr;
+    unsigned count = 0;
+    for (auto *user : F->users()) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(user);
+      if (call && (call->isMustTailCall() || call->isTailCall()))
+        { caller_ci = call; ++count; }
+    }
+    if (count != 1 || !caller_ci) break;
+    auto *caller_bb = caller_ci->getParent();
+    collectStateConstantsInBlock(caller_bb, caller_ci->getIterator(),
+                                 DL, seen, result);
+    auto *cpred = caller_bb;
+    for (unsigned pd = 0; pd < 16; ++pd) {
+      auto *sp = cpred->getSinglePredecessor();
+      if (!sp || sp == cpred || sp->getParent() != caller_bb->getParent())
+        break;
+      collectStateConstantsInBlock(sp, sp->end(), DL, seen, result);
+      cpred = sp;
+    }
+    F = caller_bb->getParent();
   }
   return result;
 }
@@ -402,7 +427,7 @@ bool propagateStateConstantsWorklist(
 
     for (auto &edge : edges) {
       if (!edge.target || edge.target->isDeclaration()) continue;
-      auto consts = collectLocalPreCallConstants(edge.site, DL);
+      auto consts = collectPreCallStateConstants(edge.site, DL);
       if (consts.empty()) continue;
       uint64_t h = hashConstants(consts);
 
@@ -686,7 +711,7 @@ bool propagateStateConstantsWorklist(
             continue;
           // This is a rewritten dispatch_call → clone call.
           // Collect the pre-call constants in the caller.
-          auto caller_consts = collectLocalPreCallConstants(CI, DL);
+          auto caller_consts = collectPreCallStateConstants(CI, DL);
 
           // Find the clone's output in the cache.
           // We need to match by clone pointer.
