@@ -8387,6 +8387,7 @@ int main(int argc, char **argv) {
   std::unique_ptr<ScopedEnvOverride> auto_skip_terminal_boundary_secondary_root_guard;
   std::unique_ptr<ScopedEnvOverride> auto_skip_late_output_target_rerun_guard;
   std::unique_ptr<ScopedEnvOverride> auto_skip_late_terminal_boundary_rerun_guard;
+  std::unique_ptr<ScopedEnvOverride> auto_skip_noabi_final_remill_normalization_guard;
   if (large_noabi_lift) {
     const auto lifted_function_count = countLiftedPipelineFunctions();
     auto_skip_late_cleanup_guard =
@@ -8395,6 +8396,9 @@ int main(int argc, char **argv) {
         "OMILL_SKIP_OUTPUT_FINAL_CLEANUP", "1");
     auto_skip_late_const_memory_fold_guard = std::make_unique<ScopedEnvOverride>(
         "OMILL_SKIP_LATE_CONST_MEMORY_FOLD", "1");
+    auto_skip_noabi_final_remill_normalization_guard =
+        std::make_unique<ScopedEnvOverride>(
+            "OMILL_SKIP_NOABI_FINAL_REMILL_NORMALIZATION", "1");
     events.emitInfo("late_cleanup_auto_suppressed",
                     "late cleanup suppressed for large no-abi module",
                     {{"lifted_functions",
