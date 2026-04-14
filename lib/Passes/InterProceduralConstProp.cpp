@@ -10,10 +10,13 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Operator.h>
 #include <llvm/Support/FormatVariadic.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
+#include <llvm/Transforms/Scalar/GVN.h>
 #include <llvm/Transforms/Utils/Cloning.h>
 
 #include "omill/Analysis/CallGraphAnalysis.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
+#include "omill/Passes/CombinedFixedPointDevirt.h"
 #include "omill/Utils/LiftedNames.h"
 #include "omill/Utils/StateFieldMap.h"
 
@@ -112,6 +115,41 @@ static void collectStateConstantsInBlock(
       }
     }
   }
+}
+
+/// Collect constant State stores at all function exits, walking backward
+/// through the exit block and its single-predecessor chain.
+/// Intersects across exits: only keeps offsets where every exit agrees.
+static PreCallConstants collectCalleeOutputConstants(
+    llvm::Function &F, const llvm::DataLayout &DL) {
+  llvm::SmallVector<PreCallConstants, 4> per_exit;
+  for (auto &BB : F) {
+    if (!llvm::isa<llvm::ReturnInst>(BB.getTerminator())) continue;
+    PreCallConstants consts;
+    llvm::DenseSet<unsigned> seen;
+    auto *cur = const_cast<llvm::BasicBlock *>(&BB);
+    for (unsigned depth = 0; depth < 16; ++depth) {
+      collectStateConstantsInBlock(cur, cur->end(), DL, seen, consts);
+      auto *sp = cur->getSinglePredecessor();
+      if (!sp || sp == cur || sp->getParent() != BB.getParent()) break;
+      cur = sp;
+    }
+    per_exit.push_back(std::move(consts));
+  }
+  if (per_exit.empty()) return PreCallConstants();
+  // Intersect: only offsets where all exits agree on the same value.
+  PreCallConstants result = per_exit[0];
+  for (unsigned i = 1; i < per_exit.size(); ++i) {
+    llvm::SmallVector<unsigned, 4> drop;
+    for (auto &[off, c] : result) {
+      auto it = per_exit[i].find(off);
+      if (it == per_exit[i].end() ||
+          it->second->getValue() != c->getValue())
+        drop.push_back(off);
+    }
+    for (unsigned k : drop) result.erase(k);
+  }
+  return result;
 }
 
 /// Collect ALL constant stores before a dispatch_call, walking backward
@@ -419,7 +457,38 @@ bool propagateStateConstantsThroughDispatches(
       clone = cloneWithStateConstants(M, *site.target, site.constants, DL, sfx);
       clone_cache[key] = clone;
     }
+    // Step 3.5: Optimize clone and extract post-call State constants.
     if (clone) {
+      bool from_cache = (cached != clone_cache.end());
+      if (!from_cache && MAM) {
+        auto &FAM =
+            MAM->getResult<llvm::FunctionAnalysisManagerModuleProxy>(M)
+                .getManager();
+        llvm::FunctionPassManager FPM;
+        FPM.addPass(CombinedFixedPointDevirtPass());
+        FPM.addPass(llvm::InstCombinePass());
+        FPM.addPass(llvm::GVNPass());
+        auto PA = FPM.run(*clone, FAM);
+        FAM.invalidate(*clone, PA);
+        if (std::getenv("OMILL_DEBUG_STATE_IPCP"))
+          llvm::errs() << "[ipcp] optimized clone " << clone->getName() << "\n";
+      }
+      auto post_call = collectCalleeOutputConstants(*clone, DL);
+      if (!post_call.empty()) {
+        for (auto &[off, c] : post_call)
+          site.constants[off] = c;
+        hash = 0;
+        for (auto &[off, c] : site.constants)
+          hash ^= llvm::hash_combine(off, c->getZExtValue());
+        if (std::getenv("OMILL_DEBUG_STATE_IPCP")) {
+          llvm::errs() << "[ipcp] post-call constants for "
+                       << site.target->getName() << ":";
+          for (auto &[off, c] : post_call)
+            llvm::errs() << " [" << off << "]=0x"
+                         << llvm::Twine::utohexstr(c->getZExtValue());
+          llvm::errs() << "\n";
+        }
+      }
       if (std::getenv("OMILL_DEBUG_STATE_IPCP"))
         llvm::errs() << "[ipcp] cloned " << site.target->getName()
                      << " -> " << clone->getName() << "\n";
