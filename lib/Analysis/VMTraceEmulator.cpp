@@ -388,8 +388,15 @@ static ExecResult stepInstruction(EmuState &state,
                                   const BinaryMemoryMap &mem) {
   uint8_t buf[15];
   if (!mem.read(state.rip, buf, 15)) {
-    // Failed to read instruction bytes — address not in mapped region.
-    return ExecResult::Unsupported;
+    // VMP pushes handler code bytes onto an RWX stack region and
+    // executes them via JMP RSP.  When RIP lands inside the
+    // emulator's internal stack, read instruction bytes from there.
+    if (state.isStackAddr(state.rip) &&
+        state.isStackAddr(state.rip + 14)) {
+      std::memcpy(buf, state.stackPtr(state.rip), 15);
+    } else {
+      return ExecResult::Unsupported;
+    }
   }
 
   unsigned pos = 0;
@@ -1116,6 +1123,24 @@ static ExecResult stepInstruction(EmuState &state,
     state.rip = inst_start + pos;
     int64_t val = static_cast<int32_t>(readOp(state, mem, rm) & 0xFFFFFFFFu);
     state.regs[reg_field] = static_cast<uint64_t>(val);
+    return ExecResult::Continue;
+  }
+
+  // XCHG r/m8, r8 (86) / XCHG r/m32/64, r32/64 (87)
+  if (opcode == 0x86 || opcode == 0x87) {
+    unsigned xsz = (opcode == 0x86) ? 1 : default_op_size;
+    uint8_t reg_field;
+    Operand rm;
+    unsigned n = decodeModRM(&buf[pos], 15 - pos, has_rex, rex,
+                             xsz, rm, reg_field);
+    if (n == 0) return ExecResult::Unsupported;
+    pos += n;
+    state.rip = inst_start + pos;
+
+    uint64_t a = readOp(state, mem, rm);
+    uint64_t b = maskToSize(state.regs[reg_field], xsz);
+    writeOp(state, rm, b);                         // r/m ← old reg
+    state.regs[reg_field] = maskToSize(a, xsz);    // reg ← old r/m
     return ExecResult::Continue;
   }
 
