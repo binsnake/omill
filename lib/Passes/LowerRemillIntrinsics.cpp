@@ -1041,12 +1041,15 @@ void lowerAsyncHyperCall(llvm::CallInst *CI) {
       is_noreturn = true;
       break;
     }
-    case 11: {  // kX86JmpFar — far jump (can't lower without segment info)
-      auto *IA = llvm::InlineAsm::get(void_fn_ty, "ud2", "",
-                                      /*hasSideEffects=*/true);
-      Builder.CreateCall(IA);
-      is_noreturn = true;
-      break;
+    case 11: {  // kX86JmpFar — far jump/call in x64 long mode.
+      // The semantic already wrote the target offset to REG_PC and the
+      // segment selector to REG_CS.flat.  In long mode the segment base
+      // is forced to 0, so the far transfer is just an indirect
+      // jump/call to the offset — which the normal dispatch flow
+      // handles.  Emit NOP; the hyper call is effectively a no-op.
+      CI->replaceAllUsesWith(mem);
+      CI->eraseFromParent();
+      return;  // CI erased, skip the common tail below.
     }
     case 12: {  // kAArch64SupervisorCall — SVC #imm
       std::string asm_str = "svc #" + std::to_string(vector);
