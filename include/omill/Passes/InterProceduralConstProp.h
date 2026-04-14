@@ -2,9 +2,10 @@
 
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/IR/Constants.h>
-#include <map>
 #include <llvm/IR/DataLayout.h>
 #include <llvm/IR/PassManager.h>
+
+#include <functional>
 
 namespace omill {
 
@@ -28,18 +29,29 @@ class InterProceduralConstPropPass
   static llvm::StringRef name() { return "InterProceduralConstPropPass"; }
 };
 
-/// Propagate constant State field values from callers into dispatch_call
-/// targets by cloning shared callees.  For each dispatch_call site with
-/// a constant PC target, collects constant stores to State fields in the
-/// same BB before the call, clones the resolved callee with those constants
-/// folded into entry-block loads, and rewrites the dispatch_call to a
-/// direct call to the clone.  Returns true if any changes were made.
-/// Persistent map of derived constants that survives across rounds.
-using DerivedStateConstants = std::map<unsigned, llvm::ConstantInt *>;
+/// Callback that lifts a block at the given PC, returning true if newly lifted.
+using IPCPLiftCallback = std::function<bool(uint64_t pc)>;
 
-bool propagateStateConstantsThroughDispatches(
+/// Worklist-based State constant propagation through dispatch edges.
+///
+/// Builds a State flow graph from all dispatch_call, dispatch_jump, and
+/// musttail edges in the module, then propagates constant State field
+/// values forward through the graph using a worklist algorithm:
+///
+/// 1. Seed: collect pre-call constants at each dispatch site.
+/// 2. For each (function, input_constants) on the worklist:
+///    - Clone the function with input constants folded into entry loads.
+///    - Optimize the clone (CombinedFixedPointDevirt + InstCombine + GVN).
+///    - Extract output constants from exit stores.
+///    - Pass-through: offsets the function doesn't access flow unchanged.
+///    - Scan the clone for new dispatch edges and enqueue their targets.
+///    - Propagate output along musttail edges to successors.
+/// 3. Rewrite call sites to use specialized clones.
+///
+/// Returns true if any IR changes were made.
+bool propagateStateConstantsWorklist(
     llvm::Module &M, const llvm::DataLayout &DL,
     llvm::ModuleAnalysisManager *MAM = nullptr,
-    DerivedStateConstants *persistent_derived = nullptr);
+    IPCPLiftCallback lift_callback = nullptr);
 
 }  // namespace omill

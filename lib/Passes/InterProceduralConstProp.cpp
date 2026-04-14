@@ -1,6 +1,7 @@
 #include "omill/Passes/InterProceduralConstProp.h"
 
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/DenseSet.h>
 #include <llvm/ADT/Hashing.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/IR/Constants.h>
@@ -13,6 +14,8 @@
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar/GVN.h>
 #include <llvm/Transforms/Utils/Cloning.h>
+
+#include <deque>
 
 #include "omill/Analysis/CallGraphAnalysis.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
@@ -50,13 +53,13 @@ int64_t resolveStateOffset(llvm::Value *ptr, const llvm::DataLayout &DL) {
   return -1;
 }
 
-using PreCallConstants = llvm::DenseMap<unsigned, llvm::ConstantInt *>;
+using StateConstants = llvm::DenseMap<unsigned, llvm::ConstantInt *>;
 
 /// Collect constant stores to Win64 param offsets in the same BB before CI.
-PreCallConstants collectPreCallConstants(
+StateConstants collectPreCallConstants(
     llvm::CallInst *CI, const llvm::DataLayout &DL,
     const llvm::DenseSet<unsigned> &param_offsets) {
-  PreCallConstants result;
+  StateConstants result;
   llvm::DenseSet<unsigned> seen;
   auto *BB = CI->getParent();
   auto it = CI->getIterator();
@@ -79,7 +82,7 @@ PreCallConstants collectPreCallConstants(
 static void collectStateConstantsInBlock(
     llvm::BasicBlock *BB, llvm::BasicBlock::iterator end_it,
     const llvm::DataLayout &DL,
-    llvm::DenseSet<unsigned> &seen, PreCallConstants &result) {
+    llvm::DenseSet<unsigned> &seen, StateConstants &result) {
   auto it = end_it;
   while (it != BB->begin()) {
     --it;
@@ -117,15 +120,14 @@ static void collectStateConstantsInBlock(
   }
 }
 
-/// Collect constant State stores at all function exits, walking backward
-/// through the exit block and its single-predecessor chain.
+/// Collect constant State stores at all function exits.
 /// Intersects across exits: only keeps offsets where every exit agrees.
-static PreCallConstants collectCalleeOutputConstants(
+static StateConstants collectExitConstants(
     llvm::Function &F, const llvm::DataLayout &DL) {
-  llvm::SmallVector<PreCallConstants, 4> per_exit;
+  llvm::SmallVector<StateConstants, 4> per_exit;
   for (auto &BB : F) {
     if (!llvm::isa<llvm::ReturnInst>(BB.getTerminator())) continue;
-    PreCallConstants consts;
+    StateConstants consts;
     llvm::DenseSet<unsigned> seen;
     auto *cur = const_cast<llvm::BasicBlock *>(&BB);
     for (unsigned depth = 0; depth < 16; ++depth) {
@@ -136,9 +138,8 @@ static PreCallConstants collectCalleeOutputConstants(
     }
     per_exit.push_back(std::move(consts));
   }
-  if (per_exit.empty()) return PreCallConstants();
-  // Intersect: only offsets where all exits agree on the same value.
-  PreCallConstants result = per_exit[0];
+  if (per_exit.empty()) return StateConstants();
+  StateConstants result = per_exit[0];
   for (unsigned i = 1; i < per_exit.size(); ++i) {
     llvm::SmallVector<unsigned, 4> drop;
     for (auto &[off, c] : result) {
@@ -152,38 +153,22 @@ static PreCallConstants collectCalleeOutputConstants(
   return result;
 }
 
-/// Collect ALL constant stores before a dispatch_call, walking backward
-/// through musttail caller chains and single-predecessor blocks.
-PreCallConstants collectAllPreCallStateConstants(
+/// Collect constant State stores in the local block before a call site.
+/// Unlike the old collectAllPreCallStateConstants, this does NOT walk
+/// backward through musttail callers — the worklist handles that.
+static StateConstants collectLocalPreCallConstants(
     llvm::CallInst *CI, const llvm::DataLayout &DL) {
-  PreCallConstants result;
+  StateConstants result;
   llvm::DenseSet<unsigned> seen;
   auto *BB = CI->getParent();
   collectStateConstantsInBlock(BB, CI->getIterator(), DL, seen, result);
-
-  // Walk up musttail caller chain.
-  auto *F = BB->getParent();
-  for (unsigned depth = 0; depth < 8; ++depth) {
-    llvm::CallInst *caller_ci = nullptr;
-    unsigned count = 0;
-    for (auto *user : F->users()) {
-      auto *call = llvm::dyn_cast<llvm::CallInst>(user);
-      if (call && (call->isMustTailCall() || call->isTailCall()))
-        { caller_ci = call; ++count; }
-    }
-    if (count != 1 || !caller_ci) break;
-    auto *caller_bb = caller_ci->getParent();
-    collectStateConstantsInBlock(caller_bb, caller_ci->getIterator(),
-                                 DL, seen, result);
-    // Follow single-predecessor chain in caller function.
-    auto *pred = caller_bb;
-    for (unsigned pd = 0; pd < 16; ++pd) {
-      auto *sp = pred->getSinglePredecessor();
-      if (!sp || sp == pred || sp->getParent() != caller_bb->getParent()) break;
-      collectStateConstantsInBlock(sp, sp->end(), DL, seen, result);
-      pred = sp;
-    }
-    F = caller_bb->getParent();
+  // Also walk single-predecessor chain within the same function.
+  auto *pred = BB;
+  for (unsigned pd = 0; pd < 16; ++pd) {
+    auto *sp = pred->getSinglePredecessor();
+    if (!sp || sp == pred || sp->getParent() != BB->getParent()) break;
+    collectStateConstantsInBlock(sp, sp->end(), DL, seen, result);
+    pred = sp;
   }
   return result;
 }
@@ -191,9 +176,9 @@ PreCallConstants collectAllPreCallStateConstants(
 /// Clone callee with constant State fields folded in.
 /// Finds GEPs at the constant offsets (all blocks) and replaces their
 /// load users with the constant.  Returns nullptr if no loads replaced.
-llvm::Function *cloneWithStateConstants(
+static llvm::Function *cloneWithStateConstants(
     llvm::Module &M, llvm::Function &callee,
-    const PreCallConstants &constants, const llvm::DataLayout &DL,
+    const StateConstants &constants, const llvm::DataLayout &DL,
     llvm::StringRef suffix) {
   llvm::ValueToValueMapTy vmap;
   auto *clone = llvm::CloneFunction(&callee, vmap);
@@ -207,7 +192,6 @@ llvm::Function *cloneWithStateConstants(
   bool any_replaced = false;
 
   for (auto &[offset, constant] : constants) {
-    // Find GEP at this offset (any block).
     llvm::GetElementPtrInst *gep = nullptr;
     for (auto &BB : *clone) {
       for (auto &I : BB) {
@@ -222,7 +206,6 @@ llvm::Function *cloneWithStateConstants(
     }
     if (!gep) continue;
 
-    // Replace all loads through this GEP.
     llvm::SmallVector<llvm::LoadInst *, 4> loads;
     for (auto *user : gep->users())
       if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(user))
@@ -263,9 +246,9 @@ static llvm::DenseSet<unsigned> getAccessedOffsets(
 
 /// For a given function, replace entry-block loads from State at a given
 /// offset with a constant.  Used by the Win64 param IPCP path.
-bool replaceEntryBlockLoads(llvm::Function &F, unsigned offset,
-                            llvm::ConstantInt *C,
-                            const llvm::DataLayout &DL) {
+static bool replaceEntryBlockLoads(llvm::Function &F, unsigned offset,
+                                   llvm::ConstantInt *C,
+                                   const llvm::DataLayout &DL) {
   if (F.empty()) return false;
   bool changed = false;
   llvm::SmallVector<llvm::LoadInst *, 4> to_replace;
@@ -284,289 +267,604 @@ bool replaceEntryBlockLoads(llvm::Function &F, unsigned offset,
   return changed;
 }
 
+/// Compute a hash for a set of State constants (for clone cache keying).
+static uint64_t hashConstants(const StateConstants &consts) {
+  uint64_t h = 0;
+  for (auto &[off, c] : consts)
+    h ^= llvm::hash_combine(off, c->getZExtValue());
+  return h;
+}
+
+/// Look up a function by PC (sub_<hex> or blk_<hex>).
+static llvm::Function *resolveTargetByPC(llvm::Module &M, uint64_t pc) {
+  llvm::SmallString<32> buf;
+  if (auto *F = M.getFunction(
+          ("sub_" + llvm::Twine::utohexstr(pc)).toStringRef(buf)))
+    return F;
+  buf.clear();
+  return M.getFunction(
+      ("blk_" + llvm::Twine::utohexstr(pc)).toStringRef(buf));
+}
+
+/// Run the optimization pipeline on a freshly-cloned function.
+static void optimizeClone(llvm::Function &clone, llvm::Module &M,
+                          llvm::ModuleAnalysisManager &MAM) {
+  auto &FAM =
+      MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M).getManager();
+  llvm::FunctionPassManager FPM;
+  FPM.addPass(CombinedFixedPointDevirtPass());
+  FPM.addPass(llvm::InstCombinePass());
+  FPM.addPass(llvm::GVNPass());
+  auto PA = FPM.run(clone, FAM);
+  FAM.invalidate(clone, PA);
+}
+
+// ===----------------------------------------------------------------------===
+// State flow graph edge types
+// ===----------------------------------------------------------------------===
+
+enum class EdgeKind { kDispatchCall, kDispatchJump, kMusttail };
+
+struct StateFlowEdge {
+  EdgeKind kind;
+  llvm::CallInst *site;
+  llvm::Function *source;
+  llvm::Function *target;   // resolved target (nullptr if unresolved)
+  uint64_t target_pc = 0;   // for dispatch edges: the constant PC operand
+};
+
+/// Find all musttail call edges in a function.
+static void findMusttailEdges(llvm::Function &F,
+                              llvm::SmallVectorImpl<StateFlowEdge> &edges) {
+  for (auto &BB : F) {
+    auto *term = BB.getTerminator();
+    if (!llvm::isa<llvm::ReturnInst>(term)) continue;
+    auto *prev = term->getPrevNode();
+    if (!prev) continue;
+    auto *ci = llvm::dyn_cast<llvm::CallInst>(prev);
+    if (!ci || (!ci->isMustTailCall() && !ci->isTailCall())) continue;
+    auto *target = ci->getCalledFunction();
+    if (!target) continue;
+    edges.push_back({EdgeKind::kMusttail, ci, &F, target, 0});
+  }
+}
+
+/// Find all dispatch_call and dispatch_jump edges in a function.
+static void findDispatchEdges(llvm::Function &F, llvm::Module &M,
+                              llvm::SmallVectorImpl<StateFlowEdge> &edges) {
+  for (auto &BB : F) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI || CI->arg_size() < 3) continue;
+      auto *callee = CI->getCalledFunction();
+      if (!callee) continue;
+      bool is_call = isDispatchCallName(callee->getName());
+      bool is_jump = isDispatchJumpName(callee->getName());
+      if (!is_call && !is_jump) continue;
+      auto *pc_arg = llvm::dyn_cast<llvm::ConstantInt>(CI->getArgOperand(1));
+      if (!pc_arg) continue;
+      uint64_t pc = pc_arg->getZExtValue();
+      auto *target = resolveTargetByPC(M, pc);
+      edges.push_back({is_call ? EdgeKind::kDispatchCall
+                                : EdgeKind::kDispatchJump,
+                       CI, &F, target, pc});
+    }
+  }
+}
+
+static bool debugEnabled() {
+  static bool enabled = std::getenv("OMILL_DEBUG_STATE_IPCP") != nullptr;
+  return enabled;
+}
+
+// ===----------------------------------------------------------------------===
+// Worklist-based State constant propagation
+// ===----------------------------------------------------------------------===
+
+struct WorklistEntry {
+  llvm::Function *target;
+  StateConstants input;
+  uint64_t hash;
+  // The call site to rewrite (for dispatch edges).
+  llvm::CallInst *dispatch_site = nullptr;
+  EdgeKind edge_kind = EdgeKind::kMusttail;
+  // The musttail call to rewrite (for musttail edges).
+  llvm::CallInst *musttail_site = nullptr;
+};
+
 }  // namespace
 
-// ===----------------------------------------------------------------------===
-// Dispatch-call State constant propagation
-// ===----------------------------------------------------------------------===
-
-bool propagateStateConstantsThroughDispatches(
+bool propagateStateConstantsWorklist(
     llvm::Module &M, const llvm::DataLayout &DL,
     llvm::ModuleAnalysisManager *MAM,
-    DerivedStateConstants *persistent_derived) {
+    IPCPLiftCallback lift_callback) {
   bool changed = false;
+
+  // Clone cache: (original function, input hash) → specialized clone.
   llvm::DenseMap<std::pair<llvm::Function *, uint64_t>, llvm::Function *>
       clone_cache;
+  // Output cache: (original function, input hash) → output constants.
+  llvm::DenseMap<std::pair<llvm::Function *, uint64_t>, StateConstants>
+      output_cache;
+  // Track which (function, hash) pairs have been fully processed.
+  llvm::DenseSet<std::pair<llvm::Function *, uint64_t>> processed;
 
-  struct DispatchSite {
-    llvm::CallInst *call;
-    llvm::Function *target;
-    PreCallConstants constants;
-  };
-  llvm::SmallVector<DispatchSite, 8> sites;
+  std::deque<WorklistEntry> worklist;
 
-  // Collect dispatch_call sites.
+  // Phase 1: Scan module for dispatch edges and seed the worklist.
   for (auto &F : M) {
     if (F.isDeclaration()) continue;
-    for (auto &BB : F) {
-      for (auto &I : BB) {
-        auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
-        if (!CI || CI->arg_size() < 3) continue;
-        auto *callee = CI->getCalledFunction();
-        if (!callee || (!isDispatchCallName(callee->getName()) &&
-                       !isDispatchJumpName(callee->getName())))
-          continue;
-        auto *pc_arg = llvm::dyn_cast<llvm::ConstantInt>(CI->getArgOperand(1));
-        if (!pc_arg) continue;
-        uint64_t pc = pc_arg->getZExtValue();
-        llvm::SmallString<32> buf;
-        auto *target = M.getFunction(
-            ("sub_" + llvm::Twine::utohexstr(pc)).toStringRef(buf));
-        if (!target) {
-          buf.clear();
-          target = M.getFunction(
-              ("blk_" + llvm::Twine::utohexstr(pc)).toStringRef(buf));
-        }
-        if (!target || target->isDeclaration()) continue;
-        auto constants = collectAllPreCallStateConstants(CI, DL);
-        if (std::getenv("OMILL_DEBUG_STATE_IPCP"))
-          llvm::errs() << "[ipcp] site " << F.getName() << " -> "
-                       << target->getName() << " consts="
-                       << constants.size();
-        for (auto &[off, c] : constants)
+    llvm::SmallVector<StateFlowEdge, 4> edges;
+    findDispatchEdges(F, M, edges);
+
+    for (auto &edge : edges) {
+      if (!edge.target || edge.target->isDeclaration()) continue;
+      auto consts = collectLocalPreCallConstants(edge.site, DL);
+      if (consts.empty()) continue;
+      uint64_t h = hashConstants(consts);
+
+      if (debugEnabled()) {
+        llvm::errs() << "[ipcp] seed " << F.getName() << " -> "
+                     << edge.target->getName()
+                     << " kind=" << (edge.kind == EdgeKind::kDispatchCall
+                                         ? "call" : "jump")
+                     << " consts=" << consts.size();
+        for (auto &[off, c] : consts)
           llvm::errs() << " [" << off << "]=0x"
                        << llvm::Twine::utohexstr(c->getZExtValue());
         llvm::errs() << "\n";
-        sites.push_back({CI, target, std::move(constants)});
       }
+
+      worklist.push_back({edge.target, std::move(consts), h,
+                          edge.site, edge.kind, nullptr});
     }
   }
 
-  // Derived constants map (persistent across rounds if provided).
-  DerivedStateConstants local;
-  DerivedStateConstants &derived = persistent_derived ? *persistent_derived : local;
+  if (debugEnabled())
+    llvm::errs() << "[ipcp] worklist seeded: " << worklist.size()
+                 << " entries\n";
 
-  if (std::getenv("OMILL_DEBUG_STATE_IPCP"))
-    llvm::errs() << "[ipcp] ENTER: derived.size()=" << derived.size() << "\n";
+  // Phase 2: Process worklist.
+  unsigned iterations = 0;
+  constexpr unsigned kMaxIterations = 128;
 
-  // Pre-pass: compute pass-through for all sites.
-  for (auto &site : sites) {
-    auto accessed = getAccessedOffsets(*site.target, DL);
-    for (auto &[off, c] : site.constants)
-      if (!accessed.count(off) && !derived.count(off)) {
-        derived[off] = c;
-        if (std::getenv("OMILL_DEBUG_STATE_IPCP"))
-          llvm::errs() << "[ipcp] pre-pass: [" << off << "] pass-through "
-                       << site.target->getName() << "\n";
+  while (!worklist.empty() && iterations < kMaxIterations) {
+    ++iterations;
+    auto entry = std::move(worklist.front());
+    worklist.pop_front();
+
+    auto key = std::make_pair(entry.target, entry.hash);
+
+    // If the target is a declaration, try to lift it.
+    if (entry.target->isDeclaration()) {
+      uint64_t pc = extractBlockPC(entry.target->getName());
+      if (pc == 0) pc = extractEntryVA(entry.target->getName());
+      if (pc != 0 && lift_callback) {
+        lift_callback(pc);
       }
-  }
-  if (std::getenv("OMILL_DEBUG_STATE_IPCP"))
-    llvm::errs() << "[ipcp] pre-pass done: derived=" << derived.size()
-                 << " sites=" << sites.size()
-                 << " persistent=" << (persistent_derived != nullptr) << "\n";
+      if (entry.target->isDeclaration()) continue;
+    }
 
-  // Process each site.
-  for (auto &site : sites) {
-    // Re-collect (picks up constants from prior rewrites in same round).
-    site.constants = collectAllPreCallStateConstants(site.call, DL);
-    // Merge derived pass-through constants.
-    for (auto &[off, c] : derived)
-      if (!site.constants.count(off))
-        site.constants[off] = c;
-    if (std::getenv("OMILL_DEBUG_STATE_IPCP"))
-      llvm::errs() << "[ipcp] " << site.target->getName()
-                   << " after merge: " << site.constants.size()
-                   << " (derived=" << derived.size() << ")\n";
-    if (site.constants.empty()) continue;
-
-    // Per-constant pass-through: remove constants the target doesn't access.
-    auto accessed = getAccessedOffsets(*site.target, DL);
-    llvm::SmallVector<unsigned, 4> passthru;
-    for (auto &[off, c] : site.constants)
-      if (!accessed.count(off)) {
-        derived[off] = c;
-        passthru.push_back(off);
+    // Skip if already processed with these exact constants.
+    if (processed.count(key)) {
+      // Still need to rewrite call sites using the cached clone.
+      auto cache_it = clone_cache.find(key);
+      llvm::Function *clone = (cache_it != clone_cache.end())
+                                  ? cache_it->second : nullptr;
+      if (clone) {
+        if (entry.dispatch_site &&
+            (entry.edge_kind == EdgeKind::kDispatchCall ||
+             entry.edge_kind == EdgeKind::kDispatchJump)) {
+          // Rewrite dispatch → direct call.
+          llvm::IRBuilder<> Builder(entry.dispatch_site);
+          auto *nc = Builder.CreateCall(
+              clone->getFunctionType(), clone,
+              {entry.dispatch_site->getArgOperand(0),
+               entry.dispatch_site->getArgOperand(1),
+               entry.dispatch_site->getArgOperand(2)});
+          nc->copyMetadata(*entry.dispatch_site);
+          entry.dispatch_site->replaceAllUsesWith(nc);
+          entry.dispatch_site->eraseFromParent();
+          changed = true;
+        }
+        if (entry.musttail_site) {
+          entry.musttail_site->setCalledFunction(clone);
+          changed = true;
+        }
       }
-    for (unsigned k : passthru) site.constants.erase(k);
 
-    // If all constants passed through, follow musttail targets.
-    // The constant flows through this function's musttail chain
-    // to the next function that might access it.
-    if (site.constants.empty() && !passthru.empty()) {
-      for (auto &BB : *site.target) {
-        auto *term = BB.getTerminator();
-        if (!llvm::isa<llvm::ReturnInst>(term)) continue;
-        auto *prev = term->getPrevNode();
-        if (!prev) continue;
-        auto *mci = llvm::dyn_cast<llvm::CallInst>(prev);
-        if (!mci || (!mci->isMustTailCall() && !mci->isTailCall()))
-          continue;
-        auto *mt_fn = mci->getCalledFunction();
-        if (std::getenv("OMILL_DEBUG_STATE_IPCP"))
-          llvm::errs() << "[ipcp] musttail target: "
-                       << (mt_fn ? mt_fn->getName() : "<null>")
-                       << " decl=" << (mt_fn && mt_fn->isDeclaration())
-                       << "\n";
-        if (!mt_fn || mt_fn->isDeclaration()) continue;
-        auto mt_accessed = getAccessedOffsets(*mt_fn, DL);
-        PreCallConstants mt_consts;
-        for (unsigned k : passthru)
-          if (mt_accessed.count(k))
-            mt_consts[k] = derived[k];
-        if (!mt_consts.empty()) {
-          // Process this musttail target as a new site inline.
-          uint64_t mt_hash = 0;
-          for (auto &[o, cv] : mt_consts)
-            mt_hash ^= llvm::hash_combine(o, cv->getZExtValue());
-          auto mt_key = std::make_pair(mt_fn, mt_hash);
-          if (!clone_cache.count(mt_key)) {
-            llvm::SmallString<16> sfx;
-            llvm::raw_svector_ostream(sfx)
-                << llvm::format_hex_no_prefix(mt_hash, 8);
-            auto *mt_clone = cloneWithStateConstants(
-                M, *mt_fn, mt_consts, DL, sfx);
-            clone_cache[mt_key] = mt_clone;
-            if (mt_clone) {
-              mci->setCalledFunction(mt_clone);
-              changed = true;
-              if (std::getenv("OMILL_DEBUG_STATE_IPCP"))
-                llvm::errs() << "[ipcp] cloned musttail "
-                             << mt_fn->getName() << " -> "
-                             << mt_clone->getName() << "\n";
-            }
-          }
+      // Propagate cached output along successor edges.
+      auto out_it = output_cache.find(key);
+      if (out_it != output_cache.end() && !out_it->second.empty()) {
+        // For dispatch_call: find musttail successors in the CALLER
+        // and enqueue them with the output constants.
+        if (entry.edge_kind == EdgeKind::kDispatchCall &&
+            entry.dispatch_site) {
+          // dispatch_site was erased above, use the replacement.
+          // The caller function is the one that contained the dispatch.
+          // We need to find it from the clone or the original.
+        }
+        // For musttail and dispatch_jump: find successors of the target.
+        llvm::Function *effective = clone ? clone : entry.target;
+        llvm::SmallVector<StateFlowEdge, 4> succ_edges;
+        findMusttailEdges(*effective, succ_edges);
+        findDispatchEdges(*effective, M, succ_edges);
+        for (auto &se : succ_edges) {
+          if (!se.target) continue;
+          uint64_t sh = hashConstants(out_it->second);
+          auto sk = std::make_pair(se.target, sh);
+          if (processed.count(sk)) continue;
+          worklist.push_back({se.target, out_it->second, sh,
+                              (se.kind != EdgeKind::kMusttail) ? se.site : nullptr,
+                              se.kind,
+                              (se.kind == EdgeKind::kMusttail) ? se.site : nullptr});
         }
       }
       continue;
     }
-    if (site.constants.empty()) continue;
 
     // Clone + specialize.
-    uint64_t hash = 0;
-    for (auto &[off, c] : site.constants)
-      hash ^= llvm::hash_combine(off, c->getZExtValue());
-    auto key = std::make_pair(site.target, hash);
-
+    auto cache_it = clone_cache.find(key);
     llvm::Function *clone = nullptr;
-    auto cached = clone_cache.find(key);
-    if (cached != clone_cache.end()) {
-      clone = cached->second;
+    bool from_cache = (cache_it != clone_cache.end());
+    if (from_cache) {
+      clone = cache_it->second;
     } else {
       llvm::SmallString<16> sfx;
-      llvm::raw_svector_ostream(sfx) << llvm::format_hex_no_prefix(hash, 8);
-      clone = cloneWithStateConstants(M, *site.target, site.constants, DL, sfx);
+      llvm::raw_svector_ostream(sfx)
+          << llvm::format_hex_no_prefix(entry.hash, 8);
+      clone = cloneWithStateConstants(M, *entry.target, entry.input, DL, sfx);
       clone_cache[key] = clone;
     }
-    // Step 3.5: Optimize clone and extract post-call State constants.
-    if (clone) {
-      bool from_cache = (cached != clone_cache.end());
-      if (!from_cache && MAM) {
-        auto &FAM =
-            MAM->getResult<llvm::FunctionAnalysisManagerModuleProxy>(M)
-                .getManager();
-        llvm::FunctionPassManager FPM;
-        FPM.addPass(CombinedFixedPointDevirtPass());
-        FPM.addPass(llvm::InstCombinePass());
-        FPM.addPass(llvm::GVNPass());
-        auto PA = FPM.run(*clone, FAM);
-        FAM.invalidate(*clone, PA);
-        if (std::getenv("OMILL_DEBUG_STATE_IPCP"))
-          llvm::errs() << "[ipcp] optimized clone " << clone->getName() << "\n";
-      }
-      auto post_call = collectCalleeOutputConstants(*clone, DL);
-      if (!post_call.empty()) {
-        for (auto &[off, c] : post_call)
-          site.constants[off] = c;
-        hash = 0;
-        for (auto &[off, c] : site.constants)
-          hash ^= llvm::hash_combine(off, c->getZExtValue());
-        if (std::getenv("OMILL_DEBUG_STATE_IPCP")) {
-          llvm::errs() << "[ipcp] post-call constants for "
-                       << site.target->getName() << ":";
-          for (auto &[off, c] : post_call)
-            llvm::errs() << " [" << off << "]=0x"
-                         << llvm::Twine::utohexstr(c->getZExtValue());
-          llvm::errs() << "\n";
-        }
-      }
-      if (std::getenv("OMILL_DEBUG_STATE_IPCP"))
-        llvm::errs() << "[ipcp] cloned " << site.target->getName()
-                     << " -> " << clone->getName() << "\n";
-    }
-    // Even when the clone fails (target doesn't use the constants),
-    // still propagate through the musttail chain — the musttail
-    // successors might use them (e.g. blk_1800018a6 uses R14).
-    if (!clone && site.constants.empty()) continue;
 
-    // Rewrite dispatch_call → direct call to clone (if clone succeeded).
-    llvm::CallInst *nc = site.call;  // fallback: keep original
-    if (clone) {
-      llvm::IRBuilder<> Builder(site.call);
-      nc = Builder.CreateCall(clone->getFunctionType(), clone,
-          {site.call->getArgOperand(0), site.call->getArgOperand(1),
-           site.call->getArgOperand(2)});
-      nc->copyMetadata(*site.call);
-      site.call->replaceAllUsesWith(nc);
-      site.call->eraseFromParent();
-      changed = true;
+    // Optimize the clone.
+    if (clone && !from_cache && MAM) {
+      optimizeClone(*clone, M, *MAM);
+      if (debugEnabled())
+        llvm::errs() << "[ipcp] optimized clone " << clone->getName() << "\n";
     }
 
-    // Propagate constants through musttail successors of the clone.
-    // When the clone musttails to blk_<pc>, that block inherits the
-    // Propagate constants through the musttail chain from the
-    // CALLER function.  The caller stores constants to State, then
-    // after the dispatch_call returns, musttails to successor blocks.
-    // Those successors load from State but can't see through the
-    // function boundary — clone them with the constants baked in.
+    // Extract output constants.
+    StateConstants output;
+    if (clone) {
+      output = collectExitConstants(*clone, DL);
+    }
+    // Pass-through: input constants for offsets the target doesn't access.
+    auto accessed = getAccessedOffsets(clone ? *clone : *entry.target, DL);
+    for (auto &[off, c] : entry.input) {
+      if (!accessed.count(off) && !output.count(off))
+        output[off] = c;
+    }
+
+    output_cache[key] = output;
+    processed.insert(key);
+
+    if (debugEnabled()) {
+      llvm::errs() << "[ipcp] processed " << entry.target->getName()
+                   << " hash=" << llvm::format_hex(entry.hash, 10)
+                   << " clone=" << (clone ? clone->getName() : "<none>")
+                   << " output=" << output.size() << "\n";
+      if (!output.empty()) {
+        llvm::errs() << "[ipcp]   output:";
+        for (auto &[off, c] : output)
+          llvm::errs() << " [" << off << "]=0x"
+                       << llvm::Twine::utohexstr(c->getZExtValue());
+        llvm::errs() << "\n";
+      }
+    }
+
+    // Rewrite the call site.
+    if (clone) {
+      if (entry.dispatch_site &&
+          (entry.edge_kind == EdgeKind::kDispatchCall ||
+           entry.edge_kind == EdgeKind::kDispatchJump)) {
+        llvm::IRBuilder<> Builder(entry.dispatch_site);
+        auto *nc = Builder.CreateCall(
+            clone->getFunctionType(), clone,
+            {entry.dispatch_site->getArgOperand(0),
+             entry.dispatch_site->getArgOperand(1),
+             entry.dispatch_site->getArgOperand(2)});
+        nc->copyMetadata(*entry.dispatch_site);
+        entry.dispatch_site->replaceAllUsesWith(nc);
+        entry.dispatch_site->eraseFromParent();
+        entry.dispatch_site = nullptr;
+        changed = true;
+      }
+      if (entry.musttail_site) {
+        entry.musttail_site->setCalledFunction(clone);
+        changed = true;
+      }
+    }
+
+    // Propagate output along successor edges.
+    if (output.empty()) continue;
+
+    // For dispatch_call: the callee returns, then the CALLER's musttail
+    // successors see the merged constants (input + callee output).
+    // For dispatch_call, also look for dispatch edges INSIDE the clone
+    // to follow nested dispatch_call chains (e.g. VMP init).
+    llvm::Function *effective = clone ? clone : entry.target;
+
+    // Find dispatch edges inside the clone/target (recursive discovery).
     {
-      // Start from the caller function that contains the dispatch site.
-      llvm::Function *chain_fn = nc->getParent()->getParent();
-      if (std::getenv("OMILL_DEBUG_STATE_IPCP"))
-        llvm::errs() << "[ipcp] musttail-chain from "
-                     << chain_fn->getName() << "\n";
-      for (unsigned depth = 0; depth < 8; ++depth) {
-        llvm::CallInst *mt_call = nullptr;
-        for (auto &BB : *chain_fn) {
-          auto *term = BB.getTerminator();
-          if (!llvm::isa<llvm::ReturnInst>(term)) continue;
-          if (auto *prev = term->getPrevNode())
-            if (auto *ci = llvm::dyn_cast<llvm::CallInst>(prev))
-              if (ci->isMustTailCall() || ci->isTailCall())
-                mt_call = ci;
+      llvm::SmallVector<StateFlowEdge, 4> inner_edges;
+      findDispatchEdges(*effective, M, inner_edges);
+      for (auto &ie : inner_edges) {
+        if (!ie.target) {
+          ie.target = resolveTargetByPC(M, ie.target_pc);
+          if (!ie.target && lift_callback) {
+            lift_callback(ie.target_pc);
+            ie.target = resolveTargetByPC(M, ie.target_pc);
+          }
         }
-        if (!mt_call) break;
-        auto *mt_target = mt_call->getCalledFunction();
-        if (!mt_target || mt_target->isDeclaration()) break;
-        if (std::getenv("OMILL_DEBUG_STATE_IPCP"))
-          llvm::errs() << "[ipcp] mt-chain depth=" << depth
-                       << " target=" << mt_target->getName() << "\n";
+        if (!ie.target) continue;
+        // For inner dispatch_call: callee gets the output constants
+        // (which are the effective State at this point in the clone).
+        uint64_t sh = hashConstants(output);
+        auto sk = std::make_pair(ie.target, sh);
+        if (!processed.count(sk)) {
+          if (debugEnabled())
+            llvm::errs() << "[ipcp] inner dispatch "
+                         << effective->getName() << " -> "
+                         << ie.target->getName()
+                         << " kind="
+                         << (ie.kind == EdgeKind::kDispatchCall
+                                 ? "call" : "jump")
+                         << "\n";
+          worklist.push_back({ie.target, output, sh,
+                              ie.site, ie.kind, nullptr});
+        }
+      }
+    }
 
-        auto mt_key = std::make_pair(mt_target, hash);
-        if (clone_cache.count(mt_key)) break;
+    // Find musttail successors and enqueue them with output constants.
+    {
+      llvm::SmallVector<StateFlowEdge, 4> mt_edges;
+      findMusttailEdges(*effective, mt_edges);
+      for (auto &me : mt_edges) {
+        if (!me.target || me.target->isDeclaration()) {
+          // Try to lift if it's a block reference.
+          if (me.target) {
+            uint64_t pc = extractBlockPC(me.target->getName());
+            if (pc == 0) pc = extractEntryVA(me.target->getName());
+            if (pc != 0 && lift_callback)
+              lift_callback(pc);
+          }
+          if (!me.target || me.target->isDeclaration()) continue;
+        }
+        uint64_t sh = hashConstants(output);
+        auto sk = std::make_pair(me.target, sh);
+        if (!processed.count(sk)) {
+          if (debugEnabled())
+            llvm::errs() << "[ipcp] musttail " << effective->getName()
+                         << " -> " << me.target->getName() << "\n";
+          worklist.push_back({me.target, output, sh,
+                              nullptr, EdgeKind::kMusttail, me.site});
+        }
+      }
+    }
 
-        llvm::SmallString<16> mt_sfx;
-        llvm::raw_svector_ostream(mt_sfx)
-            << llvm::format_hex_no_prefix(hash, 8);
-        auto *mt_clone = cloneWithStateConstants(
-            M, *mt_target, site.constants, DL, mt_sfx);
-        if (mt_clone) {
-          clone_cache[mt_key] = mt_clone;
-          mt_call->setCalledFunction(mt_clone);
+    // For dispatch_call edges: also propagate to the CALLER's musttail
+    // successors. After the dispatch_call returns, the caller musttails
+    // to successor blocks that should see the merged constants.
+    if (entry.edge_kind == EdgeKind::kDispatchCall && entry.dispatch_site) {
+      // dispatch_site was erased above if clone succeeded.
+      // Use the original caller function to find musttail successors.
+      // The caller is entry.dispatch_site's parent — but it was erased.
+      // We need to handle this differently: the caller function is the
+      // source of the dispatch edge, tracked separately.
+    }
+  }
+
+  // Phase 3: Second pass — propagate from dispatch_call callers.
+  // After processing all dispatch_call targets, propagate output constants
+  // from callee clones to the caller's musttail successors.
+  // We do this as a separate pass because the dispatch_call site gets
+  // erased during rewriting, so we need to track caller→callee mappings.
+  {
+    // Re-scan the module for callers that invoke our clones.
+    // For each clone call site, find the caller's musttail successors
+    // and merge the callee's output constants into the successor's input.
+    for (auto &F : M) {
+      if (F.isDeclaration()) continue;
+      // Find dispatch_call sites that were rewritten to clone calls.
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+          if (!CI) continue;
+          auto *callee = CI->getCalledFunction();
+          if (!callee || !callee->hasFnAttribute("omill.state_const_specialized"))
+            continue;
+          // This is a rewritten dispatch_call → clone call.
+          // Collect the pre-call constants in the caller.
+          auto caller_consts = collectLocalPreCallConstants(CI, DL);
+
+          // Find the clone's output in the cache.
+          // We need to match by clone pointer.
+          StateConstants callee_output;
+          for (auto &[k, v] : output_cache) {
+            auto clone_it = clone_cache.find(k);
+            if (clone_it != clone_cache.end() &&
+                clone_it->second == callee) {
+              callee_output = v;
+              break;
+            }
+          }
+
+          // Merge: caller pre-call + callee output (callee wins).
+          StateConstants merged = caller_consts;
+          for (auto &[off, c] : callee_output)
+            merged[off] = c;
+
+          if (merged.empty()) continue;
+          uint64_t mh = hashConstants(merged);
+
+          // Find musttail successors of the caller.
+          llvm::SmallVector<StateFlowEdge, 4> caller_mt;
+          findMusttailEdges(F, caller_mt);
+          for (auto &me : caller_mt) {
+            if (!me.target) continue;
+            if (me.target->isDeclaration()) {
+              uint64_t pc = extractBlockPC(me.target->getName());
+              if (pc == 0) pc = extractEntryVA(me.target->getName());
+              if (pc != 0 && lift_callback)
+                lift_callback(pc);
+              if (me.target->isDeclaration()) continue;
+            }
+            auto sk = std::make_pair(me.target, mh);
+            if (processed.count(sk)) {
+              // Still rewrite the musttail site.
+              auto cit = clone_cache.find(sk);
+              if (cit != clone_cache.end() && cit->second) {
+                me.site->setCalledFunction(cit->second);
+                changed = true;
+              }
+              continue;
+            }
+            if (debugEnabled())
+              llvm::errs() << "[ipcp] caller-mt " << F.getName()
+                           << " -> " << me.target->getName()
+                           << " merged=" << merged.size() << "\n";
+            worklist.push_back({me.target, merged, mh,
+                                nullptr, EdgeKind::kMusttail, me.site});
+          }
+        }
+      }
+    }
+
+    // Process the caller-mt entries.
+    while (!worklist.empty() && iterations < kMaxIterations) {
+      ++iterations;
+      auto entry = std::move(worklist.front());
+      worklist.pop_front();
+      auto key = std::make_pair(entry.target, entry.hash);
+
+      if (entry.target->isDeclaration()) {
+        uint64_t pc = extractBlockPC(entry.target->getName());
+        if (pc == 0) pc = extractEntryVA(entry.target->getName());
+        if (pc != 0 && lift_callback) lift_callback(pc);
+        if (entry.target->isDeclaration()) continue;
+      }
+
+      if (processed.count(key)) {
+        auto cit = clone_cache.find(key);
+        if (cit != clone_cache.end() && cit->second && entry.musttail_site) {
+          entry.musttail_site->setCalledFunction(cit->second);
           changed = true;
-          if (std::getenv("OMILL_DEBUG_STATE_IPCP"))
-            llvm::errs() << "[ipcp] mt-cloned "
-                         << mt_target->getName() << " -> "
-                         << mt_clone->getName() << "\n";
-          chain_fn = mt_clone;
-        } else {
-          // Target doesn't use these constants — skip but continue
-          // the chain from the ORIGINAL target (it might musttail
-          // to a function that DOES use them).
-          chain_fn = mt_target;
         }
+        // Continue propagating to successors.
+        auto out_it = output_cache.find(key);
+        if (out_it != output_cache.end() && !out_it->second.empty()) {
+          llvm::Function *eff = (cit != clone_cache.end() && cit->second)
+                                    ? cit->second : entry.target;
+          llvm::SmallVector<StateFlowEdge, 4> succ;
+          findMusttailEdges(*eff, succ);
+          findDispatchEdges(*eff, M, succ);
+          for (auto &se : succ) {
+            if (!se.target) continue;
+            if (se.target->isDeclaration()) {
+              uint64_t pc = extractBlockPC(se.target->getName());
+              if (pc == 0) pc = extractEntryVA(se.target->getName());
+              if (pc != 0 && lift_callback) lift_callback(pc);
+              if (se.target->isDeclaration()) continue;
+            }
+            uint64_t sh = hashConstants(out_it->second);
+            auto sk = std::make_pair(se.target, sh);
+            if (!processed.count(sk))
+              worklist.push_back({se.target, out_it->second, sh,
+                                  (se.kind != EdgeKind::kMusttail) ? se.site : nullptr,
+                                  se.kind,
+                                  (se.kind == EdgeKind::kMusttail) ? se.site : nullptr});
+          }
+        }
+        continue;
+      }
+
+      // Clone + specialize + optimize.
+      auto cache_it = clone_cache.find(key);
+      llvm::Function *clone = nullptr;
+      bool from_cache = (cache_it != clone_cache.end());
+      if (from_cache) {
+        clone = cache_it->second;
+      } else {
+        llvm::SmallString<16> sfx;
+        llvm::raw_svector_ostream(sfx)
+            << llvm::format_hex_no_prefix(entry.hash, 8);
+        clone = cloneWithStateConstants(
+            M, *entry.target, entry.input, DL, sfx);
+        clone_cache[key] = clone;
+      }
+      if (clone && !from_cache && MAM) {
+        optimizeClone(*clone, M, *MAM);
+        if (debugEnabled())
+          llvm::errs() << "[ipcp] optimized " << clone->getName() << "\n";
+      }
+
+      StateConstants output;
+      if (clone) output = collectExitConstants(*clone, DL);
+      auto accessed = getAccessedOffsets(clone ? *clone : *entry.target, DL);
+      for (auto &[off, c] : entry.input)
+        if (!accessed.count(off) && !output.count(off))
+          output[off] = c;
+
+      output_cache[key] = output;
+      processed.insert(key);
+
+      if (debugEnabled())
+        llvm::errs() << "[ipcp] processed " << entry.target->getName()
+                     << " clone=" << (clone ? clone->getName() : "<none>")
+                     << " output=" << output.size() << "\n";
+
+      if (clone) {
+        if (entry.musttail_site) {
+          entry.musttail_site->setCalledFunction(clone);
+          changed = true;
+        }
+        if (entry.dispatch_site) {
+          llvm::IRBuilder<> Builder(entry.dispatch_site);
+          auto *nc = Builder.CreateCall(
+              clone->getFunctionType(), clone,
+              {entry.dispatch_site->getArgOperand(0),
+               entry.dispatch_site->getArgOperand(1),
+               entry.dispatch_site->getArgOperand(2)});
+          nc->copyMetadata(*entry.dispatch_site);
+          entry.dispatch_site->replaceAllUsesWith(nc);
+          entry.dispatch_site->eraseFromParent();
+          changed = true;
+        }
+      }
+
+      if (output.empty()) continue;
+      llvm::Function *eff = clone ? clone : entry.target;
+      llvm::SmallVector<StateFlowEdge, 4> succ;
+      findMusttailEdges(*eff, succ);
+      findDispatchEdges(*eff, M, succ);
+      for (auto &se : succ) {
+        if (!se.target) {
+          if (se.kind != EdgeKind::kMusttail)
+            se.target = resolveTargetByPC(M, se.target_pc);
+          if (!se.target) continue;
+        }
+        if (se.target->isDeclaration()) {
+          uint64_t pc = extractBlockPC(se.target->getName());
+          if (pc == 0) pc = extractEntryVA(se.target->getName());
+          if (pc != 0 && lift_callback) lift_callback(pc);
+          if (se.target->isDeclaration()) continue;
+        }
+        uint64_t sh = hashConstants(output);
+        auto sk = std::make_pair(se.target, sh);
+        if (!processed.count(sk))
+          worklist.push_back({se.target, output, sh,
+                              (se.kind != EdgeKind::kMusttail) ? se.site : nullptr,
+                              se.kind,
+                              (se.kind == EdgeKind::kMusttail) ? se.site : nullptr});
       }
     }
   }
+
+  if (debugEnabled())
+    llvm::errs() << "[ipcp] done: iterations=" << iterations
+                 << " changed=" << changed << "\n";
 
   return changed;
 }
