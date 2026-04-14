@@ -9892,25 +9892,23 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
         // Current blocker: CloneFunctionInto + direct branch to cloned
         // entry blocks breaks PHI node predecessor expectations.
         // Needs a dedicated pass with proper block remapping.
-        if (false) { // disabled pending proper implementation
+        {
           struct MergeBlockLifterSCCs
               : llvm::PassInfoMixin<MergeBlockLifterSCCs> {
 
+            // State+2472 = program_counter field (PC).
+            enum : int64_t { kPCOffset = 2472 };
+
             llvm::PreservedAnalyses run(llvm::Module &M,
                                          llvm::ModuleAnalysisManager &) {
-              // Union-Find for grouping functions into SCCs.
-              llvm::DenseMap<llvm::Function *, llvm::Function *> uf_parent;
-              auto uf_find = [&](llvm::Function *f) -> llvm::Function * {
-                while (uf_parent[f] != f) {
-                  uf_parent[f] = uf_parent[uf_parent[f]];
-                  f = uf_parent[f];
-                }
+              // Union-Find.
+              llvm::DenseMap<llvm::Function *, llvm::Function *> uf;
+              auto find = [&](llvm::Function *f) -> llvm::Function * {
+                while (uf[f] != f) { uf[f] = uf[uf[f]]; f = uf[f]; }
                 return f;
               };
-              auto uf_unite = [&](llvm::Function *a, llvm::Function *b) {
-                uf_parent[uf_find(a)] = uf_find(b);
-              };
-              // Collect block-lifter functions (non-root, non-decl).
+
+              // Collect block-lifter functions.
               llvm::SmallVector<llvm::Function *, 16> blk_fns;
               llvm::DenseSet<llvm::Function *> blk_set;
               for (auto &F : M) {
@@ -9919,38 +9917,31 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
                 if (F.hasFnAttribute("omill.output_root")) continue;
                 blk_fns.push_back(&F);
                 blk_set.insert(&F);
-                uf_parent[&F] = &F;
+                uf[&F] = &F;
               }
 
-              // Build equivalence classes from tail/musttail call edges.
+              // Union functions connected by tail/musttail edges.
               for (auto *F : blk_fns)
                 for (auto &BB : *F)
                   for (auto &I : BB)
-                    if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I)) {
-                      if (!CI->isMustTailCall() && !CI->isTailCall())
-                        continue;
-                      auto *callee = CI->getCalledFunction();
-                      if (callee && blk_set.count(callee))
-                        uf_unite(F, callee);
-                    }
+                    if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
+                      if (CI->isMustTailCall() || CI->isTailCall())
+                        if (auto *c = CI->getCalledFunction())
+                          if (blk_set.count(c))
+                            uf[find(F)] = find(c);
 
               // Group by representative.
               llvm::DenseMap<llvm::Function *,
-                             llvm::SmallVector<llvm::Function *, 8>> groups;
-              for (auto *F : blk_fns)
-                groups[uf_find(F)].push_back(F);
+                  llvm::SmallVector<llvm::Function *, 8>> groups;
+              for (auto *F : blk_fns) groups[find(F)].push_back(F);
 
               bool changed = false;
+              auto &Ctx = M.getContext();
+              auto *i64Ty = llvm::Type::getInt64Ty(Ctx);
+
               for (auto &[rep, members] : groups) {
                 if (members.size() <= 1) continue;
 
-                // Pick the largest member as host.
-                llvm::Function *host = members[0];
-                for (auto *F : members)
-                  if (F->getInstructionCount() > host->getInstructionCount())
-                    host = F;
-
-                // Map each member to a unique dispatch PC.
                 llvm::DenseMap<llvm::Function *, uint64_t> fn_pc;
                 llvm::DenseSet<llvm::Function *> member_set;
                 for (auto *F : members) {
@@ -9961,124 +9952,114 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
                 }
 
                 if (std::getenv("OMILL_DEBUG_SCC_COLLAPSE")) {
-                  llvm::errs() << "[scc-merge] merging " << members.size()
-                               << " functions into " << host->getName()
-                               << ":";
-                  for (auto *F : members)
-                    if (F != host)
-                      llvm::errs() << " " << F->getName();
-                  llvm::errs() << "\n";
+                  llvm::errs() << "[scc-merge] trampoline for "
+                               << members.size() << " functions\n";
                 }
 
-                // Clone each non-host member's body into the host.
-                // Map: original function → cloned entry block in host.
-                llvm::DenseMap<llvm::Function *, llvm::BasicBlock *>
-                    cloned_entries;
-                auto *host_entry = &host->getEntryBlock();
-
+                // Step 1: In each member, replace musttail calls to other
+                // SCC members with: store target_pc to State+2472, ret mem.
                 for (auto *F : members) {
-                  if (F == host) continue;
-                  // Clone F's body into host.
-                  llvm::ValueToValueMapTy vmap;
-                  // Map F's arguments to host's arguments.
-                  for (unsigned i = 0; i < F->arg_size(); ++i)
-                    vmap[F->getArg(i)] = host->getArg(i);
-
-                  llvm::SmallVector<llvm::ReturnInst *, 4> returns;
-                  llvm::CloneFunctionInto(
-                      host, F, vmap,
-                      llvm::CloneFunctionChangeType::LocalChangesOnly,
-                      returns);
-
-                  // The cloned entry block is the first block added.
-                  // CloneFunctionInto appends blocks; find the clone of
-                  // F's entry block.
-                  auto *cloned_entry = llvm::cast<llvm::BasicBlock>(
-                      vmap[&F->getEntryBlock()]);
-                  cloned_entries[F] = cloned_entry;
-                }
-
-                // Create dispatch: split host entry, add switch on PC.
-                auto *dispatch = llvm::BasicBlock::Create(
-                    M.getContext(), "scc.dispatch", host, host_entry);
-                auto *pc_arg = host->getArg(1);  // i64 %pc
-                auto *sw = llvm::SwitchInst::Create(
-                    pc_arg, host_entry,
-                    static_cast<unsigned>(members.size()), dispatch);
-                // Host's original entry is the default case.
-                sw->addCase(
-                    llvm::ConstantInt::get(
-                        llvm::cast<llvm::IntegerType>(pc_arg->getType()),
-                        fn_pc[host]),
-                    host_entry);
-                for (auto &[F, entry] : cloned_entries)
-                  sw->addCase(
-                      llvm::ConstantInt::get(
-                          llvm::cast<llvm::IntegerType>(pc_arg->getType()),
-                          fn_pc[F]),
-                      entry);
-
-                // Replace intra-SCC tail calls with branches to dispatch.
-                // Collect first, then modify.
-                llvm::SmallVector<
-                    std::pair<llvm::CallInst *, llvm::Function *>, 16>
-                    to_replace;
-                for (auto &BB : *host) {
-                  for (auto &I : BB) {
-                    auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
-                    if (!CI) continue;
-                    if (!CI->isMustTailCall() && !CI->isTailCall())
-                      continue;
-                    auto *callee = CI->getCalledFunction();
-                    if (!callee || !member_set.count(callee)) continue;
-                    // Check: must be followed by ret.
-                    auto *next = CI->getNextNode();
-                    if (!next || !llvm::isa<llvm::ReturnInst>(next))
-                      continue;
-                    to_replace.push_back({CI, callee});
+                  llvm::SmallVector<llvm::CallInst *, 4> to_rewrite;
+                  for (auto &BB : *F)
+                    for (auto &I : BB) {
+                      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+                      if (!CI) continue;
+                      if (!CI->isMustTailCall() && !CI->isTailCall())
+                        continue;
+                      auto *callee = CI->getCalledFunction();
+                      if (!callee || callee == F) continue;
+                      if (!member_set.count(callee)) continue;
+                      auto *next = CI->getNextNode();
+                      if (!next || !llvm::isa<llvm::ReturnInst>(next))
+                        continue;
+                      to_rewrite.push_back(CI);
+                    }
+                  for (auto *CI : to_rewrite) {
+                    auto *ret = CI->getNextNode();
+                    auto *state = F->getArg(0);
+                    auto *mem_arg = CI->getArgOperand(2);
+                    auto *target_pc = CI->getArgOperand(1);
+                    // Store target PC to State+2472.
+                    llvm::IRBuilder<> B(CI);
+                    auto *pc_ptr = B.CreateGEP(
+                        B.getInt8Ty(), state,
+                        B.getInt64(kPCOffset), "scc.pc.ptr");
+                    B.CreateStore(target_pc, pc_ptr);
+                    // Replace ret to return the memory token.
+                    ret->eraseFromParent();
+                    CI->eraseFromParent();
+                    B.SetInsertPoint(&F->back());
+                    B.CreateRet(mem_arg);
                   }
                 }
 
-                for (auto &[CI, callee] : to_replace) {
-                  auto *bb = CI->getParent();
-                  auto *ret = CI->getNextNode();
-                  // The PC argument to the call is the dispatch key.
-                  // Store it so the switch picks up the right case.
-                  // We can't modify the PHI directly, so we create a
-                  // new block that sets the PC arg and branches.
-                  auto *trampoline = llvm::BasicBlock::Create(
-                      M.getContext(),
-                      "scc.to." + callee->getName(), host);
-                  // Store the new PC into the argument slot.
-                  // Since PC is an argument (not an alloca), we use
-                  // the switch directly — branch to dispatch and the
-                  // switch reads the PC that the call would have passed.
-                  // But we need to thread the new PC value...
-                  //
-                  // Simpler: branch to the target's entry block directly,
-                  // bypassing the switch.  This is valid because we know
-                  // exactly which case to take.
-                  llvm::BasicBlock *target_entry;
-                  if (callee == host)
-                    target_entry = host_entry;
-                  else
-                    target_entry = cloned_entries[callee];
+                // Step 2: Create dispatch wrapper function.
+                auto *fn_ty = members[0]->getFunctionType();
+                auto *wrapper = llvm::Function::Create(
+                    fn_ty, llvm::GlobalValue::InternalLinkage,
+                    "scc_dispatch", &M);
+                wrapper->addFnAttr("omill.block_lifter");
+                wrapper->addFnAttr(llvm::Attribute::AlwaysInline);
+                auto *state_arg = wrapper->getArg(0);
+                auto *pc_arg = wrapper->getArg(1);
+                auto *mem_arg = wrapper->getArg(2);
 
-                  // Replace the musttail call + ret with branch.
-                  ret->eraseFromParent();
-                  CI->eraseFromParent();
-                  llvm::BranchInst::Create(target_entry, bb);
+                auto *entry = llvm::BasicBlock::Create(Ctx, "entry", wrapper);
+                auto *loop = llvm::BasicBlock::Create(Ctx, "dispatch", wrapper);
+                auto *exit_bb = llvm::BasicBlock::Create(Ctx, "exit", wrapper);
+
+                // entry: store initial PC, branch to loop
+                {
+                  llvm::IRBuilder<> B(entry);
+                  auto *pc_ptr = B.CreateGEP(
+                      B.getInt8Ty(), state_arg,
+                      B.getInt64(kPCOffset), "pc.ptr");
+                  B.CreateStore(pc_arg, pc_ptr);
+                  B.CreateBr(loop);
                 }
 
-                // RAUW non-host members → host, then delete.
-                for (auto *F : members) {
-                  if (F == host) continue;
-                  // External callers need to call host with F's PC.
-                  // Since the PC is already passed as arg1, and the
-                  // dispatch switch routes on it, we can just RAUW.
-                  F->replaceAllUsesWith(host);
-                  F->eraseFromParent();
+                // loop: load PC, switch to member call blocks
+                llvm::PHINode *mem_phi;
+                {
+                  llvm::IRBuilder<> B(loop);
+                  mem_phi = B.CreatePHI(mem_arg->getType(), 2, "mem.loop");
+                  mem_phi->addIncoming(mem_arg, entry);
+                  auto *pc_ptr = B.CreateGEP(
+                      B.getInt8Ty(), state_arg,
+                      B.getInt64(kPCOffset), "pc.ptr");
+                  auto *cur_pc = B.CreateLoad(i64Ty, pc_ptr, "cur.pc");
+                  auto *sw = B.CreateSwitch(cur_pc, exit_bb,
+                      static_cast<unsigned>(members.size()));
+
+                  for (auto *F : members) {
+                    auto *call_bb = llvm::BasicBlock::Create(
+                        Ctx, "call." + F->getName(), wrapper);
+                    sw->addCase(
+                        llvm::ConstantInt::get(i64Ty, fn_pc[F]), call_bb);
+
+                    llvm::IRBuilder<> CB(call_bb);
+                    // Store sentinel 0 to PC before call.  If member
+                    // stores a new PC, the loop continues.  If not
+                    // (real return), the switch default exits.
+                    CB.CreateStore(
+                        llvm::ConstantInt::get(i64Ty, 0), pc_ptr);
+                    auto *result = CB.CreateCall(
+                        F, {state_arg, llvm::ConstantInt::get(
+                                i64Ty, fn_pc[F]), mem_phi});
+                    mem_phi->addIncoming(result, call_bb);
+                    CB.CreateBr(loop);
+                  }
                 }
+
+                // exit: return memory
+                {
+                  llvm::IRBuilder<> B(exit_bb);
+                  B.CreateRet(mem_phi);
+                }
+
+                // Step 3: RAUW all members → wrapper.
+                for (auto *F : members)
+                  F->replaceAllUsesWith(wrapper);
 
                 changed = true;
               }
