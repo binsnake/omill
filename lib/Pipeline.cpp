@@ -9888,6 +9888,40 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
         // collapses into a self-recursive musttail — convert those
         // into natural loops so the final IR has no infinite-tail-
         // recursion patterns left.
+        //
+        // Strip alwaysinline from survivors first: TailCallElimPass
+        // skips alwaysinline functions (it assumes the inliner will
+        // handle them), but the inliner can't handle recursion.
+        // Strip alwaysinline from self-recursive block lifter functions
+        // so TailCallElimPass can convert them into loops.
+        {
+          struct StripAlwaysInlineFromRecursiveBlocks
+              : llvm::PassInfoMixin<StripAlwaysInlineFromRecursiveBlocks> {
+            llvm::PreservedAnalyses run(llvm::Module &M,
+                                         llvm::ModuleAnalysisManager &) {
+              bool changed = false;
+              for (auto &F : M) {
+                if (!F.hasFnAttribute(llvm::Attribute::AlwaysInline))
+                  continue;
+                if (!F.hasFnAttribute("omill.block_lifter"))
+                  continue;
+                bool self_recursive = false;
+                for (auto *U : F.users())
+                  if (auto *CI = llvm::dyn_cast<llvm::CallInst>(U))
+                    if (CI->getFunction() == &F)
+                      { self_recursive = true; break; }
+                if (self_recursive) {
+                  F.removeFnAttr(llvm::Attribute::AlwaysInline);
+                  changed = true;
+                }
+              }
+              return changed ? llvm::PreservedAnalyses::none()
+                             : llvm::PreservedAnalyses::all();
+            }
+            static bool isRequired() { return true; }
+          };
+          MPM.addPass(StripAlwaysInlineFromRecursiveBlocks{});
+        }
         {
           llvm::FunctionPassManager FPM;
           FPM.addPass(llvm::TailCallElimPass());
