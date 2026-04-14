@@ -9974,6 +9974,16 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
                         continue;
                       to_rewrite.push_back(CI);
                     }
+                  // Clear PC at handler entry: store 0 so real return
+                  // paths leave State+2472 = 0 (dispatch exit).
+                  {
+                    auto *state = F->getArg(0);
+                    llvm::IRBuilder<> EB(&F->getEntryBlock().front());
+                    auto *pc_clr = EB.CreateGEP(
+                        EB.getInt8Ty(), state,
+                        EB.getInt64(kPCOffset), "scc.pc.clr");
+                    EB.CreateStore(llvm::ConstantInt::get(i64Ty, 0), pc_clr);
+                  }
                   for (auto *CI : to_rewrite) {
                     auto *ret = CI->getNextNode();
                     auto *state = F->getArg(0);
@@ -10038,11 +10048,10 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
                         llvm::ConstantInt::get(i64Ty, fn_pc[F]), call_bb);
 
                     llvm::IRBuilder<> CB(call_bb);
-                    // Store sentinel 0 to PC before call.  If member
-                    // stores a new PC, the loop continues.  If not
-                    // (real return), the switch default exits.
-                    CB.CreateStore(
-                        llvm::ConstantInt::get(i64Ty, 0), pc_ptr);
+                    // No sentinel store here — handlers clear PC to 0
+                    // at entry and store the real next PC on cross-SCC
+                    // paths.  The load at the loop header sees either
+                    // the real next PC or 0 (exit).
                     auto *result = CB.CreateCall(
                         F, {state_arg, llvm::ConstantInt::get(
                                 i64Ty, fn_pc[F]), mem_phi});
