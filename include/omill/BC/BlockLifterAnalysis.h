@@ -16,6 +16,11 @@ class BlockManager;
 /// returns true if the block was successfully lifted (or already existed).
 using BlockLiftCallback = std::function<bool(uint64_t pc)>;
 
+/// Callback to inject synthetic code bytes at a given PC, making them
+/// readable by the block lifter's TryReadExecutableByte.
+using AddCodeCallback = std::function<void(uint64_t pc, const uint8_t *data,
+                                           size_t size)>;
+
 /// Module-level analysis that provides a block-lifting callback.
 ///
 /// The consumer (e.g. omill-lift main.cpp) registers this analysis with
@@ -33,6 +38,7 @@ class BlockLiftAnalysis
  public:
   struct Result {
     BlockLiftCallback lift_block;
+    AddCodeCallback add_code;
 
     /// LLVM analysis invalidation — the callback is always valid.
     bool invalidate(llvm::Module &, const llvm::PreservedAnalyses &,
@@ -43,15 +49,17 @@ class BlockLiftAnalysis
 
   BlockLiftAnalysis() = default;
 
-  explicit BlockLiftAnalysis(BlockLiftCallback cb)
-      : callback_(std::move(cb)) {}
+  explicit BlockLiftAnalysis(BlockLiftCallback cb,
+                             AddCodeCallback add_code = nullptr)
+      : callback_(std::move(cb)), add_code_(std::move(add_code)) {}
 
   Result run(llvm::Module &M, llvm::ModuleAnalysisManager &) {
-    return {callback_};
+    return {callback_, add_code_};
   }
 
  private:
   BlockLiftCallback callback_;
+  AddCodeCallback add_code_;
 };
 
 }  // namespace omill

@@ -106,6 +106,10 @@ class BlockManager {
   /// If null, BlockLifter falls back to the Remill intrinsic module.
   virtual llvm::Module *GetLiftedBlockModule();
 
+  /// Inject synthetic code bytes at \p base so TryReadExecutableByte
+  /// can read them.  Used to inject decoded VMP handler stubs.
+  virtual void addCode(uint64_t base, const uint8_t *data, size_t size) {}
+
   /// Optional binary memory map used by BlockLifter to run call-target
   /// bridge analysis when no lift database descriptor is available.
   /// Default: nullptr (no fallback analysis).

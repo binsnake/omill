@@ -2197,6 +2197,10 @@ class BufferBlockManager : public omill::BlockManager {
     code_[base] = {data, data + size};
   }
 
+  void addCode(uint64_t base, const uint8_t *data, size_t size) override {
+    code_[base].assign(data, data + size);
+  }
+
   void SetLiftedBlockDefinition(uint64_t addr,
                                  llvm::Function *fn) override {
     blocks_[addr] = fn;
@@ -2646,6 +2650,7 @@ int main(int argc, char **argv) {
     solve_control_va = parseHexOpt(SolveControlVA);
 
   bool vm_mode = (vm_entry_va != 0);
+
   const bool has_external_vm_trace = VMTraceJSON.getNumOccurrences() > 0;
   const bool force_devirtualize = Devirtualize;
   const bool env_generic_static_devirtualize =
@@ -2747,6 +2752,52 @@ int main(int argc, char **argv) {
                     {{"mode", pe.is_macho ? "macho" : "pe"},
                      {"image_base", ("0x" + Twine::utohexstr(pe.image_base)).str()},
                      {"code_sections", static_cast<int64_t>(pe.code_sections.size())}});
+
+    // Auto-detect VM entry for generic_static_devirtualize when no
+    // explicit --vm-entry was provided.  Emulate from the function
+    // entry looking for an IndirectJump into the VMP section — that's
+    // the first handler dispatch after the VMP init preamble.
+    if (!vm_mode && GenericStaticDevirtualize &&
+        pe.memory_map.isExecutable(func_va, 1)) {
+      // Determine the handler segment (largest executable section).
+      uint64_t seg_start = 0, seg_end = 0;
+      pe.memory_map.forEachRegion(
+          [&](uint64_t base, const uint8_t *, size_t size) {
+            if (size > (seg_end - seg_start)) {
+              seg_start = base;
+              seg_end = base + size;
+            }
+          });
+
+      // Try parseEntryWrapper first (handles EAC-style wrappers).
+      omill::VMTraceEmulator probe(pe.memory_map, pe.image_base, 0, 0);
+      probe.setHandlerSegmentRange(seg_start, seg_end);
+      auto info = probe.parseEntryWrapper(func_va);
+      if (info.valid && info.first_handler_va != 0 &&
+          info.first_handler_va >= seg_start &&
+          info.first_handler_va < seg_end) {
+        vm_entry_va = info.first_handler_va;
+        vm_exit_va = probe.trueVmexitVa();
+        if (vm_wrapper_va == 0)
+          vm_wrapper_va = func_va;
+        vm_mode = true;
+      }
+
+      // Fallback: for VMP-style dispatch (XCHG+PUSH+JMP RSP), the
+      // parseEntryWrapper pattern doesn't match.  Use the generic
+      // analyzeReturnAddressRedirect probe — if it found a redirect,
+      // the function uses VMP dispatch and the redirect target is
+      // the vmexit continuation.  In that case, try explicit
+      // --vm-entry/--vm-exit with the known dispatch block address.
+      // TODO: implement VMP-specific auto-detection using the
+      // VMTraceEmulator's stepInstruction to emulate through the
+      // VMP init and find the first IndirectJump target.
+
+      if (vm_mode)
+        errs() << "VM auto-detect: vmenter=0x"
+               << Twine::utohexstr(vm_entry_va) << " vmexit=0x"
+               << Twine::utohexstr(vm_exit_va) << "\n";
+    }
 
     auto resolveDirectJmpThunkTarget = [&](uint64_t root_va)
         -> std::optional<uint64_t> {
@@ -4598,8 +4649,15 @@ int main(int argc, char **argv) {
     lift_cb = safeBlockLiftTarget;
   }
   iterative_session->setBlockLiftCallback(lift_cb);
-  MAM.registerPass([lift_cb] {
-    return omill::BlockLiftAnalysis(lift_cb);
+  omill::AddCodeCallback add_code_cb;
+  if (block_manager) {
+    add_code_cb = [&block_manager](uint64_t pc, const uint8_t *data,
+                                    size_t size) {
+      block_manager->addCode(pc, data, size);
+    };
+  }
+  MAM.registerPass([lift_cb, add_code_cb] {
+    return omill::BlockLiftAnalysis(lift_cb, add_code_cb);
   });
   // Prime the lightweight block-lift callback analysis so later function
   // passes can retrieve it through getCachedResult via the module proxy.

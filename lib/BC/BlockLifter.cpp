@@ -718,18 +718,24 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
 
       case remill::Instruction::kCategoryIndirectJump: {
         try_add_delay_slot(true, current_block);
-        // The JMP semantic was already lifted (line 638).  It calls
-        // __remill_jump(state, target, memory) internally, which
-        // sets PC = target.  Don't call EmitDispatchJump — the
-        // template call is opaque and PC/NEXT_PC hold stale values.
-        // Instead, terminate with the __remill_jump that the
-        // semantic template emits (visible after AlwaysInliner).
-        // Phase 3 LowerRemillIntrinsics will convert it to
-        // dispatch_jump with the correct target.
+        // Emit dispatch_jump with the PC value that the JMP semantic
+        // template wrote.  The template was already lifted (line 640)
+        // and set PC = target.  Read PC from State and use it as the
+        // dispatch_jump target.
         {
+          auto *pc_val =
+              remill::LoadProgramCounter(current_block, *intrinsics);
+          auto *lifted_fn_ty = func->getFunctionType();
+          auto dispatch = module->getOrInsertFunction(
+              canonicalDispatchIntrinsicName(
+                  DispatchIntrinsicKind::kJump, *module),
+              lifted_fn_ty);
+          auto *sp =
+              remill::NthArgument(func, remill::kStatePointerArgNum);
           llvm::IRBuilder<> ir(current_block);
-          auto *mem = LoadCurrentMemoryToken(ir, func, *intrinsics);
-          ir.CreateRet(mem);
+          auto *mp = LoadCurrentMemoryToken(ir, func, *intrinsics);
+          auto *result = ir.CreateCall(dispatch, {sp, pc_val, mp});
+          ir.CreateRet(result);
         }
 
         llvm::SmallVector<uint64_t, 8> projected_targets;

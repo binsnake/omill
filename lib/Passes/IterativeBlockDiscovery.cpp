@@ -211,6 +211,97 @@ unsigned countUnresolvedBlockDispatches(llvm::Module &M) {
   return count;
 }
 
+/// Resolve VMP PUSH+JMP RSP stack-code dispatch patterns.
+///
+/// When a dispatch_jump targets RSP-8 (after a PUSH) and the pushed
+/// value is a constant, the constant's bytes encode a handler stub.
+/// This function decodes those bytes by injecting them as synthetic
+/// code at a generated PC, then rewrites the dispatch_jump target to
+/// that PC so the normal lift+resolve flow can handle it.
+bool resolveStackCodeDispatches(
+    llvm::Module &M, BinaryMemoryMap *mem_map,
+    const AddCodeCallback &add_code) {
+  if (!mem_map || !add_code)
+    return false;
+
+  static uint64_t synth_counter = 0;
+  constexpr uint64_t kSynthBase = 0xFFFF'0000'0000'0000ULL;
+
+  bool changed = false;
+  auto *i64_ty = llvm::Type::getInt64Ty(M.getContext());
+
+  for (auto &F : M) {
+    if (!isDiscoveryFunction(F))
+      continue;
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+        if (!call)
+          continue;
+        auto *callee = call->getCalledFunction();
+        if (!callee)
+          continue;
+        if (!isDispatchIntrinsicName(callee->getName()))
+          continue;
+        if (call->arg_size() < 2)
+          continue;
+
+        // Already constant? Skip — resolveConstantDispatches handles it.
+        if (llvm::isa<llvm::ConstantInt>(call->getArgOperand(1)))
+          continue;
+
+        // Pattern: target = sub(RSP_load, 8) — the PUSH pattern.
+        auto *target = call->getArgOperand(1);
+        auto *sub = llvm::dyn_cast<llvm::BinaryOperator>(target);
+        if (!sub || sub->getOpcode() != llvm::Instruction::Sub)
+          continue;
+        auto *offset = llvm::dyn_cast<llvm::ConstantInt>(sub->getOperand(1));
+        if (!offset || offset->getZExtValue() != 8)
+          continue;
+
+        // Walk backward in this BB to find:
+        //   store i64 <const>, ptr inttoptr(target)
+        llvm::ConstantInt *code_val = nullptr;
+        for (auto it = call->getReverseIterator(); it != BB.rend(); ++it) {
+          auto *si = llvm::dyn_cast<llvm::StoreInst>(&*it);
+          if (!si)
+            continue;
+          // Check if store destination is inttoptr(target)
+          auto *i2p =
+              llvm::dyn_cast<llvm::IntToPtrInst>(si->getPointerOperand());
+          if (!i2p)
+            continue;
+          if (i2p->getOperand(0) == target) {
+            code_val =
+                llvm::dyn_cast<llvm::ConstantInt>(si->getValueOperand());
+            break;
+          }
+        }
+
+        if (!code_val)
+          continue;
+
+        // Extract the constant's bytes as handler code.
+        uint64_t raw = code_val->getZExtValue();
+        uint8_t bytes[8];
+        std::memcpy(bytes, &raw, 8);
+
+        // Assign a synthetic PC and inject the code.
+        uint64_t synth_pc = kSynthBase + (synth_counter++ * 0x100);
+        mem_map->addRegion(synth_pc, bytes, 8,
+                           /*read_only=*/true, /*executable=*/true);
+        add_code(synth_pc, bytes, 8);
+
+        // Rewrite the dispatch_jump target.
+        call->setArgOperand(1,
+                            llvm::ConstantInt::get(i64_ty, synth_pc));
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
 /// Replace dispatch calls that have a constant target PC and the callee
 /// exists as a block-function with a musttail call to that block-function.
 /// This "resolves" the dispatch into a direct block-to-block edge.
@@ -473,12 +564,14 @@ llvm::PreservedAnalyses IterativeBlockDiscoveryPass::run(
     // Step 1: Run lightweight optimization on all block-functions.
     {
       llvm::FunctionPassManager FPM;
-      // Lower __remill_function_call / __remill_jump intrinsics that
-      // survived from late-lifted blocks into dispatch_call/dispatch_jump
-      // so their constant PC targets become visible for discovery.
+      // Lower ALL remill intrinsics (Phase1 + Phase3) so that:
+      // 1. Memory read/write intrinsics become load/store (needed for
+      //    ConstantMemoryFolding to fold XCHG handler table reads)
+      // 2. JMP/CALL templates get inlined and __remill_jump becomes
+      //    dispatch_jump (needed for dispatch resolution)
       FPM.addPass(LowerRemillIntrinsicsPass(
-          LowerCategories::Call | LowerCategories::Jump |
-          LowerCategories::Return));
+          LowerCategories::Phase1 | LowerCategories::Call |
+          LowerCategories::Jump | LowerCategories::Return));
       FPM.addPass(FoldProgramCounterPass());
       FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
       FPM.addPass(CombinedFixedPointDevirtPass());
@@ -552,6 +645,16 @@ llvm::PreservedAnalyses IterativeBlockDiscoveryPass::run(
         if (!ipcp_changed && !lifted_mt) break;
         if (ipcp_changed) ever_changed = true;
       }
+    }
+
+    // Step 2.75: Resolve PUSH+JMP RSP stack-code dispatch patterns.
+    // When the PUSH operand is a constant (from IPCP + ConstantMemoryFolding),
+    // decode the constant's bytes as handler code at a synthetic PC.
+    {
+      auto &mem_map = MAM.getResult<BinaryMemoryAnalysis>(M);
+      auto add_code = MAM.getResult<BlockLiftAnalysis>(M).add_code;
+      if (resolveStackCodeDispatches(M, &mem_map, add_code))
+        ever_changed = true;
     }
 
     // Step 3: Resolve dispatch calls with constant targets.

@@ -210,7 +210,6 @@ class VMTraceEmulator {
   /// Synthetic vmcontext base address used by the concrete emulator.
   static uint64_t syntheticVMContextBase();
 
- private:
   /// Parse a VM entry wrapper to extract initial state.
   struct WrapperInfo {
     uint64_t delta = 0;           ///< base_delta from the vmenter helper.
@@ -236,6 +235,10 @@ class VMTraceEmulator {
   /// auto-detected from the delta-computer scan).
   bool isVmexitVa(uint64_t va) const;
 
+  /// Return the auto-detected vmexit VA (0 if not detected).
+  uint64_t trueVmexitVa() const { return true_vmexit_va_; }
+
+ private:
   const BinaryMemoryMap &mem_;
   uint64_t image_base_;
   uint64_t vmenter_va_;

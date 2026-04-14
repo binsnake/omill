@@ -275,7 +275,9 @@ bool propagateStateConstantsThroughDispatches(
         auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
         if (!CI || CI->arg_size() < 3) continue;
         auto *callee = CI->getCalledFunction();
-        if (!callee || !isDispatchCallName(callee->getName())) continue;
+        if (!callee || (!isDispatchCallName(callee->getName()) &&
+                       !isDispatchJumpName(callee->getName())))
+          continue;
         auto *pc_arg = llvm::dyn_cast<llvm::ConstantInt>(CI->getArgOperand(1));
         if (!pc_arg) continue;
         uint64_t pc = pc_arg->getZExtValue();
@@ -292,7 +294,11 @@ bool propagateStateConstantsThroughDispatches(
         if (std::getenv("OMILL_DEBUG_STATE_IPCP"))
           llvm::errs() << "[ipcp] site " << F.getName() << " -> "
                        << target->getName() << " consts="
-                       << constants.size() << "\n";
+                       << constants.size();
+        for (auto &[off, c] : constants)
+          llvm::errs() << " [" << off << "]=0x"
+                       << llvm::Twine::utohexstr(c->getZExtValue());
+        llvm::errs() << "\n";
         sites.push_back({CI, target, std::move(constants)});
       }
     }
@@ -413,20 +419,84 @@ bool propagateStateConstantsThroughDispatches(
       clone = cloneWithStateConstants(M, *site.target, site.constants, DL, sfx);
       clone_cache[key] = clone;
     }
-    if (!clone) continue;
-    if (std::getenv("OMILL_DEBUG_STATE_IPCP"))
-      llvm::errs() << "[ipcp] cloned " << site.target->getName()
-                   << " -> " << clone->getName() << "\n";
+    if (clone) {
+      if (std::getenv("OMILL_DEBUG_STATE_IPCP"))
+        llvm::errs() << "[ipcp] cloned " << site.target->getName()
+                     << " -> " << clone->getName() << "\n";
+    }
+    // Even when the clone fails (target doesn't use the constants),
+    // still propagate through the musttail chain — the musttail
+    // successors might use them (e.g. blk_1800018a6 uses R14).
+    if (!clone && site.constants.empty()) continue;
 
-    // Rewrite dispatch_call → direct call to clone.
-    llvm::IRBuilder<> Builder(site.call);
-    auto *nc = Builder.CreateCall(clone->getFunctionType(), clone,
-        {site.call->getArgOperand(0), site.call->getArgOperand(1),
-         site.call->getArgOperand(2)});
-    nc->copyMetadata(*site.call);
-    site.call->replaceAllUsesWith(nc);
-    site.call->eraseFromParent();
-    changed = true;
+    // Rewrite dispatch_call → direct call to clone (if clone succeeded).
+    llvm::CallInst *nc = site.call;  // fallback: keep original
+    if (clone) {
+      llvm::IRBuilder<> Builder(site.call);
+      nc = Builder.CreateCall(clone->getFunctionType(), clone,
+          {site.call->getArgOperand(0), site.call->getArgOperand(1),
+           site.call->getArgOperand(2)});
+      nc->copyMetadata(*site.call);
+      site.call->replaceAllUsesWith(nc);
+      site.call->eraseFromParent();
+      changed = true;
+    }
+
+    // Propagate constants through musttail successors of the clone.
+    // When the clone musttails to blk_<pc>, that block inherits the
+    // Propagate constants through the musttail chain from the
+    // CALLER function.  The caller stores constants to State, then
+    // after the dispatch_call returns, musttails to successor blocks.
+    // Those successors load from State but can't see through the
+    // function boundary — clone them with the constants baked in.
+    {
+      // Start from the caller function that contains the dispatch site.
+      llvm::Function *chain_fn = nc->getParent()->getParent();
+      if (std::getenv("OMILL_DEBUG_STATE_IPCP"))
+        llvm::errs() << "[ipcp] musttail-chain from "
+                     << chain_fn->getName() << "\n";
+      for (unsigned depth = 0; depth < 8; ++depth) {
+        llvm::CallInst *mt_call = nullptr;
+        for (auto &BB : *chain_fn) {
+          auto *term = BB.getTerminator();
+          if (!llvm::isa<llvm::ReturnInst>(term)) continue;
+          if (auto *prev = term->getPrevNode())
+            if (auto *ci = llvm::dyn_cast<llvm::CallInst>(prev))
+              if (ci->isMustTailCall() || ci->isTailCall())
+                mt_call = ci;
+        }
+        if (!mt_call) break;
+        auto *mt_target = mt_call->getCalledFunction();
+        if (!mt_target || mt_target->isDeclaration()) break;
+        if (std::getenv("OMILL_DEBUG_STATE_IPCP"))
+          llvm::errs() << "[ipcp] mt-chain depth=" << depth
+                       << " target=" << mt_target->getName() << "\n";
+
+        auto mt_key = std::make_pair(mt_target, hash);
+        if (clone_cache.count(mt_key)) break;
+
+        llvm::SmallString<16> mt_sfx;
+        llvm::raw_svector_ostream(mt_sfx)
+            << llvm::format_hex_no_prefix(hash, 8);
+        auto *mt_clone = cloneWithStateConstants(
+            M, *mt_target, site.constants, DL, mt_sfx);
+        if (mt_clone) {
+          clone_cache[mt_key] = mt_clone;
+          mt_call->setCalledFunction(mt_clone);
+          changed = true;
+          if (std::getenv("OMILL_DEBUG_STATE_IPCP"))
+            llvm::errs() << "[ipcp] mt-cloned "
+                         << mt_target->getName() << " -> "
+                         << mt_clone->getName() << "\n";
+          chain_fn = mt_clone;
+        } else {
+          // Target doesn't use these constants — skip but continue
+          // the chain from the ORIGINAL target (it might musttail
+          // to a function that DOES use them).
+          chain_fn = mt_target;
+        }
+      }
+    }
   }
 
   return changed;
