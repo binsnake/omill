@@ -616,7 +616,11 @@ bool propagateStateConstantsWorklist(
     // Find dispatch edges inside the clone/target (recursive discovery).
     // These are enqueued as analysis_only: cloned for constant extraction
     // but successors are NOT followed (prevents exponential cascading).
-    if (!entry.analysis_only) {
+    // Inner dispatch edges are followed from ALL entries (including
+    // analysis_only musttail successors) so that dispatch chains through
+    // musttail hops are discovered.  The resulting entries are always
+    // analysis_only to prevent rewriting shared call sites.
+    {
       llvm::SmallVector<StateFlowEdge, 4> inner_edges;
       findDispatchEdges(*effective, M, inner_edges);
       for (auto &ie : inner_edges) {
@@ -628,7 +632,14 @@ bool propagateStateConstantsWorklist(
           }
         }
         if (!ie.target) continue;
-        uint64_t sh = hashConstants(output);
+        // Merge: output constants (pass-through from caller chain)
+        // + local pre-call constants at the inner dispatch site.
+        // Local wins on conflict (it's the most recent store).
+        StateConstants inner_consts = output;
+        auto local = collectPreCallStateConstants(ie.site, DL);
+        for (auto &[off, c] : local)
+          inner_consts[off] = c;
+        uint64_t sh = hashConstants(inner_consts);
         auto sk = std::make_pair(ie.target, sh);
         if (!processed.count(sk)) {
           if (debugEnabled())
@@ -638,8 +649,9 @@ bool propagateStateConstantsWorklist(
                          << " kind="
                          << (ie.kind == EdgeKind::kDispatchCall
                                  ? "call" : "jump")
+                         << " consts=" << inner_consts.size()
                          << "\n";
-          worklist.push_back({ie.target, output, sh,
+          worklist.push_back({ie.target, inner_consts, sh,
                               nullptr, ie.kind, nullptr,
                               /*analysis_only=*/true});
         }
