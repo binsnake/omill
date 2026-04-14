@@ -621,32 +621,11 @@ bool propagateStateConstantsWorklist(
       }
     }
 
-    // Find musttail successors and enqueue them with output constants.
-    // Only follow musttail edges from non-analysis entries.
-    if (!entry.analysis_only) {
-      llvm::SmallVector<StateFlowEdge, 4> mt_edges;
-      findMusttailEdges(*effective, mt_edges);
-      for (auto &me : mt_edges) {
-        if (!me.target || me.target->isDeclaration()) {
-          if (me.target) {
-            uint64_t pc = extractBlockPC(me.target->getName());
-            if (pc == 0) pc = extractEntryVA(me.target->getName());
-            if (pc != 0 && lift_callback)
-              lift_callback(pc);
-          }
-          if (!me.target || me.target->isDeclaration()) continue;
-        }
-        uint64_t sh = hashConstants(output);
-        auto sk = std::make_pair(me.target, sh);
-        if (!processed.count(sk)) {
-          if (debugEnabled())
-            llvm::errs() << "[ipcp] musttail " << effective->getName()
-                         << " -> " << me.target->getName() << "\n";
-          worklist.push_back({me.target, output, sh,
-                              nullptr, EdgeKind::kMusttail, nullptr});
-        }
-      }
-    }
+    // NOTE: We do NOT follow musttail edges from the TARGET here.
+    // The target's musttail chain belongs to a shared function — rewriting
+    // musttail calls there would break other callers. Instead, Phase 3
+    // handles the CALLER's musttail chain (after the dispatch_call returns,
+    // the caller musttails to successor blocks that see merged constants).
 
     // For dispatch_call edges: also propagate to the CALLER's musttail
     // successors. After the dispatch_call returns, the caller musttails
