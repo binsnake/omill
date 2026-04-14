@@ -267,8 +267,12 @@ llvm::GlobalVariable *getOrCreateMappedRegionGlobal(llvm::Module &M,
   auto *init = llvm::ConstantDataArray::get(
       M.getContext(),
       llvm::ArrayRef<uint8_t>(region.data, region.size));
+  // Mark ALL mapped binary data as constant — even .data sections.
+  // The binary snapshot is immutable during our analysis; this enables
+  // LLVM to fold loads from .data (e.g. security cookies used in VMP
+  // opaque predicates) to constants.
   auto *GV = new llvm::GlobalVariable(
-      M, init->getType(), /*isConstant=*/region.read_only,
+      M, init->getType(), /*isConstant=*/true,
       llvm::GlobalValue::PrivateLinkage, init, name);
   GV->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
   GV->setAlignment(llvm::Align(1));
