@@ -20,6 +20,10 @@
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
 #include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Transforms/IPO/AlwaysInliner.h>
+#include <llvm/Analysis/DomTreeUpdater.h>
+#include <llvm/IR/Dominators.h>
+#include <llvm/Transforms/Utils/Local.h>
+#include <llvm/Transforms/Utils/PromoteMemToReg.h>
 #include <llvm/Transforms/IPO/SCCP.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/FileSystem.h>
@@ -18753,6 +18757,97 @@ native_boundary_repair_done:;
     CleanupMPM.addPass(llvm::GlobalDCEPass());
     CleanupMPM.run(*module, MAM);
   }
+  // Repair functions whose entry block has predecessors (back-edges
+  // from __remill_jump lowering / SCC merge loop creation).  LLVM
+  // requires entry blocks to have no predecessors, and any SSA value
+  // defined in a non-dominating block that is used in the entry block
+  // is a dominance violation.
+  //
+  // Fix strategy:
+  //   1. Insert a new empty preheader as the function entry.
+  //   2. Demote all instructions that are used across the back-edge
+  //      (defined in a block that doesn't dominate the use) to allocas.
+  //   3. Re-promote the allocas to SSA with PromoteMemToReg, which
+  //      inserts the correct PHI nodes at loop headers.
+  {
+    bool repaired_any = false;
+    for (auto &F : *module) {
+      if (F.isDeclaration())
+        continue;
+      auto &entry = F.getEntryBlock();
+      if (pred_begin(&entry) == pred_end(&entry))
+        continue;
+
+      // Step 1: Insert a new preheader before the old entry.
+      auto *preheader = llvm::BasicBlock::Create(
+          F.getContext(), "entry.preheader", &F, &entry);
+      llvm::BranchInst::Create(&entry, preheader);
+
+      // Step 2: Find all instructions with uses that violate dominance.
+      // After inserting the preheader, the DominatorTree is well-formed
+      // (preheader is the new entry, has no preds, dominates everything
+      // reachable from it).
+      llvm::DominatorTree DT(F);
+
+      llvm::SmallVector<llvm::Instruction *, 16> to_demote;
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          if (I.use_empty())
+            continue;
+          // Check if any use is NOT dominated by the def.
+          for (auto &U : I.uses()) {
+            auto *user_inst = llvm::cast<llvm::Instruction>(U.getUser());
+            llvm::BasicBlock *use_bb = user_inst->getParent();
+            if (auto *phi = llvm::dyn_cast<llvm::PHINode>(user_inst))
+              use_bb = phi->getIncomingBlock(U);
+            if (!DT.dominates(&I, use_bb) ||
+                (use_bb == I.getParent() &&
+                 llvm::isa<llvm::PHINode>(user_inst) &&
+                 !llvm::isa<llvm::PHINode>(&I))) {
+              // More precise: check if def dominates the specific use.
+              if (!DT.dominates(&I, U)) {
+                to_demote.push_back(&I);
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      if (to_demote.empty())
+        continue;
+
+      // Step 2b: Demote each violating instruction to an alloca.
+      llvm::SmallVector<llvm::AllocaInst *, 16> allocas;
+      for (auto *I : to_demote) {
+        if (auto *phi = llvm::dyn_cast<llvm::PHINode>(I))
+          allocas.push_back(llvm::DemotePHIToStack(phi));
+        else
+          allocas.push_back(llvm::DemoteRegToStack(*I));
+      }
+
+      // Step 3: Re-promote with proper PHI insertion.
+      // Rebuild the DomTree since DemoteRegToStack may have changed CFG.
+      DT.recalculate(F);
+      llvm::SmallVector<llvm::AllocaInst *, 16> promotable;
+      for (auto *A : allocas) {
+        if (A && llvm::isAllocaPromotable(A))
+          promotable.push_back(A);
+      }
+      if (!promotable.empty())
+        llvm::PromoteMemToReg(promotable, DT);
+
+      repaired_any = true;
+      if (std::getenv("OMILL_DEBUG_ENTRY_REPAIR") != nullptr)
+        llvm::errs() << "[entry-repair] " << F.getName()
+                     << ": demoted " << to_demote.size()
+                     << " instructions, promoted " << promotable.size()
+                     << " allocas\n";
+    }
+    if (repaired_any)
+      MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+  }
+
   std::error_code EC;
   events.emitInfo("output_write_started", "writing final output",
                   {{"path", OutputFilename}});
