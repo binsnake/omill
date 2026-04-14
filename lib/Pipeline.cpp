@@ -10174,14 +10174,20 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
                 for (auto &[off, cnt] : field_itp_count)
                   if (cnt > best_count) { best_off = off; best_count = cnt; }
 
-                if (best_count < 10)
+                // Collect ALL fields with >= 10 inttoptr derivations.
+                llvm::SmallVector<int64_t, 8> target_fields;
+                for (auto &[off, cnt] : field_itp_count)
+                  if (cnt >= 10)
+                    target_fields.push_back(off);
+                if (target_fields.empty())
                   return llvm::PreservedAnalyses::all();
 
                 if (std::getenv("OMILL_DEBUG_STACK_FRAME"))
-                  llvm::errs() << "[RSF-VMP] " << F.getName()
-                               << ": best stack base State+"
-                               << best_off << " (" << best_count
-                               << " inttoptr derivations)\n";
+                  for (auto off : target_fields)
+                    llvm::errs() << "[RSF-VMP] " << F.getName()
+                                 << ": stack base State+" << off
+                                 << " (" << field_itp_count[off]
+                                 << " inttoptr derivations)\n";
 
                 // Single-pass approach: for each inttoptr, trace back to
                 // a load from best_off.  Group by load base.  Create one
@@ -10203,20 +10209,20 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
                 llvm::DenseMap<llvm::LoadInst *,
                     llvm::SmallVector<ItpInfo, 8>> base_groups;
 
+                llvm::DenseSet<int64_t> target_set(target_fields.begin(),
+                                                    target_fields.end());
                 for (auto &BB2 : F)
                   for (auto &I2 : BB2) {
                     auto *ITP = llvm::dyn_cast<llvm::IntToPtrInst>(&I2);
                     if (!ITP) continue;
-                    // Try to trace the inttoptr operand back to a load
-                    // from State+best_off.
                     llvm::Value *cur = ITP->getOperand(0);
                     int64_t accum = 0;
                     bool is_const = true;
                     llvm::LoadInst *base_load = nullptr;
-                    // Walk the add chain to find the base load.
                     for (unsigned d = 0; d < 12; ++d) {
                       if (auto *LI2 = llvm::dyn_cast<llvm::LoadInst>(cur)) {
-                        if (resolveOff(LI2->getPointerOperand()) == best_off)
+                        if (target_set.count(resolveOff(
+                                LI2->getPointerOperand())))
                           base_load = LI2;
                         break;
                       }
@@ -10436,14 +10442,16 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
         }
         MPM.addPass(llvm::GlobalDCEPass());
 
-        // Post-tail-recursion cleanup: SROA decomposes the stack allocas
-        // created by RSF above, GVN forwards stores→loads, SimplifyCFG
-        // cleans up dead branches.
+        // Post-tail-recursion cleanup: SROA decomposes the stack allocas,
+        // CMF folds VMP bytecode reads from the binary memory map,
+        // GVN forwards stores→loads, SimplifyCFG cleans up.
         {
           llvm::FunctionPassManager FPM;
           FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+          FPM.addPass(CombinedFixedPointDevirtPass());
           FPM.addPass(llvm::InstCombinePass());
           FPM.addPass(llvm::GVNPass());
+          FPM.addPass(llvm::InstCombinePass());
           FPM.addPass(llvm::SimplifyCFGPass());
           MPM.addPass(
               llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
