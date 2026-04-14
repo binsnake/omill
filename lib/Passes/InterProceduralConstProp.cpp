@@ -370,6 +370,9 @@ struct WorklistEntry {
   EdgeKind edge_kind = EdgeKind::kMusttail;
   // The musttail call to rewrite (for musttail edges).
   llvm::CallInst *musttail_site = nullptr;
+  // If true, this is an analysis-only entry: clone for constant extraction
+  // but don't follow successor edges (prevents exponential cascading).
+  bool analysis_only = false;
 };
 
 }  // namespace
@@ -485,6 +488,8 @@ bool propagateStateConstantsWorklist(
           // We need to find it from the clone or the original.
         }
         // For musttail and dispatch_jump: find successors of the target.
+        // Don't pass call sites from inside clones — only propagate
+        // constants, don't rewrite inner IR.
         llvm::Function *effective = clone ? clone : entry.target;
         llvm::SmallVector<StateFlowEdge, 4> succ_edges;
         findMusttailEdges(*effective, succ_edges);
@@ -495,9 +500,7 @@ bool propagateStateConstantsWorklist(
           auto sk = std::make_pair(se.target, sh);
           if (processed.count(sk)) continue;
           worklist.push_back({se.target, out_it->second, sh,
-                              (se.kind != EdgeKind::kMusttail) ? se.site : nullptr,
-                              se.kind,
-                              (se.kind == EdgeKind::kMusttail) ? se.site : nullptr});
+                              nullptr, se.kind, nullptr});
         }
       }
       continue;
@@ -586,7 +589,9 @@ bool propagateStateConstantsWorklist(
     llvm::Function *effective = clone ? clone : entry.target;
 
     // Find dispatch edges inside the clone/target (recursive discovery).
-    {
+    // These are enqueued as analysis_only: cloned for constant extraction
+    // but successors are NOT followed (prevents exponential cascading).
+    if (!entry.analysis_only) {
       llvm::SmallVector<StateFlowEdge, 4> inner_edges;
       findDispatchEdges(*effective, M, inner_edges);
       for (auto &ie : inner_edges) {
@@ -598,8 +603,6 @@ bool propagateStateConstantsWorklist(
           }
         }
         if (!ie.target) continue;
-        // For inner dispatch_call: callee gets the output constants
-        // (which are the effective State at this point in the clone).
         uint64_t sh = hashConstants(output);
         auto sk = std::make_pair(ie.target, sh);
         if (!processed.count(sk)) {
@@ -612,18 +615,19 @@ bool propagateStateConstantsWorklist(
                                  ? "call" : "jump")
                          << "\n";
           worklist.push_back({ie.target, output, sh,
-                              ie.site, ie.kind, nullptr});
+                              nullptr, ie.kind, nullptr,
+                              /*analysis_only=*/true});
         }
       }
     }
 
     // Find musttail successors and enqueue them with output constants.
-    {
+    // Only follow musttail edges from non-analysis entries.
+    if (!entry.analysis_only) {
       llvm::SmallVector<StateFlowEdge, 4> mt_edges;
       findMusttailEdges(*effective, mt_edges);
       for (auto &me : mt_edges) {
         if (!me.target || me.target->isDeclaration()) {
-          // Try to lift if it's a block reference.
           if (me.target) {
             uint64_t pc = extractBlockPC(me.target->getName());
             if (pc == 0) pc = extractEntryVA(me.target->getName());
@@ -639,7 +643,7 @@ bool propagateStateConstantsWorklist(
             llvm::errs() << "[ipcp] musttail " << effective->getName()
                          << " -> " << me.target->getName() << "\n";
           worklist.push_back({me.target, output, sh,
-                              nullptr, EdgeKind::kMusttail, me.site});
+                              nullptr, EdgeKind::kMusttail, nullptr});
         }
       }
     }
@@ -772,9 +776,7 @@ bool propagateStateConstantsWorklist(
             auto sk = std::make_pair(se.target, sh);
             if (!processed.count(sk))
               worklist.push_back({se.target, out_it->second, sh,
-                                  (se.kind != EdgeKind::kMusttail) ? se.site : nullptr,
-                                  se.kind,
-                                  (se.kind == EdgeKind::kMusttail) ? se.site : nullptr});
+                                  nullptr, se.kind, nullptr});
           }
         }
         continue;
@@ -855,10 +857,28 @@ bool propagateStateConstantsWorklist(
         auto sk = std::make_pair(se.target, sh);
         if (!processed.count(sk))
           worklist.push_back({se.target, output, sh,
-                              (se.kind != EdgeKind::kMusttail) ? se.site : nullptr,
-                              se.kind,
-                              (se.kind == EdgeKind::kMusttail) ? se.site : nullptr});
+                              nullptr, se.kind, nullptr});
       }
+    }
+  }
+
+  // Phase 4: Clean up analysis-only clones.
+  // Clones created for inner dispatch edges (constant extraction only) have
+  // no callers. If left in the module, they pollute the function list and
+  // cause the main pipeline (ITR) to hang trying to resolve their dispatch
+  // calls. Delete any clone with no users.
+  {
+    llvm::SmallVector<llvm::Function *, 16> to_delete;
+    for (auto &[key, clone] : clone_cache) {
+      if (!clone) continue;
+      if (clone->use_empty())
+        to_delete.push_back(clone);
+    }
+    for (auto *F : to_delete) {
+      if (debugEnabled())
+        llvm::errs() << "[ipcp] deleting analysis-only clone "
+                     << F->getName() << "\n";
+      F->eraseFromParent();
     }
   }
 

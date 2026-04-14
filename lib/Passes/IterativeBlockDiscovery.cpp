@@ -600,6 +600,8 @@ llvm::PreservedAnalyses IterativeBlockDiscoveryPass::run(
     // dispatch_call, dispatch_jump, and musttail edges.  The worklist
     // handles multi-hop propagation, pass-through, and on-demand lifting
     // of missing block declarations internally.
+    // Run in a loop that also lifts musttail target declarations between
+    // rounds (some targets may not be reachable from seeded dispatch sites).
     {
       IPCPLiftCallback ipcp_lift;
       if (lift_block) {
@@ -613,9 +615,44 @@ llvm::PreservedAnalyses IterativeBlockDiscoveryPass::run(
           return lifted;
         };
       }
-      if (propagateStateConstantsWorklist(
-              M, M.getDataLayout(), &MAM, ipcp_lift))
-        ever_changed = true;
+      for (unsigned ipcp_round = 0; ipcp_round < 8; ++ipcp_round) {
+        bool ipcp_changed = propagateStateConstantsWorklist(
+            M, M.getDataLayout(), &MAM, ipcp_lift);
+        // Lift musttail target declarations so the next round can
+        // process them.
+        bool lifted_mt = false;
+        if (lift_block) {
+          llvm::SmallVector<uint64_t, 4> mt_pcs;
+          for (auto &F : M) {
+            if (F.isDeclaration()) continue;
+            for (auto &BB : F) {
+              auto *term = BB.getTerminator();
+              if (!llvm::isa<llvm::ReturnInst>(term)) continue;
+              if (auto *prev = term->getPrevNode()) {
+                if (auto *mci = llvm::dyn_cast<llvm::CallInst>(prev)) {
+                  if (!mci->isMustTailCall() && !mci->isTailCall())
+                    continue;
+                  auto *fn = mci->getCalledFunction();
+                  if (fn && fn->isDeclaration()) {
+                    uint64_t pc = extractBlockPC(fn->getName());
+                    if (pc == 0) pc = extractEntryVA(fn->getName());
+                    if (pc != 0) mt_pcs.push_back(pc);
+                  }
+                }
+              }
+            }
+          }
+          for (uint64_t pc : mt_pcs) {
+            if (lift_block(pc)) {
+              if (session) session->noteLiftedTarget(pc);
+              ever_changed = true;
+              lifted_mt = true;
+            }
+          }
+        }
+        if (!ipcp_changed && !lifted_mt) break;
+        if (ipcp_changed) ever_changed = true;
+      }
     }
 
     // Step 2.75: Resolve PUSH+JMP RSP stack-code dispatch patterns.

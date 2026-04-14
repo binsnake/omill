@@ -18578,6 +18578,34 @@ native_boundary_repair_done:;
                     std::move(payload));
   }
 
+  // Detect infinite self-loops in output root functions.
+  // A block like `br label %self` indicates an unresolved dispatch path
+  // that collapsed to a dead loop during optimization.
+  {
+    unsigned self_loop_count = 0;
+    for (auto &F : *module) {
+      if (!F.hasFnAttribute("omill.output_root")) continue;
+      for (auto &BB : F) {
+        auto *term = BB.getTerminator();
+        auto *br = llvm::dyn_cast<llvm::BranchInst>(term);
+        if (!br || !br->isUnconditional()) continue;
+        if (br->getSuccessor(0) != &BB) continue;
+        // Check this block only has the branch (no real work).
+        if (&BB.front() == term || BB.size() <= 2) {
+          ++self_loop_count;
+          errs() << "Warning: infinite self-loop in output root "
+                 << F.getName() << " at block " << BB.getName()
+                 << " (unresolved dispatch path)\n";
+        }
+      }
+    }
+    if (self_loop_count > 0) {
+      events.emitWarn("infinite_self_loop_in_output",
+                      "output root contains infinite self-loop(s)",
+                      {{"count", static_cast<int64_t>(self_loop_count)}});
+    }
+  }
+
   emitRuntimeArtifactBundleEvents(events, "finalization",
                                   finalization_summary.artifact_bundles);
   if (finalization_summary.has_protector_report &&
