@@ -10087,10 +10087,178 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
           };
           MPM.addPass(MergeBlockLifterSCCs{});
           MPM.addPass(llvm::VerifierPass());
-          // After merging, members get inlined into the wrapper by the
-          // later AlwaysInlinerPass (SCC is broken).
+
+          // Propagate pre-call State constants into scc_dispatch
+          // BEFORE AlwaysInlinerPass — the stores are still literal
+          // constants at this point (handler inlining would fold them).
+          // The callers (output roots) store known constants to State
+          // fields before calling scc_dispatch. Clone scc_dispatch with
+          // those constants folded into entry-block loads, enabling CMF
+          // to fold VMP bytecode reads in the first iteration.
+          {
+            struct PropagateIntoSCCDispatch
+                : llvm::PassInfoMixin<PropagateIntoSCCDispatch> {
+              llvm::PreservedAnalyses run(llvm::Module &M,
+                                           llvm::ModuleAnalysisManager &MAM) {
+                auto *dispatch = M.getFunction("scc_dispatch");
+                if (!dispatch || dispatch->isDeclaration())
+                  return llvm::PreservedAnalyses::all();
+                auto &DL = M.getDataLayout();
+
+                // Find call sites to scc_dispatch from OUTPUT ROOT functions.
+                llvm::SmallVector<llvm::CallInst *, 4> call_sites;
+                llvm::SmallVector<llvm::CallInst *, 4> root_sites;
+                for (auto *U : dispatch->users())
+                  if (auto *CI = llvm::dyn_cast<llvm::CallInst>(U)) {
+                    call_sites.push_back(CI);
+                    if (CI->getFunction()->hasFnAttribute("omill.output_root"))
+                      root_sites.push_back(CI);
+                  }
+                if (root_sites.empty())
+                  return llvm::PreservedAnalyses::all();
+
+                // Pick the root call site with the most preceding stores
+                // (the entry-point call, not a recursive internal one).
+                llvm::CallInst *CI = root_sites[0];
+                unsigned best_stores = 0;
+                for (auto *site : root_sites) {
+                  unsigned cnt = 0;
+                  for (auto It = site->getReverseIterator();
+                       It != site->getParent()->rend(); ++It)
+                    if (llvm::isa<llvm::StoreInst>(&*It)) ++cnt;
+                  if (cnt > best_stores) {
+                    best_stores = cnt;
+                    CI = site;
+                  }
+                }
+                if (best_stores < 5)
+                  return llvm::PreservedAnalyses::all();
+                auto *state = CI->getArgOperand(0);
+                llvm::DenseMap<unsigned, llvm::ConstantInt *> consts;
+                // Walk backward in the call's block collecting stores.
+                auto *BB = CI->getParent();
+                llvm::DenseSet<unsigned> seen;
+                for (auto It = CI->getReverseIterator();
+                     It != BB->rend(); ++It) {
+                  auto *SI = llvm::dyn_cast<llvm::StoreInst>(&*It);
+                  if (!SI) continue;
+                  // Resolve store target to State offset.
+                  llvm::Value *ptr = SI->getPointerOperand();
+                  llvm::Value *base = ptr;
+                  int64_t total = 0;
+                  while (auto *G = llvm::dyn_cast<llvm::GEPOperator>(base)) {
+                    llvm::APInt ap(64, 0);
+                    if (!G->accumulateConstantOffset(DL, ap)) { base = nullptr; break; }
+                    total += ap.getSExtValue();
+                    base = G->getPointerOperand();
+                  }
+                  if (base != state || total < 0) continue;
+                  unsigned off = static_cast<unsigned>(total);
+                  if (std::getenv("OMILL_DEBUG_SCC_COLLAPSE"))
+                    llvm::errs() << "[scc-ipcp]   store [" << off << "] "
+                                 << (llvm::isa<llvm::ConstantInt>(SI->getValueOperand())
+                                         ? "CONST" : "non-const")
+                                 << "\n";
+                  if (seen.count(off)) continue;
+                  if (auto *C = llvm::dyn_cast<llvm::ConstantInt>(
+                          SI->getValueOperand())) {
+                    if (!consts.count(off))
+                      consts[off] = C;
+                    seen.insert(off);
+                  }
+                }
+
+                if (std::getenv("OMILL_DEBUG_SCC_COLLAPSE")) {
+                  llvm::errs() << "[scc-ipcp] found " << consts.size()
+                               << " constants from " << call_sites.size()
+                               << " call sites, " << root_sites.size()
+                               << " root sites\n";
+                  llvm::errs() << "[scc-ipcp] state=";
+                  state->printAsOperand(llvm::errs(), false);
+                  llvm::errs() << " in " << CI->getFunction()->getName()
+                               << "\n";
+                  llvm::errs() << "[scc-ipcp] scanned " << seen.size()
+                               << " store offsets\n";
+                }
+                if (consts.size() < 5)
+                  return llvm::PreservedAnalyses::all();
+
+                if (std::getenv("OMILL_DEBUG_SCC_COLLAPSE")) {
+                  llvm::errs() << "[scc-ipcp] propagating "
+                               << consts.size() << " constants into "
+                               << dispatch->getName() << "\n";
+                  for (auto &[off, c] : consts)
+                    llvm::errs() << "  [" << off << "]=0x"
+                                 << llvm::Twine::utohexstr(c->getZExtValue())
+                                 << "\n";
+                }
+
+                // Clone scc_dispatch with constants folded.
+                llvm::ValueToValueMapTy vmap;
+                auto *clone = llvm::CloneFunction(dispatch, vmap);
+                clone->setName(dispatch->getName() + "_const");
+                clone->setLinkage(llvm::GlobalValue::InternalLinkage);
+
+                auto *clone_state = clone->getArg(0);
+                bool any = false;
+                for (auto &[offset, constant] : consts) {
+                  for (auto &CBB : *clone) {
+                    for (auto &I : CBB) {
+                      auto *G = llvm::dyn_cast<llvm::GetElementPtrInst>(&I);
+                      if (!G) continue;
+                      llvm::APInt ap(64, 0);
+                      if (!G->accumulateConstantOffset(DL, ap)) continue;
+                      if (ap.getSExtValue() != static_cast<int64_t>(offset))
+                        continue;
+                      if (G->getPointerOperand() != clone_state) continue;
+                      // Replace loads through this GEP.
+                      llvm::SmallVector<llvm::LoadInst *, 4> loads;
+                      for (auto *u : G->users())
+                        if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(u))
+                          if (LI->getType() == constant->getType())
+                            loads.push_back(LI);
+                      for (auto *LI : loads) {
+                        LI->replaceAllUsesWith(constant);
+                        any = true;
+                      }
+                      break;
+                    }
+                    if (any) break;  // Found GEP, move to next offset
+                  }
+                }
+
+                if (!any) {
+                  clone->eraseFromParent();
+                  return llvm::PreservedAnalyses::all();
+                }
+
+                // Rewrite root call sites to use the clone.
+                for (auto *site : root_sites)
+                  site->setCalledFunction(clone);
+
+                // Optimize the clone.
+                auto &FAM = MAM.getResult<
+                    llvm::FunctionAnalysisManagerModuleProxy>(M).getManager();
+                llvm::FunctionPassManager FPM;
+                FPM.addPass(omill::CombinedFixedPointDevirtPass());
+                FPM.addPass(llvm::InstCombinePass());
+                FPM.addPass(llvm::GVNPass());
+                FPM.addPass(llvm::SimplifyCFGPass());
+                auto PA = FPM.run(*clone, FAM);
+                FAM.invalidate(*clone, PA);
+
+                return llvm::PreservedAnalyses::none();
+              }
+              static bool isRequired() { return true; }
+            };
+            MPM.addPass(PropagateIntoSCCDispatch{});
+          }
+
+          // After constant propagation, inline handlers into the
+          // (now-specialized) scc_dispatch clone.
           MPM.addPass(llvm::AlwaysInlinerPass());
           MPM.addPass(llvm::GlobalDCEPass());
+
           // Targeted VMP virtual stack promotion: find the State field
           // with the most inttoptr derivations (the VMP stack pointer),
           // and run RecoverStackFrame only on those bases.
