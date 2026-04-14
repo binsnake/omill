@@ -28,6 +28,7 @@
 #include <llvm/Transforms/IPO/Inliner.h>
 #include <llvm/Transforms/IPO/SCCP.h>
 #include <llvm/Transforms/Scalar/ADCE.h>
+#include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Scalar/DeadStoreElimination.h>
 #include <llvm/Transforms/Scalar/LoopDeletion.h>
 #include <llvm/Transforms/Scalar/LoopRotation.h>
@@ -9883,11 +9884,83 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
         MPM.addPass(MarkBlockLifterBlocksAlwaysInlinePass{});
         if (alwaysInlinerEnabled())
           MPM.addPass(llvm::AlwaysInlinerPass());
-        // After forcing every acyclic blk_<pc> + sub_<pc> chain into
-        // the output root, any SCC that could not be inlined further
-        // collapses into a self-recursive musttail — convert those
-        // into natural loops so the final IR has no infinite-tail-
-        // recursion patterns left.
+
+        // Force-inline mutual recursion SCCs among block-lifter functions.
+        // AlwaysInlinerPass can't inline within SCCs (A→B→A).  This pass
+        // iteratively inlines callees into callers to collapse the SCC
+        // until only self-recursion remains.
+        {
+          struct CollapseBlockLifterSCCs
+              : llvm::PassInfoMixin<CollapseBlockLifterSCCs> {
+            llvm::PreservedAnalyses run(llvm::Module &M,
+                                         llvm::ModuleAnalysisManager &) {
+              bool ever_changed = false;
+              for (unsigned round = 0; round < 8; ++round) {
+                bool changed = false;
+                for (auto &F : llvm::make_early_inc_range(M)) {
+                  if (F.isDeclaration() || F.empty())
+                    continue;
+                  if (!F.hasFnAttribute("omill.block_lifter"))
+                    continue;
+                  if (F.hasFnAttribute("omill.output_root"))
+                    continue;
+                  // Inline one callee per function per round.
+                  // Skip callees over 2000 instructions to cap growth.
+                  llvm::CallInst *best = nullptr;
+                  unsigned best_size = UINT_MAX;
+                  for (auto &BB : F)
+                    for (auto &I : BB) {
+                      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+                      if (!CI) continue;
+                      if (!CI->isMustTailCall() && !CI->isTailCall())
+                        continue;
+                      auto *callee = CI->getCalledFunction();
+                      if (!callee || callee == &F) continue;
+                      if (!callee->hasFnAttribute("omill.block_lifter"))
+                        continue;
+                      if (callee->isDeclaration()) continue;
+                      unsigned sz = callee->getInstructionCount();
+                      if (sz <= 2000 && sz < best_size) {
+                        best = CI;
+                        best_size = sz;
+                      }
+                    }
+                  if (std::getenv("OMILL_DEBUG_SCC_COLLAPSE") && best)
+                    llvm::errs() << "[scc-collapse] inlining "
+                                 << best->getCalledFunction()->getName()
+                                 << " (" << best_size << " insns) into "
+                                 << F.getName() << " (" << F.getInstructionCount()
+                                 << " insns)\n";
+                  if (best) {
+                    best->setTailCallKind(llvm::CallInst::TCK_None);
+                    best->setMetadata(llvm::LLVMContext::MD_noalias, nullptr);
+                    best->setMetadata(
+                        llvm::LLVMContext::MD_alias_scope, nullptr);
+                    llvm::InlineFunctionInfo IFI;
+                    auto r = llvm::InlineFunction(*best, IFI);
+                    if (r.isSuccess()) {
+                      changed = true;
+                    } else if (std::getenv("OMILL_DEBUG_SCC_COLLAPSE")) {
+                      llvm::errs() << "[scc-collapse] inline failed: "
+                                   << F.getName() << " <- "
+                                   << best->getCalledFunction()->getName()
+                                   << ": " << r.getFailureReason()
+                                   << "\n";
+                    }
+                  }
+                }
+                if (!changed) break;
+                ever_changed = true;
+              }
+              return ever_changed ? llvm::PreservedAnalyses::none()
+                                  : llvm::PreservedAnalyses::all();
+            }
+            static bool isRequired() { return true; }
+          };
+          MPM.addPass(CollapseBlockLifterSCCs{});
+          MPM.addPass(llvm::GlobalDCEPass());
+        }
+
         //
         // Strip alwaysinline from survivors first: TailCallElimPass
         // skips alwaysinline functions (it assumes the inliner will
@@ -9922,9 +9995,85 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
           };
           MPM.addPass(StripAlwaysInlineFromRecursiveBlocks{});
         }
+        // Convert self-recursive musttail calls into natural loops.
+        // LLVM's TailCallElimPass can't eliminate musttail self-calls
+        // when there are State pointer stores before the call (it can't
+        // prove the stores are safe to defer).  We do the conversion
+        // unconditionally: replace `musttail call @self; ret` with a
+        // branch to a loop header with PHIs for the function arguments.
+        // The State stores remain in the loop body — GVN forwards
+        // store→load across the backedge.
         {
+          struct ConvertMusttailSelfRecursionToLoop
+              : llvm::PassInfoMixin<ConvertMusttailSelfRecursionToLoop> {
+            llvm::PreservedAnalyses run(llvm::Function &F,
+                                         llvm::FunctionAnalysisManager &) {
+              if (F.isDeclaration() || F.empty())
+                return llvm::PreservedAnalyses::all();
+
+              // Find all musttail/tail self-calls.
+              llvm::SmallVector<llvm::CallInst *, 4> self_calls;
+              for (auto &BB : F)
+                for (auto &I : BB)
+                  if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
+                    if ((CI->isMustTailCall() || CI->isTailCall()) &&
+                        CI->getCalledFunction() == &F) {
+                      // Must be immediately followed by ret.
+                      auto *next = CI->getNextNode();
+                      if (next && llvm::isa<llvm::ReturnInst>(next))
+                        self_calls.push_back(CI);
+                    }
+
+              if (self_calls.empty())
+                return llvm::PreservedAnalyses::all();
+
+              // Split the entry block to create: preheader → loop_header.
+              auto &entry = F.getEntryBlock();
+              auto *loop_header = entry.splitBasicBlock(
+                  entry.begin(), "tailrecurse");
+
+              // Create PHIs for function arguments at the loop header.
+              llvm::IRBuilder<> Builder(&*loop_header->begin());
+              llvm::SmallVector<llvm::PHINode *, 4> arg_phis;
+              for (unsigned i = 0; i < F.arg_size(); ++i) {
+                auto *arg = F.getArg(i);
+                auto *phi = Builder.CreatePHI(
+                    arg->getType(),
+                    1 + static_cast<unsigned>(self_calls.size()),
+                    arg->getName() + ".tr");
+                phi->addIncoming(arg, &entry);  // from preheader
+                // Replace all uses of the arg (except in the PHI itself)
+                // with the PHI.
+                arg->replaceUsesWithIf(phi, [phi](llvm::Use &U) {
+                  return U.getUser() != phi;
+                });
+                arg_phis.push_back(phi);
+              }
+
+              // Replace each musttail self-call with a branch to loop_header.
+              for (auto *CI : self_calls) {
+                auto *bb = CI->getParent();
+                auto *ret = CI->getNextNode();
+
+                for (unsigned i = 0; i < F.arg_size(); ++i)
+                  arg_phis[i]->addIncoming(CI->getArgOperand(i), bb);
+
+                ret->eraseFromParent();
+                CI->eraseFromParent();
+                llvm::BranchInst::Create(loop_header, bb);
+              }
+
+              return llvm::PreservedAnalyses::none();
+            }
+            static bool isRequired() { return true; }
+          };
+
           llvm::FunctionPassManager FPM;
+          FPM.addPass(ConvertMusttailSelfRecursionToLoop{});
           FPM.addPass(llvm::TailCallElimPass());
+          FPM.addPass(llvm::SimplifyCFGPass());
+          FPM.addPass(llvm::GVNPass());
+          FPM.addPass(llvm::InstCombinePass());
           FPM.addPass(llvm::SimplifyCFGPass());
           MPM.addPass(
               llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
