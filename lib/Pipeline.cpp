@@ -10082,12 +10082,239 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
           // later AlwaysInlinerPass (SCC is broken).
           MPM.addPass(llvm::AlwaysInlinerPass());
           MPM.addPass(llvm::GlobalDCEPass());
-          // TODO: Run RSF on scc_dispatch to promote VMP virtual stack
-          // (State+2328/RBP-based inttoptr) to allocas.  Currently blocked
-          // because RSF finds ALL State field loads (26K bases from 20
-          // inlined handlers) and tries to convert all of them, which is
-          // too slow.  Needs scoped RSF: only promote the VMP stack pointer
-          // (State+2328), not every State field that reaches inttoptr.
+          // Targeted VMP virtual stack promotion: find the State field
+          // with the most inttoptr derivations (the VMP stack pointer),
+          // and run RecoverStackFrame only on those bases.
+          {
+            struct PromoteVMPVirtualStack
+                : llvm::PassInfoMixin<PromoteVMPVirtualStack> {
+              llvm::PreservedAnalyses run(llvm::Function &F,
+                                           llvm::FunctionAnalysisManager &FAM) {
+                if (F.isDeclaration() || F.arg_size() == 0)
+                  return llvm::PreservedAnalyses::all();
+                auto *state_ptr = F.getArg(0);
+                auto &DL = F.getDataLayout();
+
+                // Resolve a GEP chain to a State field offset.
+                auto resolveOff = [&](llvm::Value *ptr) -> int64_t {
+                  llvm::Value *base = ptr;
+                  int64_t total = 0;
+                  while (auto *G = llvm::dyn_cast<llvm::GEPOperator>(base)) {
+                    llvm::APInt ap(64, 0);
+                    if (!G->accumulateConstantOffset(DL, ap)) return -1;
+                    total += ap.getSExtValue();
+                    base = G->getPointerOperand();
+                  }
+                  return (base == state_ptr) ? total : -1;
+                };
+
+                // Check if val traces to base + constant offset.
+                std::function<bool(llvm::Value *, llvm::Value *, int64_t &, unsigned)>
+                    traceBase = [&](llvm::Value *V, llvm::Value *base,
+                                    int64_t &off, unsigned depth) -> bool {
+                  if (depth > 8) return false;
+                  if (V == base) { off = 0; return true; }
+                  if (auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(V)) {
+                    if (BO->getOpcode() == llvm::Instruction::Add ||
+                        BO->getOpcode() == llvm::Instruction::Sub) {
+                      auto *C = llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(1));
+                      if (C && traceBase(BO->getOperand(0), base, off, depth + 1)) {
+                        off += (BO->getOpcode() == llvm::Instruction::Add)
+                                   ? C->getSExtValue() : -C->getSExtValue();
+                        return true;
+                      }
+                      C = llvm::dyn_cast<llvm::ConstantInt>(BO->getOperand(0));
+                      if (C && BO->getOpcode() == llvm::Instruction::Add &&
+                          traceBase(BO->getOperand(1), base, off, depth + 1)) {
+                        off += C->getSExtValue();
+                        return true;
+                      }
+                    }
+                  }
+                  return false;
+                };
+
+                // Check if val is derived from base (through any chain).
+                std::function<bool(llvm::Value *, llvm::Value *, unsigned)>
+                    isDerived = [&](llvm::Value *V, llvm::Value *base,
+                                    unsigned depth) -> bool {
+                  if (depth > 16) return false;
+                  if (V == base) return true;
+                  if (auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(V))
+                    return isDerived(BO->getOperand(0), base, depth + 1) ||
+                           isDerived(BO->getOperand(1), base, depth + 1);
+                  if (auto *CE = llvm::dyn_cast<llvm::CastInst>(V))
+                    return isDerived(CE->getOperand(0), base, depth + 1);
+                  return false;
+                };
+
+                // Count inttoptr derivations per State field offset.
+                llvm::DenseMap<int64_t, unsigned> field_itp_count;
+                for (auto &BB : F)
+                  for (auto &I : BB) {
+                    auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I);
+                    if (!LI || !LI->getType()->isIntegerTy(64)) continue;
+                    int64_t off = resolveOff(LI->getPointerOperand());
+                    if (off < 0) continue;
+                    unsigned count = 0;
+                    for (auto *u : LI->users())
+                      if (auto *bo = llvm::dyn_cast<llvm::BinaryOperator>(u))
+                        for (auto *bu : bo->users())
+                          if (llvm::isa<llvm::IntToPtrInst>(bu))
+                            ++count;
+                    if (count > 0)
+                      field_itp_count[off] += count;
+                  }
+                if (field_itp_count.empty())
+                  return llvm::PreservedAnalyses::all();
+
+                // Find the field with the most inttoptr derivations.
+                int64_t best_off = -1;
+                unsigned best_count = 0;
+                for (auto &[off, cnt] : field_itp_count)
+                  if (cnt > best_count) { best_off = off; best_count = cnt; }
+
+                if (best_count < 10)
+                  return llvm::PreservedAnalyses::all();
+
+                if (std::getenv("OMILL_DEBUG_STACK_FRAME"))
+                  llvm::errs() << "[RSF-VMP] " << F.getName()
+                               << ": best stack base State+"
+                               << best_off << " (" << best_count
+                               << " inttoptr derivations)\n";
+
+                // Single-pass approach: for each inttoptr, trace back to
+                // a load from best_off.  Group by load base.  Create one
+                // alloca per load base (each handler iteration has its own
+                // RSP snapshot).
+                //
+                // O(inttoptr_count) instead of O(loads × inttoptr_count).
+                llvm::IRBuilder<> EntryBuilder(&F.getEntryBlock().front());
+                auto *i8_ty = EntryBuilder.getInt8Ty();
+                auto *i64_ty = EntryBuilder.getInt64Ty();
+                bool changed = false;
+
+                // Map: load base → list of (inttoptr, const_offset) pairs.
+                struct ItpInfo {
+                  llvm::IntToPtrInst *itp;
+                  int64_t offset;
+                  bool is_const;
+                };
+                llvm::DenseMap<llvm::LoadInst *,
+                    llvm::SmallVector<ItpInfo, 8>> base_groups;
+
+                for (auto &BB2 : F)
+                  for (auto &I2 : BB2) {
+                    auto *ITP = llvm::dyn_cast<llvm::IntToPtrInst>(&I2);
+                    if (!ITP) continue;
+                    // Try to trace the inttoptr operand back to a load
+                    // from State+best_off.
+                    llvm::Value *cur = ITP->getOperand(0);
+                    int64_t accum = 0;
+                    bool is_const = true;
+                    llvm::LoadInst *base_load = nullptr;
+                    // Walk the add chain to find the base load.
+                    for (unsigned d = 0; d < 12; ++d) {
+                      if (auto *LI2 = llvm::dyn_cast<llvm::LoadInst>(cur)) {
+                        if (resolveOff(LI2->getPointerOperand()) == best_off)
+                          base_load = LI2;
+                        break;
+                      }
+                      if (auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(cur)) {
+                        if (BO->getOpcode() == llvm::Instruction::Add) {
+                          if (auto *C = llvm::dyn_cast<llvm::ConstantInt>(
+                                  BO->getOperand(1))) {
+                            accum += C->getSExtValue();
+                            cur = BO->getOperand(0);
+                            continue;
+                          }
+                          if (auto *C = llvm::dyn_cast<llvm::ConstantInt>(
+                                  BO->getOperand(0))) {
+                            accum += C->getSExtValue();
+                            cur = BO->getOperand(1);
+                            continue;
+                          }
+                          // Non-constant operand — dynamic offset.
+                          is_const = false;
+                          cur = BO->getOperand(0);
+                          continue;
+                        }
+                        if (BO->getOpcode() == llvm::Instruction::Sub) {
+                          if (auto *C = llvm::dyn_cast<llvm::ConstantInt>(
+                                  BO->getOperand(1))) {
+                            accum -= C->getSExtValue();
+                            cur = BO->getOperand(0);
+                            continue;
+                          }
+                          is_const = false;
+                          cur = BO->getOperand(0);
+                          continue;
+                        }
+                      }
+                      break;
+                    }
+                    if (base_load)
+                      base_groups[base_load].push_back({ITP, accum, is_const});
+                  }
+
+                // Process each base group.
+                for (auto &[base_load, itps] : base_groups) {
+                  // Find offset range from constant offsets.
+                  int64_t min_off = INT64_MAX, max_off = INT64_MIN;
+                  bool has_dynamic = false;
+                  for (auto &info : itps) {
+                    if (info.is_const) {
+                      min_off = std::min(min_off, info.offset);
+                      max_off = std::max(max_off, info.offset);
+                    } else {
+                      has_dynamic = true;
+                    }
+                  }
+                  if (min_off > max_off) continue;
+                  int64_t frame_size = max_off - min_off + 8;
+                  if (frame_size <= 0 || frame_size > 65536) continue;
+
+                  auto *frame_ty = llvm::ArrayType::get(i8_ty, frame_size);
+                  auto *alloca = EntryBuilder.CreateAlloca(
+                      frame_ty, nullptr, "vmp_stack");
+                  alloca->setAlignment(llvm::Align(8));
+
+                  for (auto &info : itps) {
+                    llvm::IRBuilder<> B(info.itp);
+                    if (info.is_const && info.offset >= min_off &&
+                        info.offset <= max_off) {
+                      auto *gep = B.CreateGEP(i8_ty, alloca,
+                          llvm::ConstantInt::get(i64_ty, info.offset - min_off));
+                      info.itp->replaceAllUsesWith(gep);
+                      info.itp->eraseFromParent();
+                      changed = true;
+                    } else if (has_dynamic) {
+                      auto *base_min = B.CreateAdd(
+                          base_load,
+                          llvm::ConstantInt::get(i64_ty, min_off));
+                      auto *idx = B.CreateSub(info.itp->getOperand(0),
+                                               base_min);
+                      auto *gep = B.CreateGEP(i8_ty, alloca, idx);
+                      info.itp->replaceAllUsesWith(gep);
+                      info.itp->eraseFromParent();
+                      changed = true;
+                    }
+                  }
+                }
+                return changed ? llvm::PreservedAnalyses::none()
+                               : llvm::PreservedAnalyses::all();
+              }
+              static bool isRequired() { return true; }
+            };
+            llvm::FunctionPassManager FPM;
+            FPM.addPass(PromoteVMPVirtualStack{});
+            FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+            FPM.addPass(llvm::GVNPass());
+            FPM.addPass(llvm::InstCombinePass());
+            FPM.addPass(llvm::SimplifyCFGPass());
+            MPM.addPass(
+                llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+          }
         }
 
         //
