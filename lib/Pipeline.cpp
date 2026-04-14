@@ -9979,16 +9979,16 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
                     auto *state = F->getArg(0);
                     auto *mem_arg = CI->getArgOperand(2);
                     auto *target_pc = CI->getArgOperand(1);
-                    // Store target PC to State+2472.
+                    // Store target PC to State+2472, then ret mem.
+                    auto *bb = CI->getParent();
                     llvm::IRBuilder<> B(CI);
                     auto *pc_ptr = B.CreateGEP(
                         B.getInt8Ty(), state,
                         B.getInt64(kPCOffset), "scc.pc.ptr");
                     B.CreateStore(target_pc, pc_ptr);
-                    // Replace ret to return the memory token.
                     ret->eraseFromParent();
                     CI->eraseFromParent();
-                    B.SetInsertPoint(&F->back());
+                    B.SetInsertPoint(bb);
                     B.CreateRet(mem_arg);
                   }
                 }
@@ -10057,9 +10057,16 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
                   B.CreateRet(mem_phi);
                 }
 
-                // Step 3: RAUW all members → wrapper.
+                // Step 3: Replace external uses of members → wrapper.
+                // Skip uses inside the wrapper itself (those are the
+                // dispatch calls that should remain as direct calls).
                 for (auto *F : members)
-                  F->replaceAllUsesWith(wrapper);
+                  F->replaceUsesWithIf(wrapper, [wrapper](llvm::Use &U) {
+                    auto *user = U.getUser();
+                    if (auto *I = llvm::dyn_cast<llvm::Instruction>(user))
+                      return I->getFunction() != wrapper;
+                    return true;
+                  });
 
                 changed = true;
               }
@@ -10070,6 +10077,12 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
             static bool isRequired() { return true; }
           };
           MPM.addPass(MergeBlockLifterSCCs{});
+          MPM.addPass(llvm::VerifierPass());
+          // TODO: inline member functions into the wrapper.  Currently
+          // blocked by LLVM InlineFunction crashing on ValueMapper with
+          // complex noalias metadata from remill lifting.  The members
+          // stay as separate internal functions called from the wrapper —
+          // still a big improvement over cross-recursive musttail.
           MPM.addPass(llvm::GlobalDCEPass());
         }
 
