@@ -651,9 +651,17 @@ bool propagateStateConstantsWorklist(
                                  ? "call" : "jump")
                          << " consts=" << inner_consts.size()
                          << "\n";
+          // When we have a rich constant set (>= 8 State fields known),
+          // allow full propagation (follow musttail edges from the
+          // clone).  This enables the VMP handler dispatch chain to
+          // unfold: each handler's output constants feed the next
+          // handler's input, and CMF folds the bytecode reads.
+          // With fewer constants, stay analysis_only to prevent
+          // exponential cascading from sparse propagation.
+          bool rich = inner_consts.size() >= 8;
           worklist.push_back({ie.target, inner_consts, sh,
                               nullptr, ie.kind, nullptr,
-                              /*analysis_only=*/true});
+                              /*analysis_only=*/!rich});
         }
       }
     }
