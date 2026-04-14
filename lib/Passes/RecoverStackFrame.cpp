@@ -472,9 +472,64 @@ llvm::PreservedAnalyses RecoverStackFramePass::run(
     // chain.  Stores go to the alloca, loads come from inttoptr → InstCombine
     // sees the alloca stores as dead and cascades into eliminating most of the
     // function body.  Skip alloca creation entirely when dynamic uses exist.
+    // When the same base has both constant-offset and dynamic-offset inttoptr
+    // users, create a single alloca covering the full constant-offset range.
+    // Replace constant-offset inttoptr → GEP(alloca, const_off - min_off).
+    // Replace dynamic-offset inttoptr → GEP(alloca, (val - base - min_off)).
+    // This keeps store-load chains intact (both go through the alloca).
     if (has_dynamic_uses) {
+      if (offsets.empty()) continue;
+      auto regions = clusterOffsets(offsets, 16);
+      // Merge all regions into one covering range.
+      int64_t min_off = regions.front().min_offset;
+      int64_t max_off = regions.back().max_offset;
+      int64_t frame_size = max_off - min_off + 8;
+      if (frame_size <= 0 || frame_size > 65536) {
+        if (debugStackFrame())
+          llvm::errs() << "[RSF]   SKIPPED (dynamic, size=" << frame_size
+                       << ")\n";
+        continue;
+      }
+
+      auto *frame_ty = llvm::ArrayType::get(i8_ty, frame_size);
+      auto *frame_alloca = EntryBuilder.CreateAlloca(
+          frame_ty, nullptr, "vstack_frame");
+      frame_alloca->setAlignment(llvm::Align(8));
+
       if (debugStackFrame())
-        llvm::errs() << "[RSF]   SKIPPED (dynamic uses)\n";
+        llvm::errs() << "[RSF]   dynamic base: alloca [" << frame_size
+                     << " x i8] for offsets [" << min_off << ", "
+                     << max_off << "]\n";
+
+      auto dyn_itps = collectDerivedIntToPtr(F, base);
+      for (auto *itp : dyn_itps) {
+        int64_t const_off = 0;
+        llvm::Value *operand = itp->getOperand(0);
+        llvm::IRBuilder<> Builder(itp);
+        if (traceToBase(operand, base, const_off) &&
+            const_off >= min_off && const_off <= max_off) {
+          // Constant offset → direct GEP.
+          auto *idx = llvm::ConstantInt::get(i64_ty, const_off - min_off);
+          auto *gep = Builder.CreateGEP(i8_ty, frame_alloca, idx,
+                                         "vstack.ptr");
+          itp->replaceAllUsesWith(gep);
+          itp->eraseFromParent();
+          changed = true;
+        } else {
+          // Dynamic offset → compute index from the inttoptr operand.
+          // operand = base + dynamic_off, so dynamic_off = operand - base.
+          // GEP index = dynamic_off - min_off = operand - base - min_off.
+          auto *base_plus_min = Builder.CreateAdd(
+              base, llvm::ConstantInt::get(i64_ty, min_off), "base.min");
+          auto *idx = Builder.CreateSub(operand, base_plus_min,
+                                         "vstack.dyn.idx");
+          auto *gep = Builder.CreateGEP(i8_ty, frame_alloca, idx,
+                                         "vstack.dyn.ptr");
+          itp->replaceAllUsesWith(gep);
+          itp->eraseFromParent();
+          changed = true;
+        }
+      }
       continue;
     }
 
