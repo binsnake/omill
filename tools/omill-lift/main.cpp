@@ -19353,18 +19353,29 @@ native_boundary_repair_done:;
             }
           }
 
+          // Inline scc_dispatch into the wrapper functions now that
+          // it has no recursive self-calls.  This enables store-to-load
+          // forwarding and DSE across the dispatch boundary.
+          scc_fn->addFnAttr(llvm::Attribute::AlwaysInline);
+          if (scc_fn->hasFnAttribute(llvm::Attribute::NoInline))
+            scc_fn->removeFnAttr(llvm::Attribute::NoInline);
+
           // Clean up.
           MAM.invalidate(*module, llvm::PreservedAnalyses::none());
-          llvm::FunctionPassManager CleanFPM;
-          CleanFPM.addPass(llvm::SimplifyCFGPass());
-          CleanFPM.addPass(llvm::InstCombinePass());
-          CleanFPM.addPass(llvm::GVNPass());
-          CleanFPM.addPass(llvm::DSEPass());
-          CleanFPM.addPass(llvm::ADCEPass());
-          CleanFPM.addPass(llvm::SimplifyCFGPass());
           ModulePassManager CleanMPM;
-          CleanMPM.addPass(llvm::createModuleToFunctionPassAdaptor(
-              std::move(CleanFPM)));
+          CleanMPM.addPass(llvm::AlwaysInlinerPass());
+          CleanMPM.addPass(llvm::GlobalDCEPass());
+          {
+            llvm::FunctionPassManager CleanFPM;
+            CleanFPM.addPass(llvm::SimplifyCFGPass());
+            CleanFPM.addPass(llvm::InstCombinePass());
+            CleanFPM.addPass(llvm::GVNPass());
+            CleanFPM.addPass(llvm::DSEPass());
+            CleanFPM.addPass(llvm::ADCEPass());
+            CleanFPM.addPass(llvm::SimplifyCFGPass());
+            CleanMPM.addPass(llvm::createModuleToFunctionPassAdaptor(
+                std::move(CleanFPM)));
+          }
           CleanMPM.run(*module, MAM);
           MAM.invalidate(*module, llvm::PreservedAnalyses::none());
         }
