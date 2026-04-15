@@ -78,6 +78,7 @@
 #include "omill/Passes/InterProceduralConstProp.h"
 #include "omill/Passes/CombinedFixedPointDevirt.h"
 #include "omill/Passes/ConstantMemoryFolding.h"
+#include "omill/Passes/RecoverStackFrame.h"
 #include "omill/Passes/LowerRemillIntrinsics.h"
 #include "omill/Passes/DeadStateStoreDSE.h"
 
@@ -18757,18 +18758,25 @@ native_boundary_repair_done:;
     CleanupMPM.addPass(llvm::GlobalDCEPass());
     CleanupMPM.run(*module, MAM);
   }
+
   // Repair functions whose entry block has predecessors (back-edges
   // from __remill_jump lowering / SCC merge loop creation).  LLVM
-  // requires entry blocks to have no predecessors, and any SSA value
-  // defined in a non-dominating block that is used in the entry block
-  // is a dominance violation.
+  // requires entry blocks to have no predecessors.  Must run BEFORE
+  // RSF/SROA/GVN since those passes compute DominatorTrees and crash
+  // on broken SSA.
   //
-  // Fix strategy:
-  //   1. Insert a new empty preheader as the function entry.
-  //   2. Demote all instructions that are used across the back-edge
-  //      (defined in a block that doesn't dominate the use) to allocas.
-  //   3. Re-promote the allocas to SSA with PromoteMemToReg, which
-  //      inserts the correct PHI nodes at loop headers.
+  // The pattern: a rotated loop where the original "init" section
+  // (State loads + computation) is at the BOTTOM of the back-edge
+  // source block, and the "exit" section (State stores) is at the
+  // top / entry block.  Values defined in the init section are used
+  // in the entry block without PHIs.
+  //
+  // Fix: find the back-edge source block, split it so the init
+  // section (State loads from arg0) becomes a separate block, insert
+  // a preheader that branches to the init block.  The init block
+  // gets PHIs only for the State-store values (which depend on inner
+  // loop results), with undef-safe initial values from the preheader.
+  // The State LOADS are re-executed each iteration — no PHIs needed.
   {
     bool repaired_any = false;
     for (auto &F : *module) {
@@ -18778,74 +18786,94 @@ native_boundary_repair_done:;
       if (pred_begin(&entry) == pred_end(&entry))
         continue;
 
-      // Step 1: Insert a new preheader before the old entry.
-      auto *preheader = llvm::BasicBlock::Create(
-          F.getContext(), "entry.preheader", &F, &entry);
-      llvm::BranchInst::Create(&entry, preheader);
+      // Find the back-edge source: a predecessor of the entry block
+      // that contains State loads (gep+load from arg0).
+      llvm::BasicBlock *backedge_src = nullptr;
+      for (auto *P : predecessors(&entry)) {
+        if (P == &entry)
+          continue;
+        backedge_src = P;
+        break;
+      }
+      if (!backedge_src)
+        continue;
 
-      // Step 2: Find all instructions with uses that violate dominance.
-      // After inserting the preheader, the DominatorTree is well-formed
-      // (preheader is the new entry, has no preds, dominates everything
-      // reachable from it).
-      llvm::DominatorTree DT(F);
-
-      llvm::SmallVector<llvm::Instruction *, 16> to_demote;
-      for (auto &BB : F) {
-        for (auto &I : BB) {
-          if (I.use_empty())
-            continue;
-          // Check if any use is NOT dominated by the def.
-          for (auto &U : I.uses()) {
-            auto *user_inst = llvm::cast<llvm::Instruction>(U.getUser());
-            llvm::BasicBlock *use_bb = user_inst->getParent();
-            if (auto *phi = llvm::dyn_cast<llvm::PHINode>(user_inst))
-              use_bb = phi->getIncomingBlock(U);
-            if (!DT.dominates(&I, use_bb) ||
-                (use_bb == I.getParent() &&
-                 llvm::isa<llvm::PHINode>(user_inst) &&
-                 !llvm::isa<llvm::PHINode>(&I))) {
-              // More precise: check if def dominates the specific use.
-              if (!DT.dominates(&I, U)) {
-                to_demote.push_back(&I);
-                break;
-              }
+      // Find the first State load in the back-edge source:
+      // pattern: gep i8, ptr %0 (arg0), i64 <offset>
+      llvm::Instruction *first_state_load = nullptr;
+      auto *state_arg = F.getArg(0);
+      for (auto &I : *backedge_src) {
+        if (auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(&I)) {
+          if (GEP->getPointerOperand() == state_arg) {
+            // Check if next instruction is a load from this GEP
+            auto *next = GEP->getNextNode();
+            if (next && llvm::isa<llvm::LoadInst>(next) &&
+                llvm::cast<llvm::LoadInst>(next)->getPointerOperand() == GEP) {
+              first_state_load = GEP;
+              break;
             }
           }
         }
       }
 
-      if (to_demote.empty())
+      if (!first_state_load)
         continue;
 
-      // Step 2b: Demote each violating instruction to an alloca.
-      llvm::SmallVector<llvm::AllocaInst *, 16> allocas;
-      for (auto *I : to_demote) {
-        if (auto *phi = llvm::dyn_cast<llvm::PHINode>(I))
-          allocas.push_back(llvm::DemotePHIToStack(phi));
-        else
-          allocas.push_back(llvm::DemoteRegToStack(*I));
-      }
+      // Split the back-edge source at the first State load.
+      // Everything before the split = "store" section (stays in original)
+      // Everything from the split = "init" section (new block)
+      auto *init_block = backedge_src->splitBasicBlock(
+          first_state_load->getIterator(), "loop.init");
 
-      // Step 3: Re-promote with proper PHI insertion.
-      // Rebuild the DomTree since DemoteRegToStack may have changed CFG.
-      DT.recalculate(F);
-      llvm::SmallVector<llvm::AllocaInst *, 16> promotable;
-      for (auto *A : allocas) {
-        if (A && llvm::isAllocaPromotable(A))
-          promotable.push_back(A);
-      }
-      if (!promotable.empty())
-        llvm::PromoteMemToReg(promotable, DT);
+      // Create preheader that branches to init_block.
+      auto *preheader = llvm::BasicBlock::Create(
+          F.getContext(), "entry.preheader", &F, &entry);
+      llvm::BranchInst::Create(init_block, preheader);
+
+      // The init_block terminator branches to entry (or sub_1800626f0.exit).
+      // No PHIs needed in init_block for State loads since they read from
+      // State (arg0) which is available everywhere.  But the backedge_src
+      // block's terminator was an unconditional br to init_block (from
+      // splitBasicBlock).  We need to check if init_block's PHIs (if any,
+      // from the original block's PHIs) need a preheader incoming edge.
+      // Actually, splitBasicBlock doesn't create PHIs — values defined
+      // before the split are still in backedge_src and dominate init_block.
 
       repaired_any = true;
       if (std::getenv("OMILL_DEBUG_ENTRY_REPAIR") != nullptr)
         llvm::errs() << "[entry-repair] " << F.getName()
-                     << ": demoted " << to_demote.size()
-                     << " instructions, promoted " << promotable.size()
-                     << " allocas\n";
+                     << ": split " << backedge_src->getName()
+                     << " at first State load, preheader → "
+                     << init_block->getName() << "\n";
     }
     if (repaired_any)
       MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+  }
+
+  // Post-ABI RSF + SROA + GVN: Convert RSP-relative inttoptr patterns
+  // to alloca GEPs, decompose the allocas, and forward store→load.
+  // This eliminates State struct pollution from the output and surfaces
+  // the actual algorithm logic (VM register arrays, hash constants, etc).
+  // Runs on ALL functions in the module (not gated by output_root or
+  // _native suffix) because no-ABI output roots need this cleanup.
+  if (!parseBoolEnv("OMILL_SKIP_POST_ABI_RSF").value_or(false)) {
+    llvm::FunctionPassManager RSF_FPM;
+    RSF_FPM.addPass(omill::RecoverStackFramePass());
+    RSF_FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+    RSF_FPM.addPass(llvm::InstCombinePass());
+    RSF_FPM.addPass(llvm::GVNPass());
+    RSF_FPM.addPass(llvm::InstCombinePass());
+    RSF_FPM.addPass(llvm::SimplifyCFGPass());
+    // Second round: RSF may expose new patterns after GVN forwarding.
+    RSF_FPM.addPass(omill::RecoverStackFramePass());
+    RSF_FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+    RSF_FPM.addPass(llvm::GVNPass());
+    RSF_FPM.addPass(llvm::SimplifyCFGPass());
+    ModulePassManager RSF_MPM;
+    RSF_MPM.addPass(
+        llvm::createModuleToFunctionPassAdaptor(std::move(RSF_FPM)));
+    RSF_MPM.run(*module, MAM);
+    MAM.invalidate(*module, llvm::PreservedAnalyses::none());
   }
 
   std::error_code EC;
