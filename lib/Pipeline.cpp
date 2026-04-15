@@ -69,8 +69,7 @@
 #include "omill/Devirtualization/OutputRootClosure.h"
 #include "omill/Passes/ConstantMemoryFolding.h"
 #include "omill/Passes/DeadStateStoreDSE.h"
-#include "omill/Passes/HashImportAnnotation.h"
-#include "omill/Passes/ResolveLazyImports.h"
+#include "omill/Passes/ResolveHashImports.h"
 #include "omill/Passes/FoldProgramCounter.h"
 #include "omill/Passes/SimplifyVectorReassembly.h"
 #include "omill/Passes/OutlineConstantStackData.h"
@@ -8430,13 +8429,10 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM,
   if (!envDisabled("OMILL_SKIP_DEOBF_OUTLINE_CONST_STACK")) {
     FPM.addPass(OutlineConstantStackDataPass());
   }
-  // Hash import annotation (uses the now-folded constants).
-  if (is_windows && !envDisabled("OMILL_SKIP_DEOBF_HASH_IMPORTS")) {
-    FPM.addPass(HashImportAnnotationPass());
-  }
-  // Replace lazy_importer resolution with direct import references.
-  if (is_windows && !envDisabled("OMILL_SKIP_DEOBF_RESOLVE_LAZY")) {
-    FPM.addPass(ResolveLazyImportsPass());
+  // Detect FNV-1a hash patterns and resolve to direct import references.
+  if (is_windows && !envDisabled("OMILL_SKIP_DEOBF_HASH_IMPORTS") &&
+      !envDisabled("OMILL_SKIP_DEOBF_RESOLVE_LAZY")) {
+    FPM.addPass(ResolveHashImportsPass());
   }
   // Lower resolved dispatch_calls to native Win64 ABI calls so State
   // no longer escapes, enabling SROA and dead loop elimination.
@@ -8474,19 +8470,23 @@ struct StripRemillIntrinsicBodiesPass
     : llvm::PassInfoMixin<StripRemillIntrinsicBodiesPass> {
   llvm::PreservedAnalyses run(llvm::Module &M,
                                llvm::ModuleAnalysisManager &) {
-    // Remill intrinsic prefixes to strip.
-    static constexpr llvm::StringLiteral prefixes[] = {
-        "__remill_sync_hyper_call",
-        "__remill_async_hyper_call",
-    };
-
     bool changed = false;
-    for (auto &prefix : prefixes) {
-      if (auto *F = M.getFunction(prefix)) {
-        if (!F->isDeclaration()) {
-          F->deleteBody();
-          changed = true;
+    for (auto &F : M) {
+      if (F.isDeclaration() || !F.getName().starts_with("__remill_"))
+        continue;
+      // Only strip functions whose body contains an unreachable terminator,
+      // indicating a dispatch stub (e.g. switch with unreachable default).
+      // This avoids accidentally stripping legitimate semantic helpers.
+      bool has_unreachable = false;
+      for (auto &BB : F) {
+        if (llvm::isa<llvm::UnreachableInst>(BB.getTerminator())) {
+          has_unreachable = true;
+          break;
         }
+      }
+      if (has_unreachable) {
+        F.deleteBody();
+        changed = true;
       }
     }
     return changed ? llvm::PreservedAnalyses::none()

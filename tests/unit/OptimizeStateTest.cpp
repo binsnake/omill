@@ -125,7 +125,7 @@ TEST_F(OptimizeStateTest, DeadFlagStore_Eliminated) {
 
   EXPECT_EQ(countStores(F), 2u);
 
-  runPass(F, omill::OptimizePhases::DeadFlags);
+  runPass(F, omill::OptimizePhases::DeadStores);
 
   EXPECT_EQ(countStores(F), 1u);
   EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));

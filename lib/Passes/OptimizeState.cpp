@@ -13,7 +13,6 @@
 
 #include "omill/Utils/LiftedNames.h"
 #include "omill/Analysis/StateOffsetUtils.h"
-#include "omill/Utils/StateFieldMap.h"
 
 #define DEBUG_TYPE "optimize-state"
 
@@ -22,58 +21,7 @@ namespace omill {
 namespace {
 
 // ============================================================================
-// Phase 1: DeadStateFlagElimination
-// ============================================================================
-
-static bool eliminateDeadFlagStores(llvm::Function &F,
-                                     const llvm::DataLayout &DL,
-                                     const StateFieldMap &field_map) {
-  llvm::SmallVector<llvm::Instruction *, 16> dead_stores;
-
-  for (auto &BB : F) {
-    llvm::DenseMap<unsigned, llvm::StoreInst *> last_store;
-
-    for (auto &I : BB) {
-      if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I)) {
-        int64_t off = resolveStateOffset(LI->getPointerOperand(), DL);
-        if (off >= 0) {
-          auto field = field_map.fieldAtOffset(static_cast<unsigned>(off));
-          if (field && field->category == StateFieldCategory::kFlag)
-            last_store.erase(static_cast<unsigned>(off));
-        }
-        continue;
-      }
-
-      if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
-        int64_t off = resolveStateOffset(SI->getPointerOperand(), DL);
-        if (off >= 0) {
-          auto field = field_map.fieldAtOffset(static_cast<unsigned>(off));
-          if (field && field->category == StateFieldCategory::kFlag) {
-            unsigned u_off = static_cast<unsigned>(off);
-            auto it = last_store.find(u_off);
-            if (it != last_store.end()) {
-              dead_stores.push_back(it->second);
-            }
-            last_store[u_off] = SI;
-          }
-        }
-        continue;
-      }
-
-      if (llvm::isa<llvm::CallInst>(&I) && !llvm::isa<llvm::IntrinsicInst>(&I)) {
-        last_store.clear();
-      }
-    }
-  }
-
-  for (auto *I : dead_stores)
-    I->eraseFromParent();
-
-  return !dead_stores.empty();
-}
-
-// ============================================================================
-// Phase 2: DeadStateStoreElimination
+// Phase 1: DeadStateStoreElimination
 // ============================================================================
 
 static bool eliminateDeadStateStores(llvm::Function &F,
@@ -571,11 +519,6 @@ llvm::PreservedAnalyses OptimizeStatePass::run(llvm::Function &F,
                                           llvm::FunctionAnalysisManager &AM) {
   auto &DL = F.getParent()->getDataLayout();
   bool changed = false;
-
-  if (phases_ & OptimizePhases::DeadFlags) {
-    StateFieldMap field_map(*F.getParent());
-    changed |= eliminateDeadFlagStores(F, DL, field_map);
-  }
 
   if (phases_ & OptimizePhases::DeadStores)
     changed |= eliminateDeadStateStores(F, DL);

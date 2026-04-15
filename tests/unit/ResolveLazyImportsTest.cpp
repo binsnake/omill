@@ -1,4 +1,4 @@
-#include "omill/Passes/ResolveLazyImports.h"
+#include "omill/Passes/ResolveHashImports.h"
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
@@ -20,7 +20,7 @@ class ResolveLazyImportsTest : public ::testing::Test {
 
   void runPass(llvm::Function *F) {
     llvm::FunctionPassManager FPM;
-    FPM.addPass(omill::ResolveLazyImportsPass());
+    FPM.addPass(omill::ResolveHashImportsPass());
 
     llvm::PassBuilder PB;
     llvm::LoopAnalysisManager LAM;

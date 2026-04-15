@@ -78,6 +78,88 @@ void eraseUnusedLoweringHelperDeclarations(llvm::Module &M) {
 }
 
 // ===----------------------------------------------------------------------===
+// Unified Phase 1 candidate collection
+// ===----------------------------------------------------------------------===
+
+struct Phase1Candidates {
+  struct TaggedCall {
+    llvm::CallInst *CI;
+    IntrinsicKind kind;
+  };
+
+  llvm::SmallVector<llvm::CallInst *, 32> flags;
+  llvm::SmallVector<llvm::CallInst *, 32> barrier_intrinsics;
+  llvm::SmallVector<llvm::CallInst *, 16> barrier_inline_asm;
+  llvm::SmallVector<TaggedCall, 32> memory;
+  llvm::SmallVector<TaggedCall, 16> atomics;
+  llvm::SmallVector<TaggedCall, 16> hyper_calls;
+  llvm::SmallVector<llvm::CallInst *, 8> fp80_nearbyint;
+};
+
+/// Do one walk over F, classifying each CallInst into per-category vectors.
+/// Only collects for categories that are enabled in the bitmask.
+void collectPhase1Candidates(llvm::Function &F, IntrinsicTable &table,
+                             uint32_t categories, Phase1Candidates &out) {
+  for (auto &BB : F) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+
+      // Inline asm barriers (not covered by IntrinsicTable).
+      if ((categories & LowerCategories::Barriers) && CI->isInlineAsm()) {
+        if (auto *IA =
+                llvm::dyn_cast<llvm::InlineAsm>(CI->getCalledOperand())) {
+          auto asm_str = IA->getAsmString();
+          if ((asm_str.empty() && IA->hasSideEffects()) ||
+              asm_str == "int1" || asm_str == "int $1")
+            out.barrier_inline_asm.push_back(CI);
+        }
+        continue;
+      }
+
+      // FP80 nearbyint (LLVM intrinsic, not remill).
+      if ((categories & LowerCategories::HyperCalls) &&
+          isNearbyIntFP80Intrinsic(CI)) {
+        out.fp80_nearbyint.push_back(CI);
+        continue;
+      }
+
+      auto kind = table.classifyCall(CI);
+      auto cat = IntrinsicTable::categoryOf(kind);
+
+      if ((categories & LowerCategories::Flags) &&
+          (cat == IntrinsicCategory::kFlag ||
+           cat == IntrinsicCategory::kComparison)) {
+        out.flags.push_back(CI);
+      } else if ((categories & LowerCategories::Barriers) &&
+                 (kind == IntrinsicKind::kBarrierLoadLoad ||
+                  kind == IntrinsicKind::kBarrierLoadStore ||
+                  kind == IntrinsicKind::kBarrierStoreLoad ||
+                  kind == IntrinsicKind::kBarrierStoreStore ||
+                  kind == IntrinsicKind::kDelaySlotBegin ||
+                  kind == IntrinsicKind::kDelaySlotEnd)) {
+        out.barrier_intrinsics.push_back(CI);
+      } else if ((categories & LowerCategories::Memory) &&
+                 (cat == IntrinsicCategory::kMemoryRead ||
+                  cat == IntrinsicCategory::kMemoryWrite)) {
+        out.memory.push_back({CI, kind});
+      } else if ((categories & LowerCategories::Atomics) &&
+                 (cat == IntrinsicCategory::kAtomic ||
+                  cat == IntrinsicCategory::kFetchAndOp)) {
+        out.atomics.push_back({CI, kind});
+      } else if ((categories & LowerCategories::HyperCalls) &&
+                 (cat == IntrinsicCategory::kHyperCall ||
+                  cat == IntrinsicCategory::kIOPort ||
+                  cat == IntrinsicCategory::kFPU ||
+                  cat == IntrinsicCategory::kX86Specific)) {
+        out.hyper_calls.push_back({CI, kind});
+      }
+    }
+  }
+}
+
+// ===----------------------------------------------------------------------===
 // Category 1: Flags — replace flag computation/comparison calls with arg0
 // ===----------------------------------------------------------------------===
 
@@ -1747,6 +1829,132 @@ bool lowerResolvedDispatchCalls(llvm::Function &F) {
 }  // namespace
 
 // ===----------------------------------------------------------------------===
+// ===----------------------------------------------------------------------===
+// Phase 1 processing from pre-collected candidates (single-walk path)
+// ===----------------------------------------------------------------------===
+
+bool processFlags(llvm::SmallVectorImpl<llvm::CallInst *> &calls) {
+  if (calls.empty())
+    return false;
+  for (auto *CI : calls) {
+    CI->replaceAllUsesWith(CI->getArgOperand(0));
+    CI->eraseFromParent();
+  }
+  return true;
+}
+
+bool processBarriers(llvm::SmallVectorImpl<llvm::CallInst *> &intrinsics,
+                     llvm::SmallVectorImpl<llvm::CallInst *> &inline_asm) {
+  if (intrinsics.empty() && inline_asm.empty())
+    return false;
+
+  for (auto *CI : inline_asm) {
+    auto *IA = llvm::cast<llvm::InlineAsm>(CI->getCalledOperand());
+    auto asm_str = IA->getAsmString();
+    if (asm_str.empty() && IA->hasSideEffects()) {
+      // Empty volatile asm barrier — remove.
+      if (!CI->getType()->isVoidTy() && CI->arg_size() > 0)
+        CI->replaceAllUsesWith(CI->getArgOperand(0));
+      CI->eraseFromParent();
+    } else {
+      // int1/int $1 → .byte 0xf1
+      auto *fixed = llvm::InlineAsm::get(
+          IA->getFunctionType(), ".byte 0xf1",
+          IA->getConstraintString(), IA->hasSideEffects(),
+          IA->isAlignStack(), IA->getDialect());
+      CI->setCalledOperand(fixed);
+    }
+  }
+
+  for (auto *CI : intrinsics) {
+    if (!CI->getType()->isVoidTy() && CI->arg_size() > 0)
+      CI->replaceAllUsesWith(CI->getArgOperand(0));
+    CI->eraseFromParent();
+  }
+  return true;
+}
+
+bool processMemory(llvm::SmallVectorImpl<Phase1Candidates::TaggedCall> &calls) {
+  if (calls.empty())
+    return false;
+  for (auto &[CI, kind] : calls) {
+    if (IntrinsicTable::categoryOf(kind) == IntrinsicCategory::kMemoryRead)
+      lowerReadMemory(CI, kind);
+    else
+      lowerWriteMemory(CI, kind);
+  }
+  return true;
+}
+
+bool processAtomics(
+    llvm::SmallVectorImpl<Phase1Candidates::TaggedCall> &calls) {
+  if (calls.empty())
+    return false;
+  for (auto &[CI, kind] : calls) {
+    switch (kind) {
+      case IntrinsicKind::kAtomicBegin:
+      case IntrinsicKind::kAtomicEnd:
+        CI->replaceAllUsesWith(CI->getArgOperand(0));
+        CI->eraseFromParent();
+        break;
+      case IntrinsicKind::kCompareExchange8:
+      case IntrinsicKind::kCompareExchange16:
+      case IntrinsicKind::kCompareExchange32:
+      case IntrinsicKind::kCompareExchange64:
+      case IntrinsicKind::kCompareExchange128:
+        lowerCompareExchange(CI, getAtomicBitWidth(kind));
+        break;
+      default:
+        if (IntrinsicTable::categoryOf(kind) == IntrinsicCategory::kFetchAndOp)
+          lowerFetchAndOp(CI, kind, getAtomicBitWidth(kind));
+        break;
+    }
+  }
+  return true;
+}
+
+bool processHyperCalls(
+    llvm::SmallVectorImpl<Phase1Candidates::TaggedCall> &calls) {
+  if (calls.empty())
+    return false;
+  for (auto &[CI, kind] : calls) {
+    auto cat = IntrinsicTable::categoryOf(kind);
+    switch (cat) {
+      case IntrinsicCategory::kHyperCall:
+        if (kind == IntrinsicKind::kSyncHyperCall)
+          lowerSyncHyperCall(CI);
+        else
+          lowerAsyncHyperCall(CI);
+        break;
+      case IntrinsicCategory::kIOPort:
+        lowerIOPort(CI, kind);
+        break;
+      case IntrinsicCategory::kFPU:
+        lowerFPUOp(CI, kind);
+        break;
+      case IntrinsicCategory::kX86Specific:
+        lowerX86Specific(CI);
+        break;
+      default:
+        break;
+    }
+  }
+  return true;
+}
+
+bool processFP80NearbyInt(llvm::SmallVectorImpl<llvm::CallInst *> &calls) {
+  if (calls.empty())
+    return false;
+  for (auto *CI : calls) {
+    llvm::IRBuilder<> Builder(CI);
+    auto *result = createFP80RoundToIntegral(Builder, CI->getArgOperand(0));
+    CI->replaceAllUsesWith(result);
+    CI->eraseFromParent();
+  }
+  return true;
+}
+
+// ===----------------------------------------------------------------------===
 // Main pass entry point
 // ===----------------------------------------------------------------------===
 
@@ -1764,19 +1972,42 @@ llvm::PreservedAnalyses LowerRemillIntrinsicsPass::run(
         MAMProxy.getCachedResult<LiftedFunctionAnalysis>(*F.getParent());
   }
 
-  // Process in correct order matching pipeline semantics.
-  if (categories_ & LowerCategories::Flags)
-    changed |= lowerFlagIntrinsics(F, table);
-  if (categories_ & LowerCategories::Barriers)
-    changed |= removeBarriers(F, table);
-  if (categories_ & LowerCategories::Memory)
-    changed |= lowerMemoryIntrinsics(F, table);
-  if (categories_ & LowerCategories::Atomics)
-    changed |= lowerAtomicIntrinsics(F, table);
-  if (categories_ & LowerCategories::HyperCalls)
-    changed |= lowerHyperCalls(F, table);
-  if (categories_ & LowerCategories::HyperCalls)
-    changed |= lowerFP80NearbyIntIntrinsics(F);
+  // When multiple Phase 1 categories are active, use a single unified walk
+  // instead of 5+ independent walks.
+  uint32_t phase1_mask = categories_ & LowerCategories::Phase1;
+  if (__builtin_popcount(phase1_mask) > 1) {
+    Phase1Candidates cands;
+    collectPhase1Candidates(F, table, phase1_mask, cands);
+
+    // Process in correct order matching pipeline semantics.
+    if (phase1_mask & LowerCategories::Flags)
+      changed |= processFlags(cands.flags);
+    if (phase1_mask & LowerCategories::Barriers)
+      changed |= processBarriers(cands.barrier_intrinsics,
+                                  cands.barrier_inline_asm);
+    if (phase1_mask & LowerCategories::Memory)
+      changed |= processMemory(cands.memory);
+    if (phase1_mask & LowerCategories::Atomics)
+      changed |= processAtomics(cands.atomics);
+    if (phase1_mask & LowerCategories::HyperCalls) {
+      changed |= processHyperCalls(cands.hyper_calls);
+      changed |= processFP80NearbyInt(cands.fp80_nearbyint);
+    }
+  } else {
+    // Single or no Phase 1 category — use original per-category walks.
+    if (categories_ & LowerCategories::Flags)
+      changed |= lowerFlagIntrinsics(F, table);
+    if (categories_ & LowerCategories::Barriers)
+      changed |= removeBarriers(F, table);
+    if (categories_ & LowerCategories::Memory)
+      changed |= lowerMemoryIntrinsics(F, table);
+    if (categories_ & LowerCategories::Atomics)
+      changed |= lowerAtomicIntrinsics(F, table);
+    if (categories_ & LowerCategories::HyperCalls) {
+      changed |= lowerHyperCalls(F, table);
+      changed |= lowerFP80NearbyIntIntrinsics(F);
+    }
+  }
   if (categories_ & LowerCategories::ErrorMissing)
     changed |= lowerErrorAndMissing(F, table);
   if (categories_ & LowerCategories::Return)

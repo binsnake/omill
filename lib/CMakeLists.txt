@@ -90,8 +90,7 @@ add_library(omill STATIC
   Utils/ImportHashDB.cpp
   Passes/ConstantMemoryFolding.cpp
   Passes/CombinedFixedPointDevirt.cpp
-  Passes/HashImportAnnotation.cpp
-  Passes/ResolveLazyImports.cpp
+  Passes/ResolveHashImports.cpp
   Passes/RecoverGlobalTypes.cpp
   Passes/FoldProgramCounter.cpp
   Passes/ResolveIATCalls.cpp

@@ -18,7 +18,7 @@ class DeadStateFlagEliminationTest : public ::testing::Test {
 
   void runPass(llvm::Function *F) {
     llvm::FunctionPassManager FPM;
-    FPM.addPass(omill::OptimizeStatePass(omill::OptimizePhases::DeadFlags));
+    FPM.addPass(omill::OptimizeStatePass(omill::OptimizePhases::DeadStores));
 
     llvm::PassBuilder PB;
     llvm::LoopAnalysisManager LAM;
