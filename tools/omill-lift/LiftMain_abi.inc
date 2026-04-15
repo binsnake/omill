@@ -10286,6 +10286,28 @@ native_boundary_repair_done:;
     errs() << "Error opening output: " << EC.message() << "\n";
     return fail(1, "failed to open output file");
   }
+  // Final cleanup: internalize + DCE remill semantics templates that were
+  // re-introduced by post-main child lifts (runTerminalBoundaryChildLift
+  // links fresh semantics modules back, reintroducing external-linkage
+  // template definitions like PHADDSW that the main pipeline already cleaned).
+  {
+    bool any_internalized = false;
+    for (auto &F : *module) {
+      if (F.isDeclaration() || F.hasLocalLinkage())
+        continue;
+      auto name = F.getName();
+      // Remill semantics templates from anonymous/static C++ namespaces.
+      if (name.starts_with("_ZN12_GLOBAL__N_") || name.starts_with("_ZL")) {
+        F.setLinkage(GlobalValue::InternalLinkage);
+        any_internalized = true;
+      }
+    }
+    if (any_internalized) {
+      ModulePassManager FinalCleanupMPM;
+      FinalCleanupMPM.addPass(llvm::GlobalDCEPass());
+      FinalCleanupMPM.run(*module, MAM);
+    }
+  }
   appendDebugMarker("final_output:before_print");
   module->print(Out.os(), nullptr);
   appendDebugMarker("final_output:after_print");

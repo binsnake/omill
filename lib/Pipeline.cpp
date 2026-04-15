@@ -8529,6 +8529,15 @@ struct InternalizeRemillSemanticsPass
       // and generic devirtualization produce real executable helpers under
       // blk_/block_/sub_ and related lifted-function shapes; those are not
       // dead semantics and must survive the semantics cleanup sweep.
+      //
+      // BUT: remill semantics templates (_ZN12_GLOBAL__N_1*) must always be
+      // internalized even if isLiftedPipelineFunction matches them (they
+      // share the remill 3-arg signature but are NOT lifted code).
+      if (name.starts_with("_ZN12_GLOBAL__N_") || name.starts_with("_ZL")) {
+        F.setLinkage(llvm::GlobalValue::InternalLinkage);
+        changed = true;
+        continue;
+      }
       if (isLiftedPipelineFunction(F) || name.starts_with("__remill_") ||
           name.starts_with("vm_entry_") ||
           F.hasFnAttribute("omill.output_root") ||
