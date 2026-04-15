@@ -562,6 +562,15 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
   // BRANCH_TAKEN, RETURN_PC, MONITOR allocas.
   arch->InitializeEmptyLiftedFunction(func);
 
+  // Fold the %pc argument to its constant VA at lift time.
+  // This eliminates the need for FoldProgramCounterPass on this function.
+  {
+    auto *pc_arg = remill::NthArgument(func, remill::kPCArgNum);
+    auto *pc_const =
+        llvm::ConstantInt::get(pc_arg->getType(), addr);
+    pc_arg->replaceAllUsesWith(pc_const);
+  }
+
   // Mark the function as a BlockLifter output so MergeBlockFunctionsPass
   // can safely distinguish block-lifter entries (both `sub_<pc>` and
   // `blk_<pc>`) from TraceLifter-produced `sub_<pc>` functions.
@@ -570,14 +579,15 @@ llvm::Function *BlockLifter::Impl::LiftBlock(
   auto *state_ptr = remill::NthArgument(func, remill::kStatePointerArgNum);
   auto *entry_block = &func->front();
 
-  // Store NEXT_PC = pc argument in the entry block.
+  // Store NEXT_PC = constant VA in the entry block.
   {
-    auto pc = remill::LoadProgramCounterArg(func);
+    auto *pc_const =
+        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), addr);
     auto [next_pc_ref, next_pc_ref_type] =
         arch->DefaultLifter(*intrinsics)
             ->LoadRegAddress(entry_block, state_ptr,
                              remill::kNextPCVariableName);
-    (void) new llvm::StoreInst(pc, next_pc_ref, entry_block);
+    (void) new llvm::StoreInst(pc_const, next_pc_ref, entry_block);
   }
 
   // Create body block and branch entry → body.
