@@ -19267,10 +19267,91 @@ native_boundary_repair_done:;
             ++transformed;
           }
 
+          // Fix dominance: demoted PHI loads in dispatch_bb are used
+          // by continuation blocks that aren't dominated by dispatch_bb.
+          // For each such load, insert a fresh load from the same alloca
+          // at the start of each continuation block that uses it.
+          for (auto &I : *dispatch_bb) {
+            auto *load = llvm::dyn_cast<llvm::LoadInst>(&I);
+            if (!load)
+              continue;
+            auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(
+                load->getPointerOperand());
+            if (!alloca)
+              continue;
+
+            // Check if any use is in a continuation block.
+            llvm::SmallVector<llvm::Use *, 8> to_fix;
+            for (auto &U : load->uses()) {
+              auto *user = llvm::cast<llvm::Instruction>(U.getUser());
+              auto *user_bb = user->getParent();
+              // Check if user_bb is a continuation or reachable from one.
+              if (user_bb != dispatch_bb && user_bb != cont_check_bb) {
+                to_fix.push_back(&U);
+              }
+            }
+
+            if (to_fix.empty())
+              continue;
+
+            // Group uses by block so we insert one load per block.
+            llvm::DenseMap<llvm::BasicBlock *, llvm::LoadInst *> block_loads;
+            for (auto *U : to_fix) {
+              auto *user = llvm::cast<llvm::Instruction>(U->getUser());
+              auto *user_bb = user->getParent();
+              auto &cached = block_loads[user_bb];
+              if (!cached) {
+                // Insert at block entry (after PHIs if any).
+                auto insert_pt = user_bb->getFirstNonPHIIt();
+                cached = new llvm::LoadInst(
+                    load->getType(), alloca,
+                    load->getName() + ".cont",
+                    &*insert_pt);
+              }
+              U->set(cached);
+            }
+          }
+
           if (std::getenv("OMILL_DEBUG_CPT") != nullptr)
             llvm::errs() << "[cpt] transformed " << transformed
                          << " recursive scc_dispatch calls into "
                          << "continuation-passing dispatches\n";
+
+          // Fix all dominance errors created by the CPT: demote ALL
+          // instructions with non-dominating uses to allocas, then
+          // re-promote with proper PHIs.
+          {
+            llvm::DominatorTree DT(*scc_fn);
+            llvm::SmallVector<llvm::Instruction *, 64> to_demote;
+            for (auto &BB : *scc_fn) {
+              for (auto &I : BB) {
+                if (I.use_empty() || llvm::isa<llvm::AllocaInst>(&I))
+                  continue;
+                for (auto &U : I.uses()) {
+                  if (!DT.dominates(&I, U)) {
+                    to_demote.push_back(&I);
+                    break;
+                  }
+                }
+              }
+            }
+            if (!to_demote.empty()) {
+              llvm::SmallVector<llvm::AllocaInst *, 64> allocs;
+              for (auto *I : to_demote) {
+                if (auto *phi = llvm::dyn_cast<llvm::PHINode>(I))
+                  allocs.push_back(llvm::DemotePHIToStack(phi));
+                else
+                  allocs.push_back(llvm::DemoteRegToStack(*I));
+              }
+              DT.recalculate(*scc_fn);
+              llvm::SmallVector<llvm::AllocaInst *, 64> promotable;
+              for (auto *A : allocs)
+                if (A && llvm::isAllocaPromotable(A))
+                  promotable.push_back(A);
+              if (!promotable.empty())
+                llvm::PromoteMemToReg(promotable, DT);
+            }
+          }
 
           // Clean up.
           MAM.invalidate(*module, llvm::PreservedAnalyses::none());
