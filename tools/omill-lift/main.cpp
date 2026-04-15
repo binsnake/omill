@@ -19317,9 +19317,11 @@ native_boundary_repair_done:;
                          << " recursive scc_dispatch calls into "
                          << "continuation-passing dispatches\n";
 
-          // Fix all dominance errors created by the CPT: demote ALL
-          // instructions with non-dominating uses to allocas, then
-          // re-promote with proper PHIs.
+          // Fix dominance errors: demote violating instructions to
+          // allocas, then re-promote with proper PHI insertion.
+          // The re-promotion is needed so State values flow through
+          // the arg0 pointer (not local allocas), preserving the
+          // memory effects that prevent O2 from deleting the body.
           {
             llvm::DominatorTree DT(*scc_fn);
             llvm::SmallVector<llvm::Instruction *, 64> to_demote;
@@ -19353,11 +19355,8 @@ native_boundary_repair_done:;
             }
           }
 
-          // Replace undef PHI incoming values with freeze(undef) to
-          // prevent LLVM from proving the first dispatch iteration is
-          // UB (which causes O2 to delete the entire function).
-          // The first iteration's values are "don't care" because the
-          // dispatch loop's init section reloads from State before use.
+          // Replace undef PHI values from entry with freeze(undef)
+          // to prevent O2 from proving the first iteration is UB.
           for (auto &BB : *scc_fn) {
             for (auto &I : BB) {
               auto *phi = llvm::dyn_cast<llvm::PHINode>(&I);
@@ -19381,39 +19380,19 @@ native_boundary_repair_done:;
           if (scc_fn->hasFnAttribute(llvm::Attribute::NoInline))
             scc_fn->removeFnAttr(llvm::Attribute::NoInline);
 
-          // Prevent O2 from proving output roots are dead.  LLVM infers
-          // memory(none) because the State stores aren't observed within
-          // the module.  Add `noinline` to prevent IPO from analyzing
-          // the function body and `memory(argmem: readwrite)` to declare
-          // the intended effects.  Also add `disable_sanitizer_instrumentation`
-          // which prevents some attribute inference.
-          for (auto &F : *module) {
-            if (F.isDeclaration())
-              continue;
-            if (!F.getName().starts_with("sub_"))
-              continue;
-            F.addFnAttr(llvm::Attribute::NoInline);
-            F.addFnAttr(llvm::Attribute::OptimizeNone);
-          }
 
           // Clean up.
           MAM.invalidate(*module, llvm::PreservedAnalyses::none());
           ModulePassManager CleanMPM;
           CleanMPM.addPass(llvm::AlwaysInlinerPass());
 
-          // Fix unreachable exit blocks: after inlining scc_dispatch,
-          // the switch default goes to "scc_dispatch.exit" which is
-          // unreachable.  Replace with a ret of the memory arg to
-          // prevent O2 from proving the function is noreturn.
+          // Fix unreachable terminators in output roots after inlining.
           for (auto &F : *module) {
             if (F.isDeclaration() || !F.getName().starts_with("sub_"))
               continue;
             for (auto &BB : F) {
-              if (!BB.getName().contains("scc_dispatch.exit"))
-                continue;
               if (auto *UI = llvm::dyn_cast<llvm::UnreachableInst>(
                       BB.getTerminator())) {
-                // Return the memory argument (arg 2).
                 llvm::IRBuilder<> B(UI);
                 B.CreateRet(F.getArg(2));
                 UI->eraseFromParent();
