@@ -35,7 +35,6 @@ add_executable(omill-unit-tests
   unit/DeadStateStoreEliminationTest.cpp
   unit/PromoteStateToSSATest.cpp
   unit/LowerFunctionReturnTest.cpp
-  unit/CFGRecoveryTest.cpp
   unit/CallingConventionAnalysisTest.cpp
   unit/RecoverStackFrameTest.cpp
   unit/RecoverStackFrameTypesTest.cpp

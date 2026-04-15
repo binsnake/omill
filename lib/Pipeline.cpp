@@ -52,7 +52,6 @@
 #include "omill/Analysis/SegmentsAA.h"
 #include "omill/Devirtualization/BoundaryFact.h"
 #include "omill/Devirtualization/ExecutableTargetFact.h"
-#include "omill/Passes/CFGRecovery.h"
 #include "omill/Passes/ControlFlowUnflattener.h"
 #include "omill/Passes/OptimizeState.h"
 #include "omill/Passes/LowerRemillIntrinsics.h"
@@ -7176,7 +7175,7 @@ void buildControlFlowPipeline(llvm::FunctionPassManager &FPM,
     FPM.addPass(ResolveAndLowerControlFlowPass(phases));
   }
   if (!envDisabled("OMILL_SKIP_CF_CFG_RECOVERY")) {
-    FPM.addPass(CFGRecoveryPass());
+    FPM.addPass(llvm::SimplifyCFGPass());
   }
 
   if (!envDisabled("OMILL_SKIP_ELIMINATE_DEAD_PATHS")) {

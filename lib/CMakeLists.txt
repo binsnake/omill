@@ -79,7 +79,6 @@ add_library(omill STATIC
 
   # Passes - Stage 4: Control Flow Recovery
   Passes/ResolveForcedExceptions.cpp
-  Passes/CFGRecovery.cpp
 
   # Analysis & Passes - Stage 5: ABI Recovery
   Analysis/CallingConventionAnalysis.cpp
