@@ -19115,100 +19115,170 @@ native_boundary_repair_done:;
     MAM.invalidate(*module, llvm::PreservedAnalyses::none());
   }
 
-  // Outline VMP handler cases from scc_dispatch using CodeExtractor.
-  // Each switch case's block set is extracted into its own function.
-  // Recursive `call @scc_dispatch(State, <const_pc>, mem)` then gets
-  // replaced with a direct call to the small handler (~200-600 lines).
-  if (!parseBoolEnv("OMILL_SKIP_HANDLER_OUTLINE").value_or(false)) {
+  // Continuation-passing transform: eliminate recursive scc_dispatch
+  // calls by converting them into direct dispatch loop iterations.
+  //
+  // Step 1: Demote dispatch PHIs to allocas (so new edges can branch
+  //   to the dispatch block without providing PHI values).
+  // Step 2: For each recursive call, split the handler at the call:
+  //   - "before": stores State, stores cont_id alloca, stores target
+  //     PC to State+2472, branches to dispatch.
+  //   - "after" (continuation): routed from dispatch via cont_id check.
+  // Step 3: At dispatch entry, check cont_id: if != 0, route to the
+  //   matching continuation; else, do normal PC switch.
+  if (!parseBoolEnv("OMILL_SKIP_CONTINUATION_PASSING").value_or(false)) {
     auto *scc_fn = module->getFunction("scc_dispatch");
     if (scc_fn && !scc_fn->isDeclaration()) {
-      // Find the dispatch switch (the one with many cases).
+      // Find the dispatch block (has a SwitchInst with many cases).
       llvm::SwitchInst *dispatch_switch = nullptr;
+      llvm::BasicBlock *dispatch_bb = nullptr;
       for (auto &BB : *scc_fn) {
         if (auto *SW = llvm::dyn_cast<llvm::SwitchInst>(BB.getTerminator())) {
           if (SW->getNumCases() > 10) {
             dispatch_switch = SW;
+            dispatch_bb = &BB;
             break;
           }
         }
       }
 
       if (dispatch_switch) {
-        auto *dispatch_bb = dispatch_switch->getParent();
-        llvm::DominatorTree DT(*scc_fn);
-
-        // Map PC → extracted function for recursive call replacement.
-        llvm::DenseMap<uint64_t, llvm::Function *> handler_fns;
-
-        for (auto &Case : dispatch_switch->cases()) {
-          auto *case_bb = Case.getCaseSuccessor();
-          uint64_t pc = Case.getCaseValue()->getZExtValue();
-
-          // BFS: collect all blocks reachable from case_bb that belong
-          // to this handler.  Stop at the dispatch block (loop back).
-          llvm::SetVector<llvm::BasicBlock *> handler_blocks;
-          llvm::SmallVector<llvm::BasicBlock *, 16> worklist;
-          worklist.push_back(case_bb);
-          handler_blocks.insert(case_bb);
-          while (!worklist.empty()) {
-            auto *BB = worklist.pop_back_val();
-            for (auto *succ : llvm::successors(BB)) {
-              if (succ == dispatch_bb)
-                continue;  // back-edge — boundary
-              if (succ->getParent() != scc_fn)
-                continue;  // safety
-              if (handler_blocks.insert(succ))
-                worklist.push_back(succ);
-            }
+        // Collect recursive scc_dispatch calls with constant PC.
+        llvm::SmallVector<llvm::CallInst *, 16> recursive_calls;
+        for (auto &BB : *scc_fn) {
+          for (auto &I : BB) {
+            auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+            if (!CI || CI->getCalledFunction() != scc_fn)
+              continue;
+            if (llvm::isa<llvm::ConstantInt>(CI->getArgOperand(1)))
+              recursive_calls.push_back(CI);
           }
-
-          if (handler_blocks.size() < 2)
-            continue;  // too small or single-block
-
-          // CodeExtractor needs the blocks to form a valid region.
-          // The region exits are: dispatch_bb (back-edge) and any
-          // blocks outside the handler set.
-          llvm::CodeExtractorAnalysisCache CEAC(*scc_fn);
-          llvm::CodeExtractor CE(handler_blocks.getArrayRef(), &DT);
-
-          if (!CE.isEligible())
-            continue;
-
-          llvm::Function *outlined = CE.extractCodeRegion(CEAC);
-          if (!outlined)
-            continue;
-
-          // Rename for readability.
-          outlined->setName("handler_" + llvm::Twine::utohexstr(pc));
-          outlined->setLinkage(llvm::GlobalValue::InternalLinkage);
-          handler_fns[pc] = outlined;
         }
 
-        // DomTree is invalidated after extraction — recalculate only
-        // if we need it for further transforms.
+        if (!recursive_calls.empty()) {
+          // Step 1: Demote all dispatch PHIs to allocas.
+          llvm::SmallVector<llvm::PHINode *, 64> dispatch_phis;
+          for (auto &I : *dispatch_bb) {
+            auto *phi = llvm::dyn_cast<llvm::PHINode>(&I);
+            if (!phi)
+              break;
+            dispatch_phis.push_back(phi);
+          }
 
-        // Replace recursive calls within scc_dispatch:
-        // call @scc_dispatch(State, <const_pc>, mem) where the handler
-        // at const_pc was outlined → we can't directly call the outlined
-        // handler because CodeExtractor changed the signature (it
-        // creates args for live-in values).  But the outlined handler
-        // is now small enough for LLVM's inliner to handle.
-        // Instead, the benefit is that scc_dispatch itself is now much
-        // smaller (each case is a call to the handler function), and
-        // the recursive calls inline a small scc_dispatch (just the
-        // dispatch switch + handler calls) rather than the full body.
+          for (auto *phi : dispatch_phis)
+            llvm::DemotePHIToStack(phi);
 
-        if (!handler_fns.empty()) {
-          if (std::getenv("OMILL_DEBUG_HANDLER_OUTLINE") != nullptr)
-            llvm::errs() << "[handler-outline] extracted "
-                         << handler_fns.size()
-                         << " handler functions from scc_dispatch\n";
+          // Re-find the switch (PHI demotion doesn't move it).
+          dispatch_switch = llvm::cast<llvm::SwitchInst>(
+              dispatch_bb->getTerminator());
 
-          // Clean up after extraction.
+          // Step 2: Create cont_id alloca in entry block.
+          auto &entry_bb = scc_fn->getEntryBlock();
+          llvm::IRBuilder<> EntryBuilder(&*entry_bb.getFirstInsertionPt());
+          auto *cont_id_alloca = EntryBuilder.CreateAlloca(
+              EntryBuilder.getInt32Ty(), nullptr, "cont_id");
+          EntryBuilder.CreateStore(EntryBuilder.getInt32(0), cont_id_alloca);
+
+          // Find the State+2472 (dispatch PC) GEP pattern.
+          // We need to store the target PC to State+2472 before dispatch.
+          auto *state_arg = scc_fn->getArg(0);
+
+          // Step 3: Split dispatch_bb to add cont_id check before switch.
+          // Insert at the beginning of dispatch_bb (after loads from
+          // demoted PHI allocas).
+          auto *cont_check_bb = dispatch_bb->splitBasicBlock(
+              dispatch_switch->getIterator(), "dispatch.cont_check");
+          // dispatch_bb now ends with br to cont_check_bb.
+          // cont_check_bb has the switch.
+
+          // In dispatch_bb, replace the unconditional br with cont_id check.
+          dispatch_bb->getTerminator()->eraseFromParent();
+          llvm::IRBuilder<> DispBuilder(dispatch_bb);
+          auto *cont_val = DispBuilder.CreateLoad(
+              DispBuilder.getInt32Ty(), cont_id_alloca, "cont_val");
+          // Reset cont_id for next iteration.
+          DispBuilder.CreateStore(DispBuilder.getInt32(0), cont_id_alloca);
+          auto *is_cont = DispBuilder.CreateICmpNE(
+              cont_val, DispBuilder.getInt32(0), "is_continuation");
+
+          // Create continuation dispatch block.
+          auto *cont_dispatch_bb = llvm::BasicBlock::Create(
+              scc_fn->getContext(), "dispatch.continuations", scc_fn);
+          DispBuilder.CreateCondBr(is_cont, cont_dispatch_bb, cont_check_bb);
+
+          // Build continuation switch (populated below).
+          llvm::IRBuilder<> ContBuilder(cont_dispatch_bb);
+          // Default: unreachable (shouldn't happen).
+          auto *unreachable_bb = llvm::BasicBlock::Create(
+              scc_fn->getContext(), "cont.unreachable", scc_fn);
+          llvm::IRBuilder<> UB(unreachable_bb);
+          UB.CreateUnreachable();
+          auto *cont_switch = ContBuilder.CreateSwitch(
+              cont_val, unreachable_bb,
+              static_cast<unsigned>(recursive_calls.size()));
+
+          // Step 4: Transform each recursive call.
+          unsigned cont_id_counter = 0;
+          unsigned transformed = 0;
+          for (auto *CI : recursive_calls) {
+            ++cont_id_counter;
+
+            auto *call_bb = CI->getParent();
+            auto *const_pc = llvm::cast<llvm::ConstantInt>(
+                CI->getArgOperand(1));
+
+            // Split the block at the call instruction.
+            // "before" = call_bb (up to the call)
+            // "after" = continuation block (from after the call)
+            auto *continuation_bb = call_bb->splitBasicBlock(
+                CI->getIterator(), "cont." + llvm::Twine(cont_id_counter));
+
+            // Remove the call and the unconditional br from call_bb.
+            call_bb->getTerminator()->eraseFromParent();
+
+            // In call_bb: store cont_id, store target PC, branch to dispatch.
+            llvm::IRBuilder<> BeforeBuilder(call_bb);
+            BeforeBuilder.CreateStore(
+                BeforeBuilder.getInt32(cont_id_counter), cont_id_alloca);
+            // Store target PC to State+2472.
+            auto *pc_gep = BeforeBuilder.CreateGEP(
+                BeforeBuilder.getInt8Ty(), state_arg,
+                BeforeBuilder.getInt64(2472), "pc_ptr");
+            BeforeBuilder.CreateStore(const_pc, pc_gep);
+            BeforeBuilder.CreateBr(dispatch_bb);
+
+            // In continuation_bb: the call instruction is the first inst.
+            // Replace it: the call result (ptr Memory*) was used by
+            // subsequent code.  After CPT, the memory token comes from
+            // the dispatch loop (which stores/loads it).  Use the
+            // original memory argument (arg2) as a placeholder — the
+            // memory token is threaded through State stores/loads.
+            auto *mem_arg = scc_fn->getArg(2);
+            CI->replaceAllUsesWith(mem_arg);
+            CI->eraseFromParent();
+
+            // Add this continuation to the cont_switch.
+            cont_switch->addCase(
+                llvm::ConstantInt::get(
+                    llvm::Type::getInt32Ty(scc_fn->getContext()),
+                    cont_id_counter),
+                continuation_bb);
+
+            ++transformed;
+          }
+
+          if (std::getenv("OMILL_DEBUG_CPT") != nullptr)
+            llvm::errs() << "[cpt] transformed " << transformed
+                         << " recursive scc_dispatch calls into "
+                         << "continuation-passing dispatches\n";
+
+          // Clean up.
           MAM.invalidate(*module, llvm::PreservedAnalyses::none());
           llvm::FunctionPassManager CleanFPM;
           CleanFPM.addPass(llvm::SimplifyCFGPass());
           CleanFPM.addPass(llvm::InstCombinePass());
+          CleanFPM.addPass(llvm::GVNPass());
+          CleanFPM.addPass(llvm::DSEPass());
           CleanFPM.addPass(llvm::ADCEPass());
           CleanFPM.addPass(llvm::SimplifyCFGPass());
           ModulePassManager CleanMPM;
