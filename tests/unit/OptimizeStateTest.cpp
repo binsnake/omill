@@ -290,4 +290,154 @@ TEST_F(OptimizeStateTest, DeclarationFunction_Skipped) {
   EXPECT_TRUE(F->isDeclaration());
 }
 
+// ---------------------------------------------------------------------------
+// Test 7: Roundtrip after call — flush, call, reload+store back = dead.
+// ---------------------------------------------------------------------------
+TEST_F(OptimizeStateTest, Roundtrip_AfterCall_Eliminated) {
+  auto M = createModule();
+  auto *F = createLiftedFn(*M);
+
+  auto *callee = createLiftedFn(*M, "sub_402000");
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  llvm::IRBuilder<> B(entry);
+
+  auto *state = F->getArg(0);
+  auto *mem = F->getArg(2);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+
+  // Flush: store value to State+2216 (RAX)
+  auto *gep1 = B.CreateConstGEP1_64(B.getInt8Ty(), state, 2216, "rax_ptr1");
+  B.CreateStore(B.getInt64(42), gep1);
+
+  // Call that takes State
+  auto *call1 = B.CreateCall(callee, {state, B.getInt64(0), mem});
+
+  // Roundtrip: load from State+2216, store back immediately
+  auto *gep2 = B.CreateConstGEP1_64(B.getInt8Ty(), state, 2216, "rax_ptr2");
+  auto *reloaded = B.CreateLoad(i64_ty, gep2, "reloaded");
+  auto *gep3 = B.CreateConstGEP1_64(B.getInt8Ty(), state, 2216, "rax_ptr3");
+  B.CreateStore(reloaded, gep3);
+
+  // Second call
+  auto *call2 = B.CreateCall(callee, {state, B.getInt64(0), call1});
+  B.CreateRet(call2);
+
+  unsigned stores_before = countStores(F);
+
+  runPass(F, omill::OptimizePhases::Roundtrip);
+
+  EXPECT_LT(countStores(F), stores_before);
+  EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: Roundtrip with modified value — NOT a roundtrip, preserved.
+// ---------------------------------------------------------------------------
+TEST_F(OptimizeStateTest, Roundtrip_ModifiedValue_Preserved) {
+  auto M = createModule();
+  auto *F = createLiftedFn(*M);
+
+  auto *callee = createLiftedFn(*M, "sub_402000");
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  llvm::IRBuilder<> B(entry);
+
+  auto *state = F->getArg(0);
+  auto *mem = F->getArg(2);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+
+  auto *gep1 = B.CreateConstGEP1_64(B.getInt8Ty(), state, 2216, "rax_ptr1");
+  B.CreateStore(B.getInt64(42), gep1);
+  auto *call = B.CreateCall(callee, {state, B.getInt64(0), mem});
+
+  // Load, modify, store — not a roundtrip.
+  auto *gep2 = B.CreateConstGEP1_64(B.getInt8Ty(), state, 2216, "rax_ptr2");
+  auto *loaded = B.CreateLoad(i64_ty, gep2, "loaded");
+  auto *modified = B.CreateAdd(loaded, B.getInt64(1), "modified");
+  auto *gep3 = B.CreateConstGEP1_64(B.getInt8Ty(), state, 2216, "rax_ptr3");
+  B.CreateStore(modified, gep3);
+
+  B.CreateRet(call);
+
+  unsigned stores_before = countStores(F);
+
+  runPass(F, omill::OptimizePhases::Roundtrip);
+
+  EXPECT_EQ(countStores(F), stores_before);
+  EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: Cross-block roundtrip — load and store in different blocks,
+// should be preserved (roundtrip elimination is intra-block only).
+// ---------------------------------------------------------------------------
+TEST_F(OptimizeStateTest, Roundtrip_CrossBlock_Preserved) {
+  auto M = createModule();
+  auto *F = createLiftedFn(*M);
+
+  auto *callee = createLiftedFn(*M, "sub_402000");
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  auto *cont = llvm::BasicBlock::Create(Ctx, "cont", F);
+  llvm::IRBuilder<> B(entry);
+
+  auto *state = F->getArg(0);
+  auto *mem = F->getArg(2);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+
+  auto *gep1 = B.CreateConstGEP1_64(B.getInt8Ty(), state, 2216, "rax_ptr1");
+  B.CreateStore(B.getInt64(42), gep1);
+  auto *call = B.CreateCall(callee, {state, B.getInt64(0), mem});
+
+  // Load in entry block
+  auto *gep2 = B.CreateConstGEP1_64(B.getInt8Ty(), state, 2216, "rax_ptr2");
+  auto *loaded = B.CreateLoad(i64_ty, gep2, "loaded");
+  B.CreateBr(cont);
+
+  // Store in continuation block
+  B.SetInsertPoint(cont);
+  auto *gep3 = B.CreateConstGEP1_64(B.getInt8Ty(), state, 2216, "rax_ptr3");
+  B.CreateStore(loaded, gep3);
+  B.CreateRet(call);
+
+  unsigned stores_before = countStores(F);
+
+  runPass(F, omill::OptimizePhases::Roundtrip);
+
+  EXPECT_EQ(countStores(F), stores_before);
+  EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: RedundantBytes — non-overlapping stores preserved.
+// ---------------------------------------------------------------------------
+TEST_F(OptimizeStateTest, RedundantByte_NonOverlapping_Preserved) {
+  auto M = createModule();
+  auto *F = createLiftedFn(*M);
+
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  llvm::IRBuilder<> B(entry);
+
+  auto *state = F->getArg(0);
+  auto *mem = F->getArg(2);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *i8_ty = llvm::Type::getInt8Ty(Ctx);
+
+  // Store i64 at offset 464
+  auto *gep1 = B.CreateConstGEP1_64(B.getInt8Ty(), state, 464, "ptr1");
+  B.CreateStore(B.getInt64(0), gep1);
+
+  // Store i8 at offset 500 — not overlapping with 464..471
+  auto *gep2 = B.CreateConstGEP1_64(B.getInt8Ty(), state, 500, "ptr2");
+  B.CreateStore(llvm::ConstantInt::get(i8_ty, 42), gep2);
+
+  B.CreateRet(mem);
+
+  runPass(F, omill::OptimizePhases::RedundantBytes);
+
+  EXPECT_EQ(countStores(F), 2u);
+  EXPECT_FALSE(llvm::verifyFunction(*F, &llvm::errs()));
+}
+
 }  // namespace

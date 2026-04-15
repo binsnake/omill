@@ -32,7 +32,7 @@ add_executable(omill-unit-tests
   unit/LowerFlagIntrinsicsTest.cpp
   unit/LowerMemoryIntrinsicsTest.cpp
   unit/RemoveBarriersTest.cpp
-  unit/DeadStateStoreEliminationTest.cpp
+  unit/ResolveHashImportsTest.cpp
   unit/PromoteStateToSSATest.cpp
   unit/LowerFunctionReturnTest.cpp
   unit/CallingConventionAnalysisTest.cpp
@@ -45,11 +45,9 @@ add_executable(omill-unit-tests
   unit/LowerErrorAndMissingTest.cpp
   unit/LowerFunctionCallTest.cpp
   unit/LowerJumpTest.cpp
-  unit/DeadStateFlagEliminationTest.cpp
   unit/ConstantMemoryFoldingTest.cpp
   unit/CombinedFixedPointDevirtTest.cpp
   unit/ImportHashDBTest.cpp
-  unit/HashImportAnnotationTest.cpp
   unit/FoldProgramCounterTest.cpp
   unit/OutlineConstantStackDataTest.cpp
   unit/LowerResolvedDispatchCallsTest.cpp
@@ -69,8 +67,6 @@ add_executable(omill-unit-tests
   unit/CollapsePartialXMMWritesTest.cpp
   unit/CoalesceByteReassemblyTest.cpp
   unit/FoldConstantVectorChainsTest.cpp
-  unit/DeadStateRoundtripEliminationTest.cpp
-  unit/EliminateRedundantByteStoresTest.cpp
   unit/MemoryCoalesceTest.cpp
   unit/PartialOverlapDSETest.cpp
   unit/KnownIndexSelectTest.cpp

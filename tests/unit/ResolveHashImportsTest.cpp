@@ -15,7 +15,7 @@
 
 namespace {
 
-class HashImportAnnotationTest : public ::testing::Test {
+class ResolveHashImportsTest : public ::testing::Test {
  protected:
   llvm::LLVMContext Ctx;
 
@@ -47,7 +47,7 @@ class HashImportAnnotationTest : public ::testing::Test {
   }
 };
 
-TEST_F(HashImportAnnotationTest, DetectsHashComparison) {
+TEST_F(ResolveHashImportsTest, DetectsHashComparison) {
   auto M = createModule();
   auto *i32_ty = llvm::Type::getInt32Ty(Ctx);
   auto *void_ty = llvm::Type::getVoidTy(Ctx);
@@ -99,7 +99,7 @@ TEST_F(HashImportAnnotationTest, DetectsHashComparison) {
   }
 }
 
-TEST_F(HashImportAnnotationTest, NoFalsePositiveOnArbitraryConstant) {
+TEST_F(ResolveHashImportsTest, NoFalsePositiveOnArbitraryConstant) {
   auto M = createModule();
   auto *i32_ty = llvm::Type::getInt32Ty(Ctx);
   auto *void_ty = llvm::Type::getVoidTy(Ctx);
@@ -144,7 +144,7 @@ TEST_F(HashImportAnnotationTest, NoFalsePositiveOnArbitraryConstant) {
   }
 }
 
-TEST_F(HashImportAnnotationTest, MultipleHashComparisons) {
+TEST_F(ResolveHashImportsTest, MultipleHashComparisons) {
   auto M = createModule();
   auto *i32_ty = llvm::Type::getInt32Ty(Ctx);
   auto *void_ty = llvm::Type::getVoidTy(Ctx);
@@ -199,7 +199,7 @@ TEST_F(HashImportAnnotationTest, MultipleHashComparisons) {
   EXPECT_TRUE(va_fn != nullptr || vf_fn != nullptr);
 }
 
-TEST_F(HashImportAnnotationTest, PairedCWImportHashResolution) {
+TEST_F(ResolveHashImportsTest, PairedCWImportHashResolution) {
   // Simulates CW_IMPORT pattern: two separate FNV loops in one function.
   // Loop 1: module hash (case-insensitive FNV1a32 of "kernel32.dll")
   // Loop 2: function hash (case-sensitive FNV1a32 of "VirtualAlloc")
