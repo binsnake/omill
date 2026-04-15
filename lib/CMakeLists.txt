@@ -120,6 +120,7 @@ add_library(omill STATIC
   Passes/EliminateDeadTraceCounters.cpp
   Passes/MergeBytePhis.cpp
   Passes/MergeDecomposedStatePHIs.cpp
+  Passes/SCCDispatchCPT.cpp
   Passes/CollapseRemillSHRSwitch.cpp
   Passes/RecoverAllocaPointers.cpp
   Passes/TypeRecovery.cpp
