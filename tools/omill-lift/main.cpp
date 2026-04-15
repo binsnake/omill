@@ -18850,6 +18850,216 @@ native_boundary_repair_done:;
       MAM.invalidate(*module, llvm::PreservedAnalyses::none());
   }
 
+  /// Merge SROA-decomposed PHI groups back into full-width i64 PHIs.
+  ///
+  /// SROA splits 64-bit State fields into sub-byte PHIs at the dispatch
+  /// loop header.  This pass recognizes groups of PHIs with the same
+  /// `state_XXXX.sroa` prefix, verifies their bit-widths sum to 64,
+  /// and merges them into a single i64 PHI.  Uses are rewritten:
+  /// - Existing uses of sub-field PHIs → trunc/lshr+trunc of the merged PHI
+  /// - Existing zext+shl+or reassembly chains → the merged PHI directly
+  struct MergeDecomposedStatePHIsPass
+      : llvm::PassInfoMixin<MergeDecomposedStatePHIsPass> {
+
+    /// Parse a PHI name like "state_2280.sroa.0.sroa.761.0" and extract
+    /// the State field prefix ("state_2280") and bit offset.
+    /// Returns {prefix, bit_offset} or {"", -1} on failure.
+    static std::pair<llvm::StringRef, int>
+    parseStatePHI(llvm::PHINode *phi) {
+      auto name = phi->getName();
+      // Match "state_XXXX.sroa.*" or "state_XXXX.sroa.*"
+      if (!name.starts_with("state_"))
+        return {"", -1};
+      auto dot = name.find('.');
+      if (dot == llvm::StringRef::npos)
+        return {"", -1};
+      auto prefix = name.substr(0, dot);
+      // The bit offset is encoded in the SROA suffix structure.
+      // We don't try to parse it — instead we sort by type width
+      // and assume non-overlapping contiguous layout.
+      return {prefix, 0};
+    }
+
+    /// Given a group of PHIs for the same State field, try to find the
+    /// bit-shift amounts by looking at how each PHI's value is assembled
+    /// in a zext+shl+or chain somewhere in the function.
+    struct FieldPiece {
+      llvm::PHINode *phi;
+      unsigned bit_width;
+      unsigned bit_offset;
+    };
+
+    /// Find the bit offset of a sub-field PHI by looking at its users.
+    /// If a user is `zext ... to i64` → `shl ..., <const>`, the const
+    /// is the bit offset.  If just `zext ... to i64` with no shift, offset=0.
+    static int findBitOffset(llvm::PHINode *phi) {
+      for (auto *U : phi->users()) {
+        auto *zext = llvm::dyn_cast<llvm::ZExtInst>(U);
+        if (!zext)
+          continue;
+        // Check if zext feeds into a shl
+        for (auto *ZU : zext->users()) {
+          if (auto *shl = llvm::dyn_cast<llvm::BinaryOperator>(ZU)) {
+            if (shl->getOpcode() == llvm::Instruction::Shl) {
+              if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(
+                      shl->getOperand(1)))
+                return static_cast<int>(CI->getZExtValue());
+            }
+          }
+          // If zext feeds into an or directly with mask, offset is 0
+          if (auto *or_inst = llvm::dyn_cast<llvm::BinaryOperator>(ZU)) {
+            if (or_inst->getOpcode() == llvm::Instruction::Or) {
+              // Check if other operand is shifted — this is the low part
+              return 0;
+            }
+          }
+        }
+        // Zext with no shl → bits 0..width
+        if (zext->getType()->isIntegerTy(64))
+          return 0;
+      }
+      // Special case: if the PHI is i64 and just has an 'and' mask
+      if (phi->getType()->isIntegerTy(64)) {
+        // Look for "and i64 %phi, -256" pattern (preserves upper bits)
+        for (auto *U : phi->users()) {
+          if (auto *and_inst = llvm::dyn_cast<llvm::BinaryOperator>(U)) {
+            if (and_inst->getOpcode() == llvm::Instruction::And) {
+              if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(
+                      and_inst->getOperand(1))) {
+                // -256 = clear low 8 bits → this PHI carries upper bits
+                auto mask = CI->getZExtValue();
+                if (mask == 0xFFFFFFFFFFFFFF00ULL)
+                  return 0;  // starts at bit 0 with upper bits
+              }
+            }
+          }
+        }
+      }
+      return -1;  // couldn't determine
+    }
+
+    llvm::PreservedAnalyses run(llvm::Function &F,
+                                llvm::FunctionAnalysisManager &) {
+      bool changed = false;
+
+      for (auto &BB : F) {
+        // Collect PHIs by State field prefix.
+        llvm::StringMap<llvm::SmallVector<llvm::PHINode *, 4>> groups;
+        for (auto &I : BB) {
+          auto *phi = llvm::dyn_cast<llvm::PHINode>(&I);
+          if (!phi)
+            break;  // PHIs are always at block start
+          auto [prefix, _] = parseStatePHI(phi);
+          if (prefix.empty())
+            continue;
+          groups[prefix].push_back(phi);
+        }
+
+        for (auto &[prefix, phis] : groups) {
+          if (phis.size() < 2)
+            continue;
+
+          // Check total bit width
+          unsigned total_bits = 0;
+          for (auto *phi : phis)
+            total_bits += phi->getType()->getScalarSizeInBits();
+          if (total_bits != 64)
+            continue;
+
+          // Determine bit offsets for each piece
+          llvm::SmallVector<FieldPiece, 4> pieces;
+          bool all_resolved = true;
+          for (auto *phi : phis) {
+            int offset = findBitOffset(phi);
+            if (offset < 0) {
+              all_resolved = false;
+              break;
+            }
+            pieces.push_back({phi,
+                              phi->getType()->getScalarSizeInBits(),
+                              static_cast<unsigned>(offset)});
+          }
+          if (!all_resolved)
+            continue;
+
+          // Sort by bit offset
+          llvm::sort(pieces, [](const auto &a, const auto &b) {
+            return a.bit_offset < b.bit_offset;
+          });
+
+          // Verify contiguous, non-overlapping
+          unsigned expected = 0;
+          bool valid = true;
+          for (auto &p : pieces) {
+            if (p.bit_offset != expected) {
+              valid = false;
+              break;
+            }
+            expected += p.bit_width;
+          }
+          if (!valid || expected != 64)
+            continue;
+
+          // Build the merged i64 PHI.
+          auto *merged = llvm::PHINode::Create(
+              llvm::Type::getInt64Ty(F.getContext()),
+              phis[0]->getNumIncomingValues(),
+              prefix.str(),
+              BB.getFirstNonPHIIt());
+
+          // For each incoming edge, build the i64 value from pieces.
+          for (unsigned i = 0; i < phis[0]->getNumIncomingValues(); ++i) {
+            auto *incoming_bb = phis[0]->getIncomingBlock(i);
+            // Build: (zext p0) | (zext p1 << s1) | ...
+            llvm::Value *assembled = nullptr;
+            auto *term = incoming_bb->getTerminator();
+            llvm::IRBuilder<> Builder(term);
+
+            for (auto &p : pieces) {
+              auto *val = p.phi->getIncomingValueForBlock(incoming_bb);
+              auto *ext = Builder.CreateZExt(val,
+                  llvm::Type::getInt64Ty(F.getContext()));
+              if (p.bit_offset > 0)
+                ext = Builder.CreateShl(ext, p.bit_offset);
+              if (!assembled)
+                assembled = ext;
+              else
+                assembled = Builder.CreateOr(assembled, ext);
+            }
+            merged->addIncoming(assembled, incoming_bb);
+          }
+
+          // Replace uses of sub-field PHIs with extracts from merged.
+          // Insert extracts after the merged PHI.
+          llvm::IRBuilder<> ExtractBuilder(
+              &*BB.getFirstNonPHIIt());
+          for (auto &p : pieces) {
+            llvm::Value *extracted;
+            if (p.bit_offset == 0 && p.bit_width == 64) {
+              extracted = merged;
+            } else {
+              llvm::Value *shifted = merged;
+              if (p.bit_offset > 0)
+                shifted = ExtractBuilder.CreateLShr(merged, p.bit_offset);
+              extracted = ExtractBuilder.CreateTrunc(
+                  shifted, p.phi->getType());
+            }
+            p.phi->replaceAllUsesWith(extracted);
+            changed = true;
+          }
+
+          // Erase old PHIs (in reverse to avoid iterator issues).
+          for (auto it = phis.rbegin(); it != phis.rend(); ++it)
+            (*it)->eraseFromParent();
+        }
+      }
+
+      return changed ? llvm::PreservedAnalyses::none()
+                     : llvm::PreservedAnalyses::all();
+    }
+    static bool isRequired() { return true; }
+  };
+
   // Post-ABI RSF + SROA + GVN: Convert RSP-relative inttoptr patterns
   // to alloca GEPs, decompose the allocas, and forward store→load.
   // This eliminates State struct pollution from the output and surfaces
@@ -18867,6 +19077,14 @@ native_boundary_repair_done:;
     // Second round: RSF may expose new patterns after GVN forwarding.
     RSF_FPM.addPass(omill::RecoverStackFramePass());
     RSF_FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+    RSF_FPM.addPass(llvm::GVNPass());
+    RSF_FPM.addPass(llvm::SimplifyCFGPass());
+    // Merge decomposed PHIs: SROA splits 64-bit State fields into
+    // sub-byte PHIs (i8/i16/i24/i32/i48).  Each handler reassembles
+    // them with zext+shl+or chains.  Merge them back into single i64
+    // PHIs to eliminate the reassembly overhead.
+    RSF_FPM.addPass(MergeDecomposedStatePHIsPass());
+    RSF_FPM.addPass(llvm::InstCombinePass());
     RSF_FPM.addPass(llvm::GVNPass());
     RSF_FPM.addPass(llvm::SimplifyCFGPass());
     // Dead Store Elimination: remove stores to State fields that are
