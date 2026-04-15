@@ -85,6 +85,7 @@
 #include "omill/Passes/InlineJumpTargets.h"
 #include "omill/BC/TraceLiftAnalysis.h"
 #include "omill/BC/BlockLifterAnalysis.h"
+#include "omill/Passes/IncrementalDevirtualization.h"
 #include "omill/Passes/IterativeBlockDiscovery.h"
 #include "omill/Passes/MergeBlockFunctions.h"
 #include "omill/Passes/JumpTableConcretizer.h"
@@ -9221,7 +9222,24 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
   };
 
   addPhaseMarker(MPM, "Phase 3.6: iterative target resolution");
-  if (opts.use_block_lifting) {
+  if (opts.use_block_lifting && opts.generic_static_devirtualize) {
+    // Unified incremental devirtualization: interleaves block discovery
+    // (lift→opt→resolve) with VM-model-guided materialization in a single
+    // fixpoint.  Replaces the separate Phase 3.6 + Phase 3.8 passes.
+    MPM.addPass(IncrementalDevirtualizationPass(
+        opts.session_graph, opts.max_resolution_iterations));
+    if (!envDisabled("OMILL_SKIP_NONEXEC_MISSING_BLOCK_TO_RET")) {
+      MPM.addPass(
+          llvm::RequireAnalysisPass<BinaryMemoryAnalysis, llvm::Module>());
+      MPM.addPass(RewriteNonExecutableMissingBlockToRetPass{});
+    }
+    if (opts.merge_block_functions_after_fixpoint) {
+      MPM.addPass(MergeBlockFunctionsPass());
+      addRecoveryAwareGlobalDCE(MPM, opts, RecoveryPipelinePhase::kResolve);
+      MPM.addPass(MergeBlockFunctionsPass());
+      MPM.addPass(llvm::GlobalDCEPass());
+    }
+  } else if (opts.use_block_lifting) {
     MPM.addPass(IterativeBlockDiscoveryPass(opts.max_resolution_iterations));
     // Early non-executable missing-block rewrite: if a
     // __remill_missing_block call targets a constant address in a
@@ -9463,7 +9481,10 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
                    /*aggressive_folding=*/true,
                    opts.scope_predicate});
     }
-    if (!envDisabled("OMILL_SKIP_GENERIC_STATIC_MATERIALIZATION")) {
+    // Skip standalone materialization when IncrementalDevirtualizationPass
+    // already ran it inside the unified fixpoint (block-lifting + devirt path).
+    if (!opts.use_block_lifting &&
+        !envDisabled("OMILL_SKIP_GENERIC_STATIC_MATERIALIZATION")) {
       if (opts.verify_generic_static_devirtualization)
         MPM.addPass(
             VerifiedVirtualCFGMaterializationPass(opts.session_graph));
