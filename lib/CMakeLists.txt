@@ -19,6 +19,7 @@ add_library(omill STATIC
   Utils/ProtectedBoundaryUtils.cpp
   Utils/StateFieldMap.cpp
   Tools/LiftRunContract.cpp
+  Tools/LiftEventLogger.cpp
 
   # Analysis
   Analysis/BinaryRegion.cpp
