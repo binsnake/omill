@@ -18869,6 +18869,18 @@ native_boundary_repair_done:;
     RSF_FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
     RSF_FPM.addPass(llvm::GVNPass());
     RSF_FPM.addPass(llvm::SimplifyCFGPass());
+    // Dead Store Elimination: remove stores to State fields that are
+    // overwritten before being read (VMP handler State writeback
+    // between dispatch iterations).
+    RSF_FPM.addPass(llvm::DSEPass());
+    RSF_FPM.addPass(llvm::ADCEPass());
+    // Constant Memory Folding fixpoint: fold loads from binary sections
+    // (VMP bytecode reads) + store→load forwarding + simplification.
+    RSF_FPM.addPass(omill::CombinedFixedPointDevirtPass());
+    RSF_FPM.addPass(llvm::InstCombinePass());
+    RSF_FPM.addPass(llvm::GVNPass());
+    RSF_FPM.addPass(llvm::ADCEPass());
+    RSF_FPM.addPass(llvm::SimplifyCFGPass());
     ModulePassManager RSF_MPM;
     RSF_MPM.addPass(
         llvm::createModuleToFunctionPassAdaptor(std::move(RSF_FPM)));
