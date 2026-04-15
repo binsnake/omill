@@ -1,5 +1,7 @@
 add_executable(omill-lift
   InputLoader.cpp
+  LiftMain.cpp
+  Options.cpp
   main.cpp
   RuntimeAdapters.cpp
   RecoveryBindings.cpp
