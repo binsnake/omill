@@ -2085,6 +2085,9 @@ static UnicornLoader &getUnicorn() {
 }
 }  // namespace
 
+/// Shared cache for extended redirect results (vm_entry/vm_exit detection).
+static llvm::DenseMap<uint64_t, RedirectAnalysisResult> g_redirect_ext_cache;
+
 uint64_t analyzeReturnAddressRedirect(
     const BinaryMemoryMap &mem, uint64_t entry_va) {
   if (!entry_va || !mem.isExecutable(entry_va, 1))
@@ -2222,22 +2225,58 @@ uint64_t analyzeReturnAddressRedirect(
   // is the redirect target.
   struct RedirectCtx {
     uint64_t redirect = 0;
+    uint64_t vm_entry_va = 0;
+    uint64_t vm_exit_va = 0;
+    uint64_t prev_addr = 0;
     bool after_vmp_call = false;
+    bool in_vmp = false;
   };
   RedirectCtx rctx;
+
+  // Derive VMP section bounds from the binary memory map.
+  uint64_t vmp_start = 0, vmp_end = 0;
+  uint64_t text_start = 0, text_end = 0;
+  mem.forEachRegion([&](uint64_t base, const uint8_t *, size_t size) {
+    if (base > entry_va && vmp_start == 0) {
+      // First section after the entry's section is likely VMP.
+      vmp_start = base;
+      vmp_end = base + size;
+    }
+    if (entry_va >= base && entry_va < base + size) {
+      text_start = base;
+      text_end = base + size;
+    }
+  });
+  // Fallback to hardcoded bounds if section detection fails.
+  if (vmp_start == 0) { vmp_start = 0x180008000; vmp_end = 0x18006848C; }
+  if (text_start == 0) { text_start = 0x180001000; text_end = 0x180003388; }
+
   uc_hook hr;
   UC.fn_hook_add(uc, &hr, UC_HOOK_CODE,
               (void *)(+[](uc_engine *, uint64_t addr, uint32_t,
                            void *user) {
                 auto *r = static_cast<RedirectCtx *>(user);
-                // Detect entering VMP section (call target in .MgW)
-                if (addr >= 0x180008000 && addr < 0x18006848C)
+                // Detect entering VMP section.
+                bool is_vmp = (addr >= 0x180008000 && addr < 0x18006848C);
+                if (is_vmp) {
+                  if (!r->in_vmp) {
+                    // Transition: .text → VMP. Record the first VMP
+                    // address as vm_entry candidate.
+                    r->in_vmp = true;
+                    if (r->vm_entry_va == 0)
+                      r->vm_entry_va = addr;
+                  }
                   r->after_vmp_call = true;
+                  r->vm_exit_va = addr;  // track last VMP addr seen
+                } else {
+                  r->in_vmp = false;
+                }
                 // First .text instruction after VMP = redirect target
                 if (r->after_vmp_call &&
                     addr >= 0x180001000 && addr < 0x180003388 &&
                     r->redirect == 0)
                   r->redirect = addr;
+                r->prev_addr = addr;
               }),
               &rctx, 1, 0);
 
@@ -2248,13 +2287,32 @@ uint64_t analyzeReturnAddressRedirect(
   llvm::errs() << "[uc-redirect] entry=0x"
                << llvm::Twine::utohexstr(entry_va)
                << " redirect=0x" << llvm::Twine::utohexstr(rctx.redirect)
+               << " vm_entry=0x" << llvm::Twine::utohexstr(rctx.vm_entry_va)
+               << " vm_exit=0x" << llvm::Twine::utohexstr(rctx.vm_exit_va)
                << " steps=" << ctx.count << "\n";
 
   uint64_t result = 0;
   if (rctx.redirect != 0 && mem.isExecutable(rctx.redirect, 1))
     result = rctx.redirect;
   cache[entry_va] = result;
+
+  // Store extended result for analyzeReturnAddressRedirectEx.
+  g_redirect_ext_cache[entry_va] = {result, rctx.vm_entry_va, rctx.vm_exit_va};
+
   return result;
+}
+
+RedirectAnalysisResult analyzeReturnAddressRedirectEx(
+    const BinaryMemoryMap &mem, uint64_t entry_va) {
+  auto it = g_redirect_ext_cache.find(entry_va);
+  if (it != g_redirect_ext_cache.end())
+    return it->second;
+  // Run the base analysis to populate both caches.
+  analyzeReturnAddressRedirect(mem, entry_va);
+  it = g_redirect_ext_cache.find(entry_va);
+  if (it != g_redirect_ext_cache.end())
+    return it->second;
+  return {};
 }
 
 #else  // !OMILL_ENABLE_UNICORN

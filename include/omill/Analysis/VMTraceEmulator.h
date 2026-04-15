@@ -97,9 +97,21 @@ std::optional<CallTargetBridgeEffect> analyzeCallTargetBridgeEffect(
 /// VMP entry stubs that redirect to a different continuation without
 /// returning to the instruction after the CALL.
 /// Emulate from \p entry_va (function entry, not the call target)
+/// Result of analyzeReturnAddressRedirect, including auto-detected VM
+/// entry/exit addresses observed during Unicorn emulation.
+struct RedirectAnalysisResult {
+  uint64_t redirect = 0;      ///< First .text address after VMP execution.
+  uint64_t vm_entry_va = 0;   ///< First VMP-section address hit (vm_entry candidate).
+  uint64_t vm_exit_va = 0;    ///< Last VMP-section address before returning to .text.
+};
+
 /// through the full call chain.  The function entry sets up RCX via
 /// LEA and the stack frame.  Returns the redirect target or 0.
 uint64_t analyzeReturnAddressRedirect(
+    const BinaryMemoryMap &memory_map, uint64_t entry_va);
+
+/// Extended version that also captures vm_entry/vm_exit candidates.
+RedirectAnalysisResult analyzeReturnAddressRedirectEx(
     const BinaryMemoryMap &memory_map, uint64_t entry_va);
 
 /// Concrete x86-64 emulator for the EasyAntiCheat hash-dispatch VM.
