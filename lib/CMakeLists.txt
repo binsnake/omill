@@ -124,6 +124,7 @@ add_library(omill STATIC
   Passes/VirtualCFGMaterialization.cpp
   Passes/VMHandlerInliner.cpp
   Passes/IncrementalDevirtualization.cpp
+  Passes/SplitSelectDispatch.cpp
   Passes/IterativeBlockDiscovery.cpp
   Passes/MergeBlockFunctions.cpp
   BC/BlockLifterAnalysis.cpp

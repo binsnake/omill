@@ -797,6 +797,14 @@ VirtualValueExpr specializeExpr(
   return result;
 }
 
+/// Count total nodes in an expression tree (for growth detection).
+static unsigned countExprNodes(const VirtualValueExpr &expr) {
+  unsigned count = 1;
+  for (auto &child : expr.operands)
+    count += countExprNodes(child);
+  return count;
+}
+
 VirtualValueExpr specializeExprToFixpoint(
     VirtualValueExpr expr,
     const std::map<unsigned, VirtualValueExpr> &incoming,
@@ -805,16 +813,27 @@ VirtualValueExpr specializeExprToFixpoint(
     const std::map<SlotKey, unsigned> &slot_ids,
     const std::map<StackCellKey, unsigned> &stack_cell_ids,
     unsigned max_rounds) {
-  (void) max_rounds;
-  annotateExprSlots(expr, slot_ids);
-  annotateExprStackCells(expr, stack_cell_ids, slot_ids);
-  auto specialized = specializeExpr(expr, incoming, incoming_stack, incoming_args);
-  annotateExprSlots(specialized, slot_ids);
-  annotateExprStackCells(specialized, stack_cell_ids, slot_ids);
-  canonicalizeMemoryReadsToStackCells(specialized, stack_cell_ids, slot_ids);
-  annotateExprSlots(specialized, slot_ids);
-  annotateExprStackCells(specialized, stack_cell_ids, slot_ids);
-  return specialized;
+  for (unsigned round = 0; round < max_rounds; ++round) {
+    annotateExprSlots(expr, slot_ids);
+    annotateExprStackCells(expr, stack_cell_ids, slot_ids);
+    auto specialized =
+        specializeExpr(expr, incoming, incoming_stack, incoming_args);
+    annotateExprSlots(specialized, slot_ids);
+    annotateExprStackCells(specialized, stack_cell_ids, slot_ids);
+    canonicalizeMemoryReadsToStackCells(specialized, stack_cell_ids, slot_ids);
+    annotateExprSlots(specialized, slot_ids);
+    annotateExprStackCells(specialized, stack_cell_ids, slot_ids);
+
+    // Fixpoint: no further substitution possible.
+    if (exprEquals(specialized, expr))
+      break;
+    // Safety: bail if expression is growing rather than simplifying.
+    if (countExprNodes(specialized) > countExprNodes(expr) * 2)
+      break;
+
+    expr = std::move(specialized);
+  }
+  return expr;
 }
 
 void specializeFactStateToFixpoint(
@@ -824,30 +843,42 @@ void specializeFactStateToFixpoint(
     const std::map<SlotKey, unsigned> &slot_ids,
     const std::map<StackCellKey, unsigned> &stack_cell_ids,
     unsigned max_rounds) {
-  (void) max_rounds;
-  auto snapshot_slots = slot_facts;
-  auto snapshot_stack = stack_facts;
+  for (unsigned round = 0; round < max_rounds; ++round) {
+    auto snapshot_slots = slot_facts;
+    auto snapshot_stack = stack_facts;
 
-  for (auto &[slot_id, value] : snapshot_slots) {
-    (void) slot_id;
-    annotateExprSlots(value, slot_ids);
-    annotateExprStackCells(value, stack_cell_ids, slot_ids);
-  }
-  for (auto &[cell_id, value] : snapshot_stack) {
-    (void) cell_id;
-    annotateExprSlots(value, slot_ids);
-    annotateExprStackCells(value, stack_cell_ids, slot_ids);
-  }
+    for (auto &[slot_id, value] : snapshot_slots) {
+      (void) slot_id;
+      annotateExprSlots(value, slot_ids);
+      annotateExprStackCells(value, stack_cell_ids, slot_ids);
+    }
+    for (auto &[cell_id, value] : snapshot_stack) {
+      (void) cell_id;
+      annotateExprSlots(value, slot_ids);
+      annotateExprStackCells(value, stack_cell_ids, slot_ids);
+    }
 
-  for (auto &[slot_id, value] : slot_facts) {
-    value = specializeExprToFixpoint(value, snapshot_slots, &snapshot_stack,
-                                     argument_facts, slot_ids,
-                                     stack_cell_ids, /*max_rounds=*/1);
-  }
-  for (auto &[cell_id, value] : stack_facts) {
-    value = specializeExprToFixpoint(value, snapshot_slots, &snapshot_stack,
-                                     argument_facts, slot_ids,
-                                     stack_cell_ids, /*max_rounds=*/1);
+    bool changed = false;
+    for (auto &[slot_id, value] : slot_facts) {
+      auto specialized = specializeExprToFixpoint(
+          value, snapshot_slots, &snapshot_stack, argument_facts, slot_ids,
+          stack_cell_ids, /*max_rounds=*/1);
+      if (!exprEquals(specialized, value)) {
+        value = std::move(specialized);
+        changed = true;
+      }
+    }
+    for (auto &[cell_id, value] : stack_facts) {
+      auto specialized = specializeExprToFixpoint(
+          value, snapshot_slots, &snapshot_stack, argument_facts, slot_ids,
+          stack_cell_ids, /*max_rounds=*/1);
+      if (!exprEquals(specialized, value)) {
+        value = std::move(specialized);
+        changed = true;
+      }
+    }
+    if (!changed)
+      break;
   }
 }
 

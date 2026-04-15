@@ -19,6 +19,7 @@
 #include "omill/Passes/CombinedFixedPointDevirt.h"
 #include "omill/Passes/FoldProgramCounter.h"
 #include "omill/Passes/JumpTableConcretizer.h"
+#include "omill/Passes/SplitSelectDispatch.h"
 #include "omill/Passes/LowerRemillIntrinsics.h"
 #include "omill/Passes/RecoverStackFrame.h"
 #include "omill/Passes/InterProceduralConstProp.h"
@@ -574,6 +575,7 @@ llvm::PreservedAnalyses IterativeBlockDiscoveryPass::run(
       FPM.addPass(llvm::GVNPass());
       FPM.addPass(llvm::ADCEPass());
       FPM.addPass(JumpTableConcretizerPass());
+      FPM.addPass(SplitSelectDispatchPass());
       FPM.addPass(RewriteNonExecMissingBlockFPM());
       FPM.addPass(llvm::SimplifyCFGPass());
       runDiscoveryFPM(M, MAM, std::move(FPM));
