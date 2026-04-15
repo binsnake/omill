@@ -19099,6 +19099,14 @@ native_boundary_repair_done:;
     RSF_FPM.addPass(llvm::GVNPass());
     RSF_FPM.addPass(llvm::ADCEPass());
     RSF_FPM.addPass(llvm::SimplifyCFGPass());
+    // Final cleanup round: run the PHI merge again (DSE may have
+    // exposed new opportunities), then full optimization to clean up.
+    RSF_FPM.addPass(MergeDecomposedStatePHIsPass());
+    RSF_FPM.addPass(llvm::InstCombinePass());
+    RSF_FPM.addPass(llvm::GVNPass());
+    RSF_FPM.addPass(llvm::DSEPass());
+    RSF_FPM.addPass(llvm::ADCEPass());
+    RSF_FPM.addPass(llvm::SimplifyCFGPass());
     ModulePassManager RSF_MPM;
     RSF_MPM.addPass(
         llvm::createModuleToFunctionPassAdaptor(std::move(RSF_FPM)));
