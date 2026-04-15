@@ -14,6 +14,8 @@ class Module;
 
 namespace omill {
 
+class VirtualMachineModel;
+
 /// Semantic role of a State struct offset in the context of devirtualization.
 enum class RegisterRole : uint8_t {
   kNone,
@@ -41,6 +43,12 @@ class RegisterRoleMap {
  public:
   /// Seed from static x86-64 State layout knowledge.
   void seedFromStateLayout(const llvm::DataLayout &DL, const llvm::Module &M);
+
+  /// Refine roles from the VirtualMachineModel's slot and stack owner
+  /// summaries.  Called after each VirtualMachineModelAnalysis run.
+  /// Identifies VIP from the canonical handler VIP slot, and VSP from
+  /// stack owners with kVmStackRootSlot kind.
+  void refineFromVirtualModel(const VirtualMachineModel &model);
 
   /// Bind a specific offset to a role.  Overwrites any existing binding.
   void bind(unsigned state_offset, unsigned width, RegisterRole role,

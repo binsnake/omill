@@ -123,6 +123,7 @@ add_library(omill STATIC
   Passes/TypeRecovery.cpp
   Passes/VirtualCFGMaterialization.cpp
   Passes/VMHandlerInliner.cpp
+  Passes/IncrementalDevirtualization.cpp
   Passes/IterativeBlockDiscovery.cpp
   Passes/MergeBlockFunctions.cpp
   BC/BlockLifterAnalysis.cpp

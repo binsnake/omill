@@ -9,6 +9,9 @@
 
 namespace omill {
 
+class RegisterRoleMap;
+class VirtualMachineModel;
+
 /// Inter-procedural constant propagation for lifted functions.
 ///
 /// When all resolved callers of a function store the same constant to
@@ -52,6 +55,8 @@ using IPCPLiftCallback = std::function<bool(uint64_t pc)>;
 bool propagateStateConstantsWorklist(
     llvm::Module &M, const llvm::DataLayout &DL,
     llvm::ModuleAnalysisManager *MAM = nullptr,
-    IPCPLiftCallback lift_callback = nullptr);
+    IPCPLiftCallback lift_callback = nullptr,
+    const RegisterRoleMap *role_map = nullptr,
+    const VirtualMachineModel *vm_model = nullptr);
 
 }  // namespace omill

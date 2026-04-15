@@ -18,6 +18,8 @@
 #include <deque>
 
 #include "omill/Analysis/CallGraphAnalysis.h"
+#include "omill/Analysis/RegisterRoleMap.h"
+#include "omill/Analysis/VirtualModel/Analysis.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
 #include "omill/Analysis/StateOffsetUtils.h"
 #include "omill/Passes/CombinedFixedPointDevirt.h"
@@ -437,7 +439,9 @@ struct WorklistEntry {
 bool propagateStateConstantsWorklist(
     llvm::Module &M, const llvm::DataLayout &DL,
     llvm::ModuleAnalysisManager *MAM,
-    IPCPLiftCallback lift_callback) {
+    IPCPLiftCallback lift_callback,
+    const RegisterRoleMap *role_map,
+    const VirtualMachineModel *vm_model) {
   bool changed = false;
 
   // Clone cache: (original function, input hash) → specialized clone.
@@ -451,6 +455,13 @@ bool propagateStateConstantsWorklist(
 
   std::deque<WorklistEntry> worklist;
 
+  // Resolve the VIP offset from the role map (if available).
+  std::optional<unsigned> vip_offset;
+  if (role_map) {
+    if (auto *vip_binding = role_map->bindingForRole(RegisterRole::kVIP))
+      vip_offset = vip_binding->state_offset;
+  }
+
   // Phase 1: Scan module for dispatch edges and seed the worklist.
   for (auto &F : M) {
     if (F.isDeclaration()) continue;
@@ -460,6 +471,18 @@ bool propagateStateConstantsWorklist(
     for (auto &edge : edges) {
       if (!edge.target || edge.target->isDeclaration()) continue;
       auto consts = collectPreCallStateConstants(edge.site, DL);
+
+      // VIP-seeding: if the IR doesn't have the VIP constant but the VM
+      // model has a resolved VIP for the target handler, inject it.
+      if (vip_offset && vm_model && !consts.count(*vip_offset)) {
+        auto *handler = vm_model->lookupHandler(edge.target->getName());
+        if (handler && handler->canonical_vip.resolved_pc) {
+          consts[*vip_offset] = llvm::cast<llvm::ConstantInt>(
+              llvm::ConstantInt::get(llvm::Type::getInt64Ty(M.getContext()),
+                                     *handler->canonical_vip.resolved_pc));
+        }
+      }
+
       if (consts.empty()) continue;
       uint64_t h = hashConstants(consts);
 

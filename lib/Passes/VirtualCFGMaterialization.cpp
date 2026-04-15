@@ -1,4 +1,5 @@
 #include "omill/Passes/VirtualCFGMaterialization.h"
+#include "omill/Analysis/RegisterRoleMap.h"
 #include "Analysis/VirtualModel/Internal.h"
 
 #include <llvm/ADT/SmallPtrSet.h>
@@ -2675,6 +2676,9 @@ static bool runLateTerminalBoundaryRecoveryCleanup(
 
     model =
         VirtualMachineModelAnalysis().run(M, AM, session_graph);
+    // Refine register roles from the updated model (VIP, VSP discovery).
+    if (auto *rrm = AM.getCachedResult<RegisterRoleMapAnalysis>(M))
+      rrm->map.refineFromVirtualModel(model);
     annotateClosedRootSlices(M, model);
     changed = true;
   }
@@ -2796,6 +2800,8 @@ static MaterializationResult runMaterialization(
                     " model-start");
     final_model =
         VirtualMachineModelAnalysis().run(M, AM, session_graph);
+    if (auto *rrm = AM.getCachedResult<RegisterRoleMapAnalysis>(M))
+      rrm->map.refineFromVirtualModel(final_model);
     final_model_current = true;
     genericDebugLog("iteration " + llvm::Twine(iteration).str() +
                     " model-done handlers=" +
