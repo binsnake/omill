@@ -2085,6 +2085,172 @@ static UnicornLoader &getUnicorn() {
 }
 }  // namespace
 
+/// Unicorn-backed single-step engine for VM handler tracing.
+/// Maps binary memory + EmuState stack once, then single-steps via Unicorn.
+class UnicornStepEngine {
+  uc_engine *uc_ = nullptr;
+  bool valid_ = false;
+  const BinaryMemoryMap &mem_;
+
+  static constexpr int kUCRegs[] = {
+    UC_X86_REG_RAX, UC_X86_REG_RCX, UC_X86_REG_RDX, UC_X86_REG_RBX,
+    UC_X86_REG_RSP, UC_X86_REG_RBP, UC_X86_REG_RSI, UC_X86_REG_RDI,
+    UC_X86_REG_R8, UC_X86_REG_R9, UC_X86_REG_R10, UC_X86_REG_R11,
+    UC_X86_REG_R12, UC_X86_REG_R13, UC_X86_REG_R14, UC_X86_REG_R15
+  };
+
+ public:
+  UnicornStepEngine(const BinaryMemoryMap &mem) : mem_(mem) {
+    auto &UC = getUnicorn();
+    if (!UC.loaded) return;
+    if (UC.fn_open(UC_ARCH_X86, UC_MODE_64, &uc_) != UC_ERR_OK) return;
+
+    // Map all binary sections.
+    mem.forEachRegion([&](uint64_t base, const uint8_t *data, size_t size) {
+      uint64_t page = base & ~0xFFFull;
+      uint64_t end = ((base + size) + 0xFFF) & ~0xFFFull;
+      UC.fn_mem_map(uc_, page, end - page, UC_PROT_ALL);
+      UC.fn_mem_write(uc_, base, data, size);
+    });
+
+    // Map the EmuState stack region.
+    UC.fn_mem_map(uc_, EmuState::kStackBase, EmuState::kStackSize, UC_PROT_ALL);
+
+    // Map low memory + GS segment for TEB stub.
+    UC.fn_mem_map(uc_, 0, 0x10000, UC_PROT_ALL);
+    constexpr uint64_t kGsBase = 0x7FFE0000ull;
+    UC.fn_mem_map(uc_, kGsBase, 0x10000, UC_PROT_ALL);
+    uc_x86_msr msr = {0xC0000101, kGsBase};
+    UC.fn_reg_write(uc_, UC_X86_REG_MSR, &msr);
+    uint64_t gs_self = kGsBase;
+    UC.fn_mem_write(uc_, kGsBase + 0x30, &gs_self, 8);
+    uint64_t stack_top = EmuState::kStackBase + EmuState::kStackSize;
+    UC.fn_mem_write(uc_, kGsBase + 0x08, &stack_top, 8);
+
+    // Auto-map unmapped memory on access.
+    uc_hook hm;
+    UC.fn_hook_add(uc_, &hm,
+        UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED |
+        UC_HOOK_MEM_FETCH_UNMAPPED,
+        (void *)(+[](uc_engine *uc, uc_mem_type, uint64_t addr,
+                     int, int64_t, void *) -> bool {
+          uint64_t page = addr & ~0xFFFull;
+          getUnicorn().fn_mem_map(uc, page, 0x1000, UC_PROT_ALL);
+          return true;
+        }),
+        nullptr, 1, 0);
+
+    // Skip interrupts (VMP anti-debug traps).
+    uc_hook hi;
+    UC.fn_hook_add(uc_, &hi, UC_HOOK_INTR,
+        (void *)(+[](uc_engine *uc, uint32_t, void *) {
+          auto &U = getUnicorn();
+          uint64_t rip;
+          U.fn_reg_read(uc, UC_X86_REG_RIP, &rip);
+          rip += 2;  // skip INT xx
+          U.fn_reg_write(uc, UC_X86_REG_RIP, &rip);
+        }),
+        nullptr, 1, 0);
+
+    valid_ = true;
+  }
+
+  ~UnicornStepEngine() {
+    if (uc_) getUnicorn().fn_close(uc_);
+  }
+
+  bool isValid() const { return valid_; }
+
+  /// Sync EmuState → Unicorn before stepping.
+  void syncToUnicorn(const EmuState &state) {
+    auto &UC = getUnicorn();
+    for (unsigned i = 0; i < REG_COUNT && i < 16; ++i)
+      UC.fn_reg_write(uc_, kUCRegs[i], &state.regs[i]);
+    UC.fn_reg_write(uc_, UC_X86_REG_RIP, &state.rip);
+    // Write the stack buffer.
+    UC.fn_mem_write(uc_, EmuState::kStackBase,
+                    state.stack_mem.data(), EmuState::kStackSize);
+    // Sync flags via EFLAGS register.
+    uint64_t eflags = (state.flags.CF ? 1 : 0) |
+                      (state.flags.ZF ? (1 << 6) : 0) |
+                      (state.flags.SF ? (1 << 7) : 0) |
+                      (state.flags.OF ? (1 << 11) : 0) |
+                      (1 << 1);  // reserved bit 1 always set
+    UC.fn_reg_write(uc_, UC_X86_REG_EFLAGS, &eflags);
+  }
+
+  /// Sync Unicorn → EmuState after stepping.
+  void syncFromUnicorn(EmuState &state) {
+    auto &UC = getUnicorn();
+    for (unsigned i = 0; i < REG_COUNT && i < 16; ++i)
+      UC.fn_reg_read(uc_, kUCRegs[i], &state.regs[i]);
+    UC.fn_reg_read(uc_, UC_X86_REG_RIP, &state.rip);
+    UC.fn_mem_read(uc_, EmuState::kStackBase,
+                   state.stack_mem.data(), EmuState::kStackSize);
+    uint64_t eflags = 0;
+    UC.fn_reg_read(uc_, UC_X86_REG_EFLAGS, &eflags);
+    state.flags.CF = (eflags >> 0) & 1;
+    state.flags.ZF = (eflags >> 6) & 1;
+    state.flags.SF = (eflags >> 7) & 1;
+    state.flags.OF = (eflags >> 11) & 1;
+  }
+
+  /// Execute exactly one instruction and classify the result.
+  ExecResult step(EmuState &state) {
+    auto &UC = getUnicorn();
+    uint64_t pre_rip = state.rip;
+
+    // Read instruction bytes to classify before executing.
+    uint8_t buf[15];
+    UC.fn_mem_read(uc_, pre_rip, buf, 15);
+
+    syncToUnicorn(state);
+
+    // Single-step: execute 1 instruction.
+    auto err = UC.fn_emu_start(uc_, pre_rip, 0, 0, 1);
+    syncFromUnicorn(state);
+
+    if (err != UC_ERR_OK)
+      return ExecResult::Unsupported;
+
+    // Classify by decoding the instruction at pre_rip.
+    unsigned pos = 0;
+    // Skip prefixes (REX, operand size, lock, rep, segment).
+    while (pos < 14) {
+      uint8_t b = buf[pos];
+      if ((b & 0xF0) == 0x40) { ++pos; continue; }  // REX
+      if (b == 0x66 || b == 0x67 || b == 0xF0 ||
+          b == 0xF2 || b == 0xF3) { ++pos; continue; }
+      if (b == 0x2E || b == 0x3E || b == 0x26 || b == 0x36 ||
+          b == 0x64 || b == 0x65) { ++pos; continue; }
+      break;
+    }
+    uint8_t op = buf[pos];
+
+    // RET
+    if (op == 0xC3 || op == 0xC2 || op == 0xCB || op == 0xCA)
+      return ExecResult::Ret;
+
+    // Direct CALL (E8 rel32)
+    if (op == 0xE8)
+      return ExecResult::Call;
+
+    // Indirect CALL (FF /2) or indirect JMP (FF /4)
+    if (op == 0xFF) {
+      uint8_t modrm = buf[pos + 1];
+      uint8_t reg = (modrm >> 3) & 7;
+      if (reg == 2) return ExecResult::Call;  // CALL r/m64
+      if (reg == 4) return ExecResult::IndirectJump;  // JMP r/m64
+    }
+
+    // Direct JMP (E9/EB)
+    if (op == 0xE9 || op == 0xEB)
+      return ExecResult::Jump;
+
+    return ExecResult::Continue;
+  }
+};
+
 /// Shared cache for extended redirect results (vm_entry/vm_exit detection).
 static llvm::DenseMap<uint64_t, RedirectAnalysisResult> g_redirect_ext_cache;
 
@@ -2822,6 +2988,14 @@ VMTraceEmulator::traceFromHandlerImpl(
 
   bool stateful_mode = vmcontext_snapshot && vmcontext_snapshot->size() > 0x200;
 
+  // Create Unicorn-backed step engine (replaces the built-in mini-emulator).
+  UnicornStepEngine uc_engine(mem_);
+  const bool use_unicorn = uc_engine.isValid();
+  if (!use_unicorn) {
+    llvm::errs() << "VMTraceEmulator: Unicorn not available, "
+                    "falling back to built-in emulator\n";
+  }
+
   struct TrackedSlots {
     uint64_t s38 = 0;
     uint64_t sB8 = 0;
@@ -3071,7 +3245,8 @@ VMTraceEmulator::traceFromHandlerImpl(
       uint64_t rsp_before = state.regs[RSP];
       uint64_t r12_before = state.regs[R12];
       auto slots_before = trace_slots ? readTrackedSlots(state) : TrackedSlots{};
-      ExecResult res = stepInstruction(state, mem_);
+      ExecResult res = use_unicorn ? uc_engine.step(state)
+                                    : stepInstruction(state, mem_);
       if (trace_slots) {
         auto slots_after = readTrackedSlots(state);
         bool changed = rsp_before != state.regs[RSP] ||
