@@ -19114,10 +19114,11 @@ native_boundary_repair_done:;
     MAM.invalidate(*module, llvm::PreservedAnalyses::none());
   }
 
-  // TODO: Recursive scc_dispatch calls with constant PC arguments
-  // could be specialized by extracting just the target handler case
-  // instead of inlining the entire 8K-line function.  Requires a
-  // dedicated pass that clones only the matching switch case.
+  // NOTE: Recursive scc_dispatch calls with constant PC could be
+  // specialized but full-function inlining (even one-at-a-time with
+  // cleanup) causes memory explosion on this 8K-line function.
+  // Future: implement switch-case outlining to extract individual
+  // handler bodies as small functions, then inline those.
 
   std::error_code EC;
   events.emitInfo("output_write_started", "writing final output",
