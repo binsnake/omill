@@ -1,5 +1,0 @@
-if(EXISTS "D:/binsnake/omill/build-remill2/tests/omill-e2e-tests[1]_tests.cmake")
-  include("D:/binsnake/omill/build-remill2/tests/omill-e2e-tests[1]_tests.cmake")
-else()
-  add_test(omill-e2e-tests_NOT_BUILT omill-e2e-tests_NOT_BUILT)
-endif()

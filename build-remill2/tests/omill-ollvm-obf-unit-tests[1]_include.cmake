@@ -1,5 +1,0 @@
-if(EXISTS "D:/binsnake/omill/build-remill2/tests/omill-ollvm-obf-unit-tests[1]_tests.cmake")
-  include("D:/binsnake/omill/build-remill2/tests/omill-ollvm-obf-unit-tests[1]_tests.cmake")
-else()
-  add_test(omill-ollvm-obf-unit-tests_NOT_BUILT omill-ollvm-obf-unit-tests_NOT_BUILT)
-endif()

@@ -2459,8 +2459,10 @@ VMTraceEmulator::parseEntryWrapper(
     break;
   }
 
-  // 1) lea rsp, [rsp - N]: 48 8D A4 24 <disp32>
+  // 1) lea rsp, [rsp +/- N]: 48 8D A4 24 <disp32>
   //    or: 48 8D 64 24 <disp8>
+  //    Accept any displacement (positive or negative) — VMP wrappers may
+  //    adjust RSP in either direction depending on the wrapper variant.
   if (pos + 8 <= sizeof(buf) &&
       buf[pos] == 0x48 && buf[pos + 1] == 0x8D &&
       buf[pos + 2] == 0xA4 && buf[pos + 3] == 0x24) {
@@ -2470,11 +2472,29 @@ VMTraceEmulator::parseEntryWrapper(
              buf[pos + 2] == 0x64 && buf[pos + 3] == 0x24) {
     pos += 5;  // 48 8D 64 24 + 1-byte disp
   } else {
-    // Try without LEA (some wrappers may use SUB RSP).
+    // Try without LEA (some wrappers may use SUB RSP or ADD RSP).
     // sub rsp, imm32: 48 81 EC <imm32>
     if (pos + 7 <= sizeof(buf) &&
         buf[pos] == 0x48 && buf[pos + 1] == 0x81 && buf[pos + 2] == 0xEC) {
       pos += 7;
+    }
+    // add rsp, imm32: 48 81 C4 <imm32>
+    else if (pos + 7 <= sizeof(buf) &&
+             buf[pos] == 0x48 && buf[pos + 1] == 0x81 &&
+             buf[pos + 2] == 0xC4) {
+      pos += 7;
+    }
+    // add rsp, imm8: 48 83 C4 <imm8>
+    else if (pos + 4 <= sizeof(buf) &&
+             buf[pos] == 0x48 && buf[pos + 1] == 0x83 &&
+             buf[pos + 2] == 0xC4) {
+      pos += 4;
+    }
+    // sub rsp, imm8: 48 83 EC <imm8>
+    else if (pos + 4 <= sizeof(buf) &&
+             buf[pos] == 0x48 && buf[pos + 1] == 0x83 &&
+             buf[pos + 2] == 0xEC) {
+      pos += 4;
     }
   }
 
@@ -2630,9 +2650,26 @@ std::vector<VMTraceEmulator::TraceEntry>
 VMTraceEmulator::traceFromWrapper(uint64_t wrapper_va) {
   auto info = parseEntryWrapper(wrapper_va);
   if (!info.valid) {
-    llvm::errs() << "VMTraceEmulator: failed to parse wrapper at "
-                 << llvm::utohexstr(wrapper_va) << "\n";
-    return {};
+    // Fallback: if the byte-pattern parser fails but we know the vmentry VA
+    // from Unicorn redirect analysis, use vmenter_va_ directly with zero
+    // delta and hash.  This loses the initial hash (breaking hash-threaded
+    // demerging) but still allows tracing the handler chain for dispatch
+    // target discovery.
+    auto ext = analyzeReturnAddressRedirectEx(mem_, wrapper_va);
+    if (ext.vm_entry_va != 0) {
+      llvm::errs() << "VMTraceEmulator: wrapper parse failed at "
+                   << llvm::utohexstr(wrapper_va)
+                   << ", falling back to Unicorn-detected vm_entry=0x"
+                   << llvm::utohexstr(ext.vm_entry_va) << "\n";
+      info.first_handler_va = ext.vm_entry_va;
+      info.delta = 0;
+      info.initial_hash = 0;
+      info.valid = true;
+    } else {
+      llvm::errs() << "VMTraceEmulator: failed to parse wrapper at "
+                   << llvm::utohexstr(wrapper_va) << "\n";
+      return {};
+    }
   }
 
   llvm::errs() << "VMTraceEmulator: wrapper at "
