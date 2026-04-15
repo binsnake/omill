@@ -50,6 +50,8 @@
 #include "omill/BC/TraceLifter.h"
 #include "omill/BC/BlockLifter.h"
 #include "omill/BC/BlockLifterAnalysis.h"
+#include "omill/BC/BufferMemoryAdapters.h"
+#include "omill/BC/LiftingArtifactFixes.h"
 #include "omill/BC/TraceLiftAnalysis.h"
 #include <remill/BC/Util.h>
 #include <remill/OS/OS.h>
@@ -82,6 +84,7 @@
 #include "omill/Passes/RecoverStackFrame.h"
 #include "omill/Passes/LowerRemillIntrinsics.h"
 #include "omill/Passes/DeadStateStoreDSE.h"
+#include "omill/Passes/MergeDecomposedStatePHIs.h"
 
 #include "omill/Passes/ResolveAndLowerControlFlow.h"
 #include "omill/Passes/OptimizeState.h"
@@ -113,68 +116,6 @@
 
 using namespace llvm;
 
-/// Repair malformed PHI nodes in a module so it can be written as valid LL.
-/// Handles two cases:
-/// 1. Incoming values from blocks that are not predecessors (stale entries).
-/// 2. Missing duplicate entries for multi-edge predecessors (e.g. switch
-///    with two cases branching to the same block needs two PHI entries).
-static void repairMalformedPHIs(Module &M) {
-  for (auto &F : M) {
-    if (F.isDeclaration()) continue;
-
-    auto *entry = &F.getEntryBlock();
-    if (!pred_empty(entry)) {
-      auto *new_entry = BasicBlock::Create(F.getContext(), "entry.fix", &F, entry);
-      IRBuilder<> ir(new_entry);
-      ir.CreateBr(entry);
-      for (auto &I : *entry) {
-        auto *phi = dyn_cast<PHINode>(&I);
-        if (!phi) break;
-        phi->addIncoming(PoisonValue::get(phi->getType()), new_entry);
-      }
-    }
-
-    for (auto &BB : F) {
-      // Count how many edges each predecessor has to this block.
-      DenseMap<BasicBlock *, unsigned> pred_edge_count;
-      for (auto *P : predecessors(&BB))
-        ++pred_edge_count[P];
-
-      for (auto &I : make_early_inc_range(BB)) {
-        auto *phi = dyn_cast<PHINode>(&I);
-        if (!phi) break;
-
-        // Remove entries from non-predecessors.
-        for (unsigned i = phi->getNumIncomingValues(); i-- > 0;) {
-          if (!pred_edge_count.count(phi->getIncomingBlock(i))) {
-            phi->removeIncomingValue(i, /*DeletePHIIfEmpty=*/false);
-          }
-        }
-
-        // Count current entries per predecessor.
-        DenseMap<BasicBlock *, unsigned> phi_count;
-        for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i)
-          ++phi_count[phi->getIncomingBlock(i)];
-
-        // Add missing duplicate entries for multi-edge predecessors.
-        for (auto &[pred, needed] : pred_edge_count) {
-          unsigned have = phi_count.lookup(pred);
-          if (have == 0) continue;  // No entry at all — can't invent a value.
-          for (unsigned j = have; j < needed; ++j) {
-            // Find the existing value for this predecessor.
-            Value *val = phi->getIncomingValueForBlock(pred);
-            phi->addIncoming(val, pred);
-          }
-        }
-
-        if (phi->getNumIncomingValues() == 0) {
-          phi->replaceAllUsesWith(PoisonValue::get(phi->getType()));
-          phi->eraseFromParent();
-        }
-      }
-    }
-  }
-}
 
 static bool wantIterativeSessionReport() {
   const char *env = std::getenv("OMILL_REPORT_ITERATIVE_SESSION");
@@ -2044,257 +1985,6 @@ static bool writeRuntimeArtifactReport(
   return true;
 }
 
-static std::vector<uint64_t> discoverJumpTableTargetsForInstruction(
-    const omill::BinaryMemoryMap *memory_map, omill::TargetArch target_arch,
-    const remill::Instruction &inst) {
-  if (!memory_map || target_arch != omill::TargetArch::kX86_64)
-    return {};
-  return omill::discoverJumpTableTargetsForInstruction(*memory_map, inst.pc);
-}
-
-
-/// In-memory trace manager for remill lifting.
-class BufferTraceManager : public omill::TraceManager {
- public:
-  void setCode(const uint8_t *data, size_t size, uint64_t base) {
-    code_[base] = {data, data + size};
-    base_addr_ = base;
-  }
-
-  void setBaseAddr(uint64_t addr) { base_addr_ = addr; }
-  uint64_t baseAddr() const { return base_addr_; }
-  void setBinaryMemoryMap(const omill::BinaryMemoryMap *memory_map) {
-    memory_map_ = memory_map;
-  }
-  void setTargetArch(omill::TargetArch arch) { target_arch_ = arch; }
-
-  /// Must be called after the module and arch are created so that
-  /// shallow-lift mode can create proper function declarations.
-  void setModuleAndArch(llvm::Module *m, const remill::Arch *a) {
-    module_ = m;
-    arch_ = a;
-  }
-
-  void SetLiftedTraceDefinition(uint64_t addr,
-                                llvm::Function *func) override {
-    lifted_[addr] = func;
-    ++lift_count_;
-  }
-
-  llvm::Function *GetLiftedTraceDeclaration(uint64_t addr) override {
-    auto it = lifted_.find(addr);
-    if (it == lifted_.end())
-      return nullptr;
-    auto *func = llvm::dyn_cast_or_null<llvm::Function>(it->second);
-    if (!func)
-      lifted_.erase(it);
-    return func;
-  }
-
-  llvm::Function *GetLiftedTraceDefinition(uint64_t addr) override {
-    // In shallow mode, report all addresses outside the root set as
-    // "already lifted" to prevent recursive lifting of the entire
-    // call graph.  This is used for late target discovery where we
-    // only need the target function, not its callees.
-    if (max_lift_count_ > 0 && lift_count_ >= max_lift_count_) {
-      auto it = lifted_.find(addr);
-      if (it != lifted_.end()) {
-        auto *func = llvm::dyn_cast_or_null<llvm::Function>(it->second);
-        if (!func)
-          lifted_.erase(it);
-        else
-          return func;
-      }
-      // Create a real declaration so the TraceLifter can safely
-      // dereference the returned pointer (it checks getParent()).
-      auto *decl = arch_->DeclareLiftedFunction(TraceName(addr), module_);
-      lifted_[addr] = decl;
-      return decl;
-    }
-    return GetLiftedTraceDeclaration(addr);
-  }
-
-  /// Set maximum number of traces to lift per Lift() call.  0 = unlimited.
-  void setMaxLiftCount(unsigned n) { max_lift_count_ = n; }
-  void resetLiftCount() { lift_count_ = 0; }
-
-  bool TryReadExecutableByte(uint64_t addr, uint8_t *out) override {
-    for (auto &[base, data] : code_) {
-      if (addr >= base && addr < base + data.size()) {
-        *out = data[addr - base];
-        return true;
-      }
-    }
-    return false;
-  }
-
-  void ForEachDevirtualizedTarget(
-      const remill::Instruction &inst,
-      std::function<void(uint64_t, omill::DevirtualizedTargetKind)> func)
-      override {
-    for (uint64_t target :
-         discoverJumpTableTargetsForInstruction(memory_map_, target_arch_, inst)) {
-      auto decision = getLiftTargetPolicy()->ResolveLiftTarget(
-          inst.pc, target, omill::LiftTargetEdgeKind::kIndirectTarget);
-      if (decision.shouldLift() && decision.effective_target_pc) {
-        func(*decision.effective_target_pc,
-             omill::DevirtualizedTargetKind::kTraceLocal);
-      }
-    }
-  }
-
-  omill::LiftTargetDecision ResolveLiftTarget(
-      uint64_t source_pc, uint64_t raw_target_pc,
-      omill::LiftTargetEdgeKind edge_kind) override {
-    return getLiftTargetPolicy()->ResolveLiftTarget(source_pc, raw_target_pc,
-                                                    edge_kind);
-  }
-
-  omill::DecodeFailureDecision ResolveDecodeFailure(
-      uint64_t source_addr, uint64_t failed_pc,
-      const omill::DecodeFailureContext &ctx) override {
-    llvm::SmallVector<uint64_t, 16> known_entries;
-    known_entries.reserve(lifted_.size());
-    for (const auto &[candidate_pc, candidate_vh] : lifted_) {
-      (void)candidate_vh;
-      known_entries.push_back(candidate_pc);
-    }
-    return getLiftTargetPolicy()->ResolveDecodeFailure(source_addr, failed_pc,
-                                                       known_entries, ctx);
-  }
-
-private:
-  omill::LiftTargetPolicy *getLiftTargetPolicy() {
-    if (!lift_target_policy_ ||
-        lift_target_policy_memory_map_ != memory_map_ ||
-        lift_target_policy_arch_ != target_arch_) {
-      lift_target_policy_ =
-          omill::createBinaryLiftTargetPolicy(memory_map_, target_arch_);
-      lift_target_policy_memory_map_ = memory_map_;
-      lift_target_policy_arch_ = target_arch_;
-    }
-    return lift_target_policy_.get();
-  }
-
-  std::map<uint64_t, std::vector<uint8_t>> code_;
-  std::map<uint64_t, llvm::WeakTrackingVH> lifted_;
-  uint64_t base_addr_ = 0;
-  unsigned max_lift_count_ = 0;
-  unsigned lift_count_ = 0;
-  llvm::Module *module_ = nullptr;
-  const remill::Arch *arch_ = nullptr;
-  const omill::BinaryMemoryMap *memory_map_ = nullptr;
-  omill::TargetArch target_arch_ = omill::TargetArch::kX86_64;
-  std::unique_ptr<omill::LiftTargetPolicy> lift_target_policy_;
-  const omill::BinaryMemoryMap *lift_target_policy_memory_map_ = nullptr;
-  omill::TargetArch lift_target_policy_arch_ = omill::TargetArch::kX86_64;
-};
-
-/// In-memory block manager for block-lifting mode.
-class BufferBlockManager : public omill::BlockManager {
- public:
-  void setModule(llvm::Module *module) { module_ = module; }
-  void setBinaryMemoryMap(const omill::BinaryMemoryMap *memory_map) {
-    memory_map_ = memory_map;
-  }
-  void setTargetArch(omill::TargetArch arch) { target_arch_ = arch; }
-
-  void setCode(const uint8_t *data, size_t size, uint64_t base) {
-    code_[base] = {data, data + size};
-  }
-
-  void addCode(uint64_t base, const uint8_t *data, size_t size) override {
-    code_[base].assign(data, data + size);
-  }
-
-  void SetLiftedBlockDefinition(uint64_t addr,
-                                 llvm::Function *fn) override {
-    blocks_[addr] = fn;
-  }
-
-  llvm::Function *GetLiftedBlockDeclaration(uint64_t addr) override {
-    auto it = blocks_.find(addr);
-    return (it != blocks_.end()) ? it->second : nullptr;
-  }
-
-  llvm::Function *GetLiftedBlockDefinition(uint64_t addr) override {
-    return GetLiftedBlockDeclaration(addr);
-  }
-
-  bool TryReadExecutableByte(uint64_t addr, uint8_t *out) override {
-    for (auto &[base, data] : code_) {
-      if (addr >= base && addr < base + data.size()) {
-        *out = data[addr - base];
-        return true;
-      }
-    }
-    return false;
-  }
-
-  void ForEachDevirtualizedTarget(
-      const remill::Instruction &inst,
-      std::function<void(uint64_t, omill::DevirtualizedTargetKind)> func)
-      override {
-    for (uint64_t target :
-         discoverJumpTableTargetsForInstruction(memory_map_, target_arch_, inst)) {
-      auto decision = getLiftTargetPolicy()->ResolveLiftTarget(
-          inst.pc, target, omill::LiftTargetEdgeKind::kIndirectTarget);
-      if (decision.shouldLift() && decision.effective_target_pc) {
-        func(*decision.effective_target_pc,
-             omill::DevirtualizedTargetKind::kTraceLocal);
-      }
-    }
-  }
-
-  omill::LiftTargetDecision ResolveLiftTarget(
-      uint64_t source_pc, uint64_t raw_target_pc,
-      omill::LiftTargetEdgeKind edge_kind) override {
-    return getLiftTargetPolicy()->ResolveLiftTarget(source_pc, raw_target_pc,
-                                                    edge_kind);
-  }
-
-  omill::DecodeFailureDecision ResolveDecodeFailure(
-      uint64_t source_addr, uint64_t failed_pc,
-      const omill::DecodeFailureContext &ctx) override {
-    llvm::SmallVector<uint64_t, 16> known_entries;
-    known_entries.reserve(blocks_.size());
-    for (const auto &[candidate_pc, candidate_fn] : blocks_) {
-      (void)candidate_fn;
-      known_entries.push_back(candidate_pc);
-    }
-    return getLiftTargetPolicy()->ResolveDecodeFailure(source_addr, failed_pc,
-                                                       known_entries, ctx);
-  }
-
-  llvm::Module *GetLiftedBlockModule() override { return module_; }
-
-  const omill::BinaryMemoryMap *GetBinaryMemoryMap() const override {
-    return memory_map_;
-  }
-
-private:
-  omill::LiftTargetPolicy *getLiftTargetPolicy() {
-    if (!lift_target_policy_ ||
-        lift_target_policy_memory_map_ != memory_map_ ||
-        lift_target_policy_arch_ != target_arch_) {
-      lift_target_policy_ =
-          omill::createBinaryLiftTargetPolicy(memory_map_, target_arch_);
-      lift_target_policy_memory_map_ = memory_map_;
-      lift_target_policy_arch_ = target_arch_;
-    }
-    return lift_target_policy_.get();
-  }
-
-  std::map<uint64_t, std::vector<uint8_t>> code_;
-  std::map<uint64_t, llvm::Function *> blocks_;
-  llvm::Module *module_ = nullptr;
-  const omill::BinaryMemoryMap *memory_map_ = nullptr;
-  omill::TargetArch target_arch_ = omill::TargetArch::kX86_64;
-  std::unique_ptr<omill::LiftTargetPolicy> lift_target_policy_;
-  const omill::BinaryMemoryMap *lift_target_policy_memory_map_ = nullptr;
-  omill::TargetArch lift_target_policy_arch_ = omill::TargetArch::kX86_64;
-};
-
 struct ScanResult {
   uint64_t va;
   uint32_t size;
@@ -2907,7 +2597,7 @@ int main(int argc, char **argv) {
   }
 
   // Load code into the trace manager.
-  BufferTraceManager manager;
+  omill::BufferTraceManager manager;
   manager.setModuleAndArch(module.get(), arch.get());
   if (!RawBinary)
     manager.setBinaryMemoryMap(&pe.memory_map);
@@ -2962,11 +2652,11 @@ int main(int argc, char **argv) {
   std::unique_ptr<omill::LiftDatabase> lift_db;
   std::unique_ptr<omill::StaticLiftBuilder> lift_db_builder;
 
-  std::unique_ptr<BufferBlockManager> block_manager;
+  std::unique_ptr<omill::BufferBlockManager> block_manager;
   std::unique_ptr<omill::BlockLifter> block_lifter;
   std::unique_ptr<omill::RemillProjectionLifter> projection_lifter;
   if (!vm_mode) {
-    block_manager = std::make_unique<BufferBlockManager>();
+    block_manager = std::make_unique<omill::BufferBlockManager>();
     block_manager->setModule(module.get());
     if (!RawBinary)
       block_manager->setBinaryMemoryMap(&pe.memory_map);
@@ -8463,7 +8153,7 @@ int main(int argc, char **argv) {
     ModulePassManager MPM;
     omill::buildPipeline(MPM, opts);
     MPM.run(*module, MAM);
-    repairMalformedPHIs(*module);
+    omill::repairMalformedPHIs(*module);
     MAM.invalidate(*module, llvm::PreservedAnalyses::none());
   }
   emitIterativeSessionEvents(events, iterative_session, "main-pipeline");
@@ -8871,7 +8561,7 @@ int main(int argc, char **argv) {
         errs() << "[abi-prep] repaired-live-pre-abi-edges="
                << rewritten_live_pre_abi << "\n";
         MAM.invalidate(*module, llvm::PreservedAnalyses::none());
-        repairMalformedPHIs(*module);
+        omill::repairMalformedPHIs(*module);
       }
     }
 
@@ -8896,7 +8586,7 @@ int main(int argc, char **argv) {
 
 
     appendDebugMarker("abi:before_repair_phis");
-    repairMalformedPHIs(*module);
+    omill::repairMalformedPHIs(*module);
     appendDebugMarker("abi:after_repair_phis");
     appendDebugMarker("abi:before_raw_checkpoint_print");
     {
@@ -8928,7 +8618,7 @@ int main(int argc, char **argv) {
                 ordered_calli_targets,
                 "abi_prepatch_output_root_calli",
                 "patched pre-ABI output-root constant CALLI callsites") > 0) {
-          repairMalformedPHIs(*module);
+          omill::repairMalformedPHIs(*module);
         }
       }
     }
@@ -9628,7 +9318,7 @@ int main(int argc, char **argv) {
       fixupB3DispatchArgMismatches();
       repairSyntheticStackTopStateArgs();
       materializeZeroedSyntheticStateArgs();
-      repairMalformedPHIs(*module);
+      omill::repairMalformedPHIs(*module);
       if (parseBoolEnv("OMILL_DEBUG_PUBLIC_ROOT_SEEDS").value_or(false))
         errs() << "[abi-post] fixupB3DispatchArgMismatches:late-rerun:end\n";
     };
@@ -10238,226 +9928,6 @@ int main(int argc, char **argv) {
     };
     // Legacy wrapper cloning/patching was removed with the `_native`
     // compatibility pipeline.
-
-    // Per-callsite specialization of VM native call targets.
-    // Clone functions like sub_1400dcbf8_native per call site, bake in
-    // emulator-derived GPR constants so hash-based import resolution succeeds.
-    if (false && vm_mode && !native_call_infos.empty()) {
-      // Build State-offset → emulator RegIdx lookup.
-      // Remill GPR order in State: RAX,RBX,RCX,RDX,RSI,RDI,RSP,RBP,R8..R15.
-      // x86 encoding order (EmuState): RAX=0,RCX=1,RDX=2,RBX=3,RSP=4,...
-      // State offsets: each GPR at 2208 + N*16 + 8 where N is remill order.
-      const unsigned kRemillGPRToRegIdx[] = {
-        0,  // RAX → RegIdx 0
-        3,  // RBX → RegIdx 3
-        1,  // RCX → RegIdx 1
-        2,  // RDX → RegIdx 2
-        6,  // RSI → RegIdx 6
-        7,  // RDI → RegIdx 7
-        4,  // RSP → RegIdx 4
-        5,  // RBP → RegIdx 5
-        8,  // R8  → RegIdx 8
-        9, 10, 11, 12, 13, 14, 15  // R9..R15
-      };
-      llvm::DenseMap<unsigned, unsigned> stateOffsetToRegIdx;
-      for (unsigned i = 0; i < 16; ++i) {
-        unsigned state_offset = 2208 + i * 16 + 8;
-        stateOffsetToRegIdx[state_offset] = kRemillGPRToRegIdx[i];
-      }
-
-      // Find the wrapper's _native function.
-      std::string wrapper_native_name =
-          "sub_" + llvm::Twine::utohexstr(vm_wrapper_va).str() + "_native";
-      auto *wrapper_fn = module->getFunction(wrapper_native_name);
-
-      if (wrapper_fn && !wrapper_fn->isDeclaration()) {
-        // Group NativeCallInfos by target VA.
-        llvm::DenseMap<uint64_t, llvm::SmallVector<unsigned, 4>>
-            target_to_info_indices;
-        for (unsigned i = 0; i < native_call_infos.size(); ++i)
-          target_to_info_indices[native_call_infos[i].target_va].push_back(i);
-
-        auto *i64_ty = llvm::Type::getInt64Ty(module->getContext());
-
-        for (auto &[target_va, info_indices] : target_to_info_indices) {
-          // Only specialize targets that appear multiple times (worth cloning).
-          if (info_indices.size() < 2)
-            continue;
-
-          std::string target_name =
-              "sub_" + llvm::Twine::utohexstr(target_va).str() + "_native";
-          auto *target_fn = module->getFunction(target_name);
-          if (!target_fn || target_fn->isDeclaration())
-            continue;
-
-          // Parse param_state_offsets attribute.
-          auto offsets_attr =
-              target_fn->getFnAttribute("omill.param_state_offsets");
-          if (!offsets_attr.isValid() || !offsets_attr.isStringAttribute())
-            continue;
-
-          llvm::SmallVector<int, 16> param_reg_idx;
-          llvm::StringRef offsets_str = offsets_attr.getValueAsString();
-          while (!offsets_str.empty()) {
-            llvm::StringRef token;
-            std::tie(token, offsets_str) = offsets_str.split(',');
-            if (token == "stack" || token == "xmm") {
-              param_reg_idx.push_back(-1);  // Not a GPR.
-            } else {
-              unsigned offset = 0;
-              if (token.getAsInteger(10, offset)) {
-                param_reg_idx.push_back(-1);
-              } else {
-                auto it = stateOffsetToRegIdx.find(offset);
-                if (it != stateOffsetToRegIdx.end())
-                  param_reg_idx.push_back(static_cast<int>(it->second));
-                else
-                  param_reg_idx.push_back(-1);
-              }
-            }
-          }
-
-          // Determine the number of "standard" params that the caller actually
-          // passes (typically 4 for Win64: RCX, RDX, R8, R9).
-          unsigned num_caller_args = 0;
-          for (auto &BB : *wrapper_fn) {
-            for (auto &I : BB) {
-              auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
-              if (!call)
-                continue;
-              if (call->getCalledFunction() != target_fn)
-                continue;
-              num_caller_args = call->arg_size();
-              goto found_call;
-            }
-          }
-          found_call:
-
-          // Collect all calls to the target in the wrapper (in IR order).
-          llvm::SmallVector<llvm::CallInst *, 32> target_calls;
-          for (auto &BB : *wrapper_fn) {
-            for (auto &I : BB) {
-              auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
-              if (!call)
-                continue;
-              if (call->getCalledFunction() != target_fn)
-                continue;
-              target_calls.push_back(call);
-            }
-          }
-
-          if (target_calls.size() != info_indices.size()) {
-            errs() << "VM clone: call count mismatch for "
-                   << target_name << " (IR: " << target_calls.size()
-                   << " vs infos: " << info_indices.size() << "), skipping\n";
-            continue;
-          }
-
-          errs() << "VM clone: specializing " << target_name
-                 << " (" << info_indices.size() << " call sites)\n";
-
-          // Create per-callsite clones.
-          auto &FAM =
-              MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(*module)
-                  .getManager();
-
-          for (unsigned ci = 0; ci < info_indices.size(); ++ci) {
-            const auto &info = native_call_infos[info_indices[ci]];
-            std::string clone_name = target_name + "_" + std::to_string(ci);
-
-            // Clone the function.
-            llvm::ValueToValueMapTy VMap;
-            auto *clone = llvm::CloneFunction(target_fn, VMap);
-            clone->setName(clone_name);
-            clone->setLinkage(llvm::GlobalValue::InternalLinkage);
-
-            // Replace extra params with emulator constants.
-            for (unsigned pi = num_caller_args;
-                 pi < clone->arg_size() && pi < param_reg_idx.size(); ++pi) {
-              int reg_idx = param_reg_idx[pi];
-              if (reg_idx < 0 || reg_idx >= 16)
-                continue;
-              auto *arg = clone->getArg(pi);
-              arg->replaceAllUsesWith(
-                  llvm::ConstantInt::get(i64_ty, info.gprs[reg_idx]));
-            }
-
-            // Inject vmcontext memory into BinaryMemoryMap.
-            bool injected_vmctx = false;
-            if (!info.vmcontext_snapshot.empty() && info.r12_base != 0) {
-              pe.memory_map.addRegion(info.r12_base,
-                                      info.vmcontext_snapshot.data(),
-                                      info.vmcontext_snapshot.size(),
-                                      /*read_only=*/true,
-                                      /*executable=*/false);
-              injected_vmctx = true;
-            }
-
-            // Targeted inlining of helper functions into this clone.
-            bool inlined_any = true;
-            while (inlined_any) {
-              inlined_any = false;
-              for (auto &BB : *clone) {
-                for (auto &I : llvm::make_early_inc_range(BB)) {
-                  auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
-                  if (!call || !call->getCalledFunction())
-                    continue;
-                  auto callee_name = call->getCalledFunction()->getName();
-                  // Inline VM wrapper helpers into the clone.
-                  if (!callee_name.ends_with("_native") ||
-                      callee_name == clone_name)
-                    continue;
-                  // Only inline internal helpers, not the wrapper or other
-                  // clones.
-                  auto *callee = call->getCalledFunction();
-                  if (callee->isDeclaration())
-                    continue;
-                  // Skip the wrapper function itself.
-                  if (callee == wrapper_fn)
-                    continue;
-                  llvm::InlineFunctionInfo IFI;
-                  auto result = llvm::InlineFunction(*call, IFI);
-                  if (result.isSuccess())
-                    inlined_any = true;
-                }
-              }
-            }
-
-            // Run deobf pipeline on the specialized clone.
-            {
-              llvm::FunctionPassManager FPM;
-              omill::buildDeobfuscationPipeline(FPM, opts);
-              auto PA = FPM.run(*clone, FAM);
-              if (!PA.areAllPreserved())
-                FAM.invalidate(*clone, PA);
-            }
-
-            // Remove injected vmcontext region.
-            if (injected_vmctx)
-              pe.memory_map.removeRegion(info.r12_base);
-
-            // Update the wrapper's call to point to the clone.
-            auto *orig_call = target_calls[ci];
-            // Build args matching the clone's signature (only the first
-            // num_caller_args, since extra params are baked in).
-            llvm::SmallVector<llvm::Value *, 4> clone_args;
-            for (unsigned ai = 0; ai < num_caller_args; ++ai)
-              clone_args.push_back(orig_call->getArgOperand(ai));
-
-            llvm::IRBuilder<> Builder(orig_call);
-            auto *clone_call =
-                Builder.CreateCall(clone, clone_args, clone_name + ".result");
-            clone_call->setCallingConv(orig_call->getCallingConv());
-            clone_call->setAttributes(orig_call->getAttributes());
-            orig_call->replaceAllUsesWith(clone_call);
-            orig_call->eraseFromParent();
-          }
-
-          errs() << "VM clone: created " << info_indices.size()
-                 << " specialized clones of " << target_name << "\n";
-        }
-      }
-    }
   }
 
   // Late target discovery: after ABI recovery folds MBA chains (via
@@ -11178,36 +10648,6 @@ int main(int argc, char **argv) {
       }
       collectNestedVMHelperTargets();
 
-      // Populate nested_vm_helper_targets for auto-detected wrappers
-      // whose thunks were folded.  After folding, calls go directly to
-      // the wrapper so the helper VA in the map is the wrapper VA.
-      if (false) {
-        for (auto &[thunk_va, wrapper_va] : auto_detected_wrappers) {
-          if (has_external_vm_trace)
-            break;
-          if (nested_vm_helper_targets.count(wrapper_va))
-            continue;  // already discovered
-          // Trace from this wrapper to get the first handler target.
-          omill::VMTraceEmulator probe(pe.memory_map, pe.image_base,
-                                       vm_entry_va, vm_exit_va);
-          uint64_t seg_start_l = vm_entry_va;
-          uint64_t seg_end_l = vm_entry_va + 0x2000000;
-          pe.memory_map.forEachRegion(
-              [&](uint64_t base, const uint8_t *, size_t size) {
-                if (vm_entry_va >= base && vm_entry_va < base + size) {
-                  seg_start_l = base;
-                  seg_end_l = base + size;
-                }
-              });
-          probe.setHandlerSegmentRange(seg_start_l, seg_end_l);
-          auto trace = probe.traceFromWrapper(wrapper_va);
-          if (!trace.empty() && !trace.front().successors.empty()) {
-            uint64_t target_va = trace.front().successors.front();
-            nested_vm_helper_targets[wrapper_va] = target_va;
-            nested_vm_helper_deltas[wrapper_va] = probe.lastDelta();
-          }
-        }
-      }
       auto hash_resolved_calls = collectHashResolvedCalls();
       auto nested_helper_callsites = collectNestedHelperCallsites();
       for (auto &[helper_va, target_va] : nested_vm_helper_targets) {
@@ -11894,7 +11334,7 @@ int main(int argc, char **argv) {
   // Some late lifting/materialization shapes still leave stale PHI incoming
   // edges after CFG rewrites. Repair them before verification so no-ABI
   // checkpoints and downstream ABI replay can consume valid textual IR.
-  repairMalformedPHIs(*module);
+  omill::repairMalformedPHIs(*module);
   MAM.invalidate(*module, llvm::PreservedAnalyses::none());
 
   // Verify (use nullptr to avoid crash in SlotTracker on corrupted modules)
@@ -11961,7 +11401,7 @@ int main(int argc, char **argv) {
                  opts.scope_predicate,
                  /*include_semantic_helpers=*/true});
     MPM.run(*module, MAM);
-    repairMalformedPHIs(*module);
+    omill::repairMalformedPHIs(*module);
     MAM.invalidate(*module, llvm::PreservedAnalyses::none());
   }
 
@@ -14647,7 +14087,7 @@ int main(int argc, char **argv) {
     if (debug_public_root_seeds)
       errs() << "[abi-post] final-flattened-helper-rewrite applied\n";
     MAM.invalidate(*module, llvm::PreservedAnalyses::none());
-    repairMalformedPHIs(*module);
+    omill::repairMalformedPHIs(*module);
     return true;
   };
   if (enable_debug_sample_native_fixups) {
@@ -15772,7 +15212,7 @@ int main(int argc, char **argv) {
     annotateVmUnresolvedContinuationsInCurrentModule();
     annotateOutputRootTerminalBoundaryProbeChains();
     omill::refreshTerminalBoundaryRecoveryMetadata(*module);
-    repairMalformedPHIs(*module);
+    omill::repairMalformedPHIs(*module);
     events.emitInfo("abi_truthful_noabi_child_adopted",
                     "adopted truthful recursive no-ABI child then reran ABI recovery");
     return true;
@@ -15816,7 +15256,7 @@ int main(int argc, char **argv) {
     annotateVmUnresolvedContinuationsInCurrentModule();
     annotateOutputRootTerminalBoundaryProbeChains();
     omill::refreshTerminalBoundaryRecoveryMetadata(*module);
-    repairMalformedPHIs(*module);
+    omill::repairMalformedPHIs(*module);
     events.emitInfo("pre_abi_truthful_checkpoint_adopted",
                     "adopted truthful pre-ABI checkpoint instead of ABI shell");
     return true;
@@ -16212,7 +15652,7 @@ int main(int argc, char **argv) {
           return false;
 
         MAM.invalidate(*module, llvm::PreservedAnalyses::none());
-        repairMalformedPHIs(*module);
+        omill::repairMalformedPHIs(*module);
         errs() << "[frontier] " << label << " "
                << devirtualization_orchestrator.summarizeFrontierAdvance(
                       round.advance)
@@ -16247,7 +15687,7 @@ int main(int argc, char **argv) {
         materializeConstantBoundaryPlaceholdersInCurrentModule();
     if (early_boundary_rewrite || early_boundary_materialization) {
       MAM.invalidate(*module, llvm::PreservedAnalyses::none());
-      repairMalformedPHIs(*module);
+      omill::repairMalformedPHIs(*module);
     }
     annotateVmUnresolvedContinuationsInCurrentModule();
     __try {
@@ -16550,7 +15990,7 @@ int main(int argc, char **argv) {
 
     MAM.invalidate(*module, llvm::PreservedAnalyses::none());
     omill::refreshTerminalBoundaryRecoveryMetadata(*module);
-    repairMalformedPHIs(*module);
+    omill::repairMalformedPHIs(*module);
     events.emitInfo(
         "abi_tail_graph_projected",
         "projected recursive unresolved tails from truthful no-ABI child into ABI output",
@@ -16844,7 +16284,7 @@ int main(int argc, char **argv) {
   }
 
   // Final textual output should never contain dangling PHI predecessors.
-  repairMalformedPHIs(*module);
+  omill::repairMalformedPHIs(*module);
   if (devirtualization_plan.enable_devirtualization) {
     devirtualization_orchestrator.recordEpoch(
         omill::DevirtualizationEpoch::kAbiOrNoAbiFinalization, *module,
@@ -18851,216 +18291,6 @@ native_boundary_repair_done:;
       MAM.invalidate(*module, llvm::PreservedAnalyses::none());
   }
 
-  /// Merge SROA-decomposed PHI groups back into full-width i64 PHIs.
-  ///
-  /// SROA splits 64-bit State fields into sub-byte PHIs at the dispatch
-  /// loop header.  This pass recognizes groups of PHIs with the same
-  /// `state_XXXX.sroa` prefix, verifies their bit-widths sum to 64,
-  /// and merges them into a single i64 PHI.  Uses are rewritten:
-  /// - Existing uses of sub-field PHIs → trunc/lshr+trunc of the merged PHI
-  /// - Existing zext+shl+or reassembly chains → the merged PHI directly
-  struct MergeDecomposedStatePHIsPass
-      : llvm::PassInfoMixin<MergeDecomposedStatePHIsPass> {
-
-    /// Parse a PHI name like "state_2280.sroa.0.sroa.761.0" and extract
-    /// the State field prefix ("state_2280") and bit offset.
-    /// Returns {prefix, bit_offset} or {"", -1} on failure.
-    static std::pair<llvm::StringRef, int>
-    parseStatePHI(llvm::PHINode *phi) {
-      auto name = phi->getName();
-      // Match "state_XXXX.sroa.*" or "state_XXXX.sroa.*"
-      if (!name.starts_with("state_"))
-        return {"", -1};
-      auto dot = name.find('.');
-      if (dot == llvm::StringRef::npos)
-        return {"", -1};
-      auto prefix = name.substr(0, dot);
-      // The bit offset is encoded in the SROA suffix structure.
-      // We don't try to parse it — instead we sort by type width
-      // and assume non-overlapping contiguous layout.
-      return {prefix, 0};
-    }
-
-    /// Given a group of PHIs for the same State field, try to find the
-    /// bit-shift amounts by looking at how each PHI's value is assembled
-    /// in a zext+shl+or chain somewhere in the function.
-    struct FieldPiece {
-      llvm::PHINode *phi;
-      unsigned bit_width;
-      unsigned bit_offset;
-    };
-
-    /// Find the bit offset of a sub-field PHI by looking at its users.
-    /// If a user is `zext ... to i64` → `shl ..., <const>`, the const
-    /// is the bit offset.  If just `zext ... to i64` with no shift, offset=0.
-    static int findBitOffset(llvm::PHINode *phi) {
-      for (auto *U : phi->users()) {
-        auto *zext = llvm::dyn_cast<llvm::ZExtInst>(U);
-        if (!zext)
-          continue;
-        // Check if zext feeds into a shl
-        for (auto *ZU : zext->users()) {
-          if (auto *shl = llvm::dyn_cast<llvm::BinaryOperator>(ZU)) {
-            if (shl->getOpcode() == llvm::Instruction::Shl) {
-              if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(
-                      shl->getOperand(1)))
-                return static_cast<int>(CI->getZExtValue());
-            }
-          }
-          // If zext feeds into an or directly with mask, offset is 0
-          if (auto *or_inst = llvm::dyn_cast<llvm::BinaryOperator>(ZU)) {
-            if (or_inst->getOpcode() == llvm::Instruction::Or) {
-              // Check if other operand is shifted — this is the low part
-              return 0;
-            }
-          }
-        }
-        // Zext with no shl → bits 0..width
-        if (zext->getType()->isIntegerTy(64))
-          return 0;
-      }
-      // Special case: if the PHI is i64 and just has an 'and' mask
-      if (phi->getType()->isIntegerTy(64)) {
-        // Look for "and i64 %phi, -256" pattern (preserves upper bits)
-        for (auto *U : phi->users()) {
-          if (auto *and_inst = llvm::dyn_cast<llvm::BinaryOperator>(U)) {
-            if (and_inst->getOpcode() == llvm::Instruction::And) {
-              if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(
-                      and_inst->getOperand(1))) {
-                // -256 = clear low 8 bits → this PHI carries upper bits
-                auto mask = CI->getZExtValue();
-                if (mask == 0xFFFFFFFFFFFFFF00ULL)
-                  return 0;  // starts at bit 0 with upper bits
-              }
-            }
-          }
-        }
-      }
-      return -1;  // couldn't determine
-    }
-
-    llvm::PreservedAnalyses run(llvm::Function &F,
-                                llvm::FunctionAnalysisManager &) {
-      bool changed = false;
-
-      for (auto &BB : F) {
-        // Collect PHIs by State field prefix.
-        llvm::StringMap<llvm::SmallVector<llvm::PHINode *, 4>> groups;
-        for (auto &I : BB) {
-          auto *phi = llvm::dyn_cast<llvm::PHINode>(&I);
-          if (!phi)
-            break;  // PHIs are always at block start
-          auto [prefix, _] = parseStatePHI(phi);
-          if (prefix.empty())
-            continue;
-          groups[prefix].push_back(phi);
-        }
-
-        for (auto &[prefix, phis] : groups) {
-          if (phis.size() < 2)
-            continue;
-
-          // Check total bit width
-          unsigned total_bits = 0;
-          for (auto *phi : phis)
-            total_bits += phi->getType()->getScalarSizeInBits();
-          if (total_bits != 64)
-            continue;
-
-          // Determine bit offsets for each piece
-          llvm::SmallVector<FieldPiece, 4> pieces;
-          bool all_resolved = true;
-          for (auto *phi : phis) {
-            int offset = findBitOffset(phi);
-            if (offset < 0) {
-              all_resolved = false;
-              break;
-            }
-            pieces.push_back({phi,
-                              phi->getType()->getScalarSizeInBits(),
-                              static_cast<unsigned>(offset)});
-          }
-          if (!all_resolved)
-            continue;
-
-          // Sort by bit offset
-          llvm::sort(pieces, [](const auto &a, const auto &b) {
-            return a.bit_offset < b.bit_offset;
-          });
-
-          // Verify contiguous, non-overlapping
-          unsigned expected = 0;
-          bool valid = true;
-          for (auto &p : pieces) {
-            if (p.bit_offset != expected) {
-              valid = false;
-              break;
-            }
-            expected += p.bit_width;
-          }
-          if (!valid || expected != 64)
-            continue;
-
-          // Build the merged i64 PHI.
-          auto *merged = llvm::PHINode::Create(
-              llvm::Type::getInt64Ty(F.getContext()),
-              phis[0]->getNumIncomingValues(),
-              prefix.str(),
-              BB.getFirstNonPHIIt());
-
-          // For each incoming edge, build the i64 value from pieces.
-          for (unsigned i = 0; i < phis[0]->getNumIncomingValues(); ++i) {
-            auto *incoming_bb = phis[0]->getIncomingBlock(i);
-            // Build: (zext p0) | (zext p1 << s1) | ...
-            llvm::Value *assembled = nullptr;
-            auto *term = incoming_bb->getTerminator();
-            llvm::IRBuilder<> Builder(term);
-
-            for (auto &p : pieces) {
-              auto *val = p.phi->getIncomingValueForBlock(incoming_bb);
-              auto *ext = Builder.CreateZExt(val,
-                  llvm::Type::getInt64Ty(F.getContext()));
-              if (p.bit_offset > 0)
-                ext = Builder.CreateShl(ext, p.bit_offset);
-              if (!assembled)
-                assembled = ext;
-              else
-                assembled = Builder.CreateOr(assembled, ext);
-            }
-            merged->addIncoming(assembled, incoming_bb);
-          }
-
-          // Replace uses of sub-field PHIs with extracts from merged.
-          // Insert extracts after the merged PHI.
-          llvm::IRBuilder<> ExtractBuilder(
-              &*BB.getFirstNonPHIIt());
-          for (auto &p : pieces) {
-            llvm::Value *extracted;
-            if (p.bit_offset == 0 && p.bit_width == 64) {
-              extracted = merged;
-            } else {
-              llvm::Value *shifted = merged;
-              if (p.bit_offset > 0)
-                shifted = ExtractBuilder.CreateLShr(merged, p.bit_offset);
-              extracted = ExtractBuilder.CreateTrunc(
-                  shifted, p.phi->getType());
-            }
-            p.phi->replaceAllUsesWith(extracted);
-            changed = true;
-          }
-
-          // Erase old PHIs (in reverse to avoid iterator issues).
-          for (auto it = phis.rbegin(); it != phis.rend(); ++it)
-            (*it)->eraseFromParent();
-        }
-      }
-
-      return changed ? llvm::PreservedAnalyses::none()
-                     : llvm::PreservedAnalyses::all();
-    }
-    static bool isRequired() { return true; }
-  };
-
   // Post-ABI RSF + SROA + GVN: Convert RSP-relative inttoptr patterns
   // to alloca GEPs, decompose the allocas, and forward store→load.
   // This eliminates State struct pollution from the output and surfaces
@@ -19084,7 +18314,7 @@ native_boundary_repair_done:;
     // sub-byte PHIs (i8/i16/i24/i32/i48).  Each handler reassembles
     // them with zext+shl+or chains.  Merge them back into single i64
     // PHIs to eliminate the reassembly overhead.
-    RSF_FPM.addPass(MergeDecomposedStatePHIsPass());
+    RSF_FPM.addPass(omill::MergeDecomposedStatePHIsPass());
     RSF_FPM.addPass(llvm::InstCombinePass());
     RSF_FPM.addPass(llvm::GVNPass());
     RSF_FPM.addPass(llvm::SimplifyCFGPass());
@@ -19102,7 +18332,7 @@ native_boundary_repair_done:;
     RSF_FPM.addPass(llvm::SimplifyCFGPass());
     // Final cleanup round: run the PHI merge again (DSE may have
     // exposed new opportunities), then full optimization to clean up.
-    RSF_FPM.addPass(MergeDecomposedStatePHIsPass());
+    RSF_FPM.addPass(omill::MergeDecomposedStatePHIsPass());
     RSF_FPM.addPass(llvm::InstCombinePass());
     RSF_FPM.addPass(llvm::GVNPass());
     RSF_FPM.addPass(llvm::DSEPass());
@@ -19386,7 +18616,11 @@ native_boundary_repair_done:;
           ModulePassManager CleanMPM;
           CleanMPM.addPass(llvm::AlwaysInlinerPass());
 
-          // Fix unreachable terminators in output roots after inlining.
+          // Fix output roots: replace unreachable with ret, and add a
+          // State writeback call on the entry path to ensure LLVM sees
+          // the function as having memory effects through arg0.
+          // Insert `call void asm sideeffect "", "r,~{memory}"(ptr %0)`
+          // at each ret to pin the State pointer as having side effects.
           for (auto &F : *module) {
             if (F.isDeclaration() || !F.getName().starts_with("sub_"))
               continue;
@@ -19396,6 +18630,19 @@ native_boundary_repair_done:;
                 llvm::IRBuilder<> B(UI);
                 B.CreateRet(F.getArg(2));
                 UI->eraseFromParent();
+              }
+            }
+            // Pin State arg as having side effects on every ret.
+            auto *asm_ty = llvm::FunctionType::get(
+                llvm::Type::getVoidTy(F.getContext()),
+                {F.getArg(0)->getType()}, false);
+            auto *pin_asm = llvm::InlineAsm::get(
+                asm_ty, "", "r,~{memory}", /*hasSideEffects=*/true);
+            for (auto &BB : F) {
+              if (auto *RI = llvm::dyn_cast<llvm::ReturnInst>(
+                      BB.getTerminator())) {
+                llvm::IRBuilder<> B(RI);
+                B.CreateCall(asm_ty, pin_asm, {F.getArg(0)});
               }
             }
           }

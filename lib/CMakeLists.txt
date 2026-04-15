@@ -59,6 +59,7 @@ add_library(omill STATIC
   Analysis/SegmentsAA.cpp
   Analysis/VirtualCalleeRegistry.cpp
   BC/LiftDatabase.cpp
+  BC/LiftingArtifactFixes.cpp
   BC/LiftDatabaseIO.cpp
   BC/LiftDatabaseProjection.cpp
 
@@ -117,6 +118,7 @@ add_library(omill STATIC
   Passes/StripCompilerUsed.cpp
   Passes/EliminateDeadTraceCounters.cpp
   Passes/MergeBytePhis.cpp
+  Passes/MergeDecomposedStatePHIs.cpp
   Passes/CollapseRemillSHRSwitch.cpp
   Passes/RecoverAllocaPointers.cpp
   Passes/TypeRecovery.cpp
@@ -189,6 +191,7 @@ if(OMILL_ENABLE_REMILL)
     BC/LiftTargetPolicy.cpp
     BC/TraceLifter.cpp
     BC/BlockLifter.cpp
+    BC/BufferMemoryAdapters.cpp
   )
   target_link_libraries(omill PRIVATE remill)
   target_compile_definitions(omill PUBLIC OMILL_ENABLE_REMILL=1)
