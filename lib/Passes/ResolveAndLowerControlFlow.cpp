@@ -13,6 +13,7 @@
 #include <llvm/Support/Format.h>
 
 #include "omill/Analysis/BinaryMemoryMap.h"
+#include "omill/Analysis/RemillStateVariableSolver.h"
 #include "omill/Analysis/VirtualModel/Types.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
 #include "omill/BC/BlockLifterAnalysis.h"
@@ -700,6 +701,104 @@ bool symbolicJumpTableSolve(llvm::Function &F,
   return changed;
 }
 
+// ===----------------------------------------------------------------------===
+// Phase 4: MultiValueSwitch — read omill.solved_target_pcs metadata and
+// build switch instructions for dispatch sites with 2-256 known targets.
+// ===----------------------------------------------------------------------===
+
+static bool multiValueSwitchRewrite(llvm::Function &F,
+                                    const BinaryMemoryMap *map,
+                                    const LiftedFunctionMap *lifted) {
+  struct Candidate {
+    llvm::CallInst *call;
+    llvm::SmallVector<uint64_t, 8> targets;
+  };
+  llvm::SmallVector<Candidate, 4> candidates;
+
+  for (auto &BB : F) {
+    for (auto &I : BB) {
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+      if (!CI)
+        continue;
+      auto *callee = CI->getCalledFunction();
+      if (!callee)
+        continue;
+      if (!isDispatchJumpName(callee->getName()) &&
+          !isDispatchCallName(callee->getName()))
+        continue;
+      if (llvm::isa<llvm::ConstantInt>(CI->getArgOperand(1)))
+        continue;
+
+      auto maybe_targets = readSolvedTargetSet(*CI);
+      if (!maybe_targets || maybe_targets->size() < 2 ||
+          maybe_targets->size() > 256)
+        continue;
+
+      candidates.push_back({CI, std::move(*maybe_targets)});
+    }
+  }
+
+  if (candidates.empty())
+    return false;
+
+  bool changed = false;
+  auto &Ctx = F.getContext();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+
+  for (auto &cand : candidates) {
+    auto *CI = cand.call;
+    auto *target_val = CI->getArgOperand(1);
+    auto *BB = CI->getParent();
+
+    auto *tail = BB->splitBasicBlock(CI->getIterator(), "mvsw.default");
+    BB->getTerminator()->eraseFromParent();
+
+    auto *sw = llvm::SwitchInst::Create(target_val, tail,
+                                         cand.targets.size(), BB);
+
+    for (uint64_t target_pc : cand.targets) {
+      auto *case_bb = llvm::BasicBlock::Create(
+          Ctx, "mvsw." + llvm::Twine::utohexstr(target_pc), &F);
+      llvm::IRBuilder<> Builder(case_bb);
+
+      llvm::SmallVector<llvm::Value *, 4> args;
+      for (unsigned i = 0; i < CI->arg_size(); ++i) {
+        if (i == 1)
+          args.push_back(llvm::ConstantInt::get(i64_ty, target_pc));
+        else
+          args.push_back(CI->getArgOperand(i));
+      }
+      auto *new_call = Builder.CreateCall(CI->getCalledFunction(), args);
+      new_call->setTailCallKind(CI->getTailCallKind());
+      Builder.CreateBr(tail);
+
+      sw->addCase(llvm::cast<llvm::ConstantInt>(
+                      llvm::ConstantInt::get(target_val->getType(), target_pc)),
+                  case_bb);
+    }
+
+    if (!CI->use_empty()) {
+      auto *phi = llvm::PHINode::Create(CI->getType(),
+                                         cand.targets.size() + 1,
+                                         "mvsw.result");
+      phi->insertBefore(tail->begin());
+      for (auto *pred : llvm::predecessors(tail)) {
+        llvm::CallInst *pred_call = nullptr;
+        for (auto &PI : *pred)
+          if (auto *c = llvm::dyn_cast<llvm::CallInst>(&PI))
+            pred_call = c;
+        phi->addIncoming(pred_call ? (llvm::Value *)pred_call
+                                   : llvm::UndefValue::get(CI->getType()),
+                         pred);
+      }
+      CI->replaceAllUsesWith(phi);
+    }
+    changed = true;
+  }
+
+  return changed;
+}
+
 }  // namespace
 
 // ===----------------------------------------------------------------------===
@@ -732,6 +831,10 @@ llvm::PreservedAnalyses ResolveAndLowerControlFlowPass::run(
   // Phase 3: Symbolic fallback for table index bounds.
   if (phases_ & ResolvePhases::SymbolicSolve)
     changed |= symbolicJumpTableSolve(F, AM, map, lifted);
+
+  // Phase 4: Build switch from solver multi-target metadata.
+  if (phases_ & ResolvePhases::MultiValueSwitch)
+    changed |= multiValueSwitchRewrite(F, map, lifted);
 
   return changed ? llvm::PreservedAnalyses::none()
                  : llvm::PreservedAnalyses::all();

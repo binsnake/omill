@@ -91,7 +91,8 @@ static bool collectEvaluatedTargetChoicesImpl(
     llvm::SmallDenseSet<unsigned, 8> &visiting_cells,
     llvm::SmallVectorImpl<uint64_t> &pcs, unsigned depth,
     const BinaryMemoryMap *binary_memory = nullptr) {
-  if (depth > 4 || pcs.size() > 4)
+  auto &cfg = vmModelConfig();
+  if (depth > cfg.max_target_depth || pcs.size() > cfg.max_target_count)
     return false;
 
   auto append_pc = [&](uint64_t pc) {

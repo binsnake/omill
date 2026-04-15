@@ -10,7 +10,8 @@ bool containsArgumentExpr(const VirtualValueExpr &expr) {
 
 bool isBoundedLocalizedTransferExpr(const VirtualValueExpr &expr,
                                     unsigned depth) {
-  if (depth > 6)
+  auto &cfg = vmModelConfig();
+  if (depth > cfg.max_transfer_depth)
     return false;
 
   switch (expr.kind) {
@@ -45,13 +46,13 @@ bool isBoundedLocalizedTransferExpr(const VirtualValueExpr &expr,
     case VirtualExprKind::kSge:
       if (expr.operands.size() != 2)
         return false;
-      return countSymbolicRefs(expr) <= 4 &&
+      return countSymbolicRefs(expr) <= cfg.max_symbolic_refs &&
              isBoundedLocalizedTransferExpr(expr.operands[0], depth + 1) &&
              isBoundedLocalizedTransferExpr(expr.operands[1], depth + 1);
     case VirtualExprKind::kSelect:
       if (expr.operands.size() != 3)
         return false;
-      return countSymbolicRefs(expr) <= 4 &&
+      return countSymbolicRefs(expr) <= cfg.max_symbolic_refs &&
              isBoundedLocalizedTransferExpr(expr.operands[0], depth + 1) &&
              isBoundedLocalizedTransferExpr(expr.operands[1], depth + 1) &&
              isBoundedLocalizedTransferExpr(expr.operands[2], depth + 1);

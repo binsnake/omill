@@ -307,7 +307,7 @@ static llvm::stable_hash hashOutgoingFacts(
 void propagateVirtualStateFacts(llvm::Module &M, VirtualMachineModel &model,
                                 const BinaryMemoryMap &binary_memory,
                                 CachedModuleHandlerSummaryState *module_cache) {
-  constexpr unsigned kMaxTrackedStackCells = 32;
+  const unsigned kMaxTrackedStackCells = vmModelConfig().max_stack_cells;
   vmModelStageDebugLog("propagate: setup-begin");
   auto factSubsetChanged = [](const std::map<unsigned, VirtualValueExpr> &before,
                               const std::map<unsigned, VirtualValueExpr> &after,

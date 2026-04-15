@@ -18,6 +18,31 @@
 
 namespace omill::virtual_model::detail {
 
+static unsigned parseEnvUnsigned(const char *name, unsigned default_val) {
+  const char *v = std::getenv(name);
+  if (!v || v[0] == '\0')
+    return default_val;
+  char *end = nullptr;
+  unsigned long parsed = std::strtoul(v, &end, 10);
+  return (end && *end == '\0') ? static_cast<unsigned>(parsed) : default_val;
+}
+
+VirtualModelConfig VirtualModelConfig::fromEnvironment() {
+  VirtualModelConfig c;
+  c.max_transfer_depth = parseEnvUnsigned("OMILL_VM_TRANSFER_DEPTH", 6);
+  c.max_symbolic_refs = parseEnvUnsigned("OMILL_VM_SYMBOLIC_REFS", 4);
+  c.max_stack_cells = parseEnvUnsigned("OMILL_VM_STACK_CELLS", 32);
+  c.max_target_depth = parseEnvUnsigned("OMILL_VM_TARGET_DEPTH", 4);
+  c.max_target_count = parseEnvUnsigned("OMILL_VM_TARGET_COUNT", 4);
+  c.max_total_expr_nodes = parseEnvUnsigned("OMILL_VM_MAX_EXPR_NODES", 128);
+  return c;
+}
+
+const VirtualModelConfig &vmModelConfig() {
+  static const VirtualModelConfig config = VirtualModelConfig::fromEnvironment();
+  return config;
+}
+
 bool isCallSiteHelper(const llvm::Function &F) {
   return F.getName().contains("CALLI");
 }

@@ -5,6 +5,24 @@
 #include <chrono>
 
 namespace omill::virtual_model::detail {
+
+/// Tunable limits for the VirtualModel analysis.
+/// Defaults match the previous hard-coded values.
+/// Override via environment variables for experimentation.
+struct VirtualModelConfig {
+  unsigned max_transfer_depth = 6;
+  unsigned max_symbolic_refs = 4;
+  unsigned max_stack_cells = 32;
+  unsigned max_target_depth = 4;
+  unsigned max_target_count = 4;
+  unsigned max_total_expr_nodes = 128;
+
+  static VirtualModelConfig fromEnvironment();
+};
+
+/// Global config instance (initialized once from environment).
+const VirtualModelConfig &vmModelConfig();
+
 std::map<const llvm::Module *, CachedModuleHandlerSummaryState> &
 virtualModelSummaryCaches();
 

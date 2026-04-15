@@ -6,9 +6,10 @@ namespace omill {
 
 namespace ResolvePhases {
 enum : uint32_t {
-  ResolveTargets = 1 << 0,   // constant PC -> import/function
-  RecoverTables = 1 << 1,    // dispatch_jump + table pattern -> switch
-  SymbolicSolve = 1 << 2,    // SCEV/KnownBits fallback
+  ResolveTargets = 1 << 0,    // constant PC -> import/function
+  RecoverTables = 1 << 1,     // dispatch_jump + table pattern -> switch
+  SymbolicSolve = 1 << 2,     // SCEV/KnownBits fallback
+  MultiValueSwitch = 1 << 3,  // solver metadata multi-target -> switch
   All = 0xFFFFFFFF,
 };
 }  // namespace ResolvePhases
