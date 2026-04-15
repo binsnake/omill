@@ -65,6 +65,7 @@
 #include "omill/Analysis/ExceptionInfo.h"
 #include "omill/Analysis/IterativeLiftingSession.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
+#include "omill/Analysis/RegisterRoleMap.h"
 #include "omill/Analysis/RemillStateVariableSolver.h"
 #include "omill/Analysis/VirtualMachineModel.h"
 #include "omill/Analysis/VMTraceEmulator.h"

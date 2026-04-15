@@ -12548,6 +12548,7 @@ void registerRemainingModuleAnalyses(llvm::ModuleAnalysisManager &MAM) {
   MAM.registerPass([&] { return LiftedFunctionAnalysis(); });
   MAM.registerPass([&] { return VirtualCalleeRegistryAnalysis(); });
   MAM.registerPass([&] { return VirtualMachineModelAnalysis(); });
+  MAM.registerPass([&] { return RegisterRoleMapAnalysis(); });
 }
 
 void registerAAWithManager(llvm::AAManager &AAM) {

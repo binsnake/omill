@@ -994,6 +994,7 @@
   });
   MAM.registerPass([&] { return omill::VirtualCalleeRegistryAnalysis(); });
   MAM.registerPass([&] { return omill::VirtualMachineModelAnalysis(); });
+  MAM.registerPass([&] { return omill::RegisterRoleMapAnalysis(); });
   if (!ResolveExceptions) {
     MAM.registerPass([&] { return omill::ExceptionInfoAnalysis(); });
   }
