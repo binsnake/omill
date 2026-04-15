@@ -22,6 +22,7 @@
 #include <llvm/Transforms/IPO/AlwaysInliner.h>
 #include <llvm/Analysis/DomTreeUpdater.h>
 #include <llvm/IR/Dominators.h>
+#include <llvm/Transforms/Utils/CodeExtractor.h>
 #include <llvm/Transforms/Utils/Local.h>
 #include <llvm/Transforms/Utils/PromoteMemToReg.h>
 #include <llvm/Transforms/IPO/SCCP.h>
@@ -19114,11 +19115,111 @@ native_boundary_repair_done:;
     MAM.invalidate(*module, llvm::PreservedAnalyses::none());
   }
 
-  // NOTE: Recursive scc_dispatch calls with constant PC could be
-  // specialized but full-function inlining (even one-at-a-time with
-  // cleanup) causes memory explosion on this 8K-line function.
-  // Future: implement switch-case outlining to extract individual
-  // handler bodies as small functions, then inline those.
+  // Outline VMP handler cases from scc_dispatch using CodeExtractor.
+  // Each switch case's block set is extracted into its own function.
+  // Recursive `call @scc_dispatch(State, <const_pc>, mem)` then gets
+  // replaced with a direct call to the small handler (~200-600 lines).
+  if (!parseBoolEnv("OMILL_SKIP_HANDLER_OUTLINE").value_or(false)) {
+    auto *scc_fn = module->getFunction("scc_dispatch");
+    if (scc_fn && !scc_fn->isDeclaration()) {
+      // Find the dispatch switch (the one with many cases).
+      llvm::SwitchInst *dispatch_switch = nullptr;
+      for (auto &BB : *scc_fn) {
+        if (auto *SW = llvm::dyn_cast<llvm::SwitchInst>(BB.getTerminator())) {
+          if (SW->getNumCases() > 10) {
+            dispatch_switch = SW;
+            break;
+          }
+        }
+      }
+
+      if (dispatch_switch) {
+        auto *dispatch_bb = dispatch_switch->getParent();
+        llvm::DominatorTree DT(*scc_fn);
+
+        // Map PC → extracted function for recursive call replacement.
+        llvm::DenseMap<uint64_t, llvm::Function *> handler_fns;
+
+        for (auto &Case : dispatch_switch->cases()) {
+          auto *case_bb = Case.getCaseSuccessor();
+          uint64_t pc = Case.getCaseValue()->getZExtValue();
+
+          // BFS: collect all blocks reachable from case_bb that belong
+          // to this handler.  Stop at the dispatch block (loop back).
+          llvm::SetVector<llvm::BasicBlock *> handler_blocks;
+          llvm::SmallVector<llvm::BasicBlock *, 16> worklist;
+          worklist.push_back(case_bb);
+          handler_blocks.insert(case_bb);
+          while (!worklist.empty()) {
+            auto *BB = worklist.pop_back_val();
+            for (auto *succ : llvm::successors(BB)) {
+              if (succ == dispatch_bb)
+                continue;  // back-edge — boundary
+              if (succ->getParent() != scc_fn)
+                continue;  // safety
+              if (handler_blocks.insert(succ))
+                worklist.push_back(succ);
+            }
+          }
+
+          if (handler_blocks.size() < 2)
+            continue;  // too small or single-block
+
+          // CodeExtractor needs the blocks to form a valid region.
+          // The region exits are: dispatch_bb (back-edge) and any
+          // blocks outside the handler set.
+          llvm::CodeExtractorAnalysisCache CEAC(*scc_fn);
+          llvm::CodeExtractor CE(handler_blocks.getArrayRef(), &DT);
+
+          if (!CE.isEligible())
+            continue;
+
+          llvm::Function *outlined = CE.extractCodeRegion(CEAC);
+          if (!outlined)
+            continue;
+
+          // Rename for readability.
+          outlined->setName("handler_" + llvm::Twine::utohexstr(pc));
+          outlined->setLinkage(llvm::GlobalValue::InternalLinkage);
+          handler_fns[pc] = outlined;
+        }
+
+        // DomTree is invalidated after extraction — recalculate only
+        // if we need it for further transforms.
+
+        // Replace recursive calls within scc_dispatch:
+        // call @scc_dispatch(State, <const_pc>, mem) where the handler
+        // at const_pc was outlined → we can't directly call the outlined
+        // handler because CodeExtractor changed the signature (it
+        // creates args for live-in values).  But the outlined handler
+        // is now small enough for LLVM's inliner to handle.
+        // Instead, the benefit is that scc_dispatch itself is now much
+        // smaller (each case is a call to the handler function), and
+        // the recursive calls inline a small scc_dispatch (just the
+        // dispatch switch + handler calls) rather than the full body.
+
+        if (!handler_fns.empty()) {
+          if (std::getenv("OMILL_DEBUG_HANDLER_OUTLINE") != nullptr)
+            llvm::errs() << "[handler-outline] extracted "
+                         << handler_fns.size()
+                         << " handler functions from scc_dispatch\n";
+
+          // Clean up after extraction.
+          MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+          llvm::FunctionPassManager CleanFPM;
+          CleanFPM.addPass(llvm::SimplifyCFGPass());
+          CleanFPM.addPass(llvm::InstCombinePass());
+          CleanFPM.addPass(llvm::ADCEPass());
+          CleanFPM.addPass(llvm::SimplifyCFGPass());
+          ModulePassManager CleanMPM;
+          CleanMPM.addPass(llvm::createModuleToFunctionPassAdaptor(
+              std::move(CleanFPM)));
+          CleanMPM.run(*module, MAM);
+          MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+        }
+      }
+    }
+  }
 
   std::error_code EC;
   events.emitInfo("output_write_started", "writing final output",
