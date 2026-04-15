@@ -2129,6 +2129,7 @@ class UnicornStepEngine {
     UC.fn_mem_write(uc_, kGsBase + 0x08, &stack_top, 8);
 
     // Auto-map unmapped memory on access.
+    // Ignore uc_mem_map errors (region may overlap an existing mapping).
     uc_hook hm;
     UC.fn_hook_add(uc_, &hm,
         UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED |
@@ -2136,7 +2137,10 @@ class UnicornStepEngine {
         (void *)(+[](uc_engine *uc, uc_mem_type, uint64_t addr,
                      int, int64_t, void *) -> bool {
           uint64_t page = addr & ~0xFFFull;
-          getUnicorn().fn_mem_map(uc, page, 0x1000, UC_PROT_ALL);
+          // Try mapping; silently ignore errors (page may already be mapped
+          // or overlap an existing region).
+          auto err = getUnicorn().fn_mem_map(uc, page, 0x1000, UC_PROT_ALL);
+          (void)err;
           return true;
         }),
         nullptr, 1, 0);
@@ -2227,45 +2231,13 @@ class UnicornStepEngine {
   bool needsInitialSync() const { return !synced_; }
   bool synced_ = false;
 
-  /// Execute exactly one instruction and classify the result.
-  ExecResult step(EmuState &state) {
+  /// Classify an instruction at addr into an ExecResult by byte decoding.
+  ExecResult classifyInstruction(uint64_t addr) {
     auto &UC = getUnicorn();
-    uint64_t pre_rip = state.rip;
-
-    // First step for this handler: full sync including stack.
-    if (needsInitialSync())
-      syncFullToUnicorn(state);
-    else
-      syncRegsToUnicorn(state);
-
-    // Read instruction bytes to classify before executing.
     uint8_t buf[15];
-    UC.fn_mem_read(uc_, pre_rip, buf, 15);
+    UC.fn_mem_read(uc_, addr, buf, 15);
 
-    // Single-step: execute 1 instruction.
-    auto err = UC.fn_emu_start(uc_, pre_rip, 0, 0, 1);
-    syncRegsFromUnicorn(state);
-
-    if (err != UC_ERR_OK) {
-      if (debug_) {
-        llvm::errs() << "[uc-step] ERROR at 0x"
-                     << llvm::utohexstr(pre_rip)
-                     << " err=" << err
-                     << " post_rip=0x" << llvm::utohexstr(state.rip)
-                     << " bytes:";
-        for (int i = 0; i < 8; ++i)
-          llvm::errs() << " " << llvm::utohexstr(buf[i]);
-        llvm::errs() << ", falling back to mini-emulator\n";
-      }
-      // Sync stack back before falling through to mini-emulator.
-      syncFullFromUnicorn(state);
-      state.rip = pre_rip;  // Reset RIP to retry with mini-emulator.
-      return stepInstruction(state, mem_);
-    }
-
-    // Classify by decoding the instruction at pre_rip.
     unsigned pos = 0;
-    // Skip prefixes (REX, operand size, lock, rep, segment).
     while (pos < 14) {
       uint8_t b = buf[pos];
       if ((b & 0xF0) == 0x40) { ++pos; continue; }  // REX
@@ -2277,27 +2249,70 @@ class UnicornStepEngine {
     }
     uint8_t op = buf[pos];
 
-    // RET
     if (op == 0xC3 || op == 0xC2 || op == 0xCB || op == 0xCA)
       return ExecResult::Ret;
-
-    // Direct CALL (E8 rel32)
     if (op == 0xE8)
       return ExecResult::Call;
-
-    // Indirect CALL (FF /2) or indirect JMP (FF /4)
     if (op == 0xFF) {
       uint8_t modrm = buf[pos + 1];
       uint8_t reg = (modrm >> 3) & 7;
-      if (reg == 2) return ExecResult::Call;  // CALL r/m64
-      if (reg == 4) return ExecResult::IndirectJump;  // JMP r/m64
+      if (reg == 2) return ExecResult::Call;
+      if (reg == 4) return ExecResult::IndirectJump;
     }
-
-    // Direct JMP (E9/EB)
     if (op == 0xE9 || op == 0xEB)
       return ExecResult::Jump;
-
     return ExecResult::Continue;
+  }
+
+  /// Execute exactly one instruction and classify the result.
+  /// Uses Unicorn batch execution between control flow instructions for speed.
+  ExecResult step(EmuState &state) {
+    auto &UC = getUnicorn();
+    uint64_t pre_rip = state.rip;
+
+    // First step for this handler: full sync including stack.
+    if (needsInitialSync()) {
+      syncFullToUnicorn(state);
+    }
+
+    // Classify the current instruction BEFORE executing.
+    auto result = classifyInstruction(pre_rip);
+
+    // Execute exactly 1 instruction.
+    auto err = UC.fn_emu_start(uc_, pre_rip, 0, 0, 1);
+
+    // Read back RIP (lightweight — just 1 register).
+    UC.fn_reg_read(uc_, UC_X86_REG_RIP, &state.rip);
+
+    if (err != UC_ERR_OK) {
+      if (debug_) {
+        uint8_t buf[8];
+        UC.fn_mem_read(uc_, pre_rip, buf, 8);
+        llvm::errs() << "[uc-step] ERROR at 0x"
+                     << llvm::utohexstr(pre_rip)
+                     << " err=" << err
+                     << " post_rip=0x" << llvm::utohexstr(state.rip)
+                     << " bytes:";
+        for (int i = 0; i < 8; ++i)
+          llvm::errs() << " " << llvm::utohexstr(buf[i]);
+        llvm::errs() << ", falling back to mini-emulator\n";
+      }
+      syncFullFromUnicorn(state);
+      state.rip = pre_rip;
+      return stepInstruction(state, mem_);
+    }
+
+    // For control flow instructions, sync all registers back.
+    // For normal instructions, only RIP was needed (already read above).
+    if (result != ExecResult::Continue) {
+      syncRegsFromUnicorn(state);
+    } else {
+      // For continue, we need RSP and R12 for the boundary detection logic.
+      UC.fn_reg_read(uc_, UC_X86_REG_RSP, &state.regs[RSP]);
+      UC.fn_reg_read(uc_, UC_X86_REG_R12, &state.regs[R12]);
+    }
+
+    return result;
   }
 };
 
