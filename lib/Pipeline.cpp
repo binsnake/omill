@@ -439,14 +439,6 @@ std::optional<uint32_t> envUint32(const char *name) {
   return static_cast<uint32_t>(n);
 }
 
-bool envBoolEnabled(const char *name) {
-  const char *v = std::getenv(name);
-  if (!v || v[0] == '\0')
-    return false;
-  auto sv = llvm::StringRef(v).lower();
-  return !(sv == "0" || sv == "false" || sv == "off" || sv == "no");
-}
-
 static bool isGenericStaticDevirtSignalFunction(const llvm::Function &F) {
   auto name = F.getName();
   if (name.starts_with("vm_entry_"))
@@ -574,29 +566,6 @@ void collectReachableClosedRootSliceFunctions(
 void collectReachableOutputRootFunctions(
     llvm::Module &M, llvm::SmallVectorImpl<llvm::Function *> &functions);
 bool isLargeNoAbiStateOptimizationScopeModule(const llvm::Module &M);
-
-bool getBoolMetadataValue(const llvm::Instruction &I, llvm::StringRef name) {
-  auto *md = I.getMetadata(name);
-  auto *tuple = llvm::dyn_cast_or_null<llvm::MDTuple>(md);
-  if (!tuple || tuple->getNumOperands() == 0)
-    return false;
-  auto *value = llvm::mdconst::dyn_extract<llvm::ConstantInt>(
-      tuple->getOperand(0));
-  return value && value->getZExtValue() != 0;
-}
-
-std::optional<uint64_t> getU64MetadataValue(const llvm::Instruction &I,
-                                            llvm::StringRef name) {
-  auto *md = I.getMetadata(name);
-  auto *tuple = llvm::dyn_cast_or_null<llvm::MDTuple>(md);
-  if (!tuple || tuple->getNumOperands() == 0)
-    return std::nullopt;
-  auto *value = llvm::mdconst::dyn_extract<llvm::ConstantInt>(
-      tuple->getOperand(0));
-  if (!value)
-    return std::nullopt;
-  return value->getZExtValue();
-}
 
 bool isExecutableLikeTerminalBoundaryKind(llvm::StringRef kind) {
   return kind.contains("executable");
@@ -1466,64 +1435,7 @@ struct PatchDefinedControlTargetsPass
   static bool isRequired() { return true; }
 };
 
-bool emitInlineDiagMarkers() {
-  if (envBoolEnabled("OMILL_SKIP_INLINE_DIAG_MARKERS"))
-    return false;
-  const char *force = std::getenv("OMILL_INLINE_DIAG_MARKERS");
-  if (!force || force[0] == '\0')
-    return true;
-  auto sv = llvm::StringRef(force).lower();
-  return !(sv == "0" || sv == "false" || sv == "off" || sv == "no");
-}
-
-void emitInlineDiagMarker(llvm::CallBase &call, llvm::Function &callee,
-                          llvm::StringRef phase) {
-  auto *caller = call.getFunction();
-  if (!caller)
-    return;
-
-  auto &M = *caller->getParent();
-  auto &Ctx = M.getContext();
-  auto *i8_ptr_ty = llvm::PointerType::getUnqual(Ctx);
-
-  std::string text;
-  llvm::raw_string_ostream os(text);
-  os << "omill.inline phase=" << phase << "; caller=" << caller->getName()
-     << "; callee=" << callee.getName();
-  if (callee.getName().starts_with("sub_"))
-    os << "; callee_va=0x" << llvm::utohexstr(extractEntryVA(callee.getName()));
-  os.flush();
-
-  auto *str_data = llvm::ConstantDataArray::getString(Ctx, text, true);
-  auto *str_gv = new llvm::GlobalVariable(
-      M, str_data->getType(), true, llvm::GlobalValue::PrivateLinkage, str_data,
-      "__omill_inline_diag");
-  str_gv->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
-  str_gv->setAlignment(llvm::Align(1));
-  str_gv->setSection(".omill.inline.diag");
-
-  auto *sink = M.getGlobalVariable("__omill_inline_diag_sink");
-  if (!sink) {
-    sink = new llvm::GlobalVariable(
-        M, i8_ptr_ty, false, llvm::GlobalValue::InternalLinkage,
-        llvm::ConstantPointerNull::get(i8_ptr_ty), "__omill_inline_diag_sink");
-    sink->setAlignment(llvm::Align(8));
-    sink->setSection(".omill.inline.diag");
-  }
-
-  auto *zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), 0);
-  llvm::SmallVector<llvm::Constant *, 2> idxs{zero, zero};
-  llvm::Constant *str_ptr = llvm::ConstantExpr::getInBoundsGetElementPtr(
-      str_data->getType(), str_gv, idxs);
-  if (str_ptr->getType() != i8_ptr_ty)
-    str_ptr = llvm::ConstantExpr::getPointerCast(str_ptr, i8_ptr_ty);
-
-  llvm::IRBuilder<> B(&call);
-  auto *store = B.CreateStore(str_ptr, sink, /*isVolatile=*/true);
-  store->setAlignment(llvm::Align(8));
-
-  llvm::appendToUsed(M, {str_gv, sink});
-}
+// NOTE: emitInlineDiagMarkers() and emitInlineDiagMarker() were removed as unused.
 
 /// When a __remill_missing_block call targets a constant address inside
 /// a non-executable PE section (e.g. .rdata import name table), the
@@ -10334,11 +10246,10 @@ static void buildIterativeResolutionEpoch(llvm::ModulePassManager &MPM,
                 if (field_itp_count.empty())
                   return llvm::PreservedAnalyses::all();
 
-                // Find the field with the most inttoptr derivations.
-                int64_t best_off = -1;
+                // Find the highest inttoptr derivation count (used as threshold reference).
                 unsigned best_count = 0;
                 for (auto &[off, cnt] : field_itp_count)
-                  if (cnt > best_count) { best_off = off; best_count = cnt; }
+                  if (cnt > best_count) { best_count = cnt; }
 
                 // Collect ALL fields with >= 10 inttoptr derivations.
                 llvm::SmallVector<int64_t, 8> target_fields;
@@ -10965,7 +10876,6 @@ static void buildFinalCleanupPipeline(llvm::ModulePassManager &MPM,
         llvm::PreservedAnalyses run(llvm::Module &M,
                                      llvm::ModuleAnalysisManager &) {
           bool changed = false;
-          auto &Ctx = M.getContext();
           llvm::SmallVector<llvm::CallInst *, 16> to_erase;
           llvm::SmallVector<std::pair<llvm::CallInst *, llvm::Value *>, 8>
               to_replace;
