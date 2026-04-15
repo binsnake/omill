@@ -27,6 +27,7 @@ add_library(omill STATIC
   Analysis/CallGraphAnalysis.cpp
   Analysis/LiftedFunctionMap.cpp
   Analysis/IterativeLiftingSession.cpp
+  Analysis/RegisterRoleMap.cpp
   Analysis/RemillIntrinsicAnalysis.cpp
   Analysis/RemillStateVariableSolver.cpp
   Analysis/StateFieldAccessAnalysis.cpp

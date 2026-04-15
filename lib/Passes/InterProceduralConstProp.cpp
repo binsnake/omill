@@ -32,6 +32,10 @@ static constexpr const char *kWin64ParamRegs[] = {"RCX", "RDX", "R8", "R9"};
 
 using StateConstants = llvm::DenseMap<unsigned, llvm::ConstantInt *>;
 
+/// Affine pass-through: offset X has output = input + delta.
+/// Used for VSP/RSP tracking across handlers.
+using AffineDeltas = llvm::DenseMap<unsigned, int64_t>;
+
 /// Collect constant stores to Win64 param offsets in the same BB before CI.
 StateConstants collectPreCallConstants(
     llvm::CallInst *CI, const llvm::DataLayout &DL,
@@ -59,7 +63,8 @@ StateConstants collectPreCallConstants(
 static void collectStateConstantsInBlock(
     llvm::BasicBlock *BB, llvm::BasicBlock::iterator end_it,
     const llvm::DataLayout &DL,
-    llvm::DenseSet<unsigned> &seen, StateConstants &result) {
+    llvm::DenseSet<unsigned> &seen, StateConstants &result,
+    AffineDeltas *affine = nullptr) {
   auto it = end_it;
   while (it != BB->begin()) {
     --it;
@@ -74,8 +79,8 @@ static void collectStateConstantsInBlock(
     if (auto *C = llvm::dyn_cast<llvm::ConstantInt>(val)) {
       result[u] = C;
     } else if (auto *binop = llvm::dyn_cast<llvm::BinaryOperator>(val)) {
-      // Handle: store (add %program_counter, <const>)
       if (binop->getOpcode() == llvm::Instruction::Add) {
+        // Handle: store (add %program_counter, <const>)
         llvm::ConstantInt *pc_offset = nullptr;
         llvm::Argument *pc_arg = nullptr;
         for (unsigned i = 0; i < 2; ++i) {
@@ -92,6 +97,31 @@ static void collectStateConstantsInBlock(
                 llvm::ConstantInt::get(pc_offset->getType(),
                                         va + pc_offset->getZExtValue()));
         }
+        // Handle affine: store (add (load state+X), <const>), state+X
+        // This captures VSP/RSP adjustment patterns: out = in + delta.
+        if (affine && !pc_arg && pc_offset) {
+          for (unsigned i = 0; i < 2; ++i) {
+            auto *LI = llvm::dyn_cast<llvm::LoadInst>(binop->getOperand(i));
+            if (!LI) continue;
+            int64_t load_off =
+                resolveStateOffset(LI->getPointerOperand(), DL);
+            if (load_off >= 0 && static_cast<unsigned>(load_off) == u) {
+              (*affine)[u] = pc_offset->getSExtValue();
+              break;
+            }
+          }
+        }
+      } else if (affine &&
+                 binop->getOpcode() == llvm::Instruction::Sub) {
+        // Handle affine: store (sub (load state+X), <const>), state+X
+        auto *LI = llvm::dyn_cast<llvm::LoadInst>(binop->getOperand(0));
+        auto *CI = llvm::dyn_cast<llvm::ConstantInt>(binop->getOperand(1));
+        if (LI && CI) {
+          int64_t load_off =
+              resolveStateOffset(LI->getPointerOperand(), DL);
+          if (load_off >= 0 && static_cast<unsigned>(load_off) == u)
+            (*affine)[u] = -CI->getSExtValue();
+        }
       }
     }
   }
@@ -99,35 +129,60 @@ static void collectStateConstantsInBlock(
 
 /// Collect constant State stores at all function exits.
 /// Intersects across exits: only keeps offsets where every exit agrees.
-static StateConstants collectExitConstants(
+struct ExitInfo {
+  StateConstants constants;
+  AffineDeltas affine;
+};
+
+static ExitInfo collectExitConstants(
     llvm::Function &F, const llvm::DataLayout &DL) {
-  llvm::SmallVector<StateConstants, 4> per_exit;
+  struct PerExit {
+    StateConstants consts;
+    AffineDeltas affine;
+  };
+  llvm::SmallVector<PerExit, 4> per_exit;
   for (auto &BB : F) {
     if (!llvm::isa<llvm::ReturnInst>(BB.getTerminator())) continue;
-    StateConstants consts;
+    PerExit pe;
     llvm::DenseSet<unsigned> seen;
     auto *cur = const_cast<llvm::BasicBlock *>(&BB);
     for (unsigned depth = 0; depth < 16; ++depth) {
-      collectStateConstantsInBlock(cur, cur->end(), DL, seen, consts);
+      collectStateConstantsInBlock(cur, cur->end(), DL, seen, pe.consts,
+                                   &pe.affine);
       auto *sp = cur->getSinglePredecessor();
       if (!sp || sp == cur || sp->getParent() != BB.getParent()) break;
       cur = sp;
     }
-    per_exit.push_back(std::move(consts));
+    per_exit.push_back(std::move(pe));
   }
-  if (per_exit.empty()) return StateConstants();
-  StateConstants result = per_exit[0];
+  if (per_exit.empty()) return ExitInfo();
+
+  // Intersect constants across all exits.
+  StateConstants result = per_exit[0].consts;
   for (unsigned i = 1; i < per_exit.size(); ++i) {
     llvm::SmallVector<unsigned, 4> drop;
     for (auto &[off, c] : result) {
-      auto it = per_exit[i].find(off);
-      if (it == per_exit[i].end() ||
+      auto it = per_exit[i].consts.find(off);
+      if (it == per_exit[i].consts.end() ||
           it->second->getValue() != c->getValue())
         drop.push_back(off);
     }
     for (unsigned k : drop) result.erase(k);
   }
-  return result;
+
+  // Intersect affine deltas across all exits.
+  AffineDeltas affine = per_exit[0].affine;
+  for (unsigned i = 1; i < per_exit.size(); ++i) {
+    llvm::SmallVector<unsigned, 4> drop;
+    for (auto &[off, delta] : affine) {
+      auto it = per_exit[i].affine.find(off);
+      if (it == per_exit[i].affine.end() || it->second != delta)
+        drop.push_back(off);
+    }
+    for (unsigned k : drop) affine.erase(k);
+  }
+
+  return ExitInfo{std::move(result), std::move(affine)};
 }
 
 /// Collect ALL constant State stores before a call site, walking backward
@@ -529,10 +584,23 @@ bool propagateStateConstantsWorklist(
         llvm::errs() << "[ipcp] optimized clone " << clone->getName() << "\n";
     }
 
-    // Extract output constants.
+    // Extract output constants and affine deltas.
     StateConstants output;
     if (clone) {
-      output = collectExitConstants(*clone, DL);
+      auto exit_info = collectExitConstants(*clone, DL);
+      output = std::move(exit_info.constants);
+      // Apply affine deltas: if offset X has out = in + delta, and we
+      // know the input constant at X, compute the output constant.
+      for (auto &[off, delta] : exit_info.affine) {
+        if (output.count(off)) continue;  // already have a concrete constant
+        auto in_it = entry.input.find(off);
+        if (in_it != entry.input.end()) {
+          int64_t in_val = in_it->second->getSExtValue();
+          output[off] = llvm::cast<llvm::ConstantInt>(
+              llvm::ConstantInt::get(in_it->second->getType(),
+                                     static_cast<uint64_t>(in_val + delta)));
+        }
+      }
     }
     // Pass-through: input constants for offsets the target doesn't access.
     auto accessed = getAccessedOffsets(clone ? *clone : *entry.target, DL);
@@ -830,7 +898,20 @@ bool propagateStateConstantsWorklist(
       }
 
       StateConstants output;
-      if (clone) output = collectExitConstants(*clone, DL);
+      if (clone) {
+        auto exit_info = collectExitConstants(*clone, DL);
+        output = std::move(exit_info.constants);
+        for (auto &[off, delta] : exit_info.affine) {
+          if (output.count(off)) continue;
+          auto in_it = entry.input.find(off);
+          if (in_it != entry.input.end()) {
+            int64_t in_val = in_it->second->getSExtValue();
+            output[off] = llvm::cast<llvm::ConstantInt>(
+                llvm::ConstantInt::get(in_it->second->getType(),
+                                       static_cast<uint64_t>(in_val + delta)));
+          }
+        }
+      }
       auto accessed = getAccessedOffsets(clone ? *clone : *entry.target, DL);
       for (auto &[off, c] : entry.input)
         if (!accessed.count(off) && !output.count(off))

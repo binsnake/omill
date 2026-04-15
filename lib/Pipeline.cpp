@@ -57,6 +57,7 @@
 #include "omill/Passes/LowerRemillIntrinsics.h"
 #include "omill/Analysis/ExceptionInfo.h"
 #include "omill/Analysis/IterativeLiftingSession.h"
+#include "omill/Analysis/RegisterRoleMap.h"
 #include "omill/Passes/ResolveForcedExceptions.h"
 #include "omill/Passes/RecoverStackFrame.h"
 #include "omill/Passes/RecoverStackFrameTypes.h"
@@ -12511,6 +12512,7 @@ void registerModuleAnalyses(llvm::ModuleAnalysisManager &MAM) {
   MAM.registerPass([&] { return BinaryMemoryAnalysis(); });
   MAM.registerPass([&] { return LiftedFunctionAnalysis(); });
   MAM.registerPass([&] { return IterativeLiftingSessionAnalysis(); });
+  MAM.registerPass([&] { return RegisterRoleMapAnalysis(); });
   MAM.registerPass([&] { return ExceptionInfoAnalysis(); });
   MAM.registerPass([&] { return BlockLiftAnalysis(); });
   MAM.registerPass([&] { return VMTraceMapAnalysis(); });
