@@ -2090,6 +2090,7 @@ static UnicornLoader &getUnicorn() {
 class UnicornStepEngine {
   uc_engine *uc_ = nullptr;
   bool valid_ = false;
+  bool debug_ = false;
   const BinaryMemoryMap &mem_;
 
   static constexpr int kUCRegs[] = {
@@ -2153,6 +2154,8 @@ class UnicornStepEngine {
         nullptr, 1, 0);
 
     valid_ = true;
+    const char *dbg = std::getenv("OMILL_DEBUG_UC_STEP");
+    debug_ = dbg && dbg[0] == '1';
   }
 
   ~UnicornStepEngine() {
@@ -2161,26 +2164,25 @@ class UnicornStepEngine {
 
   bool isValid() const { return valid_; }
 
-  /// Sync EmuState → Unicorn before stepping.
-  void syncToUnicorn(const EmuState &state) {
+  /// Full sync: registers + stack + flags.  Call once at handler entry.
+  void syncFullToUnicorn(const EmuState &state) {
     auto &UC = getUnicorn();
     for (unsigned i = 0; i < REG_COUNT && i < 16; ++i)
       UC.fn_reg_write(uc_, kUCRegs[i], &state.regs[i]);
     UC.fn_reg_write(uc_, UC_X86_REG_RIP, &state.rip);
-    // Write the stack buffer.
     UC.fn_mem_write(uc_, EmuState::kStackBase,
                     state.stack_mem.data(), EmuState::kStackSize);
-    // Sync flags via EFLAGS register.
     uint64_t eflags = (state.flags.CF ? 1 : 0) |
                       (state.flags.ZF ? (1 << 6) : 0) |
                       (state.flags.SF ? (1 << 7) : 0) |
                       (state.flags.OF ? (1 << 11) : 0) |
-                      (1 << 1);  // reserved bit 1 always set
+                      (1 << 1);
     UC.fn_reg_write(uc_, UC_X86_REG_EFLAGS, &eflags);
+    synced_ = true;
   }
 
-  /// Sync Unicorn → EmuState after stepping.
-  void syncFromUnicorn(EmuState &state) {
+  /// Full sync back: registers + stack + flags.  Call at handler exit.
+  void syncFullFromUnicorn(EmuState &state) {
     auto &UC = getUnicorn();
     for (unsigned i = 0; i < REG_COUNT && i < 16; ++i)
       UC.fn_reg_read(uc_, kUCRegs[i], &state.regs[i]);
@@ -2195,23 +2197,71 @@ class UnicornStepEngine {
     state.flags.OF = (eflags >> 11) & 1;
   }
 
+  /// Lightweight per-step sync: only registers (no stack copy).
+  void syncRegsToUnicorn(const EmuState &state) {
+    auto &UC = getUnicorn();
+    for (unsigned i = 0; i < REG_COUNT && i < 16; ++i)
+      UC.fn_reg_write(uc_, kUCRegs[i], &state.regs[i]);
+    UC.fn_reg_write(uc_, UC_X86_REG_RIP, &state.rip);
+    uint64_t eflags = (state.flags.CF ? 1 : 0) |
+                      (state.flags.ZF ? (1 << 6) : 0) |
+                      (state.flags.SF ? (1 << 7) : 0) |
+                      (state.flags.OF ? (1 << 11) : 0) |
+                      (1 << 1);
+    UC.fn_reg_write(uc_, UC_X86_REG_EFLAGS, &eflags);
+  }
+
+  void syncRegsFromUnicorn(EmuState &state) {
+    auto &UC = getUnicorn();
+    for (unsigned i = 0; i < REG_COUNT && i < 16; ++i)
+      UC.fn_reg_read(uc_, kUCRegs[i], &state.regs[i]);
+    UC.fn_reg_read(uc_, UC_X86_REG_RIP, &state.rip);
+    uint64_t eflags = 0;
+    UC.fn_reg_read(uc_, UC_X86_REG_EFLAGS, &eflags);
+    state.flags.CF = (eflags >> 0) & 1;
+    state.flags.ZF = (eflags >> 6) & 1;
+    state.flags.SF = (eflags >> 7) & 1;
+    state.flags.OF = (eflags >> 11) & 1;
+  }
+
+  bool needsInitialSync() const { return !synced_; }
+  bool synced_ = false;
+
   /// Execute exactly one instruction and classify the result.
   ExecResult step(EmuState &state) {
     auto &UC = getUnicorn();
     uint64_t pre_rip = state.rip;
 
+    // First step for this handler: full sync including stack.
+    if (needsInitialSync())
+      syncFullToUnicorn(state);
+    else
+      syncRegsToUnicorn(state);
+
     // Read instruction bytes to classify before executing.
     uint8_t buf[15];
     UC.fn_mem_read(uc_, pre_rip, buf, 15);
 
-    syncToUnicorn(state);
-
     // Single-step: execute 1 instruction.
     auto err = UC.fn_emu_start(uc_, pre_rip, 0, 0, 1);
-    syncFromUnicorn(state);
+    syncRegsFromUnicorn(state);
 
-    if (err != UC_ERR_OK)
-      return ExecResult::Unsupported;
+    if (err != UC_ERR_OK) {
+      if (debug_) {
+        llvm::errs() << "[uc-step] ERROR at 0x"
+                     << llvm::utohexstr(pre_rip)
+                     << " err=" << err
+                     << " post_rip=0x" << llvm::utohexstr(state.rip)
+                     << " bytes:";
+        for (int i = 0; i < 8; ++i)
+          llvm::errs() << " " << llvm::utohexstr(buf[i]);
+        llvm::errs() << ", falling back to mini-emulator\n";
+      }
+      // Sync stack back before falling through to mini-emulator.
+      syncFullFromUnicorn(state);
+      state.rip = pre_rip;  // Reset RIP to retry with mini-emulator.
+      return stepInstruction(state, mem_);
+    }
 
     // Classify by decoding the instruction at pre_rip.
     unsigned pos = 0;
@@ -3237,6 +3287,8 @@ VMTraceEmulator::traceFromHandlerImpl(
     }
 
     // Emulate the handler.
+    if (use_unicorn)
+      uc_engine.synced_ = false;  // Force full sync on first step of new handler.
     bool dispatched = false;
     unsigned call_depth = 0;  // Track internal function call nesting.
     for (unsigned step = 0; step < max_steps_per_handler_; ++step) {
@@ -3669,6 +3721,11 @@ VMTraceEmulator::traceFromHandlerImpl(
                    << " exceeded step limit\n";
       entry.is_error = true;
     }
+
+    // Sync stack back from Unicorn after handler completes so that
+    // readMem/readTrackedSlots see the updated vmcontext for the next handler.
+    if (use_unicorn && uc_engine.isValid())
+      uc_engine.syncFullFromUnicorn(state);
 
     results.push_back(std::move(entry));
   }
