@@ -2227,6 +2227,7 @@ uint64_t analyzeReturnAddressRedirect(
     uint64_t redirect = 0;
     uint64_t vm_entry_va = 0;
     uint64_t vm_exit_va = 0;
+    uint64_t vm_call_site = 0;  ///< .text address of the CALL that enters VMP
     uint64_t prev_addr = 0;
     bool after_vmp_call = false;
     bool in_vmp = false;
@@ -2263,8 +2264,10 @@ uint64_t analyzeReturnAddressRedirect(
                     // Transition: .text → VMP. Record the first VMP
                     // address as vm_entry candidate.
                     r->in_vmp = true;
-                    if (r->vm_entry_va == 0)
+                    if (r->vm_entry_va == 0) {
                       r->vm_entry_va = addr;
+                      r->vm_call_site = r->prev_addr;
+                    }
                   }
                   r->after_vmp_call = true;
                   r->vm_exit_va = addr;  // track last VMP addr seen
@@ -2287,6 +2290,7 @@ uint64_t analyzeReturnAddressRedirect(
   llvm::errs() << "[uc-redirect] entry=0x"
                << llvm::Twine::utohexstr(entry_va)
                << " redirect=0x" << llvm::Twine::utohexstr(rctx.redirect)
+               << " vm_call_site=0x" << llvm::Twine::utohexstr(rctx.vm_call_site)
                << " vm_entry=0x" << llvm::Twine::utohexstr(rctx.vm_entry_va)
                << " vm_exit=0x" << llvm::Twine::utohexstr(rctx.vm_exit_va)
                << " steps=" << ctx.count << "\n";
@@ -2297,7 +2301,8 @@ uint64_t analyzeReturnAddressRedirect(
   cache[entry_va] = result;
 
   // Store extended result for analyzeReturnAddressRedirectEx.
-  g_redirect_ext_cache[entry_va] = {result, rctx.vm_entry_va, rctx.vm_exit_va};
+  g_redirect_ext_cache[entry_va] = {result, rctx.vm_entry_va, rctx.vm_exit_va,
+                                    rctx.vm_call_site};
 
   return result;
 }

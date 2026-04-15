@@ -176,6 +176,34 @@
                      {"image_base", ("0x" + Twine::utohexstr(pe.image_base)).str()},
                      {"code_sections", static_cast<int64_t>(pe.code_sections.size())}});
 
+    // Auto-detect vm_entry/vm_exit when not specified via CLI.
+    // The Unicorn redirect emulation traces through the VMP section and
+    // captures the first/last VMP addresses hit.
+    if (vm_entry_va == 0 && func_va != 0 && !pe.is_macho &&
+        (GenericStaticDevirtualize || env_generic_static_devirtualize ||
+         force_devirtualize)) {
+      auto rr = omill::analyzeReturnAddressRedirectEx(
+          pe.memory_map, func_va);
+      if (rr.vm_entry_va != 0) {
+        vm_entry_va = rr.vm_entry_va;
+        vm_exit_va = rr.vm_exit_va;
+        vm_mode = true;
+        // Use the call site as wrapper VA — the trace emulator's wrapper
+        // parser expects the LEA RSP + CALL vmentry pattern at this address.
+        if (vm_wrapper_va == 0)
+          vm_wrapper_va = rr.vm_call_site ? rr.vm_call_site : func_va;
+        errs() << "Auto-detected VM entry/exit from Unicorn redirect:\n"
+               << "  vm_entry=0x" << Twine::utohexstr(vm_entry_va)
+               << " vm_exit=0x" << Twine::utohexstr(vm_exit_va)
+               << " vm_call_site=0x" << Twine::utohexstr(rr.vm_call_site)
+               << "\n";
+        events.emitInfo("vm_auto_detected",
+                        "auto-detected VM entry/exit from Unicorn redirect",
+                        {{"vm_entry", ("0x" + Twine::utohexstr(vm_entry_va)).str()},
+                         {"vm_exit", ("0x" + Twine::utohexstr(vm_exit_va)).str()}});
+      }
+    }
+
     auto resolveDirectJmpThunkTarget = [&](uint64_t root_va)
         -> std::optional<uint64_t> {
       const auto *section = findCodeSection(pe, root_va);

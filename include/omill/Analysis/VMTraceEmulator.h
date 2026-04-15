@@ -100,9 +100,10 @@ std::optional<CallTargetBridgeEffect> analyzeCallTargetBridgeEffect(
 /// Result of analyzeReturnAddressRedirect, including auto-detected VM
 /// entry/exit addresses observed during Unicorn emulation.
 struct RedirectAnalysisResult {
-  uint64_t redirect = 0;      ///< First .text address after VMP execution.
-  uint64_t vm_entry_va = 0;   ///< First VMP-section address hit (vm_entry candidate).
-  uint64_t vm_exit_va = 0;    ///< Last VMP-section address before returning to .text.
+  uint64_t redirect = 0;       ///< First .text address after VMP execution.
+  uint64_t vm_entry_va = 0;    ///< First VMP-section address hit (vm_entry candidate).
+  uint64_t vm_exit_va = 0;     ///< Last VMP-section address before returning to .text.
+  uint64_t vm_call_site = 0;   ///< .text address of the CALL that enters VMP.
 };
 
 /// through the full call chain.  The function entry sets up RCX via
