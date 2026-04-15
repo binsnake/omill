@@ -104,6 +104,11 @@ struct RedirectAnalysisResult {
   uint64_t vm_entry_va = 0;    ///< First VMP-section address hit (vm_entry candidate).
   uint64_t vm_exit_va = 0;     ///< Last VMP-section address before returning to .text.
   uint64_t vm_call_site = 0;   ///< .text address of the CALL that enters VMP.
+
+  /// Full register snapshot at the VMP entry point (first .MgW instruction).
+  /// Indexed by internal register enum (RAX=0..R15=15).
+  uint64_t entry_regs[16] = {};
+  bool has_entry_regs = false;
 };
 
 /// through the full call chain.  The function entry sets up RCX via
@@ -229,6 +234,8 @@ class VMTraceEmulator {
     uint64_t initial_hash = 0;    ///< Constant stored to [r12+0x190].
     uint64_t first_handler_va = 0;///< First handler VA after thunk following.
     std::vector<uint8_t> vmcontext_snapshot; ///< Wrapper-seeded vmctx bytes.
+    uint64_t initial_regs[16] = {};          ///< Register state at handler entry.
+    bool has_initial_regs = false;
     bool valid = false;
   };
 
@@ -238,7 +245,8 @@ class VMTraceEmulator {
 
   std::vector<TraceEntry> traceFromHandlerImpl(
       uint64_t handler_va, uint64_t delta, uint64_t initial_hash,
-      const std::vector<uint8_t> *vmcontext_snapshot);
+      const std::vector<uint8_t> *vmcontext_snapshot,
+      const uint64_t *initial_regs = nullptr);
 
   /// Compute the base_delta value from the vmentry helper sub-function.
   std::optional<uint64_t> computeDelta(uint64_t subfunc_va,

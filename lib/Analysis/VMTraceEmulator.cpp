@@ -2117,6 +2117,16 @@ class UnicornStepEngine {
     // Map the EmuState stack region.
     UC.fn_mem_map(uc_, EmuState::kStackBase, EmuState::kStackSize, UC_PROT_ALL);
 
+    // Map a dummy argument buffer at a plausible address.
+    // Virtualized functions that are themselves interpreters (e.g. TvmpBytecodeVm)
+    // read from their program/data pointer argument (RCX). Without a readable
+    // buffer, the handlers crash on memory access.  The content doesn't matter
+    // for handler discovery — only reachability.
+    constexpr uint64_t kDummyArgBase = 0x1000000000ull;  // 64 GB mark
+    constexpr size_t kDummyArgSize = 0x100000;           // 1 MB
+    UC.fn_mem_map(uc_, kDummyArgBase, kDummyArgSize, UC_PROT_ALL);
+    // Zero-filled by default (uc_mem_map zeroes memory).
+
     // Map low memory + GS segment for TEB stub.
     UC.fn_mem_map(uc_, 0, 0x10000, UC_PROT_ALL);
     constexpr uint64_t kGsBase = 0x7FFE0000ull;
@@ -2458,12 +2468,16 @@ uint64_t analyzeReturnAddressRedirect(
     uint64_t redirect = 0;
     uint64_t vm_entry_va = 0;
     uint64_t vm_exit_va = 0;
-    uint64_t vm_call_site = 0;  ///< .text address of the CALL that enters VMP
+    uint64_t vm_call_site = 0;
     uint64_t prev_addr = 0;
+    uint64_t entry_regs[16] = {};
+    bool has_entry_regs = false;
     bool after_vmp_call = false;
     bool in_vmp = false;
+    uc_engine *uc = nullptr;  // for register capture
   };
   RedirectCtx rctx;
+  rctx.uc = uc;
 
   // Derive VMP section bounds from the binary memory map.
   uint64_t vmp_start = 0, vmp_end = 0;
@@ -2493,11 +2507,26 @@ uint64_t analyzeReturnAddressRedirect(
                 if (is_vmp) {
                   if (!r->in_vmp) {
                     // Transition: .text → VMP. Record the first VMP
-                    // address as vm_entry candidate.
+                    // address as vm_entry candidate + register snapshot.
                     r->in_vmp = true;
                     if (r->vm_entry_va == 0) {
                       r->vm_entry_va = addr;
                       r->vm_call_site = r->prev_addr;
+                      // Capture full register state at VMP entry.
+                      if (r->uc) {
+                        static const int regs[] = {
+                          UC_X86_REG_RAX, UC_X86_REG_RCX, UC_X86_REG_RDX,
+                          UC_X86_REG_RBX, UC_X86_REG_RSP, UC_X86_REG_RBP,
+                          UC_X86_REG_RSI, UC_X86_REG_RDI, UC_X86_REG_R8,
+                          UC_X86_REG_R9, UC_X86_REG_R10, UC_X86_REG_R11,
+                          UC_X86_REG_R12, UC_X86_REG_R13, UC_X86_REG_R14,
+                          UC_X86_REG_R15
+                        };
+                        auto &U = getUnicorn();
+                        for (int i = 0; i < 16; ++i)
+                          U.fn_reg_read(r->uc, regs[i], &r->entry_regs[i]);
+                        r->has_entry_regs = true;
+                      }
                     }
                   }
                   r->after_vmp_call = true;
@@ -2532,8 +2561,15 @@ uint64_t analyzeReturnAddressRedirect(
   cache[entry_va] = result;
 
   // Store extended result for analyzeReturnAddressRedirectEx.
-  g_redirect_ext_cache[entry_va] = {result, rctx.vm_entry_va, rctx.vm_exit_va,
-                                    rctx.vm_call_site};
+  {
+    RedirectAnalysisResult ext{result, rctx.vm_entry_va, rctx.vm_exit_va,
+                               rctx.vm_call_site};
+    if (rctx.has_entry_regs) {
+      std::memcpy(ext.entry_regs, rctx.entry_regs, sizeof(ext.entry_regs));
+      ext.has_entry_regs = true;
+    }
+    g_redirect_ext_cache[entry_va] = ext;
+  }
 
   return result;
 }
@@ -2891,10 +2927,18 @@ VMTraceEmulator::traceFromWrapper(uint64_t wrapper_va) {
       llvm::errs() << "VMTraceEmulator: wrapper parse failed at "
                    << llvm::utohexstr(wrapper_va)
                    << ", falling back to Unicorn-detected vm_entry=0x"
-                   << llvm::utohexstr(ext.vm_entry_va) << "\n";
+                   << llvm::utohexstr(ext.vm_entry_va)
+                   << " has_regs=" << ext.has_entry_regs << "\n";
       info.first_handler_va = ext.vm_entry_va;
       info.delta = 0;
       info.initial_hash = 0;
+      // If we captured the register state at VMP entry, inject it into
+      // the vmcontext snapshot so the trace emulator starts with correct
+      // register values (especially RCX/RDX/R8 for function arguments).
+      if (ext.has_entry_regs) {
+        std::memcpy(info.initial_regs, ext.entry_regs, sizeof(info.initial_regs));
+        info.has_initial_regs = true;
+      }
       info.valid = true;
     } else {
       llvm::errs() << "VMTraceEmulator: failed to parse wrapper at "
@@ -2912,9 +2956,10 @@ VMTraceEmulator::traceFromWrapper(uint64_t wrapper_va) {
 
   last_delta_ = info.delta;
 
-  auto results = traceFromHandlerImpl(info.first_handler_va, info.delta,
-                                      info.initial_hash,
-                                      &info.vmcontext_snapshot);
+  auto results = traceFromHandlerImpl(
+      info.first_handler_va, info.delta, info.initial_hash,
+      &info.vmcontext_snapshot,
+      info.has_initial_regs ? info.initial_regs : nullptr);
 
   TraceEntry wrapper_entry;
   wrapper_entry.handler_va = wrapper_va;
@@ -2951,9 +2996,10 @@ VMTraceEmulator::traceFromWrapperWithSnapshot(
 
   last_delta_ = info.delta;
 
-  auto results = traceFromHandlerImpl(info.first_handler_va, info.delta,
-                                      info.initial_hash,
-                                      &info.vmcontext_snapshot);
+  auto results = traceFromHandlerImpl(
+      info.first_handler_va, info.delta, info.initial_hash,
+      &info.vmcontext_snapshot,
+      info.has_initial_regs ? info.initial_regs : nullptr);
 
   TraceEntry wrapper_entry;
   wrapper_entry.handler_va = wrapper_va;
@@ -2993,9 +3039,10 @@ VMTraceEmulator::traceFromWrapperWithSnapshotAndHash(
 
   last_delta_ = info.delta;
 
-  auto results = traceFromHandlerImpl(info.first_handler_va, info.delta,
-                                      info.initial_hash,
-                                      &info.vmcontext_snapshot);
+  auto results = traceFromHandlerImpl(
+      info.first_handler_va, info.delta, info.initial_hash,
+      &info.vmcontext_snapshot,
+      info.has_initial_regs ? info.initial_regs : nullptr);
 
   TraceEntry wrapper_entry;
   wrapper_entry.handler_va = wrapper_va;
@@ -3038,7 +3085,8 @@ VMTraceEmulator::traceFromHandlerWithSnapshot(
 std::vector<VMTraceEmulator::TraceEntry>
 VMTraceEmulator::traceFromHandlerImpl(
     uint64_t handler_va, uint64_t delta, uint64_t initial_hash,
-    const std::vector<uint8_t> *vmcontext_snapshot) {
+    const std::vector<uint8_t> *vmcontext_snapshot,
+    const uint64_t *initial_regs) {
   std::vector<TraceEntry> results;
 
   struct WorkItem {
@@ -3198,6 +3246,17 @@ VMTraceEmulator::traceFromHandlerImpl(
     state.regs[RSP] = EmuState::kStackBase + EmuState::kStackSize - 0x2000;
     state.regs[R12] = syntheticVMContextBase();
     state.rip = item.handler_va;
+
+    // Inject captured register state from Unicorn redirect analysis.
+    // This provides correct function arguments (RCX=program, RDX=length,
+    // R8=seed) for virtualized interpreter functions.
+    if (initial_regs && results.empty()) {
+      for (unsigned i = 0; i < REG_COUNT && i < 16; ++i)
+        state.regs[i] = initial_regs[i];
+      state.rip = item.handler_va;  // Override RIP from captured state.
+      // Keep R12 pointing to synthetic vmcontext.
+      state.regs[R12] = syntheticVMContextBase();
+    }
 
     if (stateful_mode && item.has_state) {
       if (!item.snapshot.empty()) {
