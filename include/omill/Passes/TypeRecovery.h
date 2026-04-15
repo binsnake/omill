@@ -13,8 +13,7 @@ namespace omill {
 ///   inttoptr(add(ptrtoint(p), const))  → GEP i8, p, const
 ///   inttoptr(sub(ptrtoint(p), const))  → GEP i8, p, -const
 ///   ptrtoint(inttoptr(x))              → x
-///   inttoptr(ptrtoint(x))              → x   (already in JunkInstructionRemover,
-///                                              but caught here too for completeness)
+///   inttoptr(ptrtoint(x))              → x
 ///
 /// Multi-layer chains are handled iteratively until fixpoint.
 class TypeRecoveryPass : public llvm::PassInfoMixin<TypeRecoveryPass> {

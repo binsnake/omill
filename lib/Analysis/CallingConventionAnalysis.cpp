@@ -11,6 +11,7 @@
 
 #include <algorithm>
 
+#include "omill/Analysis/StateOffsetUtils.h"
 #include "omill/Analysis/TargetArchAnalysis.h"
 #include "omill/Arch/ArchABI.h"
 #include "omill/Utils/LiftedNames.h"
@@ -85,36 +86,6 @@ std::optional<unsigned> maxWin64ParamCountFromSeedExprs(
   if (!found)
     return std::nullopt;
   return max_index + 1;
-}
-
-/// Resolve a pointer to its State byte offset. Returns -1 if not resolvable.
-int64_t resolveStateOffset(llvm::Value *ptr, const llvm::DataLayout &DL) {
-  int64_t total_offset = 0;
-  llvm::Value *base = ptr;
-
-  while (true) {
-    if (auto *GEP = llvm::dyn_cast<llvm::GEPOperator>(base)) {
-      llvm::APInt ap_offset(64, 0);
-      if (GEP->accumulateConstantOffset(DL, ap_offset)) {
-        total_offset += ap_offset.getSExtValue();
-        base = GEP->getPointerOperand();
-        continue;
-      }
-      return -1;
-    }
-    if (auto *BC = llvm::dyn_cast<llvm::BitCastOperator>(base)) {
-      base = BC->getOperand(0);
-      continue;
-    }
-    break;
-  }
-
-  if (auto *arg = llvm::dyn_cast<llvm::Argument>(base)) {
-    if (arg->getArgNo() == 0 && total_offset >= 0) {
-      return total_offset;
-    }
-  }
-  return -1;
 }
 
 /// Compute live-in and live-out State field offsets for a function.

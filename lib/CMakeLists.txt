@@ -70,7 +70,6 @@ add_library(omill STATIC
 
   # Passes - Stage 3: State Optimization
   Passes/OptimizeState.cpp
-  Passes/MemoryPointerElimination.cpp
 
   # Passes - Stage 2.5: VM Devirtualization
   Analysis/VMTraceMap.cpp
@@ -108,7 +107,6 @@ add_library(omill STATIC
   Passes/PartialOverlapDSE.cpp
   Passes/KnownIndexSelect.cpp
   Passes/PointersHoisting.cpp
-  Passes/JunkInstructionRemover.cpp
   Passes/JumpTableConcretizer.cpp
   Passes/IndirectCallResolver.cpp
   Passes/ControlFlowUnflattener.cpp

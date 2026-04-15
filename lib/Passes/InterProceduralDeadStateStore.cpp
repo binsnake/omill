@@ -17,6 +17,7 @@
 
 #include "omill/Analysis/CallGraphAnalysis.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
+#include "omill/Analysis/StateOffsetUtils.h"
 #include "omill/Utils/StateFieldMap.h"
 
 namespace omill {
@@ -57,39 +58,6 @@ bool isLiftedPipelineFunctionLocal(const llvm::Function &F) {
 
   return hasLiftedRemillSignatureLocal(F) &&
          !F.hasFnAttribute(llvm::Attribute::OptimizeNone);
-}
-
-
-/// Resolve a pointer value to its byte offset into the State struct.
-/// Returns -1 if not resolvable to State. Copied verbatim from
-/// InterProceduralConstProp.cpp (per plan).
-int64_t resolveStateOffset(llvm::Value *ptr, const llvm::DataLayout &DL) {
-  int64_t total_offset = 0;
-  llvm::Value *base = ptr;
-
-  while (true) {
-    if (auto *GEP = llvm::dyn_cast<llvm::GEPOperator>(base)) {
-      llvm::APInt ap_offset(64, 0);
-      if (GEP->accumulateConstantOffset(DL, ap_offset)) {
-        total_offset += ap_offset.getSExtValue();
-        base = GEP->getPointerOperand();
-        continue;
-      }
-      return -1;
-    }
-    if (auto *BC = llvm::dyn_cast<llvm::BitCastOperator>(base)) {
-      base = BC->getOperand(0);
-      continue;
-    }
-    break;
-  }
-
-  if (auto *arg = llvm::dyn_cast<llvm::Argument>(base)) {
-    if (arg->getArgNo() == 0 && total_offset >= 0) {
-      return total_offset;
-    }
-  }
-  return -1;
 }
 
 /// Lattice element: set of live State byte offsets (or "all").

@@ -19,6 +19,7 @@
 
 #include "omill/Analysis/CallGraphAnalysis.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
+#include "omill/Analysis/StateOffsetUtils.h"
 #include "omill/Passes/CombinedFixedPointDevirt.h"
 #include "omill/Utils/LiftedNames.h"
 #include "omill/Utils/StateFieldMap.h"
@@ -28,30 +29,6 @@ namespace omill {
 namespace {
 
 static constexpr const char *kWin64ParamRegs[] = {"RCX", "RDX", "R8", "R9"};
-
-/// Resolve a pointer to its byte offset into the State struct (arg0).
-int64_t resolveStateOffset(llvm::Value *ptr, const llvm::DataLayout &DL) {
-  int64_t total_offset = 0;
-  llvm::Value *base = ptr;
-  while (true) {
-    if (auto *GEP = llvm::dyn_cast<llvm::GEPOperator>(base)) {
-      llvm::APInt ap(64, 0);
-      if (GEP->accumulateConstantOffset(DL, ap)) {
-        total_offset += ap.getSExtValue();
-        base = GEP->getPointerOperand();
-        continue;
-      }
-      return -1;
-    }
-    if (auto *BC = llvm::dyn_cast<llvm::BitCastOperator>(base))
-      { base = BC->getOperand(0); continue; }
-    break;
-  }
-  if (auto *arg = llvm::dyn_cast<llvm::Argument>(base))
-    if (arg->getArgNo() == 0 && total_offset >= 0)
-      return total_offset;
-  return -1;
-}
 
 using StateConstants = llvm::DenseMap<unsigned, llvm::ConstantInt *>;
 

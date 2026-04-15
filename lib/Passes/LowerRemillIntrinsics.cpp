@@ -1790,6 +1790,17 @@ llvm::PreservedAnalyses LowerRemillIntrinsicsPass::run(
   if (categories_ & LowerCategories::ResolvedDispatch)
     changed |= lowerResolvedDispatchCalls(F);
 
+  // After memory intrinsics are lowered, the Memory* pointer (arg2) has no
+  // semantic meaning.  Replace remaining uses with poison so downstream
+  // passes see a clean function signature.
+  if ((categories_ & LowerCategories::Memory) && F.arg_size() >= 3) {
+    auto *mem_arg = F.getArg(2);
+    if (!mem_arg->use_empty()) {
+      mem_arg->replaceAllUsesWith(llvm::PoisonValue::get(mem_arg->getType()));
+      changed = true;
+    }
+  }
+
   eraseUnusedLoweringHelperDeclarations(*F.getParent());
 
   return changed ? llvm::PreservedAnalyses::none()

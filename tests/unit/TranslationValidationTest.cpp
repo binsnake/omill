@@ -1,7 +1,6 @@
 #include "omill/Utils/TranslationValidator.h"
 
 #include "omill/Passes/OptimizeState.h"
-#include "omill/Passes/MemoryPointerElimination.h"
 #include "omill/Passes/LowerRemillIntrinsics.h"
 
 #include <llvm/IR/Function.h>

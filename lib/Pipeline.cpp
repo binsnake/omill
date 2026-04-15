@@ -59,7 +59,6 @@
 #include "omill/Analysis/ExceptionInfo.h"
 #include "omill/Analysis/IterativeLiftingSession.h"
 #include "omill/Passes/ResolveForcedExceptions.h"
-#include "omill/Passes/MemoryPointerElimination.h"
 #include "omill/Passes/RecoverStackFrame.h"
 #include "omill/Passes/RecoverStackFrameTypes.h"
 #include "omill/Analysis/BinaryMemoryMap.h"
@@ -91,7 +90,6 @@
 #include "omill/Passes/MergeBlockFunctions.h"
 #include "omill/Passes/JumpTableConcretizer.h"
 #include "omill/Passes/IndirectCallResolver.h"
-#include "omill/Passes/JunkInstructionRemover.h"
 #include "omill/Passes/KnownIndexSelect.h"
 #include "omill/Passes/MemoryCoalesce.h"
 #include "omill/Passes/PartialOverlapDSE.h"
@@ -7153,10 +7151,6 @@ void buildStateOptimizationPipeline(llvm::FunctionPassManager &FPM,
     }
     FPM.addPass(OptimizeStatePass(early_mask));
   }
-  if (!envDisabled("OMILL_SKIP_MEMORY_POINTER_ELIM")) {
-    FPM.addPass(MemoryPointerEliminationPass());
-  }
-
   // Recovery-first default: expose simple redundancy without collapsing
   // State/VM evidence before continuation recovery converges.
   (void)deobfuscate;
@@ -7915,7 +7909,6 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM,
         LowerCategories::Call | LowerCategories::Jump |
         LowerCategories::Return));
     FPM.addPass(CombinedFixedPointDevirtPass());
-    FPM.addPass(MemoryPointerEliminationPass());
     FPM.addPass(RecoverStackFramePass());
     FPM.addPass(RecoverStackFrameTypesPass());
     FPM.addPass(TypeRecoveryPass());
@@ -8383,9 +8376,6 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM,
     FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(SimplifyVectorReassemblyPass());
-  }
-  if (!envDisabled("OMILL_SKIP_DEOBF_JUNK_REMOVAL")) {
-    FPM.addPass(JunkInstructionRemoverPass());
   }
   if (!envDisabled("OMILL_SKIP_DEOBF_OPT_STATE_REDUNDANT")) {
     FPM.addPass(OptimizeStatePass(OptimizePhases::RedundantBytes));

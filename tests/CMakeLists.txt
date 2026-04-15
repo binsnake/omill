@@ -47,7 +47,6 @@ add_executable(omill-unit-tests
   unit/LowerFunctionCallTest.cpp
   unit/LowerJumpTest.cpp
   unit/DeadStateFlagEliminationTest.cpp
-  unit/MemoryPointerEliminationTest.cpp
   unit/ConstantMemoryFoldingTest.cpp
   unit/CombinedFixedPointDevirtTest.cpp
   unit/ImportHashDBTest.cpp
@@ -77,7 +76,6 @@ add_executable(omill-unit-tests
   unit/PartialOverlapDSETest.cpp
   unit/KnownIndexSelectTest.cpp
   unit/PointersHoistingTest.cpp
-  unit/JunkInstructionRemoverTest.cpp
   unit/IterativeBlockDiscoveryTest.cpp
   unit/MergeBlockFunctionsTest.cpp
   unit/JumpTableConcretizerTest.cpp

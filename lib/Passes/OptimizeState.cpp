@@ -12,6 +12,7 @@
 #include <llvm/Support/Debug.h>
 
 #include "omill/Utils/LiftedNames.h"
+#include "omill/Analysis/StateOffsetUtils.h"
 #include "omill/Utils/StateFieldMap.h"
 
 #define DEBUG_TYPE "optimize-state"
@@ -19,39 +20,6 @@
 namespace omill {
 
 namespace {
-
-// ============================================================================
-// Shared utility
-// ============================================================================
-
-int64_t resolveStateOffset(llvm::Value *ptr, const llvm::DataLayout &DL) {
-  int64_t total_offset = 0;
-  llvm::Value *base = ptr;
-
-  while (true) {
-    if (auto *GEP = llvm::dyn_cast<llvm::GEPOperator>(base)) {
-      llvm::APInt ap_offset(64, 0);
-      if (GEP->accumulateConstantOffset(DL, ap_offset)) {
-        total_offset += ap_offset.getSExtValue();
-        base = GEP->getPointerOperand();
-        continue;
-      }
-      return -1;
-    }
-    if (auto *BC = llvm::dyn_cast<llvm::BitCastOperator>(base)) {
-      base = BC->getOperand(0);
-      continue;
-    }
-    break;
-  }
-
-  if (auto *arg = llvm::dyn_cast<llvm::Argument>(base)) {
-    if (arg->getArgNo() == 0 && total_offset >= 0) {
-      return total_offset;
-    }
-  }
-  return -1;
-}
 
 // ============================================================================
 // Phase 1: DeadStateFlagElimination

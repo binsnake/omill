@@ -7,6 +7,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Operator.h>
 
+#include "omill/Analysis/StateOffsetUtils.h"
 #include "omill/Utils/StateFieldMap.h"
 
 namespace omill {
@@ -49,41 +50,6 @@ bool derivesFromStatePtr(llvm::Value *V) {
   }
 
   return false;
-}
-
-/// Resolve a pointer to its byte offset from the State base.
-/// Returns -1 if not resolvable.
-int64_t resolveStateOffset(llvm::Value *ptr, const llvm::DataLayout &DL) {
-  int64_t total_offset = 0;
-  llvm::Value *base = ptr;
-
-  while (true) {
-    if (auto *GEP = llvm::dyn_cast<llvm::GEPOperator>(base)) {
-      llvm::APInt ap_offset(64, 0);
-      if (GEP->accumulateConstantOffset(DL, ap_offset)) {
-        total_offset += ap_offset.getSExtValue();
-        base = GEP->getPointerOperand();
-        continue;
-      }
-      return -1;  // Non-constant GEP offset
-    }
-
-    if (auto *BC = llvm::dyn_cast<llvm::BitCastOperator>(base)) {
-      base = BC->getOperand(0);
-      continue;
-    }
-
-    break;
-  }
-
-  // Verify the base is the State pointer
-  if (auto *arg = llvm::dyn_cast<llvm::Argument>(base)) {
-    if (arg->getArgNo() == 0 && total_offset >= 0) {
-      return total_offset;
-    }
-  }
-
-  return -1;
 }
 
 /// Compute basic liveness: is this field read before it's written?

@@ -9,6 +9,8 @@
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Operator.h>
 
+#include "omill/Analysis/StateOffsetUtils.h"
+
 namespace omill {
 
 namespace {
@@ -25,35 +27,6 @@ static constexpr const char *kVolatileGPRs[] = {
 static constexpr const char *kCalleeSavedGPRs[] = {
     "RBX", "RBP", "RDI", "RSI", "R12", "R13", "R14", "R15",
 };
-
-/// Resolve a pointer to its constant byte offset from a known base alloca.
-/// Returns -1 if not resolvable.
-int64_t resolveAllocaOffset(llvm::Value *ptr, llvm::AllocaInst *alloca,
-                            const llvm::DataLayout &DL) {
-  int64_t total_offset = 0;
-  llvm::Value *base = ptr;
-
-  while (true) {
-    if (auto *GEP = llvm::dyn_cast<llvm::GEPOperator>(base)) {
-      llvm::APInt ap_offset(64, 0);
-      if (GEP->accumulateConstantOffset(DL, ap_offset)) {
-        total_offset += ap_offset.getSExtValue();
-        base = GEP->getPointerOperand();
-        continue;
-      }
-      return -1;
-    }
-    if (auto *BC = llvm::dyn_cast<llvm::BitCastOperator>(base)) {
-      base = BC->getOperand(0);
-      continue;
-    }
-    break;
-  }
-
-  if (base == alloca && total_offset >= 0)
-    return total_offset;
-  return -1;
-}
 
 /// Check if a call instruction passes the State alloca (or a derived pointer)
 /// as an argument.  If so, the call is "State-escaping" and we can't eliminate
